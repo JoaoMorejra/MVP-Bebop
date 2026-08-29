@@ -58,7 +58,7 @@ DEFAULT_HEIGHT = 1.0      # metres (ignored by Bebop firmware, kept for API)
 DEFAULT_VELOCITY = 0.3    # normalised [-1.0, 1.0]
 DEFAULT_SIDE = 1.0        # metres (side length of the square)
 DEFAULT_STABILIZE = 5.0   # seconds to stabilise after takeoff / before land
-DEFAULT_CAMERA_TILT = -45.0  # degrees (negative = look down)
+DEFAULT_CAMERA_TILT = -80.0  # degrees (negative = look down, -80.0 is maximum Bebop 2 nadir angle)
 
 
 # ---------------------------------------------------------------------------
@@ -80,50 +80,13 @@ def _save_frame(frame: Optional[np.ndarray], output_dir: str = ".") -> Optional[
 
 
 # ---------------------------------------------------------------------------
-# Flight patterns
+# Flight pattern
 # ---------------------------------------------------------------------------
-def run_square(drone, args: argparse.Namespace) -> None:
-    """Fly a velocity-based square pattern.
-
-    Replicates ``run_velocity`` from ``nectar/examples/control/basic.py``,
-    stripped to Bebop-only semantics.
-    """
-    # Takeoff (altitude is ignored by the Bebop firmware — fixed preset)
-    if not drone.takeoff(altitude=args.height):
-        log.error("Takeoff failed")
-        return
-    log.info("Airborne — stabilising for %.1fs", DEFAULT_STABILIZE)
-    drone.delay(DEFAULT_STABILIZE)
-
-    # Compute duration per leg: side_length / velocity
-    v = args.velocity
-    t = args.side / v if v > 0 else 2.0
-    log.info("Velocity square: v=%.2f  side=%.1fm  leg_time=%.1fs", v, args.side, t)
-
-    # Four legs of the square (body-frame, normalised velocity)
-    for label, vx, vy in [
-        ("Forward", v, 0.0),
-        ("Left", 0.0, v),
-        ("Backward", -v, 0.0),
-        ("Right", 0.0, -v),
-    ]:
-        log.info(label)
-        drone.move_velocity(vx=vx, vy=vy, duration=t)
-        drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=5.0)
-
-    log.info("Square complete — returning to hover")
-    drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=5.0)
-
-    drone.land()
-    log.info("Landed")
-
-
 def run_square_with_camera(drone, args: argparse.Namespace) -> None:
-    """Fly the square pattern with a mid-flight camera capture.
+    """Fly the square pattern with a camera capture at each vertex.
 
     Uses the Nectar ``ImageHandler`` to subscribe to the Bebop's
-    ``/bebop/camera/image_raw`` topic and grab a live frame at the
-    midpoint of the mission (after leg 2).
+    ``/bebop/camera/image_raw`` topic and grab live frames saved to the PC.
     """
     # Build camera handler (its own internal node joins the SDK executor)
     cam_config = ROSConfig(
@@ -138,7 +101,9 @@ def run_square_with_camera(drone, args: argparse.Namespace) -> None:
     handler.open()
     log.info("Camera opened on %s", CAMERA_TOPIC)
 
-    # --- Flight sequence (identical to run_square, with capture inserted) ---
+    drone.camera_control(tilt=DEFAULT_CAMERA_TILT, pan=0.0)
+
+    # --- Flight sequence ---
     if not drone.takeoff(altitude=args.height):
         log.error("Takeoff failed")
         handler.cleanup()
@@ -151,25 +116,22 @@ def run_square_with_camera(drone, args: argparse.Namespace) -> None:
     log.info("Velocity square: v=%.2f  side=%.1fm  leg_time=%.1fs", v, args.side, t)
 
     for label, vx, vy in [
-            ("Forward", v, 0.0),
-            ("Left", 0.0, v),
-            ("Backward", -v, 0.0),
-            ("Right", 0.0, -v),
+        ("Forward", v, 0.0),
+        ("Left", 0.0, v),
+        ("Backward", -v, 0.0),
+        ("Right", 0.0, -v),
     ]:
         log.info(label)
         drone.move_velocity(vx=vx, vy=vy, duration=t)
         drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=5.0)
-        
-        # Capture at the midpoint (after leg 2)
-        log.info("Hovering for camera capture…")
-        drone.camera_control(tilt=DEFAULT_CAMERA_TILT, pan=0.0)
+
+        # Inclinação máxima da câmera para o solo (-80.0°)
         drone.delay(1.0)
 
+        # Captura do frame da câmera e salvamento no PC
         frame = handler.take_photo(timeout_sec=2.0)
-        _save_frame(frame) 
+        _save_frame(frame)
 
-        # Restore camera to neutral
-        drone.camera_control(tilt=0.0, pan=0.0)
         drone.delay(0.5)
 
     log.info("Square complete — returning to hover")
@@ -216,11 +178,6 @@ def main() -> None:
         default=BEBOP_IP,
         help="Bebop Wi-Fi IP address. Default: %(default)s",
     )
-    parser.add_argument(
-        "--camera",
-        action="store_true",
-        help="Enable mid-flight camera capture via /bebop/camera/image_raw.",
-    )
     args = parser.parse_args()
 
     # ---- Nectar SDK lifecycle ----
@@ -243,10 +200,7 @@ def main() -> None:
             )
             return
 
-        if args.camera:
-            run_square_with_camera(drone, args)
-        else:
-            run_square(drone, args)
+        run_square_with_camera(drone, args)
 
     except KeyboardInterrupt:
         log.info("Interrupted — emergency landing")
