@@ -57,7 +57,7 @@ CAMERA_TOPIC = "/bebop/camera/image_raw"
 DEFAULT_HEIGHT = 1.0      # metres (ignored by Bebop firmware, kept for API)
 DEFAULT_VELOCITY = 0.3    # normalised [-1.0, 1.0]
 DEFAULT_SIDE = 1.0        # metres (side length of the square)
-DEFAULT_STABILIZE = 2.0   # seconds to stabilise after takeoff / before land
+DEFAULT_STABILIZE = 5.0   # seconds to stabilise after takeoff / before land
 DEFAULT_CAMERA_TILT = -45.0  # degrees (negative = look down)
 
 
@@ -109,11 +109,10 @@ def run_square(drone, args: argparse.Namespace) -> None:
     ]:
         log.info(label)
         drone.move_velocity(vx=vx, vy=vy, duration=t)
-        drone.delay(0.5)  # brief hover between legs
+        drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=5.0)
 
     log.info("Square complete — returning to hover")
-    drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
-    drone.delay(1.0)
+    drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=5.0)
 
     drone.land()
     log.info("Landed")
@@ -151,26 +150,23 @@ def run_square_with_camera(drone, args: argparse.Namespace) -> None:
     t = args.side / v if v > 0 else 2.0
     log.info("Velocity square: v=%.2f  side=%.1fm  leg_time=%.1fs", v, args.side, t)
 
-    legs = [
-        0, ("Forward", v, 0.0),
-        1, ("Left", 0.0, v),
-        2, ("Backward", -v, 0.0),
-        3, ("Right", 0.0, -v),
-    ]
-
-    for idx, (label, vx, vy) in enumerate(legs):
+    for label, vx, vy in [
+            ("Forward", v, 0.0),
+            ("Left", 0.0, v),
+            ("Backward", -v, 0.0),
+            ("Right", 0.0, -v),
+    ]:
         log.info(label)
         drone.move_velocity(vx=vx, vy=vy, duration=t)
-        drone.delay(0.5)
-
+        drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=5.0)
+        
         # Capture at the midpoint (after leg 2)
         log.info("Hovering for camera capture…")
-        drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
         drone.camera_control(tilt=DEFAULT_CAMERA_TILT, pan=0.0)
         drone.delay(1.0)
 
         frame = handler.take_photo(timeout_sec=2.0)
-        _save_frame(frame)
+        _save_frame(frame) 
 
         # Restore camera to neutral
         drone.camera_control(tilt=0.0, pan=0.0)
@@ -178,7 +174,7 @@ def run_square_with_camera(drone, args: argparse.Namespace) -> None:
 
     log.info("Square complete — returning to hover")
     drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
-    drone.delay(1.0)
+    drone.delay(5.0)
 
     drone.land()
     log.info("Landed")
