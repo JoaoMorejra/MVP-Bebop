@@ -3,14 +3,15 @@
 <package format="3">
   <name>mvp_mission_bebop</name>
   <version>0.1.0</version>
-  <description>Missão autônoma MVP para Parrot Bebop 2 via Nectar SDK</description>
-  <maintainer email="dev@example.com">jv</maintainer>
+  <description>Autonomous search, visual servoing, nadir inspection and closed-loop RTL mission for Parrot Bebop 2 via Nectar SDK</description>
+  <maintainer email="joaomoreirraa@gmail.com">João Moreira</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>cv_bridge</depend>
 
   <test_depend>ament_copyright</test_depend>
