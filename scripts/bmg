@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# BMG: Bebop Mission GUI - Desktop Mission Control Launcher
+# ==============================================================================
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+WS_DIR="$(cd "$PACKAGE_DIR/../.." && pwd)"
+
+MISSION_DIR="${PACKAGE_DIR}/mvp_mission_bebop"
+APP_DIR="${WS_DIR}/bebop_mission_control"
+
+# Activate Nectar SDK and ROS 2 environment
+if [ -f "${WS_DIR}/bin/nectar-activate" ]; then
+    source "${WS_DIR}/bin/nectar-activate"
+elif [ -f "${WS_DIR}/.venv/bin/activate" ]; then
+    source "${WS_DIR}/.venv/bin/activate"
+fi
+
+# Ensure graphical display is available
+if [ -z "$DISPLAY" ]; then
+    export DISPLAY=":0"
+fi
+
+# Check and launch application
+if [ -d "$APP_DIR" ]; then
+    if [ ! -f "$APP_DIR/dist/index.html" ]; then
+        echo "[BMG] Initializing production build in $APP_DIR..."
+        (cd "$APP_DIR" && npm run build)
+    fi
+
+    ELECTRON_BIN="$APP_DIR/node_modules/.bin/electron"
+    if [ -x "$ELECTRON_BIN" ]; then
+        cd "$MISSION_DIR"
+        exec "$ELECTRON_BIN" --no-sandbox --disable-gpu-sandbox --disable-dev-shm-usage "$APP_DIR" "$@"
+    else
+        echo "[BMG] Error: electron binary not found in $APP_DIR/node_modules/.bin/" >&2
+        exit 1
+    fi
+else
+    echo "[BMG] Error: Application directory $APP_DIR not found." >&2
+    exit 1
+fi
