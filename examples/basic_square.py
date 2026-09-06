@@ -54,7 +54,7 @@ BEBOP_NAMESPACE = "bebop"
 CAMERA_TOPIC = "/bebop/camera/image_raw"
 
 # Flight defaults
-DEFAULT_HEIGHT = 1.0      # metres (ignored by Bebop firmware, kept for API)
+DEFAULT_HEIGHT = 1.60      # metres (ignored by Bebop firmware, kept for API)
 DEFAULT_VELOCITY = 0.3    # normalised [-1.0, 1.0]
 DEFAULT_SIDE = 1.0        # metres (side length of the square)
 DEFAULT_STABILIZE = 2.0   # seconds to stabilise after takeoff / before land
@@ -109,7 +109,7 @@ def run_square_with_camera(drone, args: argparse.Namespace) -> None:
     drone.land()
     log.info("Landed")
 
-    log.info("Camera released")
+    log.info("Camera released") 
 
 
 # ---------------------------------------------------------------------------
