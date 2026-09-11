@@ -1,49 +1,75 @@
-"""Step 3: Visual Servoing (IBVS), Gimbal Pitch & Coupled Guidance."""
+"""Stage 3: image-based visual servoing and coupled approach guidance.
+
+The step drives the phase machine and the perception loop; the control law lives
+in :mod:`mvp_mission_bebop.controllers.visual_servoing`.
+
+Target loss is handled by extrapolation rather than by a blind hold. The
+previous implementation froze its last command and waited for the target to
+reappear on its own, which gives up exactly the information the tracker has:
+where the target was going. An alpha-beta filter carries the estimate forward
+through short dropouts, so servoing continues against a prediction until the
+coast horizon expires.
+"""
 
 from __future__ import annotations
 
 import logging
-import time
-from typing import Optional
+from typing import Optional, Tuple
 
 from mvp_mission_bebop.context import MissionContext
+from mvp_mission_bebop.controllers.visual_servoing import ServoCommand, TrackingPhase
+from mvp_mission_bebop.engine.rate import Deadline, LoopRate
+from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker, TrackerGains
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 
 logger = logging.getLogger("Step3Tracking")
 
+#: Consecutive aligned cycles required before the approach is declared finished.
+_ALIGNMENT_DWELL_CYCLES: int = 8
+
 
 class VisualServoingStep(BaseStep):
-    """High-bandwidth visual servoing coupling camera gimbal pitch and longitudinal advance."""
+    """Centres, approaches, and settles over the confirmed target."""
 
     def __init__(self) -> None:
         super().__init__("STEP 3: Visual Servoing & Coupled Guidance")
 
     def execute(self, ctx: MissionContext) -> StepStatus:
-        if not ctx.shared_data.get("target_confirmed", False):
-            logger.info("Target not confirmed during search. Skipping visual servoing.")
-            ctx.shared_data["approach_finished"] = False
+        logger.info("--- [%s] ---", self.name)
+
+        if not ctx.blackboard.target_confirmed:
+            logger.warning("No target was confirmed during search. Skipping visual servoing.")
+            ctx.blackboard.approach_finished = False
             return StepStatus.SUCCESS
 
-        logger.info("--- [%s] ---", self.name)
-        nadir_tilt = ctx.params.gimbal.nadir_tilt_deg
-        search_tilt = ctx.params.gimbal.search_tilt_deg
-        tracking_timeout = ctx.params.timeouts.tracking_timeout_sec
-        recovery_timeout = ctx.params.timeouts.target_recovery_timeout_sec
-        target_classes = ctx.params.vision.target_classes
-        conf_thresh = ctx.params.vision.confidence_threshold
+        vision_cfg = ctx.params.vision
+        timeouts = ctx.params.timeouts
+        controller = ctx.visual_controller
+        controller.reset()
 
-        logger.info("Tracking objective: pitch gimbal from %.1f deg to %.1f deg centered.", search_tilt, nadir_tilt)
+        tracker = ConstantVelocityTracker(
+            TrackerGains(), max_coast_sec=timeouts.target_recovery_timeout_sec
+        )
 
-        ctx.visual_controller.reset()
-        last_confirmed_tilt = ctx.current_tilt_deg
-        tracking_start_time = time.time()
+        logger.info(
+            "Visual servoing engaged: %s geometry, tilt %.1f -> %.1f deg, "
+            "corridor %.0f px, window %.1f s.",
+            "pinhole" if vision_cfg.ibvs_enabled else "open-loop (IBVS disabled)",
+            ctx.params.gimbal.search_tilt_deg,
+            ctx.params.gimbal.nadir_tilt_deg,
+            vision_cfg.optical_center_tolerance_px * vision_cfg.approach_corridor_ratio,
+            timeouts.tracking_timeout_sec,
+        )
+
+        deadline = Deadline(timeouts.tracking_timeout_sec)
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        aligned_cycles = 0
+        lost_cycles = 0
         approach_finished = False
-        consecutive_lost: int = 0
-        nadir_dwell_start: Optional[float] = None
-        ctx.failsafe.notify_frame_received()
 
-        while (time.time() - tracking_start_time) < tracking_timeout:
+        while deadline.active:
             if ctx.emergency_event.is_set():
+                self._hold(ctx)
                 return StepStatus.ABORTED
 
             if not ctx.drone.no_fly:
@@ -53,158 +79,125 @@ class VisualServoingStep(BaseStep):
                     return StepStatus.FAILURE
 
             frame = ctx.handler.take_photo(timeout_sec=1.0)
+            dt = rate.tick()
+
             if frame is None:
+                self._hold(ctx)
                 continue
+
             ctx.failsafe.notify_frame_received()
+            result = ctx.detector.detect(frame, conf=vision_cfg.confidence_threshold)
+            targets = result.filter_by_class(vision_cfg.target_classes)
 
-            result = ctx.detector.detect(frame, conf=conf_thresh)
-            targets = result.filter_by_class(target_classes)
+            center, measured = self._resolve_target(targets, tracker, dt)
+            if center is None:
+                lost_cycles += 1
+                self._hold(ctx)
+                ctx.publish_annotated_stream(
+                    frame, result, f"STEP 3: TARGET LOST ({lost_cycles} frames)"
+                )
+                if lost_cycles >= vision_cfg.lost_frames_tolerance:
+                    logger.warning(
+                        "Target unrecoverable after %.1f s of extrapolation. Ending approach.",
+                        timeouts.target_recovery_timeout_sec,
+                    )
+                    break
+                continue
 
-            vz_cmd = ctx.governor.compute_vz(ctx.odom_supervisor.relative_altitude)
+            if measured:
+                lost_cycles = 0
 
-            phase_tag = ctx.visual_controller.phase.value.upper()
-            mode_prefix = "[NO-FLY] " if ctx.drone.no_fly else ""
-            telemetry_text = (
-                f"{mode_prefix}STEP 3: [{phase_tag}] | TILT: {ctx.current_tilt_deg:.1f}deg "
-                f"| ALT_REL: {ctx.odom_supervisor.relative_altitude:.2f}m"
+            snapshot = ctx.odom_supervisor.snapshot()
+            command = controller.compute(
+                target_center=center,
+                frame_dimensions=(ctx.frame_width, ctx.frame_height),
+                current_tilt_deg=ctx.current_tilt_deg,
+                relative_altitude_m=snapshot.relative_altitude,
+                dt=dt,
             )
-            ctx.publish_annotated_stream(frame, result, telemetry_text)
 
-            if targets:
-                consecutive_lost = 0
-                primary_target = max(targets, key=lambda d: d.confidence)
-                (
-                    vx_cmd,
-                    vy_cmd,
-                    next_tilt,
-                    total_err,
-                    is_nadir_aligned,
-                ) = ctx.visual_controller.compute_control(
-                    target_center=primary_target.center,
-                    frame_dimensions=(ctx.frame_width, ctx.frame_height),
-                    current_tilt_deg=ctx.current_tilt_deg,
-                )
+            self._apply(ctx, command)
+            self._publish(ctx, frame, result, command, deadline.elapsed_sec, measured)
 
-                if ctx.visual_controller.pop_transition_to_approach():
-                    logger.info("Target centered in camera. Commencing Phase 2 overflight & gimbal pitch.")
-                    try:
-                        from mvp_mission_bebop.telemetry.announcer import announce_sync
-                        announce_sync(
-                            "Alvo centralizado",
-                            details={"etapa": "iniciando sobrevoo e aproximação ao nadir"},
-                            wait=False,
-                        )
-                    except Exception as vocal_err:
-                        logger.debug("Announce dispatch failure: %s", vocal_err)
-
-                ctx.current_tilt_deg = next_tilt
-                last_confirmed_tilt = next_tilt
-                ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
-
-                at_nadir_position = (next_tilt <= (nadir_tilt + 2.5))
-                if at_nadir_position:
-                    if nadir_dwell_start is None:
-                        nadir_dwell_start = time.time()
-                else:
-                    nadir_dwell_start = None
-
-                nadir_settled_long_enough = (
-                    nadir_dwell_start is not None and (time.time() - nadir_dwell_start) >= 2.0
-                )
-
-                if is_nadir_aligned or nadir_settled_long_enough:
+            if command.phase is TrackingPhase.NADIR and command.nadir_aligned:
+                aligned_cycles += 1
+                if aligned_cycles >= _ALIGNMENT_DWELL_CYCLES:
                     logger.info(
-                        "Target aligned at Nadir (%.1f deg) with radial error %.1f px (settled: %s).",
-                        nadir_tilt,
-                        total_err,
-                        nadir_settled_long_enough,
+                        "Nadir alignment held for %d cycles (%.1f px error). Approach complete.",
+                        aligned_cycles,
+                        command.pixel_error,
                     )
-                    ctx.current_tilt_deg = nadir_tilt
-                    ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
-                    ctx.failsafe.assert_kinematics(vz=vz_cmd, vyaw=0.0)
-                    ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=vz_cmd, vyaw=0.0)
                     approach_finished = True
-
-                    try:
-                        from mvp_mission_bebop.telemetry.announcer import announce_sync
-                        announce_sync(
-                            "Nadir alinhado",
-                            details={"etapa": "drone sobrevoando exatamente sobre o alvo"},
-                            wait=False,
-                        )
-                    except Exception as vocal_err:
-                        logger.debug("Announce dispatch failure: %s", vocal_err)
-
                     break
-
-                ctx.failsafe.assert_kinematics(vz=vz_cmd, vyaw=0.0)
-                ctx.drone.move_velocity(vx=vx_cmd, vy=vy_cmd, vz=vz_cmd, vyaw=0.0)
-                time.sleep(0.03)
-
             else:
-                consecutive_lost += 1
-                if consecutive_lost < 3:
-                    # Brief loss: maintain current heading/gimbal and retry next frame
-                    time.sleep(0.04)
-                    continue
+                aligned_cycles = 0
 
-                consecutive_lost = 0
-                # Sustained target loss: Enter Deterministic Recovery Sub-routine
-                logger.warning(
-                    "Target lost during approach (%d frames). Halting translation and reverting gimbal to %.1f deg.",
-                    3,
-                    last_confirmed_tilt,
-                )
-                ctx.failsafe.assert_kinematics(vz=vz_cmd, vyaw=0.0)
-                ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=vz_cmd, vyaw=0.0)
+        self._hold(ctx)
+        ctx.blackboard.approach_finished = approach_finished
 
-                ctx.current_tilt_deg = last_confirmed_tilt
-                ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
-
-                recovery_start_time = time.time()
-                target_recovered = False
-
-                while (time.time() - recovery_start_time) < recovery_timeout:
-                    if ctx.emergency_event.is_set():
-                        return StepStatus.ABORTED
-
-                    if not ctx.drone.no_fly:
-                        healthy, reason = ctx.failsafe.evaluate_system_health()
-                        if not healthy:
-                            ctx.failsafe.trigger_emergency_land(reason)
-                            return StepStatus.FAILURE
-
-                    vz_cmd = ctx.governor.compute_vz(ctx.odom_supervisor.relative_altitude)
-                    ctx.failsafe.assert_kinematics(vz=vz_cmd, vyaw=0.0)
-                    ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=vz_cmd, vyaw=0.0)
-
-                    rec_frame = ctx.handler.take_photo(timeout_sec=1.0)
-                    if rec_frame is None:
-                        continue
-                    ctx.failsafe.notify_frame_received()
-
-                    rec_result = ctx.detector.detect(rec_frame, conf=conf_thresh)
-                    rec_targets = rec_result.filter_by_class(target_classes)
-
-                    telemetry_text = (
-                        f"{mode_prefix}TARGET RECOVERY | TILT: {ctx.current_tilt_deg:.1f}deg "
-                        f"| ALT_REL: {ctx.odom_supervisor.relative_altitude:.2f}m"
-                    )
-                    ctx.publish_annotated_stream(rec_frame, rec_result, telemetry_text)
-
-                    if rec_targets:
-                        logger.info("Target re-acquired during recovery window. Resuming tracking.")
-                        ctx.visual_controller.reset()
-                        target_recovered = True
-                        break
-                    time.sleep(0.04)
-
-                if not target_recovered:
-                    logger.error("Recovery failed: Target not found within %.1f s window.", recovery_timeout)
-                    break
-
-        ctx.shared_data["approach_finished"] = approach_finished
         if not approach_finished:
-            logger.warning("Step 3 did not achieve full nadir lock. Transitioning directly to RTL.")
+            logger.warning(
+                "Approach ended without confirmed nadir alignment after %.1f s.",
+                deadline.elapsed_sec,
+            )
 
         return StepStatus.SUCCESS
+
+    # ---------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _resolve_target(
+        targets, tracker: ConstantVelocityTracker, dt: float
+    ) -> Tuple[Optional[Tuple[float, float]], bool]:
+        """Return the target centre and whether it came from a real detection."""
+        if targets:
+            best = max(targets, key=lambda detection: detection.confidence)
+            estimate = tracker.update(best.center, dt)
+            return estimate.center, True
+
+        estimate = tracker.coast(dt)
+        if estimate is None or not estimate.trustworthy:
+            return None, False
+        return estimate.center, False
+
+    def _apply(self, ctx: MissionContext, command: ServoCommand) -> None:
+        """Drive the gimbal and transmit the velocity command."""
+        if abs(command.tilt_deg - ctx.current_tilt_deg) > 1e-3:
+            ctx.drone.camera_control(tilt=command.tilt_deg, pan=0.0)
+            ctx.current_tilt_deg = command.tilt_deg
+
+        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude)
+        safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
+        ctx.drone.move_velocity(
+            vx=command.vx, vy=command.vy, vz=safe_vz, vyaw=safe_vyaw
+        )
+
+    @staticmethod
+    def _hold(ctx: MissionContext) -> None:
+        """Command station keeping, keeping the anti-climb governor engaged."""
+        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude)
+        safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
+        ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
+
+    @staticmethod
+    def _publish(
+        ctx: MissionContext,
+        frame,
+        result,
+        command: ServoCommand,
+        elapsed_sec: float,
+        measured: bool,
+    ) -> None:
+        """Overlay servoing state onto the annotated stream."""
+        range_text = (
+            f"{command.ground_range_m:.2f}m" if command.ground_range_m is not None else "n/a"
+        )
+        source = "" if measured else " [PREDICTED]"
+        ctx.publish_annotated_stream(
+            frame,
+            result,
+            f"{'[NO-FLY] ' if ctx.drone.no_fly else ''}STEP 3: "
+            f"{command.phase.value.upper()}{source} ({elapsed_sec:.1f}s) "
+            f"| TILT: {command.tilt_deg:.1f}deg | RANGE: {range_text} "
+            f"| ERR: {command.pixel_error:.0f}px",
+        )

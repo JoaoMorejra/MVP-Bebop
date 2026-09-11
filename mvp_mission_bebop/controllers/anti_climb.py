@@ -1,50 +1,107 @@
-"""Active Anti-Climb Altitude Governor.
+"""Anti-climb altitude governor.
 
-Prevents ultrasound-induced altitude climb when flying over ground obstacles.
-Monitors relative altitude and computes a non-positive vertical velocity (vz <= 0).
+The Bebop holds altitude with a downward ultrasonic rangefinder. Flying over an
+obstacle shortens the measured range, the firmware reads that as having lost
+height, and it climbs to compensate -- a drift the mission never commanded and
+cannot see in its own velocity log. This governor watches the odometric altitude
+instead and asks for descent whenever the drone has gained height it was not
+told to gain.
+
+The output is non-positive by construction: the governor can only ever bring the
+drone down. Climbing is not a correction it is permitted to make, because the
+mission's vertical invariant forbids it.
 """
 
 from __future__ import annotations
 
 import logging
-import time
+from typing import Optional
 
+from mvp_mission_bebop.controllers.pid import FilteredPID, PIDGains
+from mvp_mission_bebop.engine.rate import LoopRate
 from mvp_mission_bebop.parameters import AltitudeGovernorConfig
 
-logger = logging.getLogger("AltitudeAntiClimbGovernor")
+logger = logging.getLogger("AltitudeGovernor")
 
 
 class AltitudeAntiClimbGovernor:
-    """SISO controller generating corrective downward velocity when altitude exceeds target."""
+    """Single-axis governor producing corrective descent, never climb."""
 
-    def __init__(self, target_altitude: float, config: AltitudeGovernorConfig) -> None:
+    def __init__(
+        self,
+        target_altitude: float,
+        config: AltitudeGovernorConfig,
+        *,
+        clock: Optional[object] = None,
+    ) -> None:
         self.target_altitude = target_altitude
         self.config = config
-        self._last_error: float = 0.0
-        self._last_time: float = time.time()
 
-    def compute_vz(self, current_relative_alt: float) -> float:
-        """Compute corrective vertical velocity command (vz <= 0.0)."""
-        alt_error = current_relative_alt - self.target_altitude
-        if alt_error > self.config.deadband_m:
-            dt = max(1e-3, time.time() - self._last_time)
-            d_error = (alt_error - self._last_error) / dt
-            vz_correction = -(self.config.kp * alt_error + self.config.kd * d_error)
-            vz_cmd = max(-self.config.max_descent_speed, min(0.0, vz_correction))
-            logger.debug(
-                "Anti-Climb Governor active: alt=%.2fm > target=%.2fm. vz=%.2f",
+        # Filtered derivative and an explicit dt. The previous implementation
+        # took a raw difference against a wall clock sampled twice per call, and
+        # updated its derivative memory on every invocation including those
+        # suppressed by the deadband -- so the first sample after crossing the
+        # threshold differentiated a step and produced a spike, applying full
+        # descent authority the instant the drone drifted a few centimetres.
+        self._pid = FilteredPID(
+            PIDGains(
+                kp=config.kp,
+                ki=0.0,
+                kd=config.kd,
+                output_limits=(-config.max_descent_speed, 0.0),
+                derivative_cutoff_hz=2.0,
+            ),
+            setpoint=0.0,
+        )
+        self._active = False
+        self._clock = clock
+
+    @property
+    def engaged(self) -> bool:
+        """True while the governor is actively commanding descent."""
+        return self._active
+
+    def compute_vz(self, current_relative_alt: float, dt: Optional[float] = None) -> float:
+        """Corrective vertical velocity command, always ``<= 0``.
+
+        Parameters
+        ----------
+        current_relative_alt : float
+            Altitude above the calibrated ground reference, in metres.
+        dt : Optional[float]
+            Elapsed interval. Callers running a paced loop should pass the value
+            from ``LoopRate.tick``; when omitted the nominal period is assumed,
+            which keeps the signature compatible with existing call sites.
+        """
+        interval = LoopRate.clamp_interval(dt) if dt is not None else LoopRate.clamp_interval(1.0 / 15.0)
+        excess = current_relative_alt - self.target_altitude
+
+        if excess <= self.config.deadband_m:
+            if self._active:
+                logger.debug(
+                    "Altitude governor released at %.2f m (target %.2f m).",
+                    current_relative_alt,
+                    self.target_altitude,
+                )
+                self._active = False
+            # Keep the filter primed with the current measurement so re-engaging
+            # differentiates a real trend rather than the deadband edge itself.
+            self._pid.update(0.0, interval)
+            return 0.0
+
+        if not self._active:
+            self._active = True
+            logger.info(
+                "Altitude governor engaged: %.2f m exceeds target %.2f m by %.2f m.",
                 current_relative_alt,
                 self.target_altitude,
-                vz_cmd,
+                excess,
             )
-        else:
-            vz_cmd = 0.0
 
-        self._last_error = alt_error
-        self._last_time = time.time()
-        return vz_cmd
+        command = self._pid.update(excess, interval)
+        return max(-self.config.max_descent_speed, min(0.0, command))
 
     def reset(self) -> None:
-        """Reset internal derivative states."""
-        self._last_error = 0.0
-        self._last_time = time.time()
+        """Clear the derivative memory and release the governor."""
+        self._pid.reset()
+        self._active = False

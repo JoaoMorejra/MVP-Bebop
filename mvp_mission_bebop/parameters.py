@@ -37,6 +37,10 @@ class GimbalConstraintsConfig:
     #: and never read; it now rate-limits every tilt command so the pitch axis
     #: cannot step discontinuously between control cycles.
     max_slew_limit_deg: float = 18.0
+    #: How aggressively the gimbal chases the target's measured bearing. 1.0
+    #: points the optical axis straight at the target each cycle; lower values
+    #: lag deliberately, trading tracking bandwidth for steadiness.
+    tracking_gain: float = 1.0
 
 
 @dataclass
@@ -72,6 +76,17 @@ class VisionConfig:
     #: pixel error into a bearing. Bebop 2 front camera, digitally stabilized.
     horizontal_fov_deg: float = 80.0
     vertical_fov_deg: float = 50.0
+    #: Use the geometric IBVS law. Setting this false reverts the approach to
+    #: the previous open-loop gimbal ramp without a code change -- the escape
+    #: hatch for a field session where the altitude estimate proves unusable.
+    ibvs_enabled: bool = True
+    #: Relative altitude below which the ground projection is not trusted and
+    #: the controller falls back to the open-loop ramp.
+    min_altitude_for_ibvs_m: float = 0.35
+    #: Ground range at which the approach is considered to be over the target.
+    nadir_range_threshold_m: float = 0.25
+    #: Per-cycle gimbal step used by the open-loop fallback, in degrees.
+    legacy_gimbal_ramp_deg: float = 2.0
 
 
 @dataclass

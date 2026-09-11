@@ -1,9 +1,15 @@
-"""Unit tests for flight controllers and altitude governors."""
+"""Unit tests for the altitude governor and the visual servoing control law."""
+
+import math
 
 import pytest
 
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
-from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
+from mvp_mission_bebop.controllers.visual_servoing import (
+    TrackingPhase,
+    VisualServoingController,
+)
+from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.parameters import (
     AltitudeGovernorConfig,
     FlightKinematicsConfig,
@@ -13,195 +19,289 @@ from mvp_mission_bebop.parameters import (
     VisionConfig,
 )
 
-
-def test_altitude_anti_climb_governor_deadband():
-    cfg = AltitudeGovernorConfig(deadband_m=0.05, kp=0.8, kd=0.02, max_descent_speed=0.08)
-    gov = AltitudeAntiClimbGovernor(target_altitude=1.0, config=cfg)
-
-    # Within deadband: alt=1.02m (err=0.02m <= 0.05m deadband)
-    vz = gov.compute_vz(current_relative_alt=1.02)
-    assert vz == 0.0
-
-    # Below target: alt=0.90m
-    vz_below = gov.compute_vz(current_relative_alt=0.90)
-    assert vz_below == 0.0
+DT = 1.0 / 15.0
+FRAME = (856, 480)
+CENTER = (428.0, 240.0)
 
 
-def test_altitude_anti_climb_governor_corrective_descent():
-    cfg = AltitudeGovernorConfig(deadband_m=0.03, kp=0.8, kd=0.0, max_descent_speed=0.08)
-    gov = AltitudeAntiClimbGovernor(target_altitude=1.0, config=cfg)
-
-    # Above target by 0.20m (target=1.0, current=1.20)
-    vz = gov.compute_vz(current_relative_alt=1.20)
-    assert vz < 0.0
-    assert vz >= -0.08
-
-    # Extreme altitude above target: should clamp to -max_descent_speed
-    vz_clamped = gov.compute_vz(current_relative_alt=5.0)
-    assert vz_clamped == -0.08
+# ------------------------------------------------------------------ governor
 
 
-def test_visual_servoing_centering_phase_active_lateral_no_advance():
-    """Verify that during Phase 1 (centering), vx == 0.0 and vy actively corrects."""
-    gimbal_cfg = GimbalConstraintsConfig(search_tilt_deg=-20.0, nadir_tilt_deg=-80.0)
-    gimbal_pid = GimbalPIDConfig(kp=10.0, ki=0.0, kd=0.5, output_limits=(-10.0, 10.0))
-    lateral_pid = LateralPIDConfig(kp=0.35, ki=0.0, kd=0.03, output_limits=(-0.22, 0.22), deadband=0.005, min_effective_velocity=0.06)
-    vision_cfg = VisionConfig(optical_center_tolerance_px=35.0, confirmation_frames=3)
-    kinematics_cfg = FlightKinematicsConfig(max_approach_forward_speed=0.15)
+def governor(target=1.0, **overrides):
+    return AltitudeAntiClimbGovernor(target, AltitudeGovernorConfig(**overrides))
 
-    controller = VisualServoingController(
-        gimbal_config=gimbal_cfg,
-        gimbal_pid_cfg=gimbal_pid,
-        lateral_pid_cfg=lateral_pid,
-        vision_cfg=vision_cfg,
-        kinematics_cfg=kinematics_cfg,
+
+def test_governor_is_silent_inside_the_deadband():
+    gov = governor()
+    for altitude in (0.80, 0.95, 1.00, 1.02):
+        assert gov.compute_vz(altitude, DT) == 0.0
+    assert not gov.engaged
+
+
+def test_governor_descends_when_above_target():
+    gov = governor()
+    for _ in range(10):
+        command = gov.compute_vz(1.20, DT)
+    assert command < 0.0
+    assert gov.engaged
+
+
+def test_governor_never_commands_climb():
+    """The vertical invariant is structural: this controller cannot ask to rise."""
+    gov = governor()
+    for altitude in (0.10, 0.50, 0.97, 1.00, 1.05, 1.50, 3.00, 0.20):
+        assert gov.compute_vz(altitude, DT) <= 0.0
+
+
+def test_governor_saturates_at_the_descent_limit():
+    config = AltitudeGovernorConfig()
+    gov = governor()
+    for _ in range(20):
+        command = gov.compute_vz(5.0, DT)
+    assert command == pytest.approx(-config.max_descent_speed)
+
+
+def test_governor_releases_when_altitude_recovers():
+    gov = governor()
+    for _ in range(10):
+        gov.compute_vz(1.30, DT)
+    assert gov.engaged
+    assert gov.compute_vz(0.99, DT) == 0.0
+    assert not gov.engaged
+
+
+def test_governor_does_not_spike_on_crossing_the_deadband():
+    """Regression: the derivative used to be taken across the deadband edge.
+
+    The previous implementation updated its derivative memory on suppressed
+    cycles too, so the first sample past the threshold differentiated a step and
+    applied near-full descent authority for a few centimetres of drift.
+    """
+    gov = governor()
+    for _ in range(20):
+        gov.compute_vz(0.99, DT)
+
+    first = gov.compute_vz(1.04, DT)
+    config = AltitudeGovernorConfig()
+    assert abs(first) < config.max_descent_speed, "crossing the deadband must not saturate"
+
+
+def test_governor_reset_clears_state():
+    gov = governor()
+    for _ in range(10):
+        gov.compute_vz(1.40, DT)
+    gov.reset()
+    assert not gov.engaged
+    assert gov.compute_vz(1.00, DT) == 0.0
+
+
+# ----------------------------------------------------------- visual servoing
+
+
+def build_controller(**vision_overrides):
+    vision = VisionConfig(
+        optical_center_tolerance_px=35.0,
+        confirmation_frames=3,
+        horizontal_fov_deg=80.0,
+        vertical_fov_deg=50.0,
+        **vision_overrides,
+    )
+    return VisualServoingController(
+        gimbal_config=GimbalConstraintsConfig(search_tilt_deg=-20.0, nadir_tilt_deg=-80.0),
+        gimbal_pid_cfg=GimbalPIDConfig(),
+        lateral_pid_cfg=LateralPIDConfig(),
+        vision_cfg=vision,
+        kinematics_cfg=FlightKinematicsConfig(),
+        calibration=SpeedCalibration(1.0),
     )
 
-    frame_dims = (640, 480)
-    # Target off-center to the right (cx=480 > 320, err_x=+160 px)
-    vx, vy, next_tilt, err_px, is_nadir = controller.compute_control(
-        target_center=(480.0, 240.0),
-        frame_dimensions=frame_dims,
-        current_tilt_deg=-20.0,
-    )
 
-    # Phase 1: drone must NOT advance forward while decentered
-    assert vx == 0.0
-    # Must command lateral correction (negative vy moves right in body frame)
-    assert vy < -0.05
-    assert not is_nadir
-    assert controller.phase.value == "centering"
+def drive(controller, target_px, *, tilt=-20.0, altitude=1.5, cycles=1):
+    command = None
+    for _ in range(cycles):
+        command = controller.compute(target_px, FRAME, tilt, altitude, DT)
+        tilt = command.tilt_deg
+    return command
 
 
-def test_visual_servoing_two_phase_transition_after_centering():
-    """Verify transition from CENTERING to APPROACHING after target is centered for consecutive frames."""
-    gimbal_cfg = GimbalConstraintsConfig(search_tilt_deg=-20.0, nadir_tilt_deg=-80.0)
-    gimbal_pid = GimbalPIDConfig(kp=10.0, ki=0.0, kd=0.5, output_limits=(-10.0, 10.0))
-    lateral_pid = LateralPIDConfig(kp=0.35, ki=0.0, kd=0.03, output_limits=(-0.22, 0.22), deadband=0.005, min_effective_velocity=0.06)
-    vision_cfg = VisionConfig(optical_center_tolerance_px=35.0, confirmation_frames=3)
-    kinematics_cfg = FlightKinematicsConfig(max_approach_forward_speed=0.15)
-
-    controller = VisualServoingController(
-        gimbal_config=gimbal_cfg,
-        gimbal_pid_cfg=gimbal_pid,
-        lateral_pid_cfg=lateral_pid,
-        vision_cfg=vision_cfg,
-        kinematics_cfg=kinematics_cfg,
-    )
-
-    frame_dims = (640, 480)
-    # Feed centered target (320, 240)
-    # Frame 1: CENTERING
-    vx1, vy1, _, _, _ = controller.compute_control(target_center=(320.0, 240.0), frame_dimensions=frame_dims, current_tilt_deg=-20.0)
-    assert vx1 == 0.0
-    assert controller.phase.value == "centering"
-
-    # Frame 2: CENTERING
-    vx2, vy2, _, _, _ = controller.compute_control(target_center=(320.0, 240.0), frame_dimensions=frame_dims, current_tilt_deg=-20.0)
-    assert vx2 == 0.0
-    assert controller.phase.value == "centering"
-
-    # Frame 3: Reaches confirmation threshold -> transitions to APPROACHING
-    vx3, vy3, _, _, _ = controller.compute_control(target_center=(320.0, 240.0), frame_dimensions=frame_dims, current_tilt_deg=-20.0)
-    assert controller.phase.value == "approaching"
-    assert controller.pop_transition_to_approach() is True
-
-    # Frame 4: In APPROACHING phase -> forward velocity is now active
-    vx4, vy4, next_tilt4, _, _ = controller.compute_control(target_center=(320.0, 240.0), frame_dimensions=frame_dims, current_tilt_deg=-20.0)
-    assert vx4 > 0.0
-    assert controller.phase.value == "approaching"
+def test_starts_in_centering_with_no_forward_motion():
+    controller = build_controller()
+    command = drive(controller, (700.0, 240.0))
+    assert command.phase is TrackingPhase.CENTERING
+    assert command.vx == 0.0
 
 
-def test_visual_servoing_lateral_corridor_pauses_forward_motion():
-    """Verify that lateral deviation during APPROACHING pauses vx to prevent losing target."""
-    gimbal_cfg = GimbalConstraintsConfig(search_tilt_deg=-20.0, nadir_tilt_deg=-80.0)
-    gimbal_pid = GimbalPIDConfig(kp=10.0, ki=0.0, kd=0.5, output_limits=(-10.0, 10.0))
-    lateral_pid = LateralPIDConfig(kp=0.35, ki=0.0, kd=0.03, output_limits=(-0.22, 0.22), deadband=0.005)
-    vision_cfg = VisionConfig(optical_center_tolerance_px=35.0, confirmation_frames=2)
-    kinematics_cfg = FlightKinematicsConfig(max_approach_forward_speed=0.15)
+def test_lateral_command_opposes_horizontal_error():
+    controller = build_controller()
+    right = drive(controller, (700.0, 240.0), cycles=5)
+    controller.reset()
+    left = drive(controller, (150.0, 240.0), cycles=5)
 
-    controller = VisualServoingController(
-        gimbal_config=gimbal_cfg,
-        gimbal_pid_cfg=gimbal_pid,
-        lateral_pid_cfg=lateral_pid,
-        vision_cfg=vision_cfg,
-        kinematics_cfg=kinematics_cfg,
-    )
-
-    frame_dims = (640, 480)
-    # Transition to APPROACHING
-    for _ in range(2):
-        controller.compute_control(target_center=(320.0, 240.0), frame_dimensions=frame_dims, current_tilt_deg=-20.0)
-    assert controller.phase.value == "approaching"
-
-    # Target drifts laterally: cx = 400 (err_x = 80 > corridor_tol 56)
-    vx_drift, vy_drift, _, _, _ = controller.compute_control(
-        target_center=(400.0, 240.0),
-        frame_dimensions=frame_dims,
-        current_tilt_deg=-25.0,
-    )
-    # Forward advance must be paused (vx == 0) to allow lateral re-centering
-    assert vx_drift == 0.0
-    assert vy_drift < 0.0  # Lateral correction active
+    # Target right of centre requires motion to the right, which is negative in
+    # the body FLU frame where +y is left.
+    assert right.vy < 0.0
+    assert left.vy > 0.0
 
 
-def test_visual_servoing_downward_tilt_progression():
-    """Verify camera tilts downward in APPROACHING phase when target moves into lower frame."""
-    gimbal_cfg = GimbalConstraintsConfig(search_tilt_deg=-20.0, nadir_tilt_deg=-80.0)
-    gimbal_pid = GimbalPIDConfig(kp=18.0, ki=0.0, kd=1.2, output_limits=(-18.0, 18.0))
-    lateral_pid = LateralPIDConfig(kp=0.35, ki=0.0, kd=0.03, output_limits=(-0.22, 0.22), deadband=0.005)
-    vision_cfg = VisionConfig(optical_center_tolerance_px=35.0, confirmation_frames=1)
-    kinematics_cfg = FlightKinematicsConfig(max_approach_forward_speed=0.15)
-
-    controller = VisualServoingController(
-        gimbal_config=gimbal_cfg,
-        gimbal_pid_cfg=gimbal_pid,
-        lateral_pid_cfg=lateral_pid,
-        vision_cfg=vision_cfg,
-        kinematics_cfg=kinematics_cfg,
-    )
-
-    frame_dims = (640, 480)
-    # Immediately transition to APPROACHING
-    controller.compute_control(target_center=(320.0, 240.0), frame_dimensions=frame_dims, current_tilt_deg=-20.0)
-    assert controller.phase.value == "approaching"
-
-    # Target in lower frame (cy=340 > frame_cy=240, err_y=+100 px)
-    import time
-    time.sleep(0.05)
-    vx, vy, next_tilt, err_px, is_nadir = controller.compute_control(
-        target_center=(320.0, 340.0),
-        frame_dimensions=frame_dims,
-        current_tilt_deg=-20.0,
-    )
-    assert next_tilt < -20.0  # Tilts downward (more negative toward nadir)
+def test_transitions_to_approaching_once_centred():
+    controller = build_controller()
+    command = drive(controller, CENTER, cycles=6)
+    assert command.phase is TrackingPhase.APPROACHING
 
 
-def test_visual_servoing_nadir_alignment():
-    """Verify target aligned at nadir declares is_nadir_aligned True."""
-    gimbal_cfg = GimbalConstraintsConfig(search_tilt_deg=-20.0, nadir_tilt_deg=-80.0)
-    gimbal_pid = GimbalPIDConfig(kp=18.0, ki=0.0, kd=1.2, output_limits=(-18.0, 18.0))
-    lateral_pid = LateralPIDConfig(kp=0.35, ki=0.0, kd=0.03, output_limits=(-0.22, 0.22), deadband=0.005)
-    vision_cfg = VisionConfig(optical_center_tolerance_px=35.0, confirmation_frames=1)
-    kinematics_cfg = FlightKinematicsConfig(max_approach_forward_speed=0.15)
+def steady_approach_speed(target_px, tilt, altitude, cycles=90):
+    """Run the approach to steady state and report the settled forward speed."""
+    controller = build_controller()
+    drive(controller, CENTER, cycles=6, altitude=altitude)
 
-    controller = VisualServoingController(
-        gimbal_config=gimbal_cfg,
-        gimbal_pid_cfg=gimbal_pid,
-        lateral_pid_cfg=lateral_pid,
-        vision_cfg=vision_cfg,
-        kinematics_cfg=kinematics_cfg,
-    )
+    command = None
+    for _ in range(cycles):
+        command = controller.compute(target_px, FRAME, tilt, altitude, DT)
+    return command.vx, command.ground_range_m
 
-    frame_dims = (640, 480)
-    # In NADIR phase:
-    controller._phase = controller.phase.__class__.NADIR
-    vx, vy, next_tilt, err_px, is_nadir = controller.compute_control(
-        target_center=(320.0, 240.0),
-        frame_dimensions=frame_dims,
-        current_tilt_deg=-80.0,
-    )
 
-    assert err_px < 5.0
-    assert next_tilt == -80.0
-    assert is_nadir is True
+def test_approach_speed_follows_the_measured_range():
+    """The coupling that was previously a function of elapsed frames.
+
+    Forward speed must be a non-decreasing function of how far the target
+    actually is. The old law derived it from how far the gimbal ramp had
+    progressed, which is a function of elapsed frames and says nothing about
+    distance; here the gimbal is held fixed at a range of angles so only the
+    geometry varies.
+    """
+    # Steeper gimbal, with altitude fixed, means a closer target.
+    samples = [
+        steady_approach_speed(CENTER, tilt=tilt, altitude=1.0)
+        for tilt in (-78.0, -75.0, -70.0, -60.0, -45.0, -25.0)
+    ]
+
+    ranges = [ground_range for _, ground_range in samples]
+    speeds = [speed for speed, _ in samples]
+
+    assert ranges == sorted(ranges), "steeper tilt must estimate a closer target"
+    for closer, further in zip(speeds, speeds[1:]):
+        assert closer <= further + 1e-9, "approach speed must not decrease with range"
+
+    # And the coupling must actually bite somewhere in that span, rather than
+    # saturating at the cruise cap across the whole range.
+    assert speeds[0] < speeds[-1]
+
+
+def test_gimbal_tracks_the_target_downward_during_approach():
+    controller = build_controller()
+    drive(controller, CENTER, cycles=6)
+
+    tilt = -20.0
+    tilts = []
+    for _ in range(60):
+        # Target sitting low in frame: the camera must pitch down to follow it.
+        command = controller.compute((428.0, 420.0), FRAME, tilt, 1.5, DT)
+        tilt = command.tilt_deg
+        tilts.append(tilt)
+
+    assert tilts[-1] < tilts[0], "gimbal must pitch down toward the target"
+    assert tilts[-1] >= -80.0, "gimbal must not exceed the nadir limit"
+
+
+def test_gimbal_respects_the_slew_rate_limit():
+    """``max_slew_limit_deg`` was declared in config and never read."""
+    controller = build_controller()
+    drive(controller, CENTER, cycles=6)
+
+    gimbal_cfg = GimbalConstraintsConfig()
+    max_step = gimbal_cfg.max_slew_limit_deg * DT
+    tilt = -20.0
+    for _ in range(60):
+        command = controller.compute((428.0, 470.0), FRAME, tilt, 1.5, DT)
+        assert abs(command.tilt_deg - tilt) <= max_step + 1e-6
+        tilt = command.tilt_deg
+
+
+def test_forward_motion_freezes_outside_the_lateral_corridor():
+    controller = build_controller()
+    drive(controller, CENTER, cycles=6)
+    assert controller.phase is TrackingPhase.APPROACHING
+
+    # The demand drops to zero immediately; the command follows it down the
+    # jerk-limited ramp rather than stepping, which is the whole point of the
+    # profile. What matters is that it reaches rest and says why.
+    command = None
+    for _ in range(40):
+        command = controller.compute((820.0, 300.0), FRAME, -30.0, 1.5, DT)
+        if "corridor" in command.note:
+            break
+
+    assert "corridor" in command.note
+    for _ in range(60):
+        command = controller.compute((820.0, 300.0), FRAME, -30.0, 1.5, DT)
+    assert command.vx == pytest.approx(0.0, abs=1e-6)
+
+
+def test_sustained_drift_reverts_to_centering():
+    controller = build_controller()
+    drive(controller, CENTER, cycles=6)
+
+    tilt = -30.0
+    for _ in range(VisionConfig().decentered_frames_to_revert + 2):
+        command = controller.compute((830.0, 300.0), FRAME, tilt, 1.5, DT)
+        tilt = command.tilt_deg
+
+    assert controller.phase is TrackingPhase.CENTERING
+
+
+def test_nadir_phase_is_reachable_and_exits_on_sustained_excursion():
+    """Regression: the nadir phase previously had no exit at all."""
+    controller = build_controller()
+    controller._phase = TrackingPhase.NADIR
+
+    for _ in range(VisionConfig().nadir_exit_frames + 2):
+        controller.compute((820.0, 60.0), FRAME, -80.0, 1.5, DT)
+
+    assert controller.phase is TrackingPhase.APPROACHING
+
+
+def test_nadir_alignment_is_reported_when_centred():
+    controller = build_controller()
+    controller._phase = TrackingPhase.NADIR
+    command = controller.compute(CENTER, FRAME, -80.0, 1.5, DT)
+    assert command.nadir_aligned
+    assert command.tilt_deg == pytest.approx(-80.0)
+
+
+def test_lateral_deadband_is_not_defeated():
+    """Regression: a fallback reinjected a raw proportional term.
+
+    The old controller treated any zero from the PID as a first-call artefact
+    and substituted ``-kp * error``, including when the zero came from the
+    configured output deadband. The deadband therefore never took effect.
+    """
+    controller = build_controller()
+    controller._phase = TrackingPhase.NADIR
+    command = controller.compute((429.0, 240.0), FRAME, -80.0, 1.5, DT)
+    assert command.vy == 0.0
+
+
+def test_geometry_is_reported_for_diagnostics():
+    controller = build_controller()
+    command = drive(controller, CENTER, tilt=-45.0, altitude=2.0)
+    assert command.depression_deg == pytest.approx(45.0, abs=0.5)
+    assert command.ground_range_m == pytest.approx(2.0, rel=0.02)
+
+
+def test_falls_back_to_open_loop_when_altitude_is_untrustworthy():
+    """The escape hatch for a field session where altitude proves unusable."""
+    controller = build_controller()
+    command = drive(controller, CENTER, altitude=0.05)
+    assert command.ground_range_m is None
+
+    controller = build_controller(ibvs_enabled=False)
+    command = drive(controller, CENTER, altitude=2.0)
+    assert command.ground_range_m is None
+
+
+def test_reset_returns_to_centering():
+    controller = build_controller()
+    drive(controller, CENTER, cycles=6)
+    assert controller.phase is TrackingPhase.APPROACHING
+    controller.reset()
+    assert controller.phase is TrackingPhase.CENTERING

@@ -8,13 +8,19 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Tuple
+from typing import TYPE_CHECKING, Final, Tuple
 
 from mvp_mission_bebop.exceptions import KinematicConstraintViolation
 from mvp_mission_bebop.parameters import TimeoutsConfig
-from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
+from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor, TelemetryHealth
+
+if TYPE_CHECKING:  # pragma: no cover - avoids a circular import at runtime
+    from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 
 logger = logging.getLogger("FailsafeSupervisor")
+
+#: Numerical slack below which a command counts as exactly zero.
+KINEMATIC_TOLERANCE: Final[float] = 1e-4
 
 
 class FailsafeSupervisor:
@@ -22,7 +28,7 @@ class FailsafeSupervisor:
 
     def __init__(
         self,
-        drone_actuator,
+        drone_actuator: "BenchtopDroneProxy",
         odom_supervisor: OdometrySupervisor,
         timeouts_cfg: TimeoutsConfig,
     ) -> None:
@@ -36,18 +42,48 @@ class FailsafeSupervisor:
         """Register fresh video frame arrival timestamp."""
         self.last_valid_frame_timestamp = time.time()
 
+    def clamp_kinematics(self, vz: float, vyaw: float) -> Tuple[float, float]:
+        """Saturate a command onto the kinematic invariants.
+
+        This is the guard for the normal command path. Its counterpart
+        :meth:`assert_kinematics` raises, which is correct for a contract
+        violation but wrong as a flight-time guard: a single ``vz`` of 1e-3
+        arriving from a rounding error used to propagate out of the step, through
+        the pipeline's generic exception handler, and into an emergency landing.
+        A safety supervisor that ends the mission over a sign error is a
+        liability rather than a protection.
+
+        Returns
+        -------
+        Tuple[float, float]
+            ``(vz, vyaw)`` saturated to ``vz <= 0`` and ``vyaw == 0``.
+        """
+        safe_vz = min(0.0, vz)
+        if vz > KINEMATIC_TOLERANCE:
+            logger.warning(
+                "Climb command vz=%.4f suppressed; vertical authority is descent-only.", vz
+            )
+        if abs(vyaw) > KINEMATIC_TOLERANCE:
+            logger.warning(
+                "Yaw command vyaw=%.4f suppressed; rotation is prohibited in flight.", vyaw
+            )
+        return safe_vz, 0.0
+
     def assert_kinematics(self, vz: float, vyaw: float) -> None:
-        """Enforce kinematic safety invariants.
+        """Assert the kinematic safety invariants, raising on violation.
+
+        Reserved for checkpoints and tests. Use :meth:`clamp_kinematics` on the
+        command path.
 
         1. Absolute zero yaw rate (vyaw == 0.0).
         2. Non-positive vertical velocity (vz <= 0.0).
         """
-        if abs(vyaw) > 1e-4:
+        if abs(vyaw) > KINEMATIC_TOLERANCE:
             raise KinematicConstraintViolation(
                 f"Kinematic constraint violation: vyaw={vyaw:.4f}. "
                 "Yaw rotation is strictly prohibited during flight."
             )
-        if vz > 1e-4:
+        if vz > KINEMATIC_TOLERANCE:
             raise KinematicConstraintViolation(
                 f"Kinematic constraint violation: vz={vz:.4f} > 0. "
                 "Positive vertical climbing commands are strictly prohibited."
@@ -58,7 +94,10 @@ class FailsafeSupervisor:
         if self.failsafe_active:
             return False, "Failsafe already active."
 
-        if not self.odom_supervisor.is_telemetry_healthy():
+        health = self.odom_supervisor.telemetry_health()
+        if health is TelemetryHealth.NEVER_RECEIVED:
+            return False, "No odometry has ever been received. Verify /bebop/odom is publishing."
+        if health is TelemetryHealth.STALE:
             return False, "Odometry telemetry stream loss (heartbeat timeout)."
 
         if self.odom_supervisor.is_ceiling_breached():

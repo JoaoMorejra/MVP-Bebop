@@ -121,3 +121,92 @@ def test_braking_velocity_aims_at_the_arrival_window():
 def test_braking_velocity_rejects_invalid_deceleration():
     with pytest.raises(ValueError):
         braking_velocity(1.0, 0.0, cruise_velocity=0.1)
+
+
+def test_jerk_stays_bounded_through_arbitrary_target_changes():
+    """Regression: the anti-overshoot snap used to zero acceleration outright.
+
+    Dropping the acceleration in a single cycle is itself an unbounded jerk, so
+    a profile that only ever accelerates from rest toward a fixed target could
+    satisfy the limits while a realistic command sequence violated them.
+    """
+    cfg = limits()
+    profile = JerkLimitedProfile(cfg)
+    targets = [0.20, 0.20, 0.0, -0.15, -0.15, 0.05, 0.0, 0.18, -0.02, 0.0]
+
+    previous_velocity = 0.0
+    previous_accel = 0.0
+    for target in targets:
+        for _ in range(25):
+            velocity = profile.step(target, DT)
+            accel = (velocity - previous_velocity) / DT
+            jerk = (accel - previous_accel) / DT
+
+            assert abs(accel) <= cfg.max_accel + 1e-6
+            assert abs(jerk) <= cfg.max_jerk + 1e-6, f"jerk {jerk} exceeded limit at target {target}"
+
+            previous_velocity, previous_accel = velocity, accel
+
+
+def test_settles_exactly_on_a_reachable_target():
+    profile = JerkLimitedProfile(limits())
+    for _ in range(300):
+        profile.step(0.07, DT)
+    assert profile.velocity == pytest.approx(0.07, abs=1e-9)
+
+
+def test_jerk_is_bounded_when_tracking_a_noisy_target():
+    """Regression: the terminal snap stored an acceleration it had not emitted.
+
+    A jittering target makes the snap fire on consecutive cycles. If the stored
+    state does not match the command that was actually returned, the next cycle
+    measures its jerk against the wrong reference and two opposing snaps emit
+    twice the budget.
+    """
+    import random
+
+    random.seed(11)
+    cfg = limits()
+    profile = JerkLimitedProfile(cfg)
+
+    previous_velocity = 0.0
+    previous_accel = 0.0
+    for _ in range(2000):
+        target = 0.02 + random.gauss(0.0, 0.01)
+        velocity = profile.step(target, DT)
+        accel = (velocity - previous_velocity) / DT
+        jerk = (accel - previous_accel) / DT
+
+        assert abs(accel) <= cfg.max_accel + 1e-6
+        assert abs(jerk) <= cfg.max_jerk + 1e-6
+
+        previous_velocity, previous_accel = velocity, accel
+
+
+def test_arrival_at_the_velocity_limit_is_smooth():
+    """Regression: the profile used to overshoot into the velocity clamp.
+
+    The overshoot test evaluated the stopping distance of the *current*
+    acceleration, which authorises an increment whose own stopping distance is
+    larger. One cycle later the clamp truncated the step, producing a velocity
+    discontinuity -- precisely the artefact this class exists to prevent.
+    """
+    cfg = limits(max_velocity=0.10, max_accel=0.25, max_jerk=1.0)
+    profile = JerkLimitedProfile(cfg)
+
+    previous_velocity = 0.0
+    previous_accel = 0.0
+    saturated = False
+    for _ in range(120):
+        velocity = profile.step(-cfg.max_velocity, DT)
+        accel = (velocity - previous_velocity) / DT
+        jerk = (accel - previous_accel) / DT
+
+        assert velocity >= -cfg.max_velocity - 1e-9
+        assert abs(jerk) <= cfg.max_jerk + 1e-6
+
+        previous_velocity, previous_accel = velocity, accel
+        saturated = saturated or velocity == pytest.approx(-cfg.max_velocity, abs=1e-9)
+
+    assert saturated, "the profile should reach the velocity limit"
+    assert profile.acceleration == pytest.approx(0.0, abs=1e-9)

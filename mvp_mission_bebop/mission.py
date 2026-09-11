@@ -11,6 +11,8 @@ import logging
 import sys
 
 from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
 import nectar
 from nectar.ai.detection import Detector
@@ -18,10 +20,12 @@ from nectar.control import BebopConfig, DroneFactory
 from nectar.vision import ImageHandler, QoSReliability, ROSConfig
 
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
+from mvp_mission_bebop.actuators.simulator import KinematicSimulator
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
 from mvp_mission_bebop.engine.runner import MissionRunner
+from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.parameters import MissionParameters
 from mvp_mission_bebop.steps import (
     ClosedLoopRTLStep,
@@ -33,10 +37,16 @@ from mvp_mission_bebop.steps import (
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
 
+# Mission logs go to stdout deliberately. The Electron GCS registers its step
+# matcher on the child's stdout pipe and looks for the literal "[STEP N:"
+# (electron/main.cjs:698-716), while basicConfig defaults to stderr -- so the
+# bmg:step-change event could never fire. Both pipes are forwarded to the
+# renderer, so the only visible change is that step tracking now works.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
 )
 logger = logging.getLogger("BebopMission")
 
@@ -204,7 +214,23 @@ def main() -> None:
         namespace=params.network.namespace,
     )
     raw_drone = DroneFactory.create("bebop", config)
-    actuator = BenchtopDroneProxy(raw_drone, no_fly=params.no_fly)
+
+    # Odometry is the only state feedback this airframe offers, and the SDK does
+    # not subscribe to it: BebopDrone owns nine publishers and no subscribers.
+    odom_supervisor = OdometrySupervisor(
+        kinematics_cfg=params.kinematics,
+        timeouts_cfg=params.timeouts,
+        calibration_cfg=params.calibration,
+    )
+    calibration = SpeedCalibration(params.kinematics.normalized_to_mps)
+
+    # Under --no-fly the simulator stands in for the airframe, integrating every
+    # command and publishing synthetic odometry through the supervisor's public
+    # ingress. It runs from takeoff onward, so by the time the return leg starts
+    # the drone is genuinely displaced by the cruise rather than by a constant
+    # injected for the occasion.
+    simulator = KinematicSimulator(odom_supervisor, calibration) if params.no_fly else None
+    actuator = BenchtopDroneProxy(raw_drone, no_fly=params.no_fly, simulator=simulator)
 
     if not actuator.connect():
         erro_msg = f"Falha de conexão com driver do drone no IP {params.network.drone_ip}"
@@ -265,17 +291,22 @@ def main() -> None:
 
     frame_height, frame_width = sample_frame.shape[:2]
 
-    # Initialize telemetry and supervisory nodes
-    odom_supervisor = OdometrySupervisor(
-        kinematics_cfg=params.kinematics,
-        timeouts_cfg=params.timeouts,
-    )
-    handler.node.create_subscription(
+    # Telemetry gets its own node rather than riding on the camera handler's.
+    # Both are registered with the same shared Nectar executor, so this adds no
+    # spin loop -- it just stops an odometry subscription from sharing a
+    # lifecycle with the video pipeline.
+    telemetry_node = Node("bebop_mission_telemetry", start_parameter_services=False)
+    telemetry_node.create_subscription(
         Odometry,
         params.network.odometry_topic,
         odom_supervisor.odometry_callback,
-        10,
+        qos_profile_sensor_data,
     )
+    nectar.add_node(telemetry_node)
+
+    if simulator is not None:
+        # Seed the supervisor so ground calibration has something to work with.
+        simulator.publish_initial_state()
 
     governor = AltitudeAntiClimbGovernor(
         target_altitude=params.kinematics.target_altitude_m,
@@ -292,6 +323,7 @@ def main() -> None:
         lateral_pid_cfg=params.lateral_pid,
         vision_cfg=params.vision,
         kinematics_cfg=params.kinematics,
+        calibration=calibration,
     )
 
     ctx = MissionContext(
@@ -315,13 +347,25 @@ def main() -> None:
         ClosedLoopRTLStep(),
     ]
 
-    runner = MissionRunner(context=ctx, steps=steps)
+    runner = MissionRunner(
+        context=ctx,
+        steps=steps,
+        on_finalize=lambda: telemetry_node.destroy_node(),
+    )
+
+    # Registration is explicit rather than a constructor side effect, so the
+    # runner can be constructed in a test off the main thread.
+    runner.install_signal_handlers()
 
     try:
-        runner.run()
+        succeeded = runner.run()
     finally:
-        raw_drone.cleanup()
-        nectar.shutdown()
+        # Idempotent: whichever of this and the interrupt handler arrives first
+        # performs the teardown, and the other becomes a no-op. The previous
+        # arrangement ran cleanup three times on every Ctrl-C.
+        runner.finalize()
+
+    sys.exit(0 if succeeded else 1)
 
 
 if __name__ == "__main__":

@@ -1,87 +1,76 @@
-"""Deterministic mission pipeline runner and execution engine."""
+"""Deterministic mission pipeline sequencer."""
 
 from __future__ import annotations
 
 import logging
-import signal
-import sys
 import time
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import nectar
 
 from mvp_mission_bebop.context import MissionContext
+from mvp_mission_bebop.engine.signals import EmergencyHandler
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 
 logger = logging.getLogger("MissionRunner")
 
+#: Number of stop-and-land commands transmitted during an emergency. The Bebop
+#: subscribes with a queue depth of 1 over best-effort QoS, so a single publish
+#: can be dropped; a short burst makes delivery overwhelmingly likely without
+#: consuming the time budget.
+_EMERGENCY_BURST_COUNT: int = 5
+
+#: Spacing between commands in that burst.
+_EMERGENCY_BURST_INTERVAL_SEC: float = 0.04
+
 
 class MissionRunner:
-    """Orchestrates step pipeline execution, signals, and resource finalization."""
+    """Executes mission steps in order and finalizes resources exactly once."""
 
-    def __init__(self, context: MissionContext, steps: Optional[List[BaseStep]] = None) -> None:
+    def __init__(
+        self,
+        context: MissionContext,
+        steps: Optional[List[BaseStep]] = None,
+        *,
+        on_finalize: Optional[Callable[[], None]] = None,
+    ) -> None:
         self.ctx = context
         self.steps = steps or []
-        self._emergency_in_progress = False
+        self._on_finalize = on_finalize
 
-        # Register signal handlers for operator interruption
-        signal.signal(signal.SIGINT, self._handle_operator_emergency)
-        signal.signal(signal.SIGTERM, self._handle_operator_emergency)
+        # Signal handling is constructed here but installed explicitly, so a
+        # runner can be built off the main thread -- in a test, say -- without
+        # tripping "signal only works in main thread".
+        self._emergency = EmergencyHandler(
+            emergency_event=context.emergency_event,
+            land_sequence=self._transmit_emergency_landing,
+            finalizer=self._finalize,
+        )
 
-    def _handle_operator_emergency(self, signum=None, frame=None) -> None:
-        """Execute controlled landing burst upon operator interruption. Never cuts motors."""
-        self.ctx.emergency_event.set()
-        logger.critical("=" * 65)
-        logger.critical("OPERATOR EMERGENCY SIGNAL DETECTED. TRANSMITTING CONTROLLED LANDING...")
-        logger.critical("=" * 65)
+    @property
+    def emergency(self) -> EmergencyHandler:
+        """The interrupt handler owned by this runner."""
+        return self._emergency
 
-        try:
-            from mvp_mission_bebop.telemetry.announcer import announce_sync
-            announce_sync(
-                "Missão abortada",
-                details={"etapa": "missão abortada, pousando drone"},
-                priority="URGENT",
-                wait=False,
-            )
-        except Exception as vocal_err:
-            logger.debug("Emergency abort vocal alert error: %s", vocal_err)
+    def install_signal_handlers(self) -> None:
+        """Register SIGINT and SIGTERM. Must be called from the main thread."""
+        self._emergency.install()
 
-        try:
-            for _ in range(5):
-                self.ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
-                self.ctx.drone.land()
-                time.sleep(0.06)
-            logger.info("Emergency land command burst transmitted. Flushing network buffers...")
-            time.sleep(1.2)
-        except Exception as exc:
-            logger.error("Error during emergency landing dispatch: %s", exc)
+    def finalize(self) -> None:
+        """Release resources if that has not already happened."""
+        self._emergency.finalize_once()
 
-        try:
-            from mvp_mission_bebop.telemetry.announcer import get_announcer
-            get_announcer().device.wait_until_done(timeout=3.5)
-        except Exception:
-            pass
-
-        if not self._emergency_in_progress:
-            self._emergency_in_progress = True
-            try:
-                self.ctx.handler.cleanup()
-                self.ctx.drone.cleanup()
-                nectar.shutdown()
-            except Exception:
-                pass
-            logger.info("Emergency landing sequence finalized. Exiting.")
-            sys.exit(0)
+    # -------------------------------------------------------------- execution
 
     def run(self) -> bool:
-        """Execute all configured steps sequentially.
+        """Execute every configured step in order.
 
         Returns
         -------
         bool
-            True if all steps executed successfully, False otherwise.
+            True when every step reported success.
         """
-        logger.info("Commencing autonomous mission execution (%d steps configured)...", len(self.steps))
+        logger.info("Commencing autonomous mission execution (%d steps).", len(self.steps))
         all_succeeded = True
 
         try:
@@ -93,59 +82,86 @@ class MissionRunner:
 
                 status = step.execute(self.ctx)
 
-                if status == StepStatus.ABORTED:
-                    logger.warning("Step '%s' signaled ABORT.", step.name)
-                    try:
-                        from mvp_mission_bebop.telemetry.announcer import announce_sync
-                        announce_sync(
-                            "Missão abortada",
-                            details={"etapa": "missão abortada, pousando drone"},
-                            priority="URGENT",
-                            wait=False,
-                        )
-                    except Exception:
-                        pass
-                    all_succeeded = False
-                    break
-                elif status == StepStatus.FAILURE:
-                    logger.error("Step '%s' failed. Halting mission pipeline.", step.name)
-                    try:
-                        from mvp_mission_bebop.telemetry.announcer import announce_sync
-                        announce_sync(
-                            "Falha na etapa",
-                            details={"etapa": step.name, "erro": f"falha na etapa {step.name}"},
-                            priority="CRITICAL",
-                            wait=False,
-                        )
-                    except Exception:
-                        pass
+                if status is StepStatus.ABORTED:
+                    logger.warning("Step '%s' signalled ABORT.", step.name)
+                    self._announce_failure("Missão abortada", "missão abortada, pousando drone")
                     all_succeeded = False
                     break
 
-        except KeyboardInterrupt:
-            self._handle_operator_emergency()
-        except Exception as exc:
+                if status is StepStatus.FAILURE:
+                    logger.error("Step '%s' failed. Halting mission pipeline.", step.name)
+                    self._announce_failure(
+                        "Falha na etapa", f"falha na etapa {step.name}", priority="CRITICAL"
+                    )
+                    all_succeeded = False
+                    break
+
+        except Exception as exc:  # noqa: BLE001 - any step fault must land the drone
             logger.critical("Unhandled exception in mission pipeline: %s", exc, exc_info=True)
             self.ctx.failsafe.trigger_emergency_land(str(exc))
             all_succeeded = False
-        finally:
-            self._cleanup()
 
         return all_succeeded
 
-    def _cleanup(self) -> None:
-        """Clean up peripheral and network resources safely."""
+    # ------------------------------------------------------------ termination
+
+    def _transmit_emergency_landing(self, budget_sec: float) -> None:
+        """Transmit a controlled landing within the supplied time budget.
+
+        Never cuts motors: this is a descent command, not a motor kill.
+        """
+        interval = _EMERGENCY_BURST_INTERVAL_SEC
+        affordable = int(budget_sec / interval) if interval > 0.0 else _EMERGENCY_BURST_COUNT
+        repeats = max(1, min(_EMERGENCY_BURST_COUNT, affordable))
+
+        for index in range(repeats):
+            self.ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
+            self.ctx.drone.land()
+            if index < repeats - 1:
+                time.sleep(interval)
+
+        logger.info("Emergency landing burst transmitted (%d commands).", repeats)
+
+    def _finalize(self) -> None:
+        """Release peripherals and the ROS runtime. Invoked at most once."""
         logger.info("Commencing resource de-allocation and sensor shutdown...")
-        if not self.ctx.shared_data.get("rtl_completed", False):
+
+        if not self.ctx.blackboard.rtl_completed:
+            # The mission did not land on its own, so make sure it is on its way
+            # down before the process exits.
             try:
                 self.ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
                 self.ctx.drone.land()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Landing command during cleanup failed: %s", exc)
+
+        for label, action in (
+            ("ImageHandler", self.ctx.handler.cleanup),
+            ("drone", self.ctx.drone.cleanup),
+        ):
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s cleanup exception: %s", label, exc)
+
+        if self._on_finalize is not None:
+            try:
+                self._on_finalize()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Finalization hook exception: %s", exc)
 
         try:
-            self.ctx.handler.cleanup()
-        except Exception as exc:
-            logger.warning("ImageHandler cleanup exception: %s", exc)
+            nectar.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Nectar runtime shutdown exception: %s", exc)
 
         logger.info("Mission resource cleanup finalized.")
+
+    @staticmethod
+    def _announce_failure(action: str, detail: str, *, priority: str = "URGENT") -> None:
+        try:
+            from mvp_mission_bebop.telemetry.announcer import announce_sync
+
+            announce_sync(action, details={"etapa": detail}, priority=priority, wait=False)
+        except Exception as exc:  # noqa: BLE001 - audio is never flight-critical
+            logger.debug("Announcement dispatch failed: %s", exc)

@@ -113,39 +113,87 @@ class JerkLimitedProfile:
 
         limits = self._limits
         target = self._clamp_velocity(target_velocity)
-
-        # Velocity this axis would coast to if acceleration were ramped to zero
-        # starting now, at the jerk limit. This is the quantity that must be
-        # compared against the target for the profile not to overshoot.
-        stopping_delta = self._accel * abs(self._accel) / (2.0 * limits.max_jerk)
-        projected = self._velocity + stopping_delta
-
-        error = target - projected
-        if abs(error) <= EPSILON:
-            desired_accel = 0.0
-        else:
-            desired_accel = math.copysign(limits.max_accel, error)
-
-        # Bound the change in acceleration by the jerk ceiling, then the
-        # acceleration itself.
         max_delta = limits.max_jerk * dt
-        accel = max(self._accel - max_delta, min(self._accel + max_delta, desired_accel))
-        accel = max(-limits.max_accel, min(limits.max_accel, accel))
+
+        error = target - self._velocity
+        if abs(error) <= EPSILON and abs(self._accel) <= EPSILON:
+            self._accel = 0.0
+            return self._velocity
+
+        # Two candidates, each one jerk-limited move from the current state:
+        # press on toward the target, or bleed acceleration back toward zero.
+        pursue = self._ramp(math.copysign(limits.max_accel, error) if error else 0.0, max_delta)
+        brake = self._ramp(0.0, max_delta)
+
+        # Commit to pursuing only if the axis could still be brought to rest on
+        # the target *after* this step. Testing the stopping distance of the
+        # current acceleration instead -- the obvious formulation -- authorises
+        # an increment whose own stopping distance is larger, so the profile
+        # commits to a speed it can no longer shed and overshoots into the
+        # clamp one cycle later.
+        accel = brake if self._overshoots(pursue, target, dt) else pursue
 
         velocity = self._velocity + accel * dt
 
-        # Landing exactly on the target beats hunting around it: if this step
-        # crosses the target, settle there and drop the acceleration.
-        if (self._velocity - target) * (velocity - target) < 0.0:
+        # Terminal condition. The look-ahead above is what prevents overshoot;
+        # this only finishes the last fraction of a step so the state settles
+        # exactly rather than hunting at the resolution of the arithmetic.
+        # Landing on the target this cycle and holding it the next implies two
+        # acceleration transitions -- to the one that lands exactly on target,
+        # and from there to zero -- so both must fit inside the jerk budget for
+        # the shortcut to be legitimate. Requiring anything less (or zeroing the
+        # acceleration outright) lets the snap emit twice the allowed jerk.
+        landing_accel = (target - self._velocity) / dt
+        if abs(landing_accel) <= max_delta and abs(landing_accel - self._accel) <= max_delta:
             velocity = target
-            accel = 0.0
-        elif abs(velocity - target) <= EPSILON:
-            velocity = target
-            accel = 0.0
 
-        self._velocity = self._clamp_velocity(velocity)
-        self._accel = accel
+        # Reconcile the stored state with the command actually returned. If the
+        # velocity limit truncates this step, the acceleration emitted is
+        # smaller than the one computed, and storing the computed value makes
+        # the next cycle measure its jerk against a reference the caller never
+        # saw.
+        clamped = self._clamp_velocity(velocity)
+        self._accel = (clamped - self._velocity) / dt
+        self._velocity = clamped
         return self._velocity
+
+    def _ramp(self, toward: float, max_delta: float) -> float:
+        """Acceleration after one jerk-limited move toward ``toward``."""
+        limits = self._limits
+        bounded = max(self._accel - max_delta, min(self._accel + max_delta, toward))
+        return max(-limits.max_accel, min(limits.max_accel, bounded))
+
+    def _overshoots(self, accel: float, target: float, dt: float) -> bool:
+        """Would applying ``accel`` for one step carry the axis past ``target``?"""
+        approach = target - self._velocity
+        if approach == 0.0:
+            return False
+        projected = self._velocity + accel * dt + self._stopping_delta(accel, dt)
+        return (projected - target) * approach > 0.0
+
+    def _stopping_delta(self, accel: float, dt: float) -> float:
+        """Velocity change incurred while ramping ``accel`` to zero.
+
+        Evaluated as the discrete sum the integrator will actually produce, not
+        the continuous-time closed form ``a|a| / 2j``. The closed form assumes
+        acceleration decays smoothly; a discrete integrator holds each reduced
+        acceleration for a whole interval, so it always travels further than the
+        integral predicts. The shortfall is small, but near a velocity limit it
+        is the difference between arriving smoothly and overshooting into the
+        clamp -- and a clamp is a discontinuity, which is exactly what this
+        class exists to avoid. The loop runs at most ``max_accel / (jerk * dt)``
+        times, a handful of iterations at any realistic control rate.
+        """
+        step = self._limits.max_jerk * dt
+        if step <= 0.0:
+            return 0.0
+
+        magnitude = abs(accel)
+        delta = 0.0
+        while magnitude > 0.0:
+            magnitude = max(0.0, magnitude - step)
+            delta += magnitude * dt
+        return math.copysign(delta, accel)
 
     def _clamp_velocity(self, value: float) -> float:
         limit = self._limits.max_velocity
