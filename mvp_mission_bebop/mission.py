@@ -110,6 +110,12 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         help="RTL landing arrival radius in meters.",
     )
     parser.add_argument(
+        "--rtl-velocity",
+        type=float,
+        default=None,
+        help="Cruise velocity for return to launch.",
+    )
+    parser.add_argument(
         "--params-json",
         default=None,
         help="JSON string with custom mission parameters overrides.",
@@ -136,6 +142,8 @@ def main() -> None:
         params.kinematics.target_altitude_m = args.height
     if args.velocity is not None:
         params.kinematics.forward_cruise_velocity = args.velocity
+    if getattr(args, "rtl_velocity", None) is not None:
+        params.rtl.max_speed = args.rtl_velocity
     if args.search_timeout is not None:
         params.timeouts.search_timeout_sec = args.search_timeout
     if args.hover_duration is not None:
@@ -231,13 +239,29 @@ def main() -> None:
     handler = ImageHandler(image_source=params.network.camera_raw_topic, config=cam_config)
     handler.open()
 
-    sample_frame = handler.take_photo(timeout_sec=5.0)
+    sample_frame = handler.take_photo(timeout_sec=2.5)
     if sample_frame is None:
-        logger.critical("Fatal: Unable to receive initial video frame. Aborting.")
-        handler.cleanup()
-        raw_drone.cleanup()
-        nectar.shutdown()
-        sys.exit(1)
+        if params.no_fly:
+            logger.info("[NO-FLY BENCHTOP] Physical camera not available. Utilizing benchtop test frame.")
+            import os
+            import cv2
+            import numpy as np
+            test_img_path = os.path.join(os.path.dirname(__file__), "accident_raw_20260903_033713.png")
+            if not os.path.exists(test_img_path):
+                test_img_path = os.path.join(os.path.dirname(__file__), "accident_capture_20260901_031108.jpg")
+            if os.path.exists(test_img_path):
+                sample_frame = cv2.imread(test_img_path)
+            if sample_frame is None:
+                sample_frame = np.zeros((480, 856, 3), dtype=np.uint8)
+
+            # Supply benchtop frames continuously without timeout log warnings
+            handler.take_photo = lambda timeout_sec=1.0: sample_frame.copy()
+        else:
+            logger.critical("Fatal: Unable to receive initial video frame. Aborting.")
+            handler.cleanup()
+            raw_drone.cleanup()
+            nectar.shutdown()
+            sys.exit(1)
 
     frame_height, frame_width = sample_frame.shape[:2]
 

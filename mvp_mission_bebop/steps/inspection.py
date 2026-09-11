@@ -27,9 +27,13 @@ class NadirInspectionStep(BaseStep):
         target_classes = ctx.params.vision.target_classes
         conf_thresh = ctx.params.vision.confidence_threshold
 
-        logger.info("Hovering at Nadir (-80.0 deg) for %.1f s and capturing evidence...", hover_duration)
+        logger.info("Hovering at Nadir (%.1f deg) for %.1f s and capturing evidence...", ctx.params.gimbal.nadir_tilt_deg, hover_duration)
 
-        # Ensure zero horizontal translation, active anti-climb vz
+        # 1. Guarantee camera is locked at strict nadir position
+        ctx.current_tilt_deg = ctx.params.gimbal.nadir_tilt_deg
+        ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
+
+        # 2. Ensure zero horizontal translation, active anti-climb vz
         vz_cmd = ctx.governor.compute_vz(ctx.odom_supervisor.relative_altitude)
         ctx.failsafe.assert_kinematics(vz=vz_cmd, vyaw=0.0)
         ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=vz_cmd, vyaw=0.0)

@@ -35,6 +35,9 @@ class OdometrySupervisor:
         self.current_raw_altitude: float = 0.0
         self.current_x: float = 0.0
         self.current_y: float = 0.0
+        self.current_vx: float = 0.0
+        self.current_vy: float = 0.0
+        self.current_vz: float = 0.0
         self.current_yaw: float = 0.0
         self.takeoff_x: Optional[float] = None
         self.takeoff_y: Optional[float] = None
@@ -50,6 +53,11 @@ class OdometrySupervisor:
             self.current_raw_altitude = float(msg.pose.pose.position.z)
             self.current_x = float(msg.pose.pose.position.x)
             self.current_y = float(msg.pose.pose.position.y)
+
+            # Linear velocities from driver optical-flow / IMU fusion
+            self.current_vx = float(msg.twist.twist.linear.x)
+            self.current_vy = float(msg.twist.twist.linear.y)
+            self.current_vz = float(msg.twist.twist.linear.z)
 
             # Extract yaw angle from orientation quaternion
             q = msg.pose.pose.orientation
@@ -88,6 +96,32 @@ class OdometrySupervisor:
             self.altitude_ceiling,
         )
         return True
+
+    def freeze_hover_takeoff_origin(self) -> bool:
+        """Freeze stabilized airborne coordinates as the definitive horizontal return target.
+
+        Eliminates ground-effect lift-off transients from corrupting horizontal origin.
+        """
+        with self._lock:
+            self.takeoff_x = self.current_x
+            self.takeoff_y = self.current_y
+
+        logger.info(
+            "Airborne hover takeoff origin stabilized: x0=%.3f m, y0=%.3f m (alt_rel=%.3f m).",
+            self.takeoff_x,
+            self.takeoff_y,
+            self.relative_altitude,
+        )
+        return True
+
+    def get_current_horizontal_speed(self) -> float:
+        """Compute instantaneous horizontal ground speed magnitude in m/s."""
+        with self._lock:
+            return math.hypot(self.current_vx, self.current_vy)
+
+    def is_hover_settled(self, max_speed_mps: float = 0.04) -> bool:
+        """Verify drone is effectively motionless in hover (speed <= threshold)."""
+        return self.get_current_horizontal_speed() <= max_speed_mps
 
     @property
     def relative_altitude(self) -> float:

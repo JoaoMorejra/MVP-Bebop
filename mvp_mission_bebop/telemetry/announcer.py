@@ -47,13 +47,18 @@ def _get_synthesis_client(api_key: str) -> Any:
 
 def _resolve_auth_token() -> Optional[str]:
     """Resolve authentication credentials from environment or dot-env files."""
-    key = os.environ.get("SPEECH_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
+    key = (
+        os.environ.get("SPEECH_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+        or os.environ.get("GEMINI_API_KEY", "").strip()
+    )
     if key:
         return key
 
     env_paths = [
         os.path.join(os.getcwd(), ".env"),
         "/home/jv/ros2_ws/.env",
+        os.path.expanduser("~/jarvis/.env"),
         os.path.expanduser("~/.env"),
     ]
 
@@ -261,6 +266,12 @@ def _format_telemetry_statement(
         return f"Alerta de voo: {err}. Executando pouso seguro imediatamente."
 
     action_lower = action.lower()
+    if "abortar" in action_lower or "abortada" in action_lower or "abort" in action_lower:
+        if details and "etapa" in details:
+            return str(details["etapa"]).capitalize()
+        if details and "acao" in details:
+            return f"Missão abortada, {details['acao']}."
+        return "Missão abortada, pousando drone."
     if "iniciando missão" in action_lower:
         return "Missão iniciada. Parâmetros de voo carregados."
     if "decolagem autorizada" in action_lower or "contagem" in action_lower:
@@ -417,8 +428,9 @@ class MissionAudioAnnouncer:
             audio_buffer = bytearray()
             try:
                 instruction = (
-                    f"Vocalize this exact operational status in Portuguese: '{statement}'. "
-                    "Speak clearly, calmly and concisely. Do not add greetings or extra commentary."
+                    f"Vocalize this operational status in Portuguese concisely, similar to: '{statement}'. "
+                    "Speak clearly, calmly and directly as an autonomous flight copilot. "
+                    "Never add greetings, conversational filler, or address spectators."
                 )
                 await session.send_client_content(
                     turns=types.Content(
@@ -564,3 +576,23 @@ def announce_sync(
 # Compatibility aliases
 falar_acao = announce
 falar_acao_sync = announce_sync
+DEFAULT_MODEL = SYNTHESIZER_MODEL
+DEFAULT_VOICE = SYNTHESIZER_VOICE
+get_audio_speaker = get_audio_playback_device
+get_speech_arbiter = get_announcer
+_resolve_api_key = _resolve_auth_token
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Acoustic mission telemetry announcer CLI")
+    parser.add_argument("action", nargs="?", default="Missão abortada", help="Action or milestone to announce")
+    parser.add_argument("--priority", choices=["NORMAL", "URGENT", "CRITICAL"], default="NORMAL", help="Queue priority")
+    parser.add_argument("--details", default=None, help="Details or explanation")
+    parser.add_argument("--wait", action="store_true", default=True, help="Wait for audio playback to complete")
+    args = parser.parse_args()
+
+    details_dict = {"etapa": args.details} if args.details else None
+    success = announce_sync(args.action, details=details_dict, priority=args.priority, wait=args.wait)
+    get_announcer().close()
+    sys.exit(0 if success else 1)
+

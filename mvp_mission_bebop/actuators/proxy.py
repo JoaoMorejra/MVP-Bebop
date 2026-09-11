@@ -22,7 +22,12 @@ class BenchtopDroneProxy:
 
     def flat_trim(self) -> None:
         """Calibrate IMU flat trim."""
-        self.drone.flat_trim()
+        try:
+            self.drone.flat_trim()
+        except Exception as exc:
+            if not self.no_fly:
+                raise exc
+            logger.debug("[NO-FLY] Simulated flat trim.")
 
     def takeoff(self, altitude: float) -> bool:
         """Execute autonomous takeoff."""
@@ -40,11 +45,21 @@ class BenchtopDroneProxy:
 
     def camera_control(self, tilt: float, pan: float = 0.0) -> None:
         """Actuate camera gimbal. Physically executed in both real flight and benchtop."""
-        self.drone.camera_control(tilt=tilt, pan=pan)
+        try:
+            self.drone.camera_control(tilt=tilt, pan=pan)
+        except Exception as exc:
+            if not self.no_fly:
+                raise exc
+            logger.debug("[NO-FLY] Simulated camera gimbal: tilt=%.1f, pan=%.1f", tilt, pan)
 
     def snapshot(self) -> None:
         """Trigger onboard camera snapshot."""
-        self.drone.snapshot()
+        try:
+            self.drone.snapshot()
+        except Exception as exc:
+            if not self.no_fly:
+                raise exc
+            logger.debug("[NO-FLY] Simulated snapshot trigger.")
 
     def move_velocity(
         self,
@@ -72,6 +87,14 @@ class BenchtopDroneProxy:
 
     def connect(self) -> bool:
         """Verify driver connectivity."""
+        if self.no_fly:
+            try:
+                if self.drone.connect():
+                    return True
+            except Exception:
+                pass
+            logger.info("[NO-FLY BENCHTOP] Simulated benchtop drone proxy active. Motors unpowered.")
+            return True
         return self.drone.connect()
 
     def cleanup(self) -> None:

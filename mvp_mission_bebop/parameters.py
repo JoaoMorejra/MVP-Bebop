@@ -38,8 +38,8 @@ class VisionConfig:
     confidence_threshold: float = 0.50
     target_classes: List[str] = field(default_factory=lambda: ["motorcycle", "bicycle"])
     confirmation_frames: int = 3 
-    optical_center_tolerance_px: float = 30.0
-    approach_centering_tolerance_px: float = 25.0
+    optical_center_tolerance_px: float = 35.0
+    approach_centering_tolerance_px: float = 30.0
 
 
 @dataclass
@@ -56,11 +56,12 @@ class GimbalPIDConfig:
 class LateralPIDConfig:
     """PID gains for horizontal centering via body-frame lateral velocity."""
 
-    kp: float = 0.12
+    kp: float = 0.35
     ki: float = 0.0
-    kd: float = 0.01
-    output_limits: Tuple[float, float] = (-0.04, 0.04)
+    kd: float = 0.03
+    output_limits: Tuple[float, float] = (-0.22, 0.22)
     deadband: float = 0.005
+    min_effective_velocity: float = 0.06
 
 
 @dataclass
@@ -79,8 +80,8 @@ class FlightKinematicsConfig:
 
     target_altitude_m: float = 1.00
     altitude_ceiling_margin_m: float = 0.25
-    forward_cruise_velocity: float = 0.05
-    max_approach_forward_speed: float = 0.04
+    forward_cruise_velocity: float = 0.20
+    max_approach_forward_speed: float = 0.15
     takeoff_stabilize_duration_sec: float = 4.0
     hover_duration_sec: float = 7.0
     countdown_sec: float = 0.0
@@ -90,10 +91,17 @@ class FlightKinematicsConfig:
 class ReturnToLaunchConfig:
     """Closed-loop odometry Return-to-Launch navigation parameters."""
 
-    max_speed: float = 0.05
-    kp: float = 0.08
-    arrival_radius_m: float = 0.12
-    timeout_sec: float = 35.0
+    max_speed: float = 0.10
+    kp: float = 0.15
+    kd: float = 0.01
+    lateral_kp: float = 0.18
+    max_lateral_speed: float = 0.05
+    braking_distance_m: float = 0.45
+    deadband_m: float = 0.03
+    min_effective_speed: float = 0.035
+    settle_cycles: int = 3
+    arrival_radius_m: float = 0.20
+    timeout_sec: float = 60.0
     final_hover_delay_sec: float = 2.0
 
 
@@ -102,7 +110,7 @@ class TimeoutsConfig:
     """Execution timeouts and sensor watchdog windows."""
 
     search_timeout_sec: float = 30.0
-    tracking_timeout_sec: float = 45.0
+    tracking_timeout_sec: float = 60.0
     target_recovery_timeout_sec: float = 4.0
     odometry_heartbeat_timeout_sec: float = 3.0
     video_stream_timeout_sec: float = 8.0

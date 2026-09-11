@@ -36,6 +36,17 @@ class MissionRunner:
         logger.critical("=" * 65)
 
         try:
+            from mvp_mission_bebop.telemetry.announcer import announce_sync
+            announce_sync(
+                "Missão abortada",
+                details={"etapa": "missão abortada, pousando drone"},
+                priority="URGENT",
+                wait=False,
+            )
+        except Exception as vocal_err:
+            logger.debug("Emergency abort vocal alert error: %s", vocal_err)
+
+        try:
             for _ in range(5):
                 self.ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
                 self.ctx.drone.land()
@@ -44,6 +55,12 @@ class MissionRunner:
             time.sleep(1.2)
         except Exception as exc:
             logger.error("Error during emergency landing dispatch: %s", exc)
+
+        try:
+            from mvp_mission_bebop.telemetry.announcer import get_announcer
+            get_announcer().device.wait_until_done(timeout=3.5)
+        except Exception:
+            pass
 
         if not self._emergency_in_progress:
             self._emergency_in_progress = True
@@ -78,6 +95,16 @@ class MissionRunner:
 
                 if status == StepStatus.ABORTED:
                     logger.warning("Step '%s' signaled ABORT.", step.name)
+                    try:
+                        from mvp_mission_bebop.telemetry.announcer import announce_sync
+                        announce_sync(
+                            "Missão abortada",
+                            details={"etapa": "missão abortada, pousando drone"},
+                            priority="URGENT",
+                            wait=False,
+                        )
+                    except Exception:
+                        pass
                     all_succeeded = False
                     break
                 elif status == StepStatus.FAILURE:

@@ -32,18 +32,32 @@ class TakeoffStep(BaseStep):
         # 3. Establish ground launch reference coordinates (x0, y0, z0)
         ctx.odom_supervisor.calibrate_ground_reference()
 
-        # 4. Pre-flight synchronization countdown
+        # 4. Pre-flight synchronization countdown & optical warmup
         countdown = ctx.params.kinematics.countdown_sec
         announced_second_3 = False
+        countdown_start = time.time()
         if countdown > 0:
-            logger.info("Pre-flight synchronization countdown initiated (%.1f s)...", countdown)
+            logger.info("Pre-flight countdown and sensor warmup initiated (%.1f s)...", countdown)
             while True:
                 if ctx.emergency_event.is_set():
                     return StepStatus.ABORTED
-                elapsed_prep = time.time() - ctx.start_time
+                elapsed_prep = time.time() - countdown_start
                 remaining = countdown - elapsed_prep
                 if remaining <= 0:
                     break
+
+                # Poll optical frame and run warmup inference so YOLO is fully loaded
+                frame = ctx.handler.take_photo(timeout_sec=0.2)
+                if frame is not None:
+                    ctx.failsafe.notify_frame_received()
+                    try:
+                        warmup_result = ctx.detector.detect(frame)
+                        status_text = f"CONTAGEM REGRESSIVA: {remaining:.1f}s | YOLO PRONTO"
+                        ctx.publish_annotated_stream(frame, warmup_result, status_text)
+                    except Exception as inf_err:
+                        logger.debug("Warmup inference notice: %s", inf_err)
+                else:
+                    time.sleep(0.08)
 
                 # Autorização vocal de decolagem no limiar de 3s
                 if remaining <= 3.2 and not announced_second_3:
@@ -58,8 +72,6 @@ class TakeoffStep(BaseStep):
                         )
                     except Exception as vocal_err:
                         logger.debug("Announce dispatch failure: %s", vocal_err)
-
-                time.sleep(0.1)
 
         # 5. Autonomous takeoff
         target_alt = ctx.params.kinematics.target_altitude_m
@@ -95,6 +107,9 @@ class TakeoffStep(BaseStep):
             time.sleep(0.05)
 
         ctx.failsafe.notify_frame_received()
+
+        # Freeze airborne hover coordinates to establish precise return origin
+        ctx.odom_supervisor.freeze_hover_takeoff_origin()
 
         # 7. Post-takeoff health verification
         if not ctx.drone.no_fly:
