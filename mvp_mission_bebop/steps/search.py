@@ -15,8 +15,6 @@ blink discarded accumulated evidence.
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
 from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
@@ -142,11 +140,24 @@ class ForwardSearchStep(BaseStep):
 
     # ---------------------------------------------------------------- motion
 
-    def _cruise(self, ctx, profile, shaper, dt: float, cruise_mps: float) -> None:
+    def _cruise(
+        self,
+        ctx: MissionContext,
+        profile: JerkLimitedProfile,
+        shaper: QuantizedCommandShaper,
+        dt: float,
+        cruise_mps: float,
+    ) -> None:
         """Advance along the search track under the jerk-limited profile."""
         self._command(ctx, profile, shaper, dt, cruise_mps)
 
-    def _halt(self, ctx, profile, shaper, dt: float) -> None:
+    def _halt(
+        self,
+        ctx: MissionContext,
+        profile: JerkLimitedProfile,
+        shaper: QuantizedCommandShaper,
+        dt: float,
+    ) -> None:
         """Decelerate to a stop without the nose-down transient of a step command.
 
         Ramping down matters here specifically: an abrupt stop pitches the
@@ -158,7 +169,14 @@ class ForwardSearchStep(BaseStep):
             if abs(profile.velocity) <= 1e-6:
                 break
 
-    def _command(self, ctx, profile, shaper, dt: float, target_mps: float) -> None:
+    def _command(
+        self,
+        ctx: MissionContext,
+        profile: JerkLimitedProfile,
+        shaper: QuantizedCommandShaper,
+        dt: float,
+        target_mps: float,
+    ) -> None:
         """Profile, convert, shape, and transmit one forward velocity command."""
         profiled = profile.step(target_mps, dt)
         vx = shaper.shape(ctx.speed_calibration.to_normalized(profiled), dt)

@@ -14,8 +14,6 @@ more than none at all. The metadata records which of the two paths was taken.
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
@@ -36,9 +34,6 @@ class NadirInspectionStep(BaseStep):
         if not ctx.blackboard.approach_finished:
             logger.warning("Approach never completed. Skipping nadir inspection.")
             return StepStatus.SUCCESS
-
-        inspection_cfg = ctx.params.inspection
-        vision_cfg = ctx.params.vision
 
         # Lock the gimbal down for the whole stage.
         ctx.current_tilt_deg = ctx.params.gimbal.nadir_tilt_deg
@@ -68,7 +63,6 @@ class NadirInspectionStep(BaseStep):
         else:
             logger.error("Stage 4 finished without recording any evidence.")
 
-        _ = vision_cfg  # configuration is consumed inside the helpers
         return StepStatus.SUCCESS
 
     # -------------------------------------------------------------- stillness

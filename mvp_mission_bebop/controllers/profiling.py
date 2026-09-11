@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Final, Optional
+from typing import Final
 
 #: Below this magnitude a residual velocity or acceleration is treated as zero,
 #: which is what lets the profiler settle exactly on target instead of

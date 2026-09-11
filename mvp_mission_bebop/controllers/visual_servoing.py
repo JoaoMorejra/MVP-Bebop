@@ -226,7 +226,16 @@ class VisualServoingController:
 
     # ----------------------------------------------------------------- phases
 
-    def _centering(self, err_x, err_y, pixel_error, vy, current_tilt_deg, projection, dt):
+    def _centering(
+        self,
+        err_x: float,
+        err_y: float,
+        pixel_error: float,
+        vy: float,
+        current_tilt_deg: float,
+        projection: Optional[GroundProjection],
+        dt: float,
+    ) -> ServoCommand:
         """Hold position and align the target horizontally before advancing."""
         tolerance = self.vision_cfg.optical_center_tolerance_px
         vertical_tolerance = tolerance * self.vision_cfg.centering_vertical_ratio
@@ -268,7 +277,16 @@ class VisualServoingController:
             note="centering",
         )
 
-    def _approaching(self, err_x, err_y, pixel_error, vy, current_tilt_deg, projection, dt):
+    def _approaching(
+        self,
+        err_x: float,
+        err_y: float,
+        pixel_error: float,
+        vy: float,
+        current_tilt_deg: float,
+        projection: Optional[GroundProjection],
+        dt: float,
+    ) -> ServoCommand:
         """Advance along-track with the gimbal tracking the target down to nadir."""
         vision_cfg = self.vision_cfg
         corridor = vision_cfg.optical_center_tolerance_px * vision_cfg.approach_corridor_ratio
@@ -325,7 +343,16 @@ class VisualServoingController:
             note=note,
         )
 
-    def _nadir(self, err_x, err_y, pixel_error, vy, current_tilt_deg, projection, dt):
+    def _nadir(
+        self,
+        err_x: float,
+        err_y: float,
+        pixel_error: float,
+        vy: float,
+        current_tilt_deg: float,
+        projection: Optional[GroundProjection],
+        dt: float,
+    ) -> ServoCommand:
         """Fine two-axis positioning directly over the target."""
         vision_cfg = self.vision_cfg
         # Slewed rather than assigned: entering this phase from a shallower

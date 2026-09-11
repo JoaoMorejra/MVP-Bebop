@@ -14,13 +14,17 @@ coast horizon expires.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.visual_servoing import ServoCommand, TrackingPhase
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker, TrackerGains
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the runtime import out
+    import numpy as np
+    from nectar.ai.detection.core.types import Detection, DetectionResult
 
 logger = logging.getLogger("Step3Tracking")
 
@@ -147,7 +151,9 @@ class VisualServoingStep(BaseStep):
 
     @staticmethod
     def _resolve_target(
-        targets, tracker: ConstantVelocityTracker, dt: float
+        targets: Sequence["Detection"],
+        tracker: ConstantVelocityTracker,
+        dt: float,
     ) -> Tuple[Optional[Tuple[float, float]], bool]:
         """Return the target centre and whether it came from a real detection."""
         if targets:
@@ -182,8 +188,8 @@ class VisualServoingStep(BaseStep):
     @staticmethod
     def _publish(
         ctx: MissionContext,
-        frame,
-        result,
+        frame: "np.ndarray",
+        result: "DetectionResult",
         command: ServoCommand,
         elapsed_sec: float,
         measured: bool,

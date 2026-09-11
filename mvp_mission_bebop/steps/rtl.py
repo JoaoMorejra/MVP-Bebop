@@ -23,7 +23,7 @@ protection for the last several seconds of the flight.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.rtl_guidance import (

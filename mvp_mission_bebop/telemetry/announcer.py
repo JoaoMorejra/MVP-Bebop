@@ -14,7 +14,7 @@ import queue
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 try:
     from google import genai

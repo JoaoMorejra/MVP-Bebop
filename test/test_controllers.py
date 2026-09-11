@@ -1,7 +1,5 @@
 """Unit tests for the altitude governor and the visual servoing control law."""
 
-import math
-
 import pytest
 
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
