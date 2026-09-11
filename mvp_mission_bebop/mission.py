@@ -307,6 +307,14 @@ def main() -> None:
     if simulator is not None:
         # Seed the supervisor so ground calibration has something to work with.
         simulator.publish_initial_state()
+        # Drive the simulation from the executor, at the rate the real driver
+        # publishes odometry. Advancing it only when the mission thread issues a
+        # command would freeze the simulated state through any phase that sends
+        # none -- the post-takeoff hover, for one, which then never completes
+        # its climb and leaves every altitude-dependent law on its fallback path.
+        telemetry_node.create_timer(
+            1.0 / params.kinematics.control_loop_hz, simulator.integrate
+        )
 
     governor = AltitudeAntiClimbGovernor(
         target_altitude=params.kinematics.target_altitude_m,

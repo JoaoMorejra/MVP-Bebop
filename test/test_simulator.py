@@ -223,3 +223,53 @@ def test_proxy_forwards_everything_when_flying():
 
     kinds = [call[0] for call in drone.calls]
     assert kinds == ["takeoff", "move_velocity", "land", "delay"]
+
+
+def test_state_advances_without_any_command():
+    """Regression: the simulation froze through phases that issue no commands.
+
+    The post-takeoff hover sends nothing, so a simulator driven only by command
+    calls never finished its climb. Every altitude-dependent law then ran on its
+    fallback path, and the benchtop run silently exercised the wrong code.
+    """
+    clock = FakeClock()
+    supervisor, simulator = build(clock)
+
+    simulator.takeoff(1.0)
+    for _ in range(40):
+        clock.advance(0.1)
+        simulator.integrate()   # no command in between, as a hover would be
+
+    assert supervisor.snapshot().relative_altitude == pytest.approx(1.0, abs=0.01)
+
+
+def test_integration_is_safe_from_two_threads():
+    """Commands arrive on the mission thread; integration runs on the executor."""
+    import threading
+
+    supervisor, simulator = build()
+    simulator.takeoff(1.0)
+    errors = []
+
+    def integrate():
+        try:
+            for _ in range(400):
+                simulator.integrate()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def command():
+        try:
+            for index in range(400):
+                simulator.command(0.1 * (index % 3), 0.0, 0.0, 0.0)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=integrate), threading.Thread(target=command)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert math.isfinite(supervisor.snapshot().x)

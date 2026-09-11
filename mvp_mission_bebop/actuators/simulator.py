@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from typing import Callable, Final
 
@@ -51,6 +52,13 @@ class KinematicSimulator:
     The Bebop latches the last Twist it received until another arrives and never
     zeroes it on its own, so the simulation integrates the *held* command over
     the interval between calls, which is what the real airframe does.
+
+    Integration is driven by a timer on the executor rather than by the mission
+    thread, because real odometry arrives at a steady rate whatever the mission
+    is doing. Driving it from command calls alone leaves the simulated state
+    frozen through any phase that issues no commands -- the post-takeoff hover,
+    for one, which then never finishes its climb and leaves every altitude-
+    dependent law running on its fallback path.
     """
 
     __slots__ = (
@@ -68,6 +76,7 @@ class KinematicSimulator:
         "_last_update",
         "_airborne",
         "_target_altitude",
+        "_lock",
     )
 
     def __init__(
@@ -92,6 +101,9 @@ class KinematicSimulator:
         self._last_update: float = clock()
         self._airborne: bool = False
         self._target_altitude: float = 0.0
+        # Commands arrive on the mission thread; integration is driven from an
+        # executor timer. Both mutate this state.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------- properties
 
@@ -103,7 +115,8 @@ class KinematicSimulator:
     @property
     def position(self) -> tuple[float, float, float]:
         """Current simulated world position ``(x, y, z)`` in metres."""
-        return self._x, self._y, self._z
+        with self._lock:
+            return self._x, self._y, self._z
 
     # ----------------------------------------------------------------- events
 
@@ -119,33 +132,42 @@ class KinematicSimulator:
     def takeoff(self, altitude_m: float) -> None:
         """Begin a simulated climb to the requested altitude."""
         self.integrate()
-        self._airborne = True
-        self._target_altitude = max(0.0, altitude_m)
+        with self._lock:
+            self._airborne = True
+            self._target_altitude = max(0.0, altitude_m)
         logger.debug("Simulated takeoff to %.2f m from (%.2f, %.2f).", altitude_m, self._x, self._y)
 
     def land(self) -> None:
         """Begin a simulated descent to the ground."""
         self.integrate()
-        self._target_altitude = 0.0
+        with self._lock:
+            self._target_altitude = 0.0
         logger.debug("Simulated landing from %.2f m.", self._z)
 
     def command(self, vx: float, vy: float, vz: float, vyaw: float) -> None:
         """Integrate the previously held command, then latch a new one."""
         self.integrate()
-        self._vx = vx
-        self._vy = vy
-        self._vz = vz
-        self._vyaw = vyaw
+        with self._lock:
+            self._vx = vx
+            self._vy = vy
+            self._vz = vz
+            self._vyaw = vyaw
 
     # -------------------------------------------------------------- mechanics
 
     def integrate(self) -> None:
         """Advance the simulated state to now and publish a synthetic sample."""
-        now = self._clock()
-        dt = min(MAX_INTEGRATION_STEP_SEC, max(0.0, now - self._last_update))
-        self._last_update = now
-        if dt <= 0.0:
-            return
+        with self._lock:
+            now = self._clock()
+            dt = min(MAX_INTEGRATION_STEP_SEC, max(0.0, now - self._last_update))
+            self._last_update = now
+            if dt <= 0.0:
+                return
+            self._advance(dt)
+        self._emit()
+
+    def _advance(self, dt: float) -> None:
+        """Integrate one step. The caller holds the lock."""
 
         # Vertical: the climb and descent transients dominate the commanded vz,
         # matching a Bebop that runs its own altitude loop during takeoff and
@@ -169,27 +191,24 @@ class KinematicSimulator:
             self._x += (speed_x * cos_psi - speed_y * sin_psi) * dt
             self._y += (speed_x * sin_psi + speed_y * cos_psi) * dt
 
-        self._emit()
-
     def _emit(self) -> None:
         """Publish the current simulated state through the public ingress."""
-        if self._airborne:
-            speed_x = self._calibration.to_mps(self._vx)
-            speed_y = self._calibration.to_mps(self._vy)
-            cos_psi = math.cos(self._yaw)
-            sin_psi = math.sin(self._yaw)
+        with self._lock:
+            state = (self._x, self._y, self._z, self._yaw, self._vx, self._vy,
+                     self._vz, self._airborne)
+
+        x, y, z, yaw, vx, vy, vz, airborne = state
+        if airborne:
+            speed_x = self._calibration.to_mps(vx)
+            speed_y = self._calibration.to_mps(vy)
+            cos_psi = math.cos(yaw)
+            sin_psi = math.sin(yaw)
             world_vx = speed_x * cos_psi - speed_y * sin_psi
             world_vy = speed_x * sin_psi + speed_y * cos_psi
-            world_vz = self._calibration.to_mps(self._vz)
+            world_vz = self._calibration.to_mps(vz)
         else:
             world_vx = world_vy = world_vz = 0.0
 
         self._supervisor.inject_synthetic_sample(
-            x=self._x,
-            y=self._y,
-            z=self._z,
-            vx=world_vx,
-            vy=world_vy,
-            vz=world_vz,
-            yaw=self._yaw,
+            x=x, y=y, z=z, vx=world_vx, vy=world_vy, vz=world_vz, yaw=yaw
         )
