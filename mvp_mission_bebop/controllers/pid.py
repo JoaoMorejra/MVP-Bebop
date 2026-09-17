@@ -100,6 +100,25 @@ class FilteredPID:
         """
         self._setpoint = setpoint
 
+    def bleed_integral(self, retention: float) -> None:
+        """Scale the accumulated integral toward zero.
+
+        Exists for a controller that suppresses its own output inside a
+        deadband. With the error forced to zero the integral neither grows nor
+        decays -- ``ki * 0 * dt`` is nothing -- so a bank accumulated against a
+        disturbance survives the disturbance and drives an overshoot the next
+        time the band is left. Leaking it is the fix, and leaking it has to be
+        the caller's decision rather than this class's: a guidance law that
+        holds a steady offset against a steady disturbance wants exactly the
+        opposite behaviour.
+
+        Parameters
+        ----------
+        retention : float
+            Fraction of the integral to keep, clamped to ``[0, 1]``.
+        """
+        self._integral *= max(0.0, min(1.0, retention))
+
     def reset(self) -> None:
         """Clear integral, derivative, and the priming state."""
         self._integral = 0.0
@@ -119,6 +138,27 @@ class FilteredPID:
             reported by ``LoopRate.tick`` rather than a nominal period.
         """
         gains = self._gains
+
+        if not math.isfinite(measurement):
+            # A non-finite sample is not a small error, it is an absence of
+            # information, and the arithmetic below cannot represent that.
+            #
+            # The failure is silent and permanent, which is what makes it worth
+            # a guard rather than a comment. ``0.0 * nan`` is ``nan``, so even
+            # ``ki = 0.0`` does not keep NaN out of the integral; the clamp then
+            # resolves it to the *upper* bound, because CPython's ``min`` returns
+            # its first operand whenever the comparison is False. One corrupt
+            # odometry sample therefore pins the controller at full positive
+            # authority, and with ``ki = 0`` there is no integral action left to
+            # unwind it -- only an explicit ``reset``, which the flight path
+            # calls once at engagement. Measured on the RTL longitudinal gains,
+            # a single NaN takes the output from 0.075 to the 0.10 saturation
+            # limit and holds it there indefinitely.
+            #
+            # Returning zero demand leaves the airframe coasting on the
+            # actuator's latched command rather than lurching, and leaves the
+            # filter state clean so the next valid sample resumes normally.
+            return 0.0
 
         if dt <= 0.0:
             return self._clamp_output(gains.kp * (self._setpoint - measurement))

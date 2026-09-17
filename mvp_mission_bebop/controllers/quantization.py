@@ -36,6 +36,12 @@ _QUANTIZATION_GUARD: Final[float] = 1e-6
 #: pathological sequence of ``dt`` values.
 _MAX_RESIDUAL_PULSES: Final[float] = 10.0
 
+#: Reference control period used to express the accumulator bound as a fixed
+#: displacement. Deliberately not the caller's ``dt``: a bound scaled by the
+#: current interval widens precisely when the loop is running slowly, which is
+#: the case it has to contain.
+_NOMINAL_PERIOD_SEC: Final[float] = 1.0 / 15.0
+
 logger = logging.getLogger("QuantizedCommandShaper")
 
 
@@ -139,7 +145,20 @@ class QuantizedCommandShaper:
             # the outstanding residual back into the demand before snapping, so
             # successive cycles dither between the two adjacent grid levels and
             # the mean lands on the demand rather than on the nearest step.
-            command = self._quantize(demand + self._residual / dt)
+            #
+            # The dither is bounded to a single grid step, which is the whole of
+            # what it is for -- it exists to spread one rounding error across
+            # several cycles, never to add authority. Unbounded, it is a loaded
+            # gun: the residual is a *displacement*, so dividing it by the
+            # current ``dt`` converts a bank accumulated over slow cycles into a
+            # velocity scaled by the ratio of the two intervals. A stretch of
+            # cycles at the ``LoopRate`` ceiling of 0.5 s -- which a blocking
+            # frame grab produces routinely -- followed by one normal 1/15 s
+            # cycle measured a 0.35 command against a 0.10 cruise cap, a
+            # full-authority lurch that defeats every jerk and braking limit
+            # upstream of it.
+            correction = max(-self._step, min(self._step, self._residual / dt))
+            command = self._quantize(demand + correction)
             self._residual += (demand - command) * dt
             self._pulses += 1
         elif abs(self._residual + demand * dt) >= pulse_displacement:
@@ -155,7 +174,12 @@ class QuantizedCommandShaper:
             self._residual += demand * dt
             command = 0.0
 
-        bound = _MAX_RESIDUAL_PULSES * pulse_displacement
+        # Bound the bank in absolute displacement, not in units of the current
+        # interval. Scaling the bound by ``dt`` let a slow cycle authorize a
+        # large residual that a subsequent fast cycle would then discharge at a
+        # correspondingly large velocity -- the bound grew in exactly the
+        # circumstance it existed to guard against.
+        bound = _MAX_RESIDUAL_PULSES * self._floor * _NOMINAL_PERIOD_SEC
         self._residual = max(-bound, min(bound, self._residual))
         return command
 
