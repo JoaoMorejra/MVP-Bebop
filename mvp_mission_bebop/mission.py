@@ -7,7 +7,9 @@ Entry point executing the deterministic 5-step mission pipeline via Nectar SDK.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
 
 from nav_msgs.msg import Odometry
@@ -22,10 +24,12 @@ from nectar.vision import ImageHandler, QoSReliability, ROSConfig
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
 from mvp_mission_bebop.context import MissionContext
+from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
 from mvp_mission_bebop.engine.runner import MissionRunner
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
+from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
 from mvp_mission_bebop.parameters import MissionParameters
 from mvp_mission_bebop.steps import (
     ClosedLoopRTLStep,
@@ -108,6 +112,15 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         help="Benchtop simulation mode: vision & gimbal active without spinning motors.",
     )
     parser.add_argument(
+        "--fly",
+        action="store_true",
+        default=None,
+        help=(
+            "Arm the motors for a real flight, overriding a persisted no_fly. "
+            "Required because --no-fly could previously only ever be set, never cleared."
+        ),
+    )
+    parser.add_argument(
         "--countdown",
         type=float,
         default=None,
@@ -135,18 +148,27 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
 
 def main() -> None:
     """CLI initialization and mission lifecycle execution."""
-    import os
     config_file = os.path.join(os.path.dirname(__file__), "mission_config.json")
     params = MissionParameters.load_from_file(config_file)
     args = parse_arguments(params)
 
     if args.params_json:
+        # A malformed payload is fatal, not a warning. This carries the whole
+        # parameter document the operator just edited in the GCS; swallowing it
+        # and flying the file on disk instead is indistinguishable, from the
+        # cockpit, from the interface having no effect at all.
         try:
-            import json
             custom_data = json.loads(args.params_json)
-            params.update_from_dict(custom_data)
-        except Exception as e:
-            logger.warning("Failed to apply custom params JSON: %s", e)
+        except json.JSONDecodeError as error:
+            raise SystemExit(
+                f"--params-json is not valid JSON ({error}); refusing to fly a "
+                f"configuration the operator did not approve."
+            ) from error
+        if not isinstance(custom_data, dict):
+            raise SystemExit(
+                "--params-json must be a JSON object of MissionParameters fields."
+            )
+        params.update_from_dict(custom_data)
 
     if args.height is not None:
         params.kinematics.target_altitude_m = args.height
@@ -168,13 +190,35 @@ def main() -> None:
         params.network.drone_ip = args.ip
     if args.detection_topic:
         params.network.detection_stream_topic = args.detection_topic
+    # ``--no-fly`` is ``store_true``, so it can only ever set the flag, and the
+    # merged configuration is written back to disk a few lines below. One
+    # benchtop run therefore used to stamp ``no_fly: true`` into
+    # mission_config.json permanently, and every later invocation -- the real
+    # flight included -- silently loaded it and reported a successful mission it
+    # never flew. ``--fly`` is the missing counterpart, and the flag is excluded
+    # from what gets persisted so the latch cannot form again.
+    if args.fly and args.no_fly:
+        parser_error = "--fly and --no-fly are mutually exclusive."
+        raise SystemExit(parser_error)
     if args.no_fly:
-        params.no_fly = args.no_fly
+        params.no_fly = True
+    if args.fly:
+        params.no_fly = False
     if args.countdown is not None:
         params.kinematics.countdown_sec = args.countdown
 
     try:
+        # Persist the tuning, never the arming state: see the note above on the
+        # one-way latch. ``no_fly`` is a per-invocation decision made at the
+        # command line, so it is restored to whatever the file already held
+        # before the file is rewritten.
+        persisted = MissionParameters.load_from_file(config_file).no_fly if os.path.exists(
+            config_file
+        ) else False
+        armed_for_this_run = params.no_fly
+        params.no_fly = persisted
         params.save_to_file(config_file)
+        params.no_fly = armed_for_this_run
     except Exception as save_err:
         logger.warning("Could not persist active mission config: %s", save_err)
 
@@ -222,7 +266,19 @@ def main() -> None:
         timeouts_cfg=params.timeouts,
         calibration_cfg=params.calibration,
     )
-    calibration = SpeedCalibration(params.kinematics.normalized_to_mps)
+    calibration = SpeedCalibration.from_kinematics(params.kinematics)
+
+    # The aggregated motion sequence. Fed by the actuator proxy, so every
+    # ``move_velocity`` the mission transmits is accounted for without any step
+    # having to remember to report itself, and armed by Stage 1 at the same
+    # instant the horizontal origin is frozen -- the two have to agree on which
+    # point ``(0, 0)`` is, or the return leg flies home to a place the drone was
+    # never at.
+    motion_tracker = (
+        DeadReckoningTracker(calibration, params.dead_reckoning)
+        if params.dead_reckoning.enabled
+        else None
+    )
 
     # Under --no-fly the simulator stands in for the airframe, integrating every
     # command and publishing synthetic odometry through the supervisor's public
@@ -230,7 +286,12 @@ def main() -> None:
     # the drone is genuinely displaced by the cruise rather than by a constant
     # injected for the occasion.
     simulator = KinematicSimulator(odom_supervisor, calibration) if params.no_fly else None
-    actuator = BenchtopDroneProxy(raw_drone, no_fly=params.no_fly, simulator=simulator)
+    actuator = BenchtopDroneProxy(
+        raw_drone,
+        no_fly=params.no_fly,
+        simulator=simulator,
+        motion_tracker=motion_tracker,
+    )
 
     if not actuator.connect():
         erro_msg = f"Falha de conexão com driver do drone no IP {params.network.drone_ip}"
@@ -269,7 +330,6 @@ def main() -> None:
     if sample_frame is None:
         if params.no_fly:
             logger.info("[NO-FLY BENCHTOP] Physical camera not available. Utilizing benchtop test frame.")
-            import os
             import cv2
             import numpy as np
             test_img_path = os.path.join(os.path.dirname(__file__), "accident_raw_20260903_033713.png")
@@ -316,14 +376,29 @@ def main() -> None:
             1.0 / params.kinematics.control_loop_hz, simulator.integrate
         )
 
-    governor = AltitudeAntiClimbGovernor(
+    # Two-sided altitude hold unless the configuration explicitly declines it.
+    # The descent-only governor is kept as the escape hatch rather than deleted:
+    # it is the reference behaviour above the setpoint, and a field session that
+    # finds the hold misbehaving needs a way back that is not a code change.
+    governor_class = (
+        AltitudeHoldGovernor if params.governor.hold_enabled else AltitudeAntiClimbGovernor
+    )
+    governor = governor_class(
         target_altitude=params.kinematics.target_altitude_m,
         config=params.governor,
+    )
+    logger.info(
+        "Vertical axis: %s at %.2f m (descent <= %.3f, ascent <= %.3f normalized).",
+        governor_class.__name__,
+        params.kinematics.target_altitude_m,
+        params.governor.max_descent_speed,
+        params.governor.climb_authority,
     )
     failsafe = FailsafeSupervisor(
         drone_actuator=actuator,
         odom_supervisor=odom_supervisor,
         timeouts_cfg=params.timeouts,
+        kinematics_cfg=params.kinematics,
     )
     visual_controller = VisualServoingController(
         gimbal_config=params.gimbal,
@@ -367,6 +442,8 @@ def main() -> None:
 
     try:
         succeeded = runner.run()
+        if motion_tracker is not None:
+            logger.info("Motion sequence summary -- %s", motion_tracker.summary())
     finally:
         # Idempotent: whichever of this and the interrupt handler arrives first
         # performs the teardown, and the other becomes a no-op. The previous

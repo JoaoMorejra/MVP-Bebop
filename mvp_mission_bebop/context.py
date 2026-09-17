@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from mvp_mission_bebop.blackboard import EvidenceRecord, MissionBlackboard
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
+from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
 from mvp_mission_bebop.parameters import MissionParameters
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, OdometrySupervisor
@@ -72,8 +74,113 @@ class MissionContext:
 
         # Single source of truth for the normalized-command to m/s conversion.
         # Guidance laws work in physical units; this is the only place the two
-        # domains meet.
-        self.speed_calibration = SpeedCalibration(parameters.kinematics.normalized_to_mps)
+        # domains meet, and it now also carries the dead zone and efficiency the
+        # dead-reckoning integration needs.
+        self.speed_calibration = SpeedCalibration.from_kinematics(parameters.kinematics)
+
+        # Whether the camera can be asked for a *new* frame rather than for
+        # whatever it last received. See :meth:`grab_frame`.
+        self._camera_blocks_for_new_frames = self._probe_frame_waiting()
+
+    # -------------------------------------------------------------- estimation
+
+    @property
+    def motion_tracker(self) -> Optional["DeadReckoningTracker"]:
+        """Aggregated motion sequence, or ``None`` when dead reckoning is off.
+
+        Owned by the actuator proxy rather than by this context, because the
+        proxy is where every ``move_velocity`` in the mission passes through and
+        an aggregate assembled anywhere else would be only as complete as five
+        separate control loops remembering to report themselves. Exposed here so
+        the steps have one obvious place to look.
+        """
+        return getattr(self.drone, "motion_tracker", None)
+
+    # ------------------------------------------------------------- perception
+
+    def _probe_frame_waiting(self) -> bool:
+        """Can the camera driver distinguish a new frame from a repeated one?"""
+        camera = getattr(self.handler, "camera", None)
+        getter = getattr(camera, "get_frame", None)
+        if getter is None:
+            return False
+        try:
+            return "wait_for_new" in inspect.signature(getter).parameters
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            return False
+
+    def grab_frame(self, timeout_sec: float = 1.0) -> Optional[np.ndarray]:
+        """Acquire one genuinely new camera frame, or ``None`` on timeout.
+
+        The mission's perception loops must go through this rather than through
+        ``ImageHandler.take_photo``, because that method cannot deliver what its
+        own signature promises against this camera.
+
+        ``take_photo`` selects between a blocking and a polling path on
+        ``getattr(camera, "_use_ros_topics", False) or getattr(camera,
+        "is_threaded", False)``. ``ROSCam`` defines neither attribute, so the
+        polling path always wins -- and that path calls ``camera.get_frame()``
+        with no arguments, discarding ``take_photo``'s own ``wait_for_new=True``
+        default. ``ROSCam.get_frame`` then returns its cached frame
+        unconditionally.
+
+        Three consequences, all of which matter in flight:
+
+        *The video-loss failsafe becomes unreachable.* ``take_photo`` never
+        returns ``None`` once a single frame has ever arrived, so the frame
+        heartbeat is refreshed forever and the eight-second stream timeout in
+        ``FailsafeSupervisor.evaluate_system_health`` cannot fire. Losing the
+        Bebop's video link produced no abort at all.
+
+        *Every "no frame this cycle" branch becomes dead code*, including the
+        station-keeping holds in Stages 2 and 3.
+
+        *Target confirmation can fire on one frozen image.* The hysteresis
+        confirmer counts loop iterations, not distinct frames, so three passes
+        over an identical cached image satisfy ``confirmation_frames`` and commit
+        the mission to an approach -- while the airframe is still physically
+        cruising forward past whatever it actually saw.
+
+        ``ROSCam.get_frame(wait_for_new=True, timeout=...)`` is implemented
+        correctly, with a frame counter and an event; nothing was reaching it.
+        This method does, and falls back to ``take_photo`` for any camera that
+        does not offer the parameter -- which is also what keeps the benchtop
+        path, where ``take_photo`` is replaced by a fixture, working unchanged.
+        """
+        if self._camera_blocks_for_new_frames and not self.params.no_fly:
+            frame = self.handler.camera.get_frame(wait_for_new=True, timeout=timeout_sec)
+        else:
+            frame = self.handler.take_photo(timeout_sec=timeout_sec)
+
+        if frame is not None:
+            self._observe_frame_geometry(frame)
+        return frame
+
+    def _observe_frame_geometry(self, frame: np.ndarray) -> None:
+        """Track the live frame size instead of trusting the first one forever.
+
+        The dimensions used to be sampled once at startup and then passed to the
+        servoing law for the rest of the mission. The Bebop's H.264 stream can
+        renegotiate resolution when the link degrades, and the principal point
+        the control law subtracts is derived from these numbers: a change from
+        856x480 to 1280x720 would leave the assumed centre 212 px off the true
+        one, and the lateral loop would faithfully fly that bias out.
+        """
+        height, width = frame.shape[:2]
+        if width == self.frame_width and height == self.frame_height:
+            return
+
+        logger.warning(
+            "Camera frame geometry changed from %dx%d to %dx%d; re-centring the optical axis.",
+            self.frame_width,
+            self.frame_height,
+            width,
+            height,
+        )
+        self.frame_width = int(width)
+        self.frame_height = int(height)
+        self.frame_center_x = self.frame_width / 2.0
+        self.frame_center_y = self.frame_height / 2.0
 
     def publish_annotated_stream(
         self, frame: Optional[np.ndarray], result: Any, status_text: str
