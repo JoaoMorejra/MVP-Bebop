@@ -38,6 +38,20 @@ class TrackerGains:
 
     alpha: float = 0.60
     beta: float = 0.20
+    #: Ceiling on the tracked velocity state, in pixels per second.
+    #:
+    #: The velocity update divides the residual by ``dt``, so an outlier
+    #: centroid injects an arbitrarily large rate into the state. A YOLO
+    #: identity switch between two objects -- routine on a vibrating airframe --
+    #: is exactly that outlier, and ``coast`` then extrapolates the corrupted
+    #: rate forward for the whole recovery horizon. The bound is generous
+    #: against real target motion: a whole frame width per second at the
+    #: mission's capture size.
+    max_velocity_px_s: float = 900.0
+    #: Residual beyond which a measurement is treated as an outlier and its
+    #: correction damped, in pixels. Sized well above the frame-to-frame
+    #: centroid jitter of a small detection and well below an identity switch.
+    outlier_residual_px: float = 180.0
 
     def __post_init__(self) -> None:
         if not 0.0 < self.alpha <= 1.0:
@@ -127,12 +141,31 @@ class ConstantVelocityTracker:
         ry = my - py
 
         alpha, beta = self._gains.alpha, self._gains.beta
+
+        # Gate the velocity correction on the residual. A jump far larger than
+        # the detector's frame-to-frame jitter is far more likely to be an
+        # identity switch onto a different object than a genuine acceleration,
+        # and the velocity channel is where that mistake becomes expensive: the
+        # residual is divided by ``dt``, so one bad centroid writes a rate the
+        # filter will then extrapolate through the entire coast horizon. The
+        # position still follows the measurement -- the track should go where
+        # the evidence is -- but the velocity is held rather than rewritten.
+        residual = math.hypot(rx, ry)
+        velocity_gain = 0.0 if residual > self._gains.outlier_residual_px else beta
+
         self._x = px + alpha * rx
         self._y = py + alpha * ry
-        self._vx += beta * rx / dt
-        self._vy += beta * ry / dt
+        self._vx = self._bound_velocity(self._vx + velocity_gain * rx / dt)
+        self._vy = self._bound_velocity(self._vy + velocity_gain * ry / dt)
         self._coast = 0.0
         return self._estimate()
+
+    def _bound_velocity(self, value: float) -> float:
+        """Saturate a velocity state onto the configured ceiling."""
+        if not math.isfinite(value):
+            return 0.0
+        limit = self._gains.max_velocity_px_s
+        return max(-limit, min(limit, value))
 
     def coast(self, dt: float) -> Optional[TrackEstimate]:
         """Extrapolate through a dropout without a measurement.
