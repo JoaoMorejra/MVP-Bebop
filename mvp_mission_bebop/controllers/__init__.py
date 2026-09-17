@@ -4,6 +4,7 @@ Every module here is free of ROS and of wall-clock reads, so the flight
 mathematics can be exercised without hardware.
 """
 
+from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.geometry import (
     CameraIntrinsics,
@@ -19,6 +20,7 @@ from mvp_mission_bebop.controllers.profiling import (
 from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
 from mvp_mission_bebop.controllers.rtl_guidance import (
     GuidanceCommand,
+    ReturnReference,
     RTLGuidanceController,
     RTLPhase,
 )
@@ -30,6 +32,7 @@ from mvp_mission_bebop.controllers.visual_servoing import (
 
 __all__ = [
     "AltitudeAntiClimbGovernor",
+    "AltitudeHoldGovernor",
     "CameraIntrinsics",
     "FilteredPID",
     "GroundProjection",
@@ -40,6 +43,7 @@ __all__ = [
     "QuantizedCommandShaper",
     "RTLGuidanceController",
     "RTLPhase",
+    "ReturnReference",
     "ServoCommand",
     "TrackingPhase",
     "VisualServoingController",

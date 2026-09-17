@@ -10,6 +10,19 @@ told to gain.
 The output is non-positive by construction: the governor can only ever bring the
 drone down. Climbing is not a correction it is permitted to make, because the
 mission's vertical invariant forbids it.
+
+That one-way rule is no longer the mission default. Horizontal translation costs
+the Bebop lift, and a sink is exactly the error this governor has no authority
+over -- it computes ``vz = 0.0`` and the airframe goes on descending, which is
+how a mission that hovered at 1.55 m arrived at the scene most of a metre low.
+:class:`~mvp_mission_bebop.controllers.altitude_hold.AltitudeHoldGovernor`
+replaces it and holds both sides of the setpoint.
+
+This class is retained deliberately rather than deleted. It is what
+``governor.hold_enabled = false`` selects: the escape hatch for a field session
+where the two-sided law misbehaves, and the reference against which its
+behaviour above the setpoint is checked. It exposes the same cooperative
+interface so the two are interchangeable at every call site.
 """
 
 from __future__ import annotations
@@ -54,12 +67,38 @@ class AltitudeAntiClimbGovernor:
             setpoint=0.0,
         )
         self._active = False
+        self._error_m = 0.0
         self._clock = clock
 
     @property
     def engaged(self) -> bool:
         """True while the governor is actively commanding descent."""
         return self._active
+
+    @property
+    def climbing(self) -> bool:
+        """Always False. This governor has no ascent authority at all."""
+        return False
+
+    @property
+    def altitude_error_m(self) -> float:
+        """Last measured ``target - altitude``, positive when the drone is low."""
+        return self._error_m
+
+    @property
+    def climb_authority(self) -> float:
+        """Zero: selecting this governor is what declines climb authority."""
+        return 0.0
+
+    def horizontal_scale(self) -> float:
+        """Always unity.
+
+        The two-sided governor throttles translation when its altitude loop is
+        losing, because translation is the disturbance. This one cannot act on a
+        sink at all, so throttling would cost speed without buying altitude.
+        Present so the two governors are interchangeable at every call site.
+        """
+        return 1.0
 
     def compute_vz(self, current_relative_alt: float, dt: Optional[float] = None) -> float:
         """Corrective vertical velocity command, always ``<= 0``.
@@ -75,6 +114,7 @@ class AltitudeAntiClimbGovernor:
         """
         interval = LoopRate.clamp_interval(dt) if dt is not None else LoopRate.clamp_interval(1.0 / 15.0)
         excess = current_relative_alt - self.target_altitude
+        self._error_m = -excess
 
         if excess <= self.config.deadband_m:
             if self._active:
@@ -105,3 +145,4 @@ class AltitudeAntiClimbGovernor:
         """Clear the derivative memory and release the governor."""
         self._pid.reset()
         self._active = False
+        self._error_m = 0.0
