@@ -6,6 +6,11 @@ depend on them testable in isolation.
 """
 
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration, SpeedGainEstimator
+from mvp_mission_bebop.estimation.dead_reckoning import (
+    DeadReckonedState,
+    DeadReckoningTracker,
+    MotionSegment,
+)
 from mvp_mission_bebop.estimation.detection_filter import (
     ConfirmationReport,
     ConfirmationState,
@@ -26,7 +31,10 @@ __all__ = [
     "ConfirmationReport",
     "ConfirmationState",
     "ConstantVelocityTracker",
+    "DeadReckonedState",
+    "DeadReckoningTracker",
     "HysteresisConfirmer",
+    "MotionSegment",
     "SettlementCriteria",
     "SettlementDetector",
     "SettlementReport",
