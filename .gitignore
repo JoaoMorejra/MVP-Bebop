@@ -41,3 +41,4 @@ Thumbs.db
 # Dynamic runtime configuration outputs
 mission_config.json
 active_config.json
+accident_metadata_*.json
