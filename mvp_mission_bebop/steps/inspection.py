@@ -9,11 +9,21 @@ sample at face value.
 Verification is bounded: if the drone never settles within the window the
 capture happens anyway, because an imperfect photograph of the scene is worth
 more than none at all. The metadata records which of the two paths was taken.
+
+The whole stage runs inside an altitude-hold window. That is not a translation
+phase, so it might look unnecessary -- but the airframe arrives here having just
+decelerated out of the approach, and the sink that deceleration leaves behind
+does not stop at the moment the velocity command does. Without the window the
+hover would settle wherever the transient left it and photograph the scene from
+there, which is the same failure the translation phases had, arriving a stage
+later.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
+
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
@@ -31,15 +41,48 @@ class NadirInspectionStep(BaseStep):
     def execute(self, ctx: MissionContext) -> StepStatus:
         logger.info("--- [%s] ---", self.name)
 
-        if not ctx.blackboard.approach_finished:
-            logger.warning("Approach never completed. Skipping nadir inspection.")
-            return StepStatus.SUCCESS
+        # A degraded approach is the case where evidence is most valuable, not
+        # least. The stage used to return immediately when the approach had not
+        # confirmed nadir alignment -- which is precisely the outcome Stage 3
+        # reports on any timeout or lost target -- so the common failure
+        # produced no imagery at all, never moved the gimbal to nadir, and still
+        # logged success. Capture anyway, from wherever the airframe got to, and
+        # record in the evidence metadata that the alignment was unconfirmed so
+        # nothing downstream mistakes it for a centred inspection.
+        degraded = not ctx.blackboard.approach_finished
+        if degraded:
+            logger.warning(
+                "Approach never confirmed nadir alignment. Inspecting in degraded mode: "
+                "evidence will be captured and flagged as unaligned."
+            )
 
-        # Lock the gimbal down for the whole stage.
+        # Lock the gimbal at the inspection attitude for the whole stage. Stage 3
+        # has already brought it here and frozen the airframe at the standoff
+        # this angle frames; re-asserting it costs nothing and means a degraded
+        # approach that never reached the attitude still photographs the ground
+        # rather than the horizon.
         ctx.current_tilt_deg = ctx.params.gimbal.nadir_tilt_deg
         ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
+        self._announce("Inspecionando acidente", "drone pairado sobre o acidente em visada nadir")
 
+        with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
+            return self._inspect(ctx, degraded)
+
+    # ------------------------------------------------------------- inspection
+
+    def _inspect(self, ctx: MissionContext, degraded: bool) -> StepStatus:
+        """Settle, capture, and hold. Called inside the altitude-hold window."""
         settled = self._await_stillness(ctx)
+        if ctx.emergency_event.is_set():
+            # ``_await_stillness`` returns False both on timeout and on an
+            # emergency, and the caller could not tell them apart -- so an abort
+            # raised during the settle wait was followed by a full blocking
+            # capture before anything acted on it.
+            logger.warning("Emergency raised during the settle wait; abandoning evidence capture.")
+            self._hold(ctx)
+            return StepStatus.ABORTED
+
+        settled = settled and not degraded
         captured = self._capture(ctx, settled)
 
         status = self._hover(ctx, captured)
@@ -120,19 +163,26 @@ class NadirInspectionStep(BaseStep):
     # ---------------------------------------------------------------- capture
 
     def _capture(self, ctx: MissionContext, settled: bool, *, forced: bool = False) -> bool:
-        """Trigger the onboard snapshot and persist local evidence."""
-        frame = ctx.handler.take_photo(timeout_sec=1.5)
+        """Trigger the onboard snapshot and persist local evidence.
+
+        Station keeping is re-commanded first. The capture that follows is
+        synchronous and takes appreciable time -- a blocking frame grab, a YOLO
+        inference, an uncompressed PNG write measured at ~155 ms for an 856x480
+        frame, a quality-100 JPEG and a JSON sidecar -- and the Bebop latches the
+        last Twist it received until another arrives. Whatever the hold loop last
+        sent would otherwise stay open-loop for that whole window, and the anti-
+        climb governor's descent command is the thing most likely to be latched.
+        """
+        self._hold(ctx)
+        frame = ctx.grab_frame(timeout_sec=1.5)
         if frame is None:
             logger.error("No frame available for evidence capture.")
             return False
 
         ctx.failsafe.notify_frame_received()
-        result = ctx.detector.detect(frame, conf=ctx.params.vision.confidence_threshold)
+        nadir_conf = ctx.params.inspection.nadir_confidence_threshold
+        result = ctx.detector.detect(frame, conf=nadir_conf)
         targets = result.filter_by_class(ctx.params.vision.target_classes)
-
-        if not targets and not forced:
-            logger.info("No target visible at nadir yet; deferring capture.")
-            return False
 
         # Trigger the 14 MP onboard camera. It acknowledges nothing and returns
         # no path, so the local frames below are the evidence this mission can
@@ -169,14 +219,15 @@ class NadirInspectionStep(BaseStep):
                 return StepStatus.ABORTED
 
             self._hold(ctx)
-            frame = ctx.handler.take_photo(timeout_sec=0.2)
+            frame = ctx.grab_frame(timeout_sec=0.2)
             rate.tick()
 
             if frame is None:
                 continue
             ctx.failsafe.notify_frame_received()
 
-            result = ctx.detector.detect(frame, conf=ctx.params.vision.confidence_threshold)
+            nadir_conf = ctx.params.inspection.nadir_confidence_threshold
+            result = ctx.detector.detect(frame, conf=nadir_conf)
             targets = result.filter_by_class(ctx.params.vision.target_classes)
             ctx.publish_annotated_stream(
                 frame,
@@ -193,9 +244,9 @@ class NadirInspectionStep(BaseStep):
     # ---------------------------------------------------------------- helpers
 
     @staticmethod
-    def _hold(ctx: MissionContext) -> None:
-        """Command a stationary hover with the anti-climb governor engaged."""
-        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude)
+    def _hold(ctx: MissionContext, dt: Optional[float] = None) -> None:
+        """Command a stationary hover with the altitude governor engaged."""
+        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude, dt)
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
 

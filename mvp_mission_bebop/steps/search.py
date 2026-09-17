@@ -1,9 +1,19 @@
 """Stage 2: linear forward search under strict kinematic locks.
 
-Two invariants hold for the whole cruise. Yaw rate is pinned at zero, because
+One invariant holds for the whole cruise: yaw rate is pinned at zero, because
 the Bebop derives its odometry from optical flow and any rotation corrupts the
-horizontal position estimate the return leg later depends on. Vertical velocity
-is constrained non-positive by the anti-climb governor.
+horizontal position estimate the return leg later depends on.
+
+The vertical axis used to be a second one -- constrained non-positive by the
+anti-climb governor -- and this is the stage where that turned out to be the
+wrong constraint. Pitching into the cruise command tilts the thrust vector, the
+firmware does not make up the vertical component, and the airframe sinks for as
+long as the translation lasts. A descent-only governor has no authority over an
+error of that sign, so it commanded ``vz = 0.0`` and the drone went on sinking:
+the cruise began at the target altitude and did not end there. The stage now
+runs inside an altitude-hold window, and scales its own cruise demand back
+whenever that loop is losing -- the cruise is the disturbance, so flying it
+slower is the most direct correction available.
 
 Two defects in the previous implementation are fixed here. It issued no velocity
 command at all on an iteration where a target was visible but not yet confirmed,
@@ -15,6 +25,8 @@ blink discarded accumulated evidence.
 from __future__ import annotations
 
 import logging
+from typing import Optional
+
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
 from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
@@ -59,15 +71,48 @@ class ForwardSearchStep(BaseStep):
             kinematics_cfg.max_accel_mps2,
             kinematics_cfg.max_jerk_mps3,
         )
-        logger.info("Invariants: vyaw == 0.0 (optical-flow fidelity), vz <= 0.0 (anti-climb).")
+        logger.info(
+            "Invariants: vyaw == 0.0 (optical-flow fidelity), vz bounded to "
+            "[-%.3f, +%.3f] by altitude hold at %.2f m.",
+            ctx.params.governor.max_descent_speed,
+            ctx.params.governor.climb_authority,
+            kinematics_cfg.target_altitude_m,
+        )
 
         deadline = Deadline(timeout)
         rate = LoopRate(kinematics_cfg.control_loop_hz)
         ctx.failsafe.notify_frame_received()
 
+        with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
+            return self._cruise_until_confirmed(
+                ctx, deadline, rate, profile, shaper, confirmer, cruise_mps, timeout
+            )
+
+    # ------------------------------------------------------------ cruise loop
+
+    def _cruise_until_confirmed(
+        self,
+        ctx: MissionContext,
+        deadline: Deadline,
+        rate: LoopRate,
+        profile: JerkLimitedProfile,
+        shaper: QuantizedCommandShaper,
+        confirmer: HysteresisConfirmer,
+        cruise_mps: float,
+        timeout: float,
+    ) -> StepStatus:
+        """Cruise the search track until a target confirms or the window closes.
+
+        Separated from :meth:`execute` so that the altitude-hold window is a
+        scope: every exit from this loop -- confirmation, timeout, abort, health
+        failure -- passes back out through the ``with`` block, and the vertical
+        axis is descent-only again before the next stage begins.
+        """
+        vision_cfg = ctx.params.vision
+
         while deadline.active:
             if ctx.emergency_event.is_set():
-                self._halt(ctx, profile, shaper, rate.period_sec)
+                self._halt(ctx, profile, shaper, rate.period_sec, rate)
                 return StepStatus.ABORTED
 
             if not ctx.drone.no_fly:
@@ -76,7 +121,7 @@ class ForwardSearchStep(BaseStep):
                     ctx.failsafe.trigger_emergency_land(reason)
                     return StepStatus.FAILURE
 
-            frame = ctx.handler.take_photo(timeout_sec=1.0)
+            frame = ctx.grab_frame(timeout_sec=1.0)
             dt = rate.tick()
 
             if frame is None:
@@ -114,7 +159,7 @@ class ForwardSearchStep(BaseStep):
                 self._announce(
                     "Acidente detectado", "alvo detectado na pista, iniciando aproximação"
                 )
-                self._halt(ctx, profile, shaper, rate.period_sec)
+                self._halt(ctx, profile, shaper, rate.period_sec, rate)
                 return StepStatus.SUCCESS
 
             if targets:
@@ -135,7 +180,7 @@ class ForwardSearchStep(BaseStep):
 
         logger.warning("Search window of %.1f s expired without confirmation.", timeout)
         ctx.blackboard.target_confirmed = False
-        self._halt(ctx, profile, shaper, rate.period_sec)
+        self._halt(ctx, profile, shaper, rate.period_sec, rate)
         return StepStatus.SUCCESS
 
     # ---------------------------------------------------------------- motion
@@ -148,8 +193,18 @@ class ForwardSearchStep(BaseStep):
         dt: float,
         cruise_mps: float,
     ) -> None:
-        """Advance along the search track under the jerk-limited profile."""
-        self._command(ctx, profile, shaper, dt, cruise_mps)
+        """Advance along the search track under the jerk-limited profile.
+
+        The demand is scaled by what the altitude loop will tolerate before it
+        is profiled, not after. Scaling the shaped command instead would leave
+        the profile believing it was still tracking the full cruise, so the jerk
+        limit would be measured against a velocity the airframe was never given
+        -- and a demand scaled below the driver's quantization floor would be
+        truncated to a standstill rather than duty-cycled down to it.
+        """
+        scale = getattr(ctx.governor, "horizontal_scale", None)
+        permitted = cruise_mps * (float(scale()) if callable(scale) else 1.0)
+        self._command(ctx, profile, shaper, dt, permitted)
 
     def _halt(
         self,
@@ -157,17 +212,29 @@ class ForwardSearchStep(BaseStep):
         profile: JerkLimitedProfile,
         shaper: QuantizedCommandShaper,
         dt: float,
+        rate: Optional[LoopRate] = None,
     ) -> None:
         """Decelerate to a stop without the nose-down transient of a step command.
 
         Ramping down matters here specifically: an abrupt stop pitches the
         airframe, which swings the camera at the exact moment the mission needs
         a stable view of the target it just confirmed.
+
+        The ramp has to be *paced* for any of that to be true, and it was not.
+        The loop stepped the profile by a nominal ``dt`` with nothing sleeping
+        between iterations, so the whole 0.6 s deceleration was published in
+        about 0.4 ms -- eleven Twist messages back to back onto a depth-1
+        queue, of which the airframe observes essentially only the last. The
+        drone therefore received the step command this method exists to avoid,
+        and the profile was decorative. Pacing it against the same ``LoopRate``
+        the caller is already running restores the intent.
         """
         for _ in range(self._cycles_to_rest(profile, dt)):
             self._command(ctx, profile, shaper, dt, 0.0)
             if abs(profile.velocity) <= 1e-6:
                 break
+            if rate is not None:
+                rate.tick()
 
     def _command(
         self,
@@ -180,9 +247,10 @@ class ForwardSearchStep(BaseStep):
         """Profile, convert, shape, and transmit one forward velocity command."""
         profiled = profile.step(target_mps, dt)
         vx = shaper.shape(ctx.speed_calibration.to_normalized(profiled), dt)
-        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude)
+        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude, dt)
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
-        ctx.drone.move_velocity(vx=max(0.0, vx), vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
+        safe_vx, safe_vy = ctx.failsafe.clamp_translation(max(0.0, vx), 0.0)
+        ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
 
     @staticmethod
     def _cycles_to_rest(profile: JerkLimitedProfile, dt: float) -> int:
