@@ -21,6 +21,14 @@ DT = 1.0 / 15.0
 FRAME = (856, 480)
 CENTER = (428.0, 240.0)
 
+#: The configured inspection attitude, in degrees.
+NADIR_TILT = GimbalConstraintsConfig().nadir_tilt_deg
+
+#: Cycles needed to clear the acquisition dwell. The phase is no longer gated on
+#: pixel error -- gating on it is what produced the Stage 3 hover trap -- so it
+#: is bounded by time and by a persistent detection instead.
+ACQUIRE_CYCLES = int(VisionConfig().acquisition_dwell_sec / DT) + 3
+
 
 # ------------------------------------------------------------------ governor
 
@@ -105,7 +113,12 @@ def build_controller(**vision_overrides):
         **vision_overrides,
     )
     return VisualServoingController(
-        gimbal_config=GimbalConstraintsConfig(search_tilt_deg=-20.0, nadir_tilt_deg=-80.0),
+        # The shipped geometry. The inspection attitude is load-bearing for
+        # almost everything below -- it sets the gimbal's lower stop, the
+        # standoff the approach brakes against, and the point at which the
+        # airframe freezes -- so the unit tests exercise the configured value
+        # rather than a historical one.
+        gimbal_config=GimbalConstraintsConfig(),
         gimbal_pid_cfg=GimbalPIDConfig(),
         lateral_pid_cfg=LateralPIDConfig(),
         vision_cfg=vision,
@@ -141,16 +154,16 @@ def test_lateral_command_opposes_horizontal_error():
     assert left.vy > 0.0
 
 
-def test_transitions_to_approaching_once_centred():
+def test_transitions_to_approaching_after_the_acquisition_dwell():
     controller = build_controller()
-    command = drive(controller, CENTER, cycles=6)
+    command = drive(controller, CENTER, cycles=ACQUIRE_CYCLES)
     assert command.phase is TrackingPhase.APPROACHING
 
 
 def steady_approach_speed(target_px, tilt, altitude, cycles=90):
     """Run the approach to steady state and report the settled forward speed."""
     controller = build_controller()
-    drive(controller, CENTER, cycles=6, altitude=altitude)
+    drive(controller, CENTER, cycles=ACQUIRE_CYCLES, altitude=altitude)
 
     command = None
     for _ in range(cycles):
@@ -167,10 +180,13 @@ def test_approach_speed_follows_the_measured_range():
     distance; here the gimbal is held fixed at a range of angles so only the
     geometry varies.
     """
-    # Steeper gimbal, with altitude fixed, means a closer target.
+    # Steeper gimbal, with altitude fixed, means a closer target. Every angle
+    # here is shallower than the inspection attitude: at or past it the approach
+    # is over by construction, and a frozen airframe has no approach speed to
+    # be a function of anything.
     samples = [
         steady_approach_speed(CENTER, tilt=tilt, altitude=1.0)
-        for tilt in (-78.0, -75.0, -70.0, -60.0, -45.0, -25.0)
+        for tilt in (-67.0, -66.0, -64.0, -62.0, -50.0, -25.0)
     ]
 
     ranges = [ground_range for _, ground_range in samples]
@@ -187,7 +203,7 @@ def test_approach_speed_follows_the_measured_range():
 
 def test_gimbal_tracks_the_target_downward_during_approach():
     controller = build_controller()
-    drive(controller, CENTER, cycles=6)
+    drive(controller, CENTER, cycles=ACQUIRE_CYCLES)
 
     tilt = -20.0
     tilts = []
@@ -198,13 +214,15 @@ def test_gimbal_tracks_the_target_downward_during_approach():
         tilts.append(tilt)
 
     assert tilts[-1] < tilts[0], "gimbal must pitch down toward the target"
-    assert tilts[-1] >= -80.0, "gimbal must not exceed the nadir limit"
+    assert tilts[-1] >= GimbalConstraintsConfig().nadir_tilt_deg - 1e-6, (
+        "gimbal must not go past the inspection attitude"
+    )
 
 
 def test_gimbal_respects_the_slew_rate_limit():
     """``max_slew_limit_deg`` was declared in config and never read."""
     controller = build_controller()
-    drive(controller, CENTER, cycles=6)
+    drive(controller, CENTER, cycles=ACQUIRE_CYCLES)
 
     gimbal_cfg = GimbalConstraintsConfig()
     max_step = gimbal_cfg.max_slew_limit_deg * DT
@@ -217,7 +235,7 @@ def test_gimbal_respects_the_slew_rate_limit():
 
 def test_forward_motion_freezes_outside_the_lateral_corridor():
     controller = build_controller()
-    drive(controller, CENTER, cycles=6)
+    drive(controller, CENTER, cycles=ACQUIRE_CYCLES)
     assert controller.phase is TrackingPhase.APPROACHING
 
     # The demand drops to zero immediately; the command follows it down the
@@ -235,16 +253,27 @@ def test_forward_motion_freezes_outside_the_lateral_corridor():
     assert command.vx == pytest.approx(0.0, abs=1e-6)
 
 
-def test_sustained_drift_reverts_to_centering():
+def test_sustained_drift_withholds_forward_motion_without_changing_phase():
+    """Superseded contract: sustained drift used to revert to centering.
+
+    Reverting put the drone into a second phase that also commanded zero forward
+    velocity, so the pair was a livelock rather than a recovery. An off-axis
+    target is not a lost target -- nothing about the observation needs
+    recovering -- and the cross-track loop is the thing that fixes a cross-track
+    error. It keeps running; only the forward axis is withheld.
+    """
     controller = build_controller()
-    drive(controller, CENTER, cycles=6)
+    drive(controller, CENTER, cycles=ACQUIRE_CYCLES)
 
     tilt = -30.0
-    for _ in range(VisionConfig().decentered_frames_to_revert + 2):
+    for _ in range(VisionConfig().decentered_frames_to_revert + 20):
         command = controller.compute((830.0, 300.0), FRAME, tilt, 1.5, DT)
         tilt = command.tilt_deg
 
-    assert controller.phase is TrackingPhase.CENTERING
+    assert controller.phase is TrackingPhase.APPROACHING, "no livelock phase flip"
+    assert command.vx == pytest.approx(0.0, abs=1e-6)
+    assert command.alignment == 0.0
+    assert command.vy != 0.0, "the cross-track loop must keep working"
 
 
 def test_nadir_phase_is_reachable_and_exits_on_sustained_excursion():
@@ -253,17 +282,20 @@ def test_nadir_phase_is_reachable_and_exits_on_sustained_excursion():
     controller._phase = TrackingPhase.NADIR
 
     for _ in range(VisionConfig().nadir_exit_frames + 2):
-        controller.compute((820.0, 60.0), FRAME, -80.0, 1.5, DT)
+        controller.compute((820.0, 60.0), FRAME, NADIR_TILT, 1.5, DT)
 
     assert controller.phase is TrackingPhase.APPROACHING
+    assert not controller.nadir_committed, (
+        "a hold entered without committing to the freeze must stay revertible"
+    )
 
 
 def test_nadir_alignment_is_reported_when_centred():
     controller = build_controller()
     controller._phase = TrackingPhase.NADIR
-    command = controller.compute(CENTER, FRAME, -80.0, 1.5, DT)
+    command = controller.compute(CENTER, FRAME, NADIR_TILT, 1.5, DT)
     assert command.nadir_aligned
-    assert command.tilt_deg == pytest.approx(-80.0)
+    assert command.tilt_deg == pytest.approx(NADIR_TILT)
 
 
 def test_lateral_deadband_is_not_defeated():
@@ -275,7 +307,7 @@ def test_lateral_deadband_is_not_defeated():
     """
     controller = build_controller()
     controller._phase = TrackingPhase.NADIR
-    command = controller.compute((429.0, 240.0), FRAME, -80.0, 1.5, DT)
+    command = controller.compute((429.0, 240.0), FRAME, NADIR_TILT, 1.5, DT)
     assert command.vy == 0.0
 
 
@@ -297,9 +329,55 @@ def test_falls_back_to_open_loop_when_altitude_is_untrustworthy():
     assert command.ground_range_m is None
 
 
-def test_reset_returns_to_centering():
+def test_reset_returns_to_acquisition():
     controller = build_controller()
-    drive(controller, CENTER, cycles=6)
+    drive(controller, CENTER, cycles=ACQUIRE_CYCLES)
     assert controller.phase is TrackingPhase.APPROACHING
     controller.reset()
     assert controller.phase is TrackingPhase.CENTERING
+
+
+# ------------------------ governor integrity at a raised operating altitude
+
+
+def test_governor_suppresses_a_phantom_climb_above_a_raised_target():
+    """Requirement C: the governor stays the authority against firmware drift.
+
+    Flying over an obstacle shortens the ultrasonic range, the firmware reads
+    that as lost height and climbs to compensate. At a 1.80 m operating altitude
+    that drift must still produce descent, exactly as it does at 1.00 m -- the
+    Stage 1 ascent changed which altitude is nominal, not who governs it.
+    """
+    gov = governor(target=1.80)
+
+    assert gov.compute_vz(1.80, DT) == 0.0
+    assert not gov.engaged
+
+    command = gov.compute_vz(1.95, DT)
+
+    assert command < 0.0
+    assert gov.engaged
+
+
+def test_governor_never_climbs_toward_a_raised_target():
+    """The deficit the Stage 1 ascent closes is not the governor's to close.
+
+    Below target the excess is negative, so the governor must output exactly
+    zero -- not a corrective climb. Climb authority belongs solely to Stage 1.
+    """
+    gov = governor(target=1.80)
+
+    for altitude in (0.00, 0.50, 1.00, 1.35, 1.79, 1.80, 1.82):
+        assert gov.compute_vz(altitude, DT) <= 0.0
+
+    assert gov.compute_vz(1.00, DT) == 0.0
+
+
+def test_governor_output_limits_remain_descent_only():
+    """Requirement C: the output band is (-max_descent_speed, 0.0], always."""
+    config = AltitudeGovernorConfig()
+    gov = AltitudeAntiClimbGovernor(1.80, config)
+
+    for _ in range(40):
+        command = gov.compute_vz(3.00, DT)
+        assert -config.max_descent_speed <= command <= 0.0

@@ -229,3 +229,51 @@ def test_ceiling_breach_is_detected():
     assert not sup.is_ceiling_breached()
     sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.40)
     assert sup.is_ceiling_breached()
+
+
+# ------------------------------------------- ceiling across a Stage 1 ascent
+
+
+def test_ceiling_leaves_headroom_for_the_ascent_to_a_raised_target():
+    """The margin is what the Stage 1 climb has to converge in.
+
+    A 1.80 m target puts the ceiling at 2.05 m, so the whole ascent -- including
+    the overshoot the profile is sized to avoid -- has 0.25 m of room. If the
+    ceiling sat at the target the climb could not reach it without tripping.
+    """
+    sup = supervisor()
+    sup.kinematics_cfg.target_altitude_m = 1.80
+
+    assert sup.altitude_ceiling == pytest.approx(2.05)
+
+    feed(sup, 10, z=0.0)
+    sup.calibrate_ground_reference()
+
+    for altitude in (1.00, 1.40, 1.79, 1.80, 2.04):
+        sup.inject_synthetic_sample(x=0.0, y=0.0, z=altitude)
+        assert not sup.is_ceiling_breached(), f"{altitude} m must be inside the envelope"
+
+
+def test_ceiling_breach_is_detected_during_an_ascent():
+    """An overshoot past the ceiling is what aborts the climb."""
+    sup = supervisor(min_ground_samples=5)
+    sup.kinematics_cfg.target_altitude_m = 1.80
+    feed(sup, 10, z=0.0)
+    sup.calibrate_ground_reference()
+
+    sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.00)
+    assert not sup.is_ceiling_breached()
+
+    sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.20)
+    assert sup.is_ceiling_breached()
+
+
+def test_relative_altitude_tracks_the_climb_above_the_ground_reference():
+    """Ceiling and governor both read relative altitude, so it must follow."""
+    sup = supervisor(min_ground_samples=5)
+    feed(sup, 10, z=0.30)
+    assert sup.calibrate_ground_reference()
+
+    sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.10)
+
+    assert sup.snapshot().relative_altitude == pytest.approx(1.80, abs=1e-6)

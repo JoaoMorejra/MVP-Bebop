@@ -5,7 +5,10 @@ import math
 import pytest
 
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
-from mvp_mission_bebop.actuators.simulator import KinematicSimulator
+from mvp_mission_bebop.actuators.simulator import (
+    FIRMWARE_HOVER_ALTITUDE_M,
+    KinematicSimulator,
+)
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.parameters import (
     CalibrationConfig,
@@ -273,3 +276,83 @@ def test_integration_is_safe_from_two_threads():
 
     assert not errors
     assert math.isfinite(supervisor.snapshot().x)
+
+
+# ----------------------------------------------- firmware ceiling and commanded climb
+
+
+def test_firmware_launch_levels_below_a_higher_target():
+    """Regression: the bench used to fly a manoeuvre the airframe cannot.
+
+    ``takeoff`` was honouring its altitude argument as a hard setpoint and
+    ramping all the way to it, so --no-fly reported a clean climb to 1.8 m while
+    the real Bebop -- whose firmware ignores that argument and levels at its own
+    hover height -- sat at ~1 m for the whole mission. The simulator now stops
+    where the firmware stops.
+    """
+    clock = FakeClock()
+    supervisor, simulator = build(clock)
+
+    simulator.takeoff(1.80)
+    for _ in range(60):
+        clock.advance(0.1)
+        simulator.integrate()
+
+    assert supervisor.snapshot().raw_altitude == pytest.approx(FIRMWARE_HOVER_ALTITUDE_M)
+
+
+def test_commanded_climb_closes_the_gap_to_the_target():
+    """Above the firmware's hover height, altitude must be earned with vz."""
+    clock = FakeClock()
+    supervisor, simulator = build(clock)
+
+    simulator.takeoff(1.80)
+    for _ in range(40):
+        clock.advance(0.1)
+        simulator.integrate()
+    assert supervisor.snapshot().raw_altitude == pytest.approx(1.0)
+
+    # 0.20 m/s for 4.0 s of simulated time closes the remaining 0.80 m.
+    simulator.command(0.0, 0.0, 0.20, 0.0)
+    for _ in range(40):
+        clock.advance(0.1)
+        simulator.integrate()
+
+    assert supervisor.snapshot().raw_altitude == pytest.approx(1.80, abs=0.02)
+
+
+def test_commanded_descent_is_honoured_after_the_launch_transient():
+    """Regression: the launch ramp used to outrank every later command.
+
+    While the climb branch was keyed on ``_airborne`` alone it re-engaged at
+    0.60 m/s whenever altitude fell below the setpoint -- far faster than the
+    governor's 0.08 m/s descent authority -- so the anti-climb governor was
+    silently cancelled for the whole flight in simulation.
+    """
+    clock = FakeClock()
+    supervisor, simulator = build(clock)
+
+    simulator.takeoff(1.0)
+    for _ in range(40):
+        clock.advance(0.1)
+        simulator.integrate()
+
+    simulator.command(0.0, 0.0, -0.08, 0.0)
+    for _ in range(20):
+        clock.advance(0.1)
+        simulator.integrate()
+
+    assert supervisor.snapshot().raw_altitude == pytest.approx(1.0 - 0.16, abs=0.02)
+
+
+def test_a_lower_requested_altitude_still_caps_the_transient():
+    """The firmware height is a ceiling on the transient, not a floor."""
+    clock = FakeClock()
+    supervisor, simulator = build(clock)
+
+    simulator.takeoff(0.60)
+    for _ in range(40):
+        clock.advance(0.1)
+        simulator.integrate()
+
+    assert supervisor.snapshot().raw_altitude == pytest.approx(0.60)

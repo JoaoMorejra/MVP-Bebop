@@ -190,11 +190,30 @@ def test_deadband_suppresses_commands_at_the_origin(controller):
 # ------------------------------------------------------------------- behaviour
 
 
-def test_overshoot_holds_the_along_track_axis(controller):
-    """The origin ahead of the nose cannot be corrected without forward flight."""
+def test_overshoot_is_recovered_under_a_bounded_forward_trim(rtl_config, controller):
+    """Superseded contract: an overshoot used to pin the along-track axis at zero.
+
+    Holding the axis meant the distance never changed, so arrival could never
+    confirm and the drone hovered past the origin until the whole return window
+    expired -- observed in flight as returning to the takeoff point and never
+    landing. A braking profile plus odometry lag makes overshoot close to
+    certain, so it has to be recoverable. The trim is capped far below cruise
+    and applies only in the terminal regime.
+    """
     for _ in range(120):
         command = controller.compute(snapshot(-0.6, 0.2), vz_command=0.0, dt=DT)
+
+    assert 0.0 < command.vx <= rtl_config.overshoot_recovery_speed
+    assert "overshoot recovery" in command.note
+
+
+def test_an_origin_far_ahead_still_holds_the_axis(rtl_config, controller):
+    """Beyond the recovery range, something worse than overshoot has happened."""
+    far = rtl_config.overshoot_recovery_radius_m + 1.0
+    for _ in range(120):
+        command = controller.compute(snapshot(-far, 0.0), vz_command=0.0, dt=DT)
     assert command.vx == 0.0
+    assert "beyond recovery range" in command.note
     assert "overshoot" in command.note
 
 
@@ -250,3 +269,147 @@ def test_reset_clears_controller_state(controller):
 def test_calibration_converts_configuration_into_physical_units(rtl_config, kinematics_config):
     controller = RTLGuidanceController(rtl_config, kinematics_config, SpeedCalibration(2.0))
     assert controller.cruise_speed_mps == pytest.approx(rtl_config.max_speed * 2.0)
+
+
+# ------------------------------------------------ dead-reckoned return vector
+
+
+def reference(ex, ey, source="dead_reckoning"):
+    """A return vector supplied by the aggregated motion sequence.
+
+    ``x``/``y`` are the estimated position in the launch frame, which for a
+    yaw-locked mission is exactly the negation of the body-frame error.
+    """
+    from mvp_mission_bebop.controllers.rtl_guidance import ReturnReference
+
+    return ReturnReference(
+        ex_body_m=ex,
+        ey_body_m=ey,
+        distance_m=math.hypot(ex, ey),
+        x_m=-ex,
+        y_m=-ey,
+        source=source,
+    )
+
+
+def test_the_guidance_law_navigates_on_the_supplied_reference(controller):
+    """Odometry is not consulted for position when a reference is given.
+
+    The snapshot says the drone is sitting on the origin; the aggregate says it
+    is two metres out. The law must fly the aggregate, or supplying one achieves
+    nothing.
+    """
+    command = controller.compute(
+        snapshot(0.0, 0.0), vz_command=0.0, dt=DT, reference=reference(-2.0, 0.4)
+    )
+
+    assert command.reference_source == "dead_reckoning"
+    assert command.ex_body_m == pytest.approx(-2.0)
+    assert command.ey_body_m == pytest.approx(0.4)
+    assert command.distance_m == pytest.approx(math.hypot(2.0, 0.4))
+
+
+def test_omitting_the_reference_reproduces_the_odometric_behaviour(controller):
+    """Every call site did this implicitly before the parameter existed."""
+    explicit = controller.compute(snapshot(2.0, 0.3), vz_command=0.0, dt=DT)
+    assert explicit.reference_source == "odometry"
+    assert explicit.ex_body_m == pytest.approx(-2.0)
+    assert explicit.ey_body_m == pytest.approx(-0.3)
+
+
+def test_a_dead_reckoned_return_converges_to_the_origin(controller, rtl_config):
+    """Close the loop on the aggregate itself.
+
+    The return leg's own commands feed back into the displacement -- that is what
+    makes it navigation rather than bookkeeping -- so this integrates the emitted
+    velocity into the reference and requires the range to null.
+    """
+    ex, ey = -4.0, -1.0  # the origin lies four metres astern and a metre to port
+    speed = 0.0
+    arrival = None
+
+    for cycle in range(1500):
+        command = controller.compute(
+            snapshot(0.0, 0.0, vx=speed),
+            vz_command=0.0,
+            dt=DT,
+            reference=reference(ex, ey),
+        )
+        # The drone moves; the aggregate shrinks by exactly what was commanded,
+        # which is the property that makes the return leg self-closing.
+        ex -= command.vx * DT
+        ey -= command.vy * DT
+        speed = command.vx
+        if command.ready_to_land or command.arrived:
+            arrival = cycle * DT
+            break
+
+    assert arrival is not None, "the dead-reckoned return never committed to landing"
+    assert math.hypot(ex, ey) <= rtl_config.arrival_radius_m
+
+
+def test_the_backward_only_invariant_holds_on_a_dead_reckoned_reference(controller):
+    ex, ey = -3.0, 0.6
+    for _ in range(600):
+        command = controller.compute(
+            snapshot(0.0, 0.0), vz_command=0.0, dt=DT, reference=reference(ex, ey)
+        )
+        assert command.vx <= 0.0
+        assert command.vyaw == 0.0
+        ex -= command.vx * DT
+        ey -= command.vy * DT
+
+
+def test_settlement_dispersion_is_measured_on_the_estimate_being_flown(controller):
+    """Position from the reference, speed from odometry, and the split matters.
+
+    The dispersion term asks how steady the *estimate* is, so feeding it a
+    different estimator than the one being navigated on measures the steadiness
+    of something the drone is not flying. Here odometry jitters wildly while the
+    aggregate sits still: settlement must follow the aggregate.
+    """
+    for cycle in range(int(4.0 / DT)):
+        # Odometry reports the drone teleporting almost two metres every cycle.
+        jittering = snapshot(0.9 * ((-1) ** cycle), 0.9 * ((-1) ** cycle))
+        command = controller.compute(
+            jittering, vz_command=0.0, dt=DT, reference=reference(-0.02, 0.01)
+        )
+        if command.arrived:
+            break
+
+    assert command.arrived, "the jittering odometry was used for dispersion"
+
+
+def test_the_climb_ceiling_is_zero_unless_a_governor_is_configured(
+    rtl_config, kinematics_config
+):
+    """The historical descent-only behaviour survives for any caller that does
+    not opt into altitude hold."""
+    from mvp_mission_bebop.controllers.rtl_guidance import RTLGuidanceController
+
+    law = RTLGuidanceController(rtl_config, kinematics_config, SpeedCalibration(1.0))
+    assert law.climb_ceiling == 0.0
+    assert law.compute(snapshot(1.0, 0.0), vz_command=0.30, dt=DT).vz == 0.0
+
+
+def test_a_configured_governor_lets_the_altitude_trim_through(rtl_config, kinematics_config):
+    """The return leg translates, so it sinks, so it needs the trim.
+
+    Bounded to exactly what the governor was configured to authorize -- the
+    failsafe has the final say at the actuator boundary, but a guidance law that
+    silently discards half of a command it was handed cannot be reasoned about.
+    """
+    from mvp_mission_bebop.controllers.rtl_guidance import RTLGuidanceController
+    from mvp_mission_bebop.parameters import AltitudeGovernorConfig
+
+    governor_cfg = AltitudeGovernorConfig()
+    law = RTLGuidanceController(
+        rtl_config, kinematics_config, SpeedCalibration(1.0), governor_cfg
+    )
+
+    assert law.climb_ceiling == pytest.approx(governor_cfg.climb_authority)
+    assert law.compute(snapshot(1.0, 0.0), vz_command=0.04, dt=DT).vz == pytest.approx(0.04)
+    assert law.compute(snapshot(1.0, 0.0), vz_command=5.0, dt=DT).vz == pytest.approx(
+        governor_cfg.climb_authority
+    )
+    assert law.compute(snapshot(1.0, 0.0), vz_command=-0.06, dt=DT).vz == pytest.approx(-0.06)
