@@ -220,14 +220,39 @@ class OdometrySupervisor:
         cosy_cosp = 1.0 - 2.0 * (orientation.y * orientation.y + orientation.z * orientation.z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
+        sample = (
+            float(position.x),
+            float(position.y),
+            float(position.z),
+            float(twist.x),
+            float(twist.y),
+            float(twist.z),
+            yaw,
+        )
+
+        # Reject the message rather than store a non-finite component.
+        #
+        # A NaN is not a large error, it is the absence of a measurement, and
+        # nothing downstream can represent that. It propagates silently and
+        # inverts the meaning of every guard it passes: ``min``/``max`` resolve
+        # it to whichever bound is the first operand, so a NaN altitude turns
+        # the ceiling check into "not breached" and a NaN position turns a
+        # guidance clamp into full authority. Dropping the sample instead leaves
+        # the last good one in place and lets the heartbeat call it stale if the
+        # condition persists, which is the failure the supervisor already knows
+        # how to handle.
+        if not all(math.isfinite(component) for component in sample):
+            logger.warning("Discarding odometry sample with non-finite components: %r", sample)
+            return
+
         self._store_sample(
-            x=float(position.x),
-            y=float(position.y),
-            z=float(position.z),
-            vx=float(twist.x),
-            vy=float(twist.y),
-            vz=float(twist.z),
-            yaw=yaw,
+            x=sample[0],
+            y=sample[1],
+            z=sample[2],
+            vx=sample[3],
+            vy=sample[4],
+            vz=sample[5],
+            yaw=sample[6],
         )
 
     def inject_synthetic_sample(
@@ -269,7 +294,7 @@ class OdometrySupervisor:
             self.current_vy = vy
             self.current_vz = vz
             self.current_yaw = yaw
-            self.last_odometry_timestamp = time.time()
+            self.last_odometry_timestamp = time.monotonic()
             self.sample_count += 1
 
             if self.ground_reference_altitude is None:
@@ -412,7 +437,16 @@ class OdometrySupervisor:
     # ------------------------------------------------------------------ health
 
     def telemetry_health(self, timeout_sec: Optional[float] = None) -> TelemetryHealth:
-        """Classify the odometry stream as never-received, stale, or healthy."""
+        """Classify the odometry stream as never-received, stale, or healthy.
+
+        Timed on ``time.monotonic``. The heartbeat used the wall clock on both
+        the write and the read, against a three-second timeout -- so a forward
+        NTP correction larger than that made healthy odometry read as STALE, and
+        ``evaluate_system_health`` turns STALE into an emergency landing. A
+        backward step did the opposite and masked a genuine stall. This is the
+        same defect ``engine.rate`` documents as its reason for moving
+        ``Deadline`` off the wall clock; the reasoning applies identically here.
+        """
         timeout = timeout_sec or self.timeouts_cfg.odometry_heartbeat_timeout_sec
         with self._lock:
             last = self.last_odometry_timestamp
@@ -420,7 +454,7 @@ class OdometrySupervisor:
 
         if count == 0 or last == 0.0:
             return TelemetryHealth.NEVER_RECEIVED
-        if (time.time() - last) > timeout:
+        if (time.monotonic() - last) > timeout:
             return TelemetryHealth.STALE
         return TelemetryHealth.HEALTHY
 
