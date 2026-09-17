@@ -45,6 +45,17 @@ MAX_INTEGRATION_STEP_SEC: Final[float] = 0.25
 CLIMB_RATE_MPS: Final[float] = 0.60
 DESCENT_RATE_MPS: Final[float] = 0.35
 
+#: Altitude, in metres, at which the Bebop firmware ends its launch profile.
+#:
+#: The firmware runs its own takeoff and hovers here regardless of the altitude
+#: the SDK was given -- ``BebopDrone.takeoff`` accepts the argument and the
+#: airframe ignores it. The simulator used to honour that argument as a hard
+#: setpoint and ramp all the way to it, which made ``--no-fly`` report a
+#: successful climb to any requested altitude while the real drone sat at ~1 m.
+#: The bench cannot be allowed to pass a manoeuvre the airframe fails: anything
+#: above this height has to be earned with a commanded ``vz``.
+FIRMWARE_HOVER_ALTITUDE_M: Final[float] = 1.00
+
 
 class KinematicSimulator:
     """Integrates latched velocity commands into synthetic odometry.
@@ -75,6 +86,7 @@ class KinematicSimulator:
         "_vyaw",
         "_last_update",
         "_airborne",
+        "_launching",
         "_target_altitude",
         "_lock",
     )
@@ -100,6 +112,7 @@ class KinematicSimulator:
         self._vyaw: float = 0.0
         self._last_update: float = clock()
         self._airborne: bool = False
+        self._launching: bool = False
         self._target_altitude: float = 0.0
         # Commands arrive on the mission thread; integration is driven from an
         # executor timer. Both mutate this state.
@@ -130,17 +143,32 @@ class KinematicSimulator:
             self._emit()
 
     def takeoff(self, altitude_m: float) -> None:
-        """Begin a simulated climb to the requested altitude."""
+        """Begin the simulated firmware launch profile.
+
+        The requested altitude only ever *caps* the transient; it cannot raise it
+        above :data:`FIRMWARE_HOVER_ALTITUDE_M`, because the firmware this stands
+        in for does not climb higher on its own. Closing the remaining gap to a
+        higher target is Stage 1's job, through commanded ``vz``.
+        """
         self.integrate()
         with self._lock:
             self._airborne = True
-            self._target_altitude = max(0.0, altitude_m)
-        logger.debug("Simulated takeoff to %.2f m from (%.2f, %.2f).", altitude_m, self._x, self._y)
+            self._launching = True
+            self._target_altitude = min(max(0.0, altitude_m), FIRMWARE_HOVER_ALTITUDE_M)
+            hover = self._target_altitude
+        logger.debug(
+            "Simulated takeoff from (%.2f, %.2f): firmware levels at %.2f m of the %.2f m requested.",
+            self._x,
+            self._y,
+            hover,
+            altitude_m,
+        )
 
     def land(self) -> None:
         """Begin a simulated descent to the ground."""
         self.integrate()
         with self._lock:
+            self._launching = False
             self._target_altitude = 0.0
         logger.debug("Simulated landing from %.2f m.", self._z)
 
@@ -172,12 +200,21 @@ class KinematicSimulator:
         # Vertical: the climb and descent transients dominate the commanded vz,
         # matching a Bebop that runs its own altitude loop during takeoff and
         # landing and ignores velocity commands in those phases.
-        if self._airborne and self._z < self._target_altitude:
+        if self._launching and self._z < self._target_altitude:
             self._z = min(self._target_altitude, self._z + CLIMB_RATE_MPS * dt)
+            if self._z >= self._target_altitude:
+                # The launch profile is over. From here the airframe holds
+                # altitude and obeys commanded vz -- including the descent the
+                # anti-climb governor asks for. While this branch was keyed on
+                # ``_airborne`` alone it outranked every command for the whole
+                # flight, so any dip below the setpoint was force-climbed at
+                # CLIMB_RATE_MPS and the governor was silently cancelled.
+                self._launching = False
         elif self._target_altitude <= 0.0 and self._z > 0.0:
             self._z = max(0.0, self._z - DESCENT_RATE_MPS * dt)
             if self._z == 0.0:
                 self._airborne = False
+                self._launching = False
         elif self._airborne:
             self._z = max(0.0, self._z + self._calibration.to_mps(self._vz) * dt)
 

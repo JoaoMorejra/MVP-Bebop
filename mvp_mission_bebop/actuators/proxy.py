@@ -6,6 +6,7 @@ import logging
 from typing import Optional, Protocol
 
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
+from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
 
 logger = logging.getLogger("ActuatorProxy")
 
@@ -48,10 +49,17 @@ class BenchtopDroneProxy:
         drone: DroneActuator,
         no_fly: bool = False,
         simulator: Optional[KinematicSimulator] = None,
+        motion_tracker: Optional[DeadReckoningTracker] = None,
     ) -> None:
         self.drone = drone
         self.no_fly = no_fly
         self.simulator = simulator
+        # Dead reckoning is fed here rather than by the steps, and that is the
+        # point: every velocity command in the mission passes through this
+        # method, so the aggregate cannot silently lose a leg because some stage
+        # forgot to report its own motion. A tracker that is only as complete as
+        # the discipline of five separate control loops is not a tracker.
+        self.motion_tracker = motion_tracker
 
     def flat_trim(self) -> None:
         """Calibrate IMU flat trim. The drone must be on a level surface."""
@@ -78,6 +86,12 @@ class BenchtopDroneProxy:
         ``Empty`` message and returns immediately with no acknowledgement, so a
         ``True`` here means "commanded", never "landed".
         """
+        # A landing ends translation whatever the last Twist said, so the
+        # aggregate must stop accruing displacement under it. Without this the
+        # tracker goes on crediting the final held command for the whole descent.
+        if self.motion_tracker is not None:
+            self.motion_tracker.command(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
+
         if self.no_fly:
             logger.info("[NO-FLY] Simulated landing. Motors unpowered.")
             if self.simulator is not None:
@@ -121,6 +135,9 @@ class BenchtopDroneProxy:
         clamps and publishes them as a Twist that the firmware interprets as a
         throttle fraction. The command is latched until another arrives.
         """
+        if self.motion_tracker is not None:
+            self.motion_tracker.command(vx=vx, vy=vy, vz=vz, vyaw=vyaw, duration=duration)
+
         if self.no_fly:
             if self.simulator is not None:
                 self.simulator.command(vx, vy, vz, vyaw)
