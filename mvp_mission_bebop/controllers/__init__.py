@@ -19,10 +19,14 @@ from mvp_mission_bebop.controllers.profiling import (
 )
 from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
 from mvp_mission_bebop.controllers.rtl_guidance import (
+    ArucoCenteringController,
+    CenteringCommand,
     GuidanceCommand,
+    MarkerObservation,
     ReturnReference,
     RTLGuidanceController,
     RTLPhase,
+    project_marker_to_body,
 )
 from mvp_mission_bebop.controllers.visual_servoing import (
     ServoCommand,
@@ -33,11 +37,14 @@ from mvp_mission_bebop.controllers.visual_servoing import (
 __all__ = [
     "AltitudeAntiClimbGovernor",
     "AltitudeHoldGovernor",
+    "ArucoCenteringController",
     "CameraIntrinsics",
+    "CenteringCommand",
     "FilteredPID",
     "GroundProjection",
     "GuidanceCommand",
     "JerkLimitedProfile",
+    "MarkerObservation",
     "PIDGains",
     "ProfileLimits",
     "QuantizedCommandShaper",
@@ -48,5 +55,6 @@ __all__ = [
     "TrackingPhase",
     "VisualServoingController",
     "braking_velocity",
+    "project_marker_to_body",
     "project_to_ground",
 ]
