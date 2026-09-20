@@ -45,6 +45,12 @@ class MissionBlackboard:
     approach_finished: bool = False
     #: Forensic artefacts from the inspection stage.
     evidence: EvidenceRecord = field(default_factory=EvidenceRecord)
+    #: Set by the return leg once the landing marker has cleared its
+    #: confirmation filter. Distinguishes, in the post-flight record, a landing
+    #: that was guided onto the pad from one that happened wherever the search
+    #: window ran out -- which is otherwise indistinguishable from the outside,
+    #: because both end in a confirmed touchdown.
+    rtl_marker_sighted: bool = False
     #: Set once the return leg has landed, so the runner's cleanup does not
     #: issue a second, redundant landing command.
     rtl_completed: bool = False
