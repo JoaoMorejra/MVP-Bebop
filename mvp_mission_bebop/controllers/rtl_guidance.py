@@ -42,14 +42,32 @@ takeoff point until the return window expired. The invariant now permits a
 forward trim capped at ``overshoot_recovery_speed`` and only within
 ``overshoot_recovery_radius_m`` -- enough to null a terminal overshoot, far too
 little to constitute forward flight.
+
+**Two laws live in this module.** :class:`RTLGuidanceController`, described
+above, closes on an *estimate* of where the launch origin is; it is what flies
+when no marker detector can be built, and it is the best this airframe can do
+from proprioception alone. :class:`ArucoCenteringController`, at the bottom of
+the file, closes on a *measurement* of where the landing pad actually is, taken
+through the camera. That distinction is the whole argument for the second law:
+every estimator the first one can be handed integrates something -- commands, or
+apparent motion -- so its error grows without bound over a mission and nothing on
+the airframe observes that it has. The marker fix integrates nothing. Its error
+is a property of the camera calibration rather than of the flight so far, which
+is what makes a centimetre-class landing a reachable objective instead of a
+hopeful one.
+
+Both are free of ROS, of hardware, and of wall-clock reads: they take a state
+and a ``dt`` and return a command, so the flight mathematics is exercisable in a
+unit test at whatever rate the test chooses.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Final, Optional
+from typing import Final, Optional, Sequence
 
 from mvp_mission_bebop.controllers.pid import FilteredPID, PIDGains
 from mvp_mission_bebop.controllers.profiling import (
@@ -490,3 +508,234 @@ class RTLGuidanceController:
         demand = self._lateral.update(-ey, dt)
         target = max(-lateral_cap, min(lateral_cap, demand))
         return self._lateral_profile.step(target, dt)
+
+
+# ════════════════════════════════════════════════════ ArUco terminal guidance
+#
+# Everything below closes the return leg on a *landmark* rather than on a
+# coordinate. The law above navigates to where the mission believes the origin
+# is; this one navigates to where the camera can see that it actually is.
+#
+# The two are complementary rather than redundant. Dead reckoning and optical
+# flow are both open-loop with respect to the ground -- one integrates the
+# commands that were sent, the other integrates apparent motion -- so their error
+# grows with the length of the mission and nothing on the airframe bounds it. A
+# marker observation does not integrate anything: it is a metric, absolute,
+# drift-free fix on the pad, and its error is a property of the camera
+# calibration rather than of how long the drone has been flying.
+
+
+#: Smallest radial error, in metres, that the settle test will accept as a
+#: tolerance. A tolerance at or below zero is unsatisfiable and would hold a
+#: converged aircraft airborne until its window expired.
+_MIN_CENTERING_TOLERANCE_M: Final[float] = 1e-3
+
+
+@dataclass(frozen=True)
+class MarkerObservation:
+    """One accepted sighting of the landing marker, in the camera frame.
+
+    Units are metres throughout, and the frame is OpenCV's camera frame rather
+    than ROS's: **+X right** across the image, **+Y down** the image, **+Z
+    forward** along the optical axis. That is the frame
+    ``cv2.aruco.estimatePoseSingleMarkers`` returns translation in -- and the
+    frame its ``cv2.solvePnP`` replacement returns too -- so the projection in
+    :func:`project_marker_to_body` is written against it directly rather than
+    against a re-labelled copy that would only ever be one sign error away from
+    flying the aircraft in the wrong direction.
+
+    This type exists so that the boundary
+    between "what the SDK returned" and "what the control law consumes" is a
+    single, validated, immutable object: the SDK's ``pose_estimate`` returns a
+    three-tuple whose members are independently nullable and whose ID is not
+    checked against anything, and a control law should not be the place where
+    that is discovered.
+    """
+
+    #: Marker identity as reported by the detector, already checked against the
+    #: configured target by :meth:`from_pose_estimate`.
+    marker_id: int
+    #: Lateral offset along the camera's +X axis: positive when the marker lies
+    #: to the *right* of the optical axis.
+    x_cam_m: float
+    #: Offset along the camera's +Y axis: positive when the marker lies *below*
+    #: the optical axis in the image.
+    y_cam_m: float
+    #: Range along the optical axis (+Z). Always positive for a marker the
+    #: camera can see.
+    z_cam_m: float
+    #: Planar marker yaw in degrees, as computed by the SDK from the corner
+    #: vertices. Carried for telemetry only: the mission pins ``vyaw`` at zero,
+    #: so there is no channel that could act on it.
+    yaw_deg: Optional[float] = None
+
+    @property
+    def slant_range_m(self) -> float:
+        """Straight-line distance from the camera to the marker, metres."""
+        return math.sqrt(self.x_cam_m**2 + self.y_cam_m**2 + self.z_cam_m**2)
+
+    @classmethod
+    def from_pose_estimate(
+        cls,
+        marker_id: Optional[object],
+        translation: Optional[Sequence[float]],
+        yaw_deg: Optional[float],
+        *,
+        expected_id: int,
+    ) -> Optional["MarkerObservation"]:
+        """Validate one ``Aruco.pose_estimate`` return, or reject it.
+
+        The SDK's contract is ``(id, tvec, yaw)`` where every member is ``None``
+        when nothing was detected, ``id`` is whichever marker happened to be
+        first in the detector's output, and ``tvec`` is a NumPy array rather than
+        a Python sequence. Each of those is a way for a bad frame to reach a
+        control loop, so each is checked here:
+
+        * **No detection.** ``id`` or ``tvec`` is ``None``; nothing to fly on.
+        * **Wrong marker.** ``id`` is a marker from the configured dictionary
+          that is not the landing pad. Rejected outright rather than downweighted
+          -- the consequence of accepting it is a landing at the wrong place, and
+          Stage 5 is the last stage, so nothing downstream would catch it.
+        * **Degenerate pose.** A non-finite component, or a non-positive range
+          along the optical axis. ``solvePnP`` can return a mirrored solution for
+          a marker seen near-edge-on, and a negative ``z`` is that solution
+          announcing itself: the marker is not behind the camera, the pose is
+          wrong. Flying a PD law on it inverts both error channels.
+
+        Returns
+        -------
+        Optional[MarkerObservation]
+            The validated sighting, or ``None`` when the frame carries no usable
+            observation of the configured marker.
+        """
+        if marker_id is None or translation is None:
+            return None
+
+        try:
+            identity = int(marker_id)
+        except (TypeError, ValueError):
+            return None
+        if identity != int(expected_id):
+            return None
+
+        try:
+            x_cam, y_cam, z_cam = (float(translation[0]), float(translation[1]), float(translation[2]))
+        except (TypeError, ValueError, IndexError):
+            return None
+
+        if not all(math.isfinite(value) for value in (x_cam, y_cam, z_cam)):
+            return None
+        if z_cam <= 0.0:
+            return None
+
+        planar_yaw: Optional[float] = None
+        if yaw_deg is not None:
+            try:
+                candidate = float(yaw_deg)
+            except (TypeError, ValueError):
+                candidate = float("nan")
+            if math.isfinite(candidate):
+                planar_yaw = candidate
+
+        return cls(
+            marker_id=identity,
+            x_cam_m=x_cam,
+            y_cam_m=y_cam,
+            z_cam_m=z_cam,
+            yaw_deg=planar_yaw,
+        )
+
+
+@dataclass(frozen=True)
+class CenteringCommand:
+    """One cycle of the ArUco centering law: what to fly, and why."""
+
+    #: Along-track command, normalized. Positive is forward.
+    vx: float
+    #: Cross-track command, normalized. Positive is left, in body FLU.
+    vy: float
+    #: Body-frame along-track error, metres: positive when the marker lies ahead
+    #: of the airframe.
+    ex_body_m: float
+    #: Body-frame cross-track error, metres: positive when the marker lies to the
+    #: left of the airframe.
+    ey_body_m: float
+    #: Planar range from the airframe to the marker, metres.
+    radial_error_m: float
+    #: Straight-line camera-to-marker range this cycle, metres. Zero while the
+    #: marker is not being observed.
+    slant_range_m: float
+    #: Commanded translational speed this cycle, m/s, before normalization.
+    commanded_speed_mps: float
+    #: True when a validated observation of the target marker drove this cycle.
+    tracking: bool
+    #: Consecutive cycles the marker has been missing.
+    lost_frames: int
+    #: True when the radial error is inside the configured tolerance *this*
+    #: cycle. Instantaneous, and on its own not sufficient to land: a drone
+    #: crossing the centre at speed satisfies it.
+    within_tolerance: bool
+    #: True when the airframe has been inside the tolerance at residual speed for
+    #: ``centering_settle_cycles`` consecutive cycles. This is the landing gate.
+    settled: bool
+    #: Marker identity driving this cycle, or ``None`` while it is not visible.
+    marker_id: Optional[int]
+    note: str
+
+
+def project_marker_to_body(
+    x_cam_m: float, y_cam_m: float, z_cam_m: float, camera_tilt_deg: float
+) -> tuple[float, float]:
+    """Resolve a camera-frame marker offset into body-FLU horizontal errors.
+
+    The gimbal pitches the camera down by ``|camera_tilt_deg|`` from the nose and
+    does not roll or pan, so the camera frame is the body frame rotated about the
+    body-y axis by that depression angle. Writing ``t`` for the depression, the
+    camera axes expressed in body FLU are
+
+    ==========  ====================================
+    camera +X   ``(0, -1, 0)``    -- image right is body right, i.e. ``-y``
+    camera +Y   ``(-sin t, 0, -cos t)`` -- image down
+    camera +Z   ``(cos t, 0, -sin t)``  -- optical axis, forward and down
+    ==========  ====================================
+
+    so a marker at camera coordinates ``(x, y, z)`` sits at body offset
+    ``x * X + y * Y + z * Z``, whose horizontal components are
+
+    .. math::
+
+        e_x = z \\cos t - y \\sin t \\qquad e_y = -x
+
+    Two sanity checks on the signs, both of which are flight-critical:
+
+    * **Marker to the right** of the optical axis means ``x > 0``, so ``e_y < 0``
+      and the lateral channel commands ``vy < 0`` -- rightward in body FLU.
+    * **Marker below** the optical centre means ``y > 0``, which drives ``e_x``
+      negative and commands ``vx < 0`` -- reverse. That is correct for a
+      downward-and-forward-looking camera: a target lower in the image is behind
+      the point the optical axis meets the ground, therefore behind the drone.
+
+    At ``t = 90`` degrees (true nadir) this degenerates to ``e_x = -y``,
+    ``e_y = -x``, which is the familiar pure-nadir mapping and is what makes the
+    tilt a configuration choice rather than a structural assumption.
+
+    Parameters
+    ----------
+    x_cam_m, y_cam_m, z_cam_m : float
+        Marker translation in the OpenCV camera frame, metres.
+    camera_tilt_deg : float
+        Commanded gimbal tilt in degrees, negative below the horizon. Only the
+        magnitude is used, so a configuration that states the depression as a
+        positive angle behaves identically.
+
+    Returns
+    -------
+    Tuple[float, float]
+        ``(ex_body_m, ey_body_m)`` -- forward and left error, metres.
+    """
+    depression = math.radians(abs(camera_tilt_deg))
+    ex_body = z_cam_m * math.cos(depression) - y_cam_m * math.sin(depression)
+    ey_body = -x_cam_m
+    return ex_body, ey_body
+
+
