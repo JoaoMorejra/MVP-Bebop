@@ -139,6 +139,27 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         help="Cruise velocity for return to launch.",
     )
     parser.add_argument(
+        "--aruco-id",
+        type=int,
+        default=None,
+        help=(
+            "ID do marcador ArUco de decolagem e pouso para a etapa de RTL "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--aruco-dict",
+        type=int,
+        default=None,
+        help="Tamanho do dicionário ArUco (default: 5 para 5x5_1000).",
+    )
+    parser.add_argument(
+        "--aruco-size",
+        type=float,
+        default=None,
+        help="Tamanho físico do marcador ArUco em metros (default: 0.20m).",
+    )
+    parser.add_argument(
         "--params-json",
         default=None,
         help="JSON string with custom mission parameters overrides.",
@@ -184,6 +205,15 @@ def main() -> None:
         params.vision.confidence_threshold = args.confidence
     if args.arrival_radius is not None:
         params.rtl.arrival_radius_m = args.arrival_radius
+    # The three ArUco overrides are read through ``getattr`` with a default,
+    # like ``--rtl-velocity`` above, so that a caller holding an older Namespace
+    # -- a test, or a GCS build that predates these flags -- does not raise here.
+    if getattr(args, "aruco_id", None) is not None:
+        params.rtl.target_aruco_id = args.aruco_id
+    if getattr(args, "aruco_dict", None) is not None:
+        params.rtl.marker_dict = args.aruco_dict
+    if getattr(args, "aruco_size", None) is not None:
+        params.rtl.tag_size = args.aruco_size
     if args.model_path:
         params.vision.model_path = args.model_path
     if args.ip:
@@ -225,7 +255,8 @@ def main() -> None:
     logger.info(
         "Active parameters: altitude=%.2fm, velocity=%.3fm/s, hover=%.1fs, "
         "search_timeout=%.1fs, confidence=%.2f, confirmation_frames=%d, "
-        "classes=%s, rtl_radius=%.2fm, countdown=%.1fs, no_fly=%s",
+        "classes=%s, rtl_radius=%.2fm, countdown=%.1fs, no_fly=%s, "
+        "aruco_id=%d, aruco_dict=%dx%d, aruco_size=%.3fm",
         params.kinematics.target_altitude_m,
         params.kinematics.forward_cruise_velocity,
         params.kinematics.hover_duration_sec,
@@ -236,6 +267,10 @@ def main() -> None:
         params.rtl.arrival_radius_m,
         params.kinematics.countdown_sec,
         params.no_fly,
+        params.rtl.target_aruco_id,
+        params.rtl.marker_dict,
+        params.rtl.marker_dict,
+        params.rtl.tag_size,
     )
 
     try:
