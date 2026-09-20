@@ -455,7 +455,22 @@ class FlightKinematicsConfig:
 
 @dataclass
 class ReturnToLaunchConfig:
-    """Closed-loop odometry Return-to-Launch navigation parameters."""
+    """Return-to-Launch navigation, ArUco terminal guidance, and landing.
+
+    Two return laws are configured here and the split is deliberate.
+
+    The **ArUco** fields at the bottom drive the flown path: a reverse cruise
+    that searches for the marker on the launch pad, a closed-loop centering over
+    it, and a precision touchdown. Every quantity that law consumes is an
+    absolute observation of the ground.
+
+    The fields above them configure the **legacy closed-loop odometry return**,
+    which is retained as the degraded path for the case where no marker detector
+    can be constructed at all -- missing intrinsic calibration, an unsupported
+    dictionary, a workspace without the vision SDK. It is open-loop with respect
+    to the ground and cannot land to marker precision, but it is airworthy and
+    it is better than having no return leg.
+    """
 
     max_speed: float = 0.10
     #: Longitudinal PD trim applied on top of the feedforward braking profile.
@@ -569,6 +584,107 @@ class ReturnToLaunchConfig:
     #: window the comparison is between two physical quantities and the loop
     #: rate cannot enter into it.
     touchdown_stagnation_sec: float = 1.50
+
+    # ------------------------------------------------------------------ ArUco
+    #
+    # Stage 5 no longer returns to a *coordinate*; it returns to a *landmark*.
+    #
+    # The dead-reckoned and odometric estimates of the launch origin are both
+    # open-loop with respect to the ground: one integrates commands, the other
+    # integrates optical flow, and neither of them can tell the mission that it
+    # is actually above the pad. Over a mission spent translating at low
+    # altitude over featureless tarmac the accumulated error is metres, and a
+    # landing is a manoeuvre whose acceptable error is centimetres. The ArUco
+    # marker that the drone took off from closes that loop: it is an absolute,
+    # metric, drift-free observation of the base, and the fields below are what
+    # it takes to find it and settle over it.
+    #
+    # The legacy fields above are retained and still flown -- they are the
+    # degraded path taken when the marker detector cannot be constructed at all
+    # (no intrinsic calibration on disk, an unsupported dictionary, no SDK).
+
+    #: Identity of the marker that physically marks the launch/landing pad.
+    #:
+    #: Checked strictly. A marker from the same dictionary carrying any other ID
+    #: is rejected outright rather than treated as a weak observation: a
+    #: mis-identified pad is a landing at the wrong place, and there is no
+    #: subsequent stage to catch it.
+    target_aruco_id: int = 0
+    #: ArUco dictionary order N, selecting ``cv2.aruco.DICT_NxN_1000`` through
+    #: ``nectar.vision.Aruco``. 5 is the 5x5_1000 family. Values outside
+    #: {4, 5, 6, 7} have no predefined dictionary and are rejected at detector
+    #: construction rather than at the first frame.
+    marker_dict: int = 5
+    #: Physical edge length of the printed marker, in metres.
+    #:
+    #: This is the scale factor of the entire pose estimate: ``solvePnP`` recovers
+    #: translation in units of the object model it is given, so a tag declared
+    #: 0.20 m and printed 0.15 m reports every distance 33% too large and the
+    #: centering law converges onto a point 33% off. Measure the printed
+    #: marker's black border, edge to edge.
+    tag_size: float = 0.20
+    #: Gimbal depression for the return leg, in degrees (negative is down).
+    #:
+    #: Near-nadir, and deliberately not fully nadir. At exactly -90 the marker's
+    #: image position is a pure function of horizontal offset, which is ideal for
+    #: centering and useless for *finding*: the footprint ahead of the airframe
+    #: is zero, so a reverse cruise would only ever see the pad at the instant it
+    #: was already over it, with no range in which to brake. Ten degrees of
+    #: forward lean puts the optical axis on the ground roughly
+    #: ``altitude / tan(80 deg)`` ahead -- 0.18 m at 1.0 m AGL -- and, more to the
+    #: point, keeps the whole forward half of the frame looking at ground the
+    #: drone has not yet flown over.
+    camera_tilt_deg: float = -80.0
+    #: Reverse cruise command for the marker search, normalized.
+    #:
+    #: Signed, and the sign is load-bearing: the search leg is the mirror of
+    #: Stage 2, flown backward along the track the mission came out on, and the
+    #: along-track command is saturated non-positive at the actuator boundary so
+    #: a sign error in configuration cannot turn the return into an outbound
+    #: cruise. Slower than the Stage 2 cruise because the payoff is detection
+    #: probability per metre travelled, not metres travelled.
+    reverse_cruise_velocity: float = -0.10
+    #: Longitudinal (body-x) centering gains, m/s per metre of error and per
+    #: metre-per-second of error rate.
+    centering_kp_x: float = 0.25
+    centering_kd_x: float = 0.02
+    #: Lateral (body-y) centering gains. Higher than the longitudinal pair: the
+    #: lateral error is recovered from the camera's x axis, which is unaffected
+    #: by the tilt projection and therefore the better-conditioned of the two
+    #: channels, so it tolerates more gain before it chases noise.
+    centering_kp_y: float = 0.30
+    centering_kd_y: float = 0.03
+    #: Speed ceiling while centering, normalized, on the *resultant* horizontal
+    #: velocity rather than on either axis alone. Well below the cruise cap:
+    #: this phase is a convergence, not a transit, and every metre per second of
+    #: overshoot has to be paid back over the marker.
+    max_centering_speed: float = 0.08
+    #: Radial error inside which the airframe counts as centred, in metres.
+    centering_tolerance_m: float = 0.04
+    #: Consecutive cycles inside :attr:`centering_tolerance_m` *at residual
+    #: speed* required before the landing is authorized. A single sample inside
+    #: the tolerance is satisfied by a drone flying through the centre at speed.
+    centering_settle_cycles: int = 4
+    #: Consecutive frames carrying the target ID required before the reverse
+    #: cruise brakes. Guards against a single-frame false positive committing the
+    #: mission to a landing site.
+    confirmation_frames: int = 2
+    #: Frames the marker may be absent before centering treats it as lost.
+    #:
+    #: Detection over a moving airframe drops frames -- motion blur, the drone's
+    #: own shadow, a glint -- and zeroing the loop on the first miss would make
+    #: the phase a sequence of restarts. Within the tolerance the law holds
+    #: station and keeps its PD state; beyond it the settle counter is cleared,
+    #: because a settlement claim built on stale observations is exactly the
+    #: claim that puts the aircraft down somewhere it was not looking.
+    lost_frames_tolerance: int = 5
+    #: Window for the centering phase alone, in seconds.
+    #:
+    #: Separate from :attr:`timeout_sec`, which bounds the search. Sharing one
+    #: window would let a long search consume the budget for the convergence it
+    #: exists to enable, and the failure mode of that is an aircraft landing
+    #: half-centred because the clock ran out on a phase that was converging.
+    centering_timeout_sec: float = 25.0
 
 
 @dataclass
