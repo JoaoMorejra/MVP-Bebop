@@ -739,3 +739,360 @@ def project_marker_to_body(
     return ex_body, ey_body
 
 
+class ArucoCenteringController:
+    """Closed-loop centering of the airframe over the landing marker.
+
+    The law is a per-axis filtered PD on the body-frame horizontal error,
+    saturated onto a centering speed ceiling, jerk-limited, converted to the
+    actuator's normalized domain once at the output, and rendered through the
+    sigma-delta shaper so that sub-quantum demands survive the driver's
+    ``int8(v * 100)`` truncation without a hard velocity floor.
+
+    Three properties are worth stating explicitly because each of them is a
+    failure this class exists to prevent.
+
+    *It never rotates.* ``vyaw`` is not an output of this class at all. Yaw
+    would be the obvious way to null the marker's planar orientation, and it is
+    exactly what must not happen: the Bebop's odometry is optical flow, the
+    mission's altitude and dead-reckoning estimates ride on it, and a rotation
+    during the terminal phase corrupts all of them at the moment they matter
+    most. The marker's yaw is carried in telemetry and acted on by nothing.
+
+    *Its speed ceiling bounds the resultant, not the axes.* ``max_centering_speed``
+    is a statement about how fast the aircraft may move over the pad, and two
+    axes each clipped at that value move sqrt(2) times faster than it on a
+    diagonal. Scaling the pair also keeps the commanded direction pointing at
+    the marker; clipping one railed axis turns a straight approach into a
+    dog-leg.
+
+    *It stops before it claims to have arrived.* Being inside the tolerance for
+    one cycle is satisfied by a drone flying through the centre at cruise speed.
+    The settle counter advances only while the airframe is both inside the
+    tolerance and commanding residual speed, and it is cleared outright the
+    moment either condition fails.
+
+    *It does not fly on stale observations.* A missing frame within
+    ``lost_frames_tolerance`` holds station and keeps the PD state, because
+    detection over a moving airframe drops frames routinely and restarting the
+    loop on each one would make the phase a sequence of restarts. Beyond the
+    tolerance the settle counter is cleared: a settlement claim assembled from
+    observations the camera is no longer making is precisely the claim that puts
+    an aircraft down somewhere it was not looking.
+
+    All internal computation is in metres and metres per second; the boundary
+    with the actuator's normalized units is
+    :class:`~mvp_mission_bebop.estimation.calibration.SpeedCalibration` and it is
+    crossed exactly once, at the output.
+    """
+
+    def __init__(
+        self,
+        rtl_cfg: ReturnToLaunchConfig,
+        kinematics_cfg: FlightKinematicsConfig,
+        calibration: Optional[SpeedCalibration] = None,
+    ) -> None:
+        self.rtl_cfg = rtl_cfg
+        self.kinematics_cfg = kinematics_cfg
+        self.calibration = calibration or SpeedCalibration(kinematics_cfg.normalized_to_mps)
+
+        #: Gimbal depression the projection is built against. Held as state
+        #: rather than read per cycle so that a mid-phase configuration edit
+        #: cannot change the frame the PD state was accumulated in.
+        self._tilt_deg: float = rtl_cfg.camera_tilt_deg
+
+        # The ceiling arrives normalized because that is the domain the GCS
+        # parameter sheet speaks; the law works in m/s.
+        self._max_speed_mps: float = abs(
+            self.calibration.to_mps(rtl_cfg.max_centering_speed)
+        )
+        if self._max_speed_mps <= 0.0:
+            raise ValueError(
+                f"rtl.max_centering_speed must be non-zero, got "
+                f"{rtl_cfg.max_centering_speed!r}; a centering law with no speed "
+                f"authority cannot converge and would hold the aircraft over the "
+                f"marker until its window expired"
+            )
+
+        self._tolerance_m: float = max(
+            _MIN_CENTERING_TOLERANCE_M, abs(rtl_cfg.centering_tolerance_m)
+        )
+        # The deadband suppresses pixel-scale jitter; it must stay strictly
+        # inside the convergence gate or the law would stop correcting while
+        # still outside the tolerance it is gated on, and the phase would run to
+        # its timeout with the aircraft parked just off centre.
+        self._deadband_m: float = min(abs(rtl_cfg.deadband_m), 0.5 * self._tolerance_m)
+        self._settle_target: int = max(1, int(rtl_cfg.centering_settle_cycles))
+        self._lost_tolerance: int = max(0, int(rtl_cfg.lost_frames_tolerance))
+        # Residual-speed gate for the settle test, reusing the same threshold the
+        # odometric settlement detector applies. One notion of "stopped" for the
+        # whole return leg.
+        self._settle_speed_mps: float = abs(rtl_cfg.settle_max_speed_mps)
+
+        self._longitudinal = FilteredPID(
+            PIDGains(
+                kp=rtl_cfg.centering_kp_x,
+                ki=0.0,
+                kd=rtl_cfg.centering_kd_x,
+                output_limits=(-self._max_speed_mps, self._max_speed_mps),
+                error_deadband=self._deadband_m,
+            )
+        )
+        self._lateral = FilteredPID(
+            PIDGains(
+                kp=rtl_cfg.centering_kp_y,
+                ki=0.0,
+                kd=rtl_cfg.centering_kd_y,
+                output_limits=(-self._max_speed_mps, self._max_speed_mps),
+                error_deadband=self._deadband_m,
+            )
+        )
+
+        self._longitudinal_profile = JerkLimitedProfile(
+            ProfileLimits(
+                max_velocity=self._max_speed_mps,
+                max_accel=rtl_cfg.max_accel_mps2,
+                max_jerk=rtl_cfg.max_jerk_mps3,
+            )
+        )
+        self._lateral_profile = JerkLimitedProfile(
+            ProfileLimits(
+                max_velocity=self._max_speed_mps,
+                max_accel=rtl_cfg.max_accel_mps2,
+                max_jerk=rtl_cfg.max_jerk_mps3,
+            )
+        )
+
+        self._shaper_x = QuantizedCommandShaper(
+            rtl_cfg.min_effective_speed, rtl_cfg.quantization_step
+        )
+        self._shaper_y = QuantizedCommandShaper(
+            rtl_cfg.min_effective_speed, rtl_cfg.quantization_step
+        )
+
+        self._settle_cycles: int = 0
+        self._lost_frames: int = 0
+        self._elapsed: float = 0.0
+
+    # ------------------------------------------------------------- properties
+
+    @property
+    def max_speed_mps(self) -> float:
+        """Centering speed ceiling in physical units."""
+        return self._max_speed_mps
+
+    @property
+    def tolerance_m(self) -> float:
+        """Radial error inside which the airframe counts as centred."""
+        return self._tolerance_m
+
+    @property
+    def deadband_m(self) -> float:
+        """Per-axis error below which the law commands nothing."""
+        return self._deadband_m
+
+    @property
+    def settle_cycles(self) -> int:
+        """Consecutive qualifying cycles accumulated toward the landing gate."""
+        return self._settle_cycles
+
+    @property
+    def lost_frames(self) -> int:
+        """Consecutive cycles without a validated observation."""
+        return self._lost_frames
+
+    @property
+    def elapsed_sec(self) -> float:
+        """Phase time accumulated from the supplied ``dt`` values."""
+        return self._elapsed
+
+    # ------------------------------------------------------------------ cycle
+
+    def reset(self) -> None:
+        """Clear all controller state. Call once before engaging centering."""
+        self._longitudinal.reset()
+        self._lateral.reset()
+        self._longitudinal_profile.reset()
+        self._lateral_profile.reset()
+        self._shaper_x.reset()
+        self._shaper_y.reset()
+        self._settle_cycles = 0
+        self._lost_frames = 0
+        self._elapsed = 0.0
+
+    def update(self, observation: Optional[MarkerObservation], dt: float) -> CenteringCommand:
+        """Produce one cycle of centering guidance.
+
+        Parameters
+        ----------
+        observation : Optional[MarkerObservation]
+            The validated sighting for this cycle, or ``None`` when the frame
+            carried no usable observation of the configured marker -- no frame at
+            all, no detection, or a detection the validator rejected. All three
+            are the same thing to this law and are handled identically.
+        dt : float
+            True elapsed interval, in seconds, from
+            :meth:`~mvp_mission_bebop.engine.rate.LoopRate.tick`. A non-positive
+            interval is absorbed without advancing any state.
+
+        Returns
+        -------
+        CenteringCommand
+            Normalized ``vx``/``vy`` plus the full reasoning behind them.
+            ``vz`` and ``vyaw`` are deliberately absent: the vertical axis
+            belongs to the altitude governor for the whole of this phase, and
+            rotation is prohibited outright.
+        """
+        self._elapsed += max(0.0, dt)
+
+        if observation is None:
+            return self._coast(dt)
+
+        self._lost_frames = 0
+
+        ex_body, ey_body = project_marker_to_body(
+            observation.x_cam_m, observation.y_cam_m, observation.z_cam_m, self._tilt_deg
+        )
+        radial = math.hypot(ex_body, ey_body)
+        within = radial <= self._tolerance_m
+
+        if within:
+            # Inside the gate the objective changes from "reduce the error" to
+            # "come to rest", and those are different commands. Driving the
+            # profile to zero rather than letting the PD trickle along is what
+            # makes the settle test reachable: with the deadband suppressing the
+            # residual error the PD output is already nil, but the *profile*
+            # still carries whatever velocity the approach left in it, and the
+            # airframe with it.
+            longitudinal_mps = self._longitudinal_profile.step(0.0, dt)
+            lateral_mps = self._lateral_profile.step(0.0, dt)
+            note = f"centred: radial {radial:.3f} m <= {self._tolerance_m:.3f} m"
+        else:
+            # Measurement is the airframe's displacement *from* the marker, which
+            # is the negation of the error vector pointing at it, against a zero
+            # setpoint. The sign convention is the same one the odometric law
+            # above uses, deliberately: one reading of "error" across the module.
+            longitudinal_demand = self._longitudinal.update(-ex_body, dt)
+            lateral_demand = self._lateral.update(-ey_body, dt)
+            # Saturated as a vector, not per axis. Clipping the two channels
+            # independently lets the resultant reach sqrt(2) times the ceiling on
+            # a diagonal approach -- 0.113 against a configured 0.08 -- and it
+            # also rotates the commanded direction away from the marker whenever
+            # exactly one axis is railed, so the aircraft crabs in on a dog-leg
+            # instead of a straight line. Scaling preserves the heading.
+            longitudinal_target, lateral_target = self._saturate_pair(
+                longitudinal_demand, lateral_demand
+            )
+            longitudinal_mps = self._longitudinal_profile.step(longitudinal_target, dt)
+            lateral_mps = self._lateral_profile.step(lateral_target, dt)
+            note = f"centering: radial {radial:.3f} m, target <= {self._tolerance_m:.3f} m"
+
+        # The two profiles are independent second-order systems, so even with
+        # in-envelope targets their outputs can transiently combine above the
+        # ceiling while they track at different rates. Bound the resultant and
+        # then reconcile each profile's state with what was actually emitted --
+        # the same reconciliation JerkLimitedProfile performs internally when its
+        # own velocity clamp truncates a step, and for the same reason: a
+        # profile whose stored velocity is not the one the actuator received
+        # measures its next jerk against a command that never existed.
+        longitudinal_mps, lateral_mps = self._reconcile(longitudinal_mps, lateral_mps)
+
+        speed_mps = math.hypot(longitudinal_mps, lateral_mps)
+        # Both conditions, every cycle. Inside the tolerance but still moving is
+        # a drone crossing the centre, not a drone over it.
+        if within and speed_mps <= self._settle_speed_mps:
+            self._settle_cycles += 1
+        else:
+            self._settle_cycles = 0
+        settled = self._settle_cycles >= self._settle_target
+
+        vx = self._shaper_x.shape(self.calibration.to_normalized(longitudinal_mps), dt)
+        vy = self._shaper_y.shape(self.calibration.to_normalized(lateral_mps), dt)
+
+        return CenteringCommand(
+            vx=vx,
+            vy=vy,
+            ex_body_m=ex_body,
+            ey_body_m=ey_body,
+            radial_error_m=radial,
+            slant_range_m=observation.slant_range_m,
+            commanded_speed_mps=speed_mps,
+            tracking=True,
+            lost_frames=0,
+            within_tolerance=within,
+            settled=settled,
+            marker_id=observation.marker_id,
+            note=note,
+        )
+
+    # ---------------------------------------------------------------- helpers
+
+    def _coast(self, dt: float) -> CenteringCommand:
+        """Hold station through a cycle that carried no usable observation.
+
+        The airframe is brought to rest rather than left on its last command,
+        because the Bebop latches the last Twist it received indefinitely: doing
+        nothing here is not "hold position", it is "keep flying the correction
+        computed for a marker position nobody can currently see".
+        """
+        self._lost_frames += 1
+        longitudinal_mps = self._longitudinal_profile.step(0.0, dt)
+        lateral_mps = self._lateral_profile.step(0.0, dt)
+
+        tolerated = self._lost_frames <= self._lost_tolerance
+        if not tolerated:
+            # Past the tolerance the PD state describes a world the camera is no
+            # longer confirming. Clearing it stops a stale derivative from firing
+            # into the first frame that comes back.
+            self._settle_cycles = 0
+            self._longitudinal.reset()
+            self._lateral.reset()
+            note = f"marker lost for {self._lost_frames} frames: holding station"
+        else:
+            note = f"marker absent ({self._lost_frames}/{self._lost_tolerance}): coasting"
+
+        vx = self._shaper_x.shape(self.calibration.to_normalized(longitudinal_mps), dt)
+        vy = self._shaper_y.shape(self.calibration.to_normalized(lateral_mps), dt)
+
+        return CenteringCommand(
+            vx=vx,
+            vy=vy,
+            ex_body_m=0.0,
+            ey_body_m=0.0,
+            radial_error_m=float("inf"),
+            slant_range_m=0.0,
+            commanded_speed_mps=math.hypot(longitudinal_mps, lateral_mps),
+            tracking=False,
+            lost_frames=self._lost_frames,
+            within_tolerance=False,
+            # A landing is never authorized on a cycle the marker was not seen.
+            # The counter is preserved while inside the tolerated window so a
+            # single dropped frame does not discard a near-complete settlement,
+            # but the gate itself requires a live observation.
+            settled=False,
+            marker_id=None,
+            note=note,
+        )
+
+    def _saturate_pair(self, longitudinal_mps: float, lateral_mps: float) -> tuple[float, float]:
+        """Scale a velocity demand onto the centering speed ceiling.
+
+        The ceiling bounds the *resultant* translational speed, so the pair is
+        scaled rather than clipped: a uniform scale leaves the commanded
+        direction pointing at the marker, while an independent clip on each axis
+        rotates it toward the diagonal.
+        """
+        magnitude = math.hypot(longitudinal_mps, lateral_mps)
+        if magnitude <= self._max_speed_mps or magnitude <= 0.0:
+            return longitudinal_mps, lateral_mps
+        scale = self._max_speed_mps / magnitude
+        return longitudinal_mps * scale, lateral_mps * scale
+
+    def _reconcile(self, longitudinal_mps: float, lateral_mps: float) -> tuple[float, float]:
+        """Bound the emitted resultant and re-seed the profiles onto it."""
+        bounded_x, bounded_y = self._saturate_pair(longitudinal_mps, lateral_mps)
+        if bounded_x != longitudinal_mps or bounded_y != lateral_mps:
+            self._longitudinal_profile.reset(
+                bounded_x, self._longitudinal_profile.acceleration
+            )
+            self._lateral_profile.reset(bounded_y, self._lateral_profile.acceleration)
+        return bounded_x, bounded_y
