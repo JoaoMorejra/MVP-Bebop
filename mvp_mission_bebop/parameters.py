@@ -12,7 +12,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger("MissionParameters")
 
@@ -609,12 +609,13 @@ class ReturnToLaunchConfig:
     #: is rejected outright rather than treated as a weak observation: a
     #: mis-identified pad is a landing at the wrong place, and there is no
     #: subsequent stage to catch it.
-    target_aruco_id: int = 0
-    #: ArUco dictionary order N, selecting ``cv2.aruco.DICT_NxN_1000`` through
-    #: ``nectar.vision.Aruco``. 5 is the 5x5_1000 family. Values outside
-    #: {4, 5, 6, 7} have no predefined dictionary and are rejected at detector
-    #: construction rather than at the first frame.
-    marker_dict: int = 5
+    target_aruco_id: int = 8
+    #: ArUco/AprilTag dictionary identifier, passed to
+    #: ``nectar.vision.Aruco``.  Accepts legacy integer orders (4, 5, 6, 7 for
+    #: ``DICT_NxN_1000``), OpenCV enum integers (e.g. ``20`` for
+    #: ``DICT_APRILTAG_36h11``), or string names (e.g. ``"DICT_APRILTAG_36h11"``,
+    #: ``"tag36h11"``).
+    marker_dict: Union[int, str] = "DICT_APRILTAG_36h11"
     #: Physical edge length of the printed marker, in metres.
     #:
     #: This is the scale factor of the entire pose estimate: ``solvePnP`` recovers
