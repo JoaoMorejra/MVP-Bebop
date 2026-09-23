@@ -1162,6 +1162,7 @@ def test_a_frame_with_no_marker_raises_nothing_against_the_real_sdk():
     [
         ("--aruco-id", "12", "target_aruco_id", 12),
         ("--aruco-dict", "4", "marker_dict", 4),
+        ("--aruco-dict", "DICT_APRILTAG_36h11", "marker_dict", "DICT_APRILTAG_36h11"),
         ("--aruco-size", "0.15", "tag_size", 0.15),
     ],
 )
