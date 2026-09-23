@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import queue
+import random
 import sys
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     from google import genai
@@ -55,9 +57,17 @@ def _resolve_auth_token() -> Optional[str]:
     if key:
         return key
 
+    # The workspace root is the natural place for this file, and the daemon's
+    # working directory is the package rather than the workspace, so `getcwd()`
+    # alone never finds it. The path is derived from this module rather than
+    # hardcoded: the previous list named another machine's home directory.
+    workspace_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+    )
     env_paths = [
         os.path.join(os.getcwd(), ".env"),
-        "/home/jv/ros2_ws/.env",
+        os.path.join(workspace_root, ".env"),
+        os.path.expanduser("~/ros2_ws/.env"),
         os.path.expanduser("~/jarvis/.env"),
         os.path.expanduser("~/.env"),
     ]
@@ -112,6 +122,12 @@ class AudioPlaybackDevice:
         self.dtype = dtype
 
         self._queue: queue.Queue[Optional[bytes]] = queue.Queue()
+        # Output level, applied to the samples on their way to the device.
+        # Scaling PCM here rather than touching the host mixer keeps the
+        # station's voice independent of everything else the machine is
+        # playing, which is what an operator adjusting "the copilot" means.
+        self._volume: float = 1.0
+        self._muted: bool = False
         self._thread: Optional[threading.Thread] = None
         self._active: bool = False
         self._is_playing: bool = False
@@ -141,6 +157,18 @@ class AudioPlaybackDevice:
                 self._active = False
                 return False
 
+    def set_level(self, volume: Optional[float] = None, muted: Optional[bool] = None) -> None:
+        """Set output gain and mute state. Takes effect on the next buffer."""
+        with self._lock:
+            if volume is not None:
+                self._volume = max(0.0, min(1.0, float(volume)))
+            if muted is not None:
+                self._muted = bool(muted)
+
+    def get_level(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"volume": self._volume, "muted": self._muted}
+
     def play_audio(self, pcm_data: bytes) -> None:
         """Enqueue PCM audio buffer for sequential playback."""
         if not pcm_data or not self._active:
@@ -167,8 +195,20 @@ class AudioPlaybackDevice:
                     self._playback_finished.clear()
                     try:
                         samples = np.frombuffer(data, dtype=np.int16)
-                        sd.play(samples, samplerate=self.sample_rate)
-                        sd.wait()
+                        with self._lock:
+                            gain = 0.0 if self._muted else self._volume
+                        if gain <= 0.0:
+                            # Nothing to play, but the timing still has to be
+                            # the timing: the station reveals a card per line
+                            # read, and a muted copilot returning instantly
+                            # would collapse the report into one frame. The
+                            # buffer's own duration is the honest wait.
+                            time.sleep(len(samples) / float(self.sample_rate))
+                        else:
+                            if gain < 1.0:
+                                samples = (samples.astype(np.float32) * gain).astype(np.int16)
+                            sd.play(samples, samplerate=self.sample_rate)
+                            sd.wait()
                     except Exception as err:
                         logger.debug("Sounddevice playback error: %s", err)
 
