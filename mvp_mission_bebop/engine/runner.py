@@ -33,10 +33,15 @@ class MissionRunner:
         steps: Optional[List[BaseStep]] = None,
         *,
         on_finalize: Optional[Callable[[], None]] = None,
+        stage_numbers: Optional[List[int]] = None,
     ) -> None:
         self.ctx = context
         self.steps = steps or []
         self._on_finalize = on_finalize
+        #: Stage number of each configured step, as the ground station numbers
+        #: them. Needed because a partial run (``--stages 4``) holds one step
+        #: whose number is not its index.
+        self.stage_numbers = stage_numbers or list(range(1, len(self.steps) + 1))
 
         # Signal handling is constructed here but installed explicitly, so a
         # runner can be built off the main thread -- in a test, say -- without
@@ -72,15 +77,26 @@ class MissionRunner:
         """
         logger.info("Commencing autonomous mission execution (%d steps).", len(self.steps))
         all_succeeded = True
+        index = 0
 
         try:
-            for step in self.steps:
+            while index < len(self.steps):
                 if self.ctx.emergency_event.is_set():
                     logger.warning("Emergency signal active. Halting step progression.")
                     all_succeeded = False
                     break
 
+                step = self.steps[index]
                 status = step.execute(self.ctx)
+
+                # A step that unwound because the operator asked for a different
+                # stage did not fail, and must not be reported as though it did.
+                # This is checked before the status, because the status it
+                # returned is its abort path -- that is how it stops quickly.
+                target = self._take_stage_jump()
+                if target is not None:
+                    index = target
+                    continue
 
                 if status is StepStatus.ABORTED:
                     logger.warning("Step '%s' signalled ABORT.", step.name)
@@ -96,12 +112,47 @@ class MissionRunner:
                     all_succeeded = False
                     break
 
+                index += 1
+
         except Exception as exc:  # noqa: BLE001 - any step fault must land the drone
             logger.critical("Unhandled exception in mission pipeline: %s", exc, exc_info=True)
             self.ctx.failsafe.trigger_emergency_land(str(exc))
             all_succeeded = False
 
         return all_succeeded
+
+    def _take_stage_jump(self) -> Optional[int]:
+        """Consume a pending stage jump and return the step index to run next.
+
+        Returns ``None`` when no jump is pending or the requested stage is not
+        one this run holds -- a partial bench run configured with ``--stages 4``
+        has nowhere to jump to, and a request naming a stage it does not carry is
+        dropped rather than silently redirected to a different one.
+        """
+        if not self.ctx.stage_jump_event.is_set():
+            return None
+
+        requested = self.ctx.requested_stage
+        self.ctx.stage_jump_event.clear()
+        self.ctx.requested_stage = None
+
+        if requested is None:
+            return None
+        if requested not in self.stage_numbers:
+            logger.warning(
+                "Stage jump to %s ignored: this run holds stages %s.",
+                requested,
+                self.stage_numbers,
+            )
+            return None
+
+        index = self.stage_numbers.index(requested)
+        logger.info(
+            "--- [STEP %d: %s] --- (salto comandado pela estação)",
+            requested,
+            self.steps[index].name,
+        )
+        return index
 
     # ------------------------------------------------------------ termination
 
