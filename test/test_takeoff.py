@@ -80,7 +80,13 @@ class ClimbContext:
         self.failsafe = failsafe
         self.handler = StubHandler()
         self.emergency_event = threading.Event()
+        self.stage_jump_event = threading.Event()
+        self.requested_stage = None
         self.speed_calibration = SpeedCalibration(params.kinematics.normalized_to_mps)
+
+    def interrupted(self) -> bool:
+        """Mirrors MissionContext.interrupted: an abort or a commanded stage jump."""
+        return self.emergency_event.is_set() or self.stage_jump_event.is_set()
 
     def grab_frame(self, timeout_sec=1.0):
         """Mirror ``MissionContext.grab_frame``.

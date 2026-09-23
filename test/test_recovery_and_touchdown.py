@@ -402,6 +402,12 @@ def landing_ctx(drone):
     )
     ctx.blackboard = Blackboard()
     ctx.emergency_event = threading.Event()
+    ctx.stage_jump_event = threading.Event()
+    ctx.requested_stage = None
+    # Mirrors MissionContext.interrupted: an abort, or a commanded stage jump.
+    ctx.interrupted = lambda: (
+        ctx.emergency_event.is_set() or ctx.stage_jump_event.is_set()
+    )
     ctx.handler = None
     return ctx
 

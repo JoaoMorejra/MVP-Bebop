@@ -825,9 +825,15 @@ class Ctx:
         self.speed_calibration = SpeedCalibration(1.0)
         self.blackboard = Blackboard()
         self.emergency_event = threading.Event()
+        self.stage_jump_event = threading.Event()
+        self.requested_stage = None
         self.handler = object()
         self.frames = 0
         self.sensor = sensor
+
+    def interrupted(self) -> bool:
+        """Mirrors MissionContext.interrupted: an abort or a commanded stage jump."""
+        return self.emergency_event.is_set() or self.stage_jump_event.is_set()
 
     def grab_frame(self, timeout_sec=1.0):
         self.frames += 1

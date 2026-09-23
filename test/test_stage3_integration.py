@@ -188,6 +188,8 @@ class Ctx:
         )
         self.blackboard = Blackboard()
         self.emergency_event = threading.Event()
+        self.stage_jump_event = threading.Event()
+        self.requested_stage = None
         self.frame_width, self.frame_height = FRAME
         self.current_tilt_deg = params.gimbal.search_tilt_deg
         self.detector = self
@@ -206,6 +208,10 @@ class Ctx:
     #: Cycles over which the detector returns nothing, simulating the dropout
     #: that happens near nadir. Set by the loss test.
     blackout = range(0, 0)
+
+    def interrupted(self) -> bool:
+        """Mirrors MissionContext.interrupted: an abort or a commanded stage jump."""
+        return self.emergency_event.is_set() or self.stage_jump_event.is_set()
 
     def detect(self, _frame, conf=0.5):
         self._cycle = getattr(self, "_cycle", -1) + 1

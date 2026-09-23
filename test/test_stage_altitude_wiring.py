@@ -153,11 +153,17 @@ class Ctx:
         )
         self.blackboard = Blackboard()
         self.emergency_event = threading.Event()
+        self.stage_jump_event = threading.Event()
+        self.requested_stage = None
         self.frame_width, self.frame_height = 856, 480
         self.current_tilt_deg = self.params.gimbal.search_tilt_deg
         self.detector = self
         self.handler = None
         self._detections = detections
+
+    def interrupted(self) -> bool:
+        """Mirrors MissionContext.interrupted: an abort or a commanded stage jump."""
+        return self.emergency_event.is_set() or self.stage_jump_event.is_set()
 
     def grab_frame(self, timeout_sec=1.0):
         return object()
