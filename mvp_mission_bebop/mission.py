@@ -149,11 +149,20 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
             "(default: %(default)s)."
         ),
     )
+    def _parse_dict_arg(value: str):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+
     parser.add_argument(
         "--aruco-dict",
-        type=int,
+        type=_parse_dict_arg,
         default=None,
-        help="Tamanho do dicionário ArUco (default: 5 para 5x5_1000).",
+        help=(
+            "ArUco/AprilTag dictionary: integer order (4-7), OpenCV enum code "
+            "(e.g. 20), or string name (e.g. DICT_APRILTAG_36h11, tag36h11)."
+        ),
     )
     parser.add_argument(
         "--aruco-size",
