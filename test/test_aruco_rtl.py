@@ -984,13 +984,13 @@ def test_an_emergency_during_the_search_aborts_without_a_landing_claim():
 
 
 def test_an_unusable_marker_configuration_falls_back_rather_than_raising():
-    """A dictionary order with no predefined family is a configuration fault.
+    """A dictionary identifier with no predefined family is a configuration fault.
 
     It must surface as a logged degradation to the odometric return, not as an
     ``AttributeError`` out of the SDK during Stage 5.
     """
     ctx = Ctx()
-    ctx.params.rtl.marker_dict = 3
+    ctx.params.rtl.marker_dict = -1
     assert ClosedLoopRTLStep()._build_sensor(ctx) is None
 
     ctx.params.rtl.marker_dict = 5
@@ -1001,7 +1001,7 @@ def test_an_unusable_marker_configuration_falls_back_rather_than_raising():
 def test_the_degraded_path_flies_the_legacy_return_and_lands():
     """No detector means a less precise landing, never an absent one."""
     ctx = Ctx(altitude=0.20)
-    ctx.params.rtl.marker_dict = 3  # forces _build_sensor to decline
+    ctx.params.rtl.marker_dict = -1  # forces _build_sensor to decline
 
     status = ClosedLoopRTLStep().execute(ctx)
 
