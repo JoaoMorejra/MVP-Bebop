@@ -101,11 +101,27 @@ _STREAM_DECIMATION: int = 3
 #: begun.
 _MIN_CONFIRMED_DESCENT_RATIO: float = 4.0
 
-#: ArUco dictionary orders OpenCV ships a predefined ``DICT_NxN_1000`` family
-#: for. ``nectar.vision.Aruco`` builds the attribute name by interpolation and
-#: fails with an :class:`AttributeError` for anything else, which is a poor way
-#: for a configuration mistake to surface -- during Stage 5, in the air.
+#: Legacy ArUco dictionary orders that map to ``DICT_NxN_1000`` families.
+#: The detector now also accepts AprilTag dictionaries and direct OpenCV enum
+#: codes through ``nectar.vision.algorithms.markers.aruco.resolve_aruco_dict``,
+#: so this set is kept only for the degraded-path guard that needs to reject a
+#: truly invalid value (like ``3``) without importing the SDK.
 _SUPPORTED_MARKER_DICTS: Final[FrozenSet[int]] = frozenset({4, 5, 6, 7})
+
+
+def _resolve_marker_dict(marker_dict) -> Optional[int]:
+    """Resolve a marker dictionary identifier to an OpenCV enum, or ``None``.
+
+    Returns ``None`` on any input that cannot be resolved — an unsupported
+    legacy order, a misspelled family name, or an enum code OpenCV does not
+    recognise.  The caller treats ``None`` as a configuration fault and falls
+    back to the legacy odometric return.
+    """
+    try:
+        from nectar.vision.algorithms.markers.aruco import resolve_aruco_dict
+        return resolve_aruco_dict(marker_dict)
+    except Exception:  # noqa: BLE001
+        return None
 
 #: Frame-grab budget for the reverse cruise, in seconds. Matches Stage 2: the
 #: search leg is tolerant of a slow frame because the aircraft is flying a
