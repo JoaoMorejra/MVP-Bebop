@@ -663,9 +663,8 @@ class ClosedLoopRTLStep(BaseStep):
         faults rather than flight faults, so each is reported precisely and none
         of them raises:
 
-        * an unsupported dictionary order, which would surface inside the SDK as
-          an :class:`AttributeError` on a ``getattr`` of a name that does not
-          exist;
+        * an unsupported dictionary identifier, which would surface inside the
+          SDK as a :class:`ValueError` or :class:`AttributeError`;
         * a non-positive tag size, which is the scale factor of the whole pose
           estimate and would make every reported distance meaningless;
         * missing intrinsic calibration. ``Aruco.__init__`` calls
@@ -676,12 +675,13 @@ class ClosedLoopRTLStep(BaseStep):
         """
         rtl_cfg = ctx.params.rtl
 
-        order = int(rtl_cfg.marker_dict)
-        if order not in _SUPPORTED_MARKER_DICTS:
+        resolved = _resolve_marker_dict(rtl_cfg.marker_dict)
+        if resolved is None:
             logger.error(
-                "rtl.marker_dict=%d has no predefined ArUco family; supported orders are %s.",
-                order,
-                sorted(_SUPPORTED_MARKER_DICTS),
+                "rtl.marker_dict=%r cannot be resolved to a known ArUco/AprilTag "
+                "dictionary; supported values include legacy orders {4, 5, 6, 7}, "
+                "OpenCV enum codes, or string names like 'DICT_APRILTAG_36h11'.",
+                rtl_cfg.marker_dict,
             )
             return None
 
@@ -696,7 +696,7 @@ class ClosedLoopRTLStep(BaseStep):
         try:
             from nectar.vision import Aruco
 
-            detector = Aruco(marker_dict=order, tag_size=tag_size)
+            detector = Aruco(marker_dict=rtl_cfg.marker_dict, tag_size=tag_size)
         except Exception as exc:  # noqa: BLE001 - degrade, never abort
             logger.error(
                 "ArUco detector construction failed (%s: %s). Camera intrinsics are loaded "
@@ -708,9 +708,10 @@ class ClosedLoopRTLStep(BaseStep):
             return None
 
         logger.info(
-            "ArUco detector ready: DICT_%dX%d_1000, tag %.3f m, accepting only ID %d.",
-            order,
-            order,
+            "ArUco/AprilTag detector ready: dict %s (resolved enum %d), "
+            "tag %.3f m, accepting only ID %d.",
+            rtl_cfg.marker_dict,
+            resolved,
             tag_size,
             int(rtl_cfg.target_aruco_id),
         )
