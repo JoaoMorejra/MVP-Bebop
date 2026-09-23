@@ -69,6 +69,15 @@ class MissionContext:
 
         self.current_tilt_deg: float = self.params.gimbal.search_tilt_deg
         self.emergency_event = threading.Event()
+        #: A stage jump commanded by the ground station.
+        #:
+        #: Distinct from ``emergency_event`` on purpose: both stop the running
+        #: step promptly, but one is on its way to the ground and the other is
+        #: on its way to a different part of the mission. The runner reads which
+        #: is which after the step unwinds.
+        self.stage_jump_event = threading.Event()
+        #: Stage number requested with ``stage_jump_event``, 1-5.
+        self.requested_stage: Optional[int] = None
         self.start_time: float = time.time()
         self.blackboard = MissionBlackboard()
 
@@ -83,6 +92,21 @@ class MissionContext:
         self._camera_blocks_for_new_frames = self._probe_frame_waiting()
 
     # -------------------------------------------------------------- estimation
+
+    def interrupted(self) -> bool:
+        """True when the running step must stop early.
+
+        Two things end a step before its own logic would: the operator aborting,
+        and the operator jumping to a different stage. Steps react identically —
+        stop flying this, unwind, hand control back — so they ask one question.
+        Which of the two it was is the runner's business, not theirs.
+        """
+        return self.emergency_event.is_set() or self.stage_jump_event.is_set()
+
+    def request_stage(self, stage: int) -> None:
+        """Ask the runner to continue at ``stage`` (1-5) once this step unwinds."""
+        self.requested_stage = stage
+        self.stage_jump_event.set()
 
     @property
     def motion_tracker(self) -> Optional["DeadReckoningTracker"]:
