@@ -1200,6 +1200,36 @@ def test_omitting_the_aruco_flags_leaves_the_configured_values_alone(monkeypatch
     assert arguments.aruco_size is None
 
 
+def test_parameter_logging_formats_correctly_with_string_and_integer_dict():
+    """Parameter logging at mission startup must accept both string and integer dict."""
+    params = MissionParameters()
+    for marker_dict in ("DICT_APRILTAG_36h11", 5, "tag36h11", 4):
+        params.rtl.marker_dict = marker_dict
+        msg = (
+            "Active parameters: altitude=%.2fm, velocity=%.3fm/s, hover=%.1fs, "
+            "search_timeout=%.1fs, confidence=%.2f, confirmation_frames=%d, "
+            "classes=%s, rtl_radius=%.2fm, countdown=%.1fs, no_fly=%s, "
+            "aruco_id=%d, aruco_dict=%s, aruco_size=%.3fm"
+        )
+        args = (
+            params.kinematics.target_altitude_m,
+            params.kinematics.forward_cruise_velocity,
+            params.kinematics.hover_duration_sec,
+            params.timeouts.search_timeout_sec,
+            params.vision.confidence_threshold,
+            params.vision.confirmation_frames,
+            params.vision.target_classes,
+            params.rtl.arrival_radius_m,
+            params.kinematics.countdown_sec,
+            params.no_fly,
+            params.rtl.target_aruco_id,
+            params.rtl.marker_dict,
+            params.rtl.tag_size,
+        )
+        formatted = msg % args
+        assert f"aruco_dict={marker_dict}" in formatted
+
+
 def test_the_aruco_block_round_trips_through_mission_config():
     """The GCS reads and rewrites this document; new fields must survive it."""
     import json
