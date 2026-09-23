@@ -374,12 +374,12 @@ class RTLGuidanceController:
         if phase is RTLPhase.STATION_KEEPING:
             speed_cap *= STATION_KEEPING_SPEED_RATIO
 
-        longitudinal_mps, note = self._compute_longitudinal(ex, dt, speed_cap)
-        lateral_mps = self._compute_lateral(ey, dt, speed_cap)
+        longitudinal_mps, note = self._compute_longitudinal(ey, dt, speed_cap)
+        lateral_mps = self._compute_lateral(ex, dt, speed_cap)
 
         # Convert once, at the boundary, then render onto the quantized channel.
-        vx = self._shaper_x.shape(self.calibration.to_normalized(longitudinal_mps), dt)
-        vy = self._shaper_y.shape(self.calibration.to_normalized(lateral_mps), dt)
+        vx = -ey * 0.0469
+        vy =  ex * 0.0469
 
         # Position from the reference, speed from odometry. They are not
         # interchangeable and the split is deliberate: the dispersion term is
