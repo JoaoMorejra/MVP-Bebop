@@ -307,7 +307,7 @@ def main() -> None:
         "Active parameters: altitude=%.2fm, velocity=%.3fm/s, hover=%.1fs, "
         "search_timeout=%.1fs, confidence=%.2f, confirmation_frames=%d, "
         "classes=%s, rtl_radius=%.2fm, countdown=%.1fs, no_fly=%s, "
-        "aruco_id=%d, aruco_dict=%dx%d, aruco_size=%.3fm",
+        "aruco_id=%d, aruco_dict=%s, aruco_size=%.3fm",
         params.kinematics.target_altitude_m,
         params.kinematics.forward_cruise_velocity,
         params.kinematics.hover_duration_sec,
@@ -319,7 +319,6 @@ def main() -> None:
         params.kinematics.countdown_sec,
         params.no_fly,
         params.rtl.target_aruco_id,
-        params.rtl.marker_dict,
         params.rtl.marker_dict,
         params.rtl.tag_size,
     )
