@@ -711,6 +711,105 @@ def speak(
     return announce(text, priority=priority, wait=wait, timeout=timeout, verbatim=True)
 
 
+# -----------------------------------------------------------------------------
+# Forensic report
+#
+# Four findings, one per topic the operator is required to clear before a claim
+# can be closed remotely. Each exists in several wordings and the order is drawn
+# fresh per flight, so two consecutive missions never produce the same-looking
+# report -- a demonstration that reads as a live assessment rather than a canned
+# slide. The ground station holds the same table in
+# `src/lib/forensics.ts` and is the one that decides the order for a given
+# flight; this copy is what the mission side uses when it narrates on its own.
+# -----------------------------------------------------------------------------
+
+FORENSIC_FINDINGS: Dict[str, List[str]] = {
+    "police": [
+        "Sem necessidade de polícia",
+        "Acionamento policial dispensado",
+        "Sem demanda para autoridade policial",
+        "Segurança pública não requisitada",
+    ],
+    "samu": [
+        "Sem necessidade de Samu",
+        "Socorro médico dispensado",
+        "Atendimento emergencial não necessário",
+        "SAMU dispensado para a ocorrência",
+    ],
+    "victim": [
+        "Estado do acidentado não é grave",
+        "Vítima consciente e sem gravidade",
+        "Acidentado sem ferimentos críticos",
+        "Condição da vítima considerada leve",
+    ],
+    "vehicle": [
+        "Veículo não danificado",
+        "Sem danos estruturais aparentes no veículo",
+        "Integridade do automóvel preservada",
+        "Veículo sem avarias mecânicas",
+    ],
+}
+
+FORENSIC_ORDINALS = ("Primeiro", "Segundo", "Terceiro", "Quarto")
+
+
+def _decapitalise(line: str) -> str:
+    """Lower the first letter so a line reads on after an ordinal.
+
+    An acronym is left alone: "SAMU dispensado" must not become "sAMU".
+    """
+    if len(line) > 1 and line[1].isupper():
+        return line
+    return line[0].lower() + line[1:]
+
+FORENSIC_INTRO = "Inspeção do sinistro concluída. Apresentando laudo preliminar."
+FORENSIC_OUTRO = "Relatório pericial emitido e pronto para exportação."
+
+
+def build_forensic_report(seed: Optional[int] = None) -> List[Dict[str, str]]:
+    """Draw one report: a wording per topic, in a shuffled order.
+
+    Returns one dict per finding with ``topic``, ``card`` (the line the station
+    displays) and ``speech`` (the same line, ordinal-prefixed, as the copilot
+    reads it).
+    """
+    rng = random.Random(seed)
+    topics = list(FORENSIC_FINDINGS)
+    rng.shuffle(topics)
+    report: List[Dict[str, str]] = []
+    for index, topic in enumerate(topics):
+        card = rng.choice(FORENSIC_FINDINGS[topic])
+        report.append(
+            {
+                "topic": topic,
+                "card": card,
+                "speech": f"{FORENSIC_ORDINALS[index]}: {_decapitalise(card)}.",
+            }
+        )
+    return report
+
+
+def announce_forensic_report(
+    report: Optional[List[Dict[str, str]]] = None,
+    gap_sec: float = 2.0,
+) -> List[Dict[str, str]]:
+    """Read a whole report aloud, one finding at a time.
+
+    Blocks for the length of the narration, so a caller that also paints the
+    screen stays in step with it. The ground station does not use this path --
+    it drives the cadence itself over the daemon below, so that each card lands
+    on the sentence that describes it -- but the mission process can narrate a
+    report with one call.
+    """
+    findings = report if report is not None else build_forensic_report()
+    speak(FORENSIC_INTRO, wait=True, timeout=25.0)
+    for finding in findings:
+        speak(finding["speech"], wait=True, timeout=25.0)
+        time.sleep(gap_sec)
+    speak(FORENSIC_OUTRO, wait=True, timeout=25.0)
+    return findings
+
+
 # Compatibility aliases
 falar_acao = announce
 falar_acao_sync = announce_sync
@@ -727,10 +826,32 @@ if __name__ == "__main__":
     parser.add_argument("--priority", choices=["NORMAL", "URGENT", "CRITICAL"], default="NORMAL", help="Queue priority")
     parser.add_argument("--details", default=None, help="Details or explanation")
     parser.add_argument("--wait", action="store_true", default=True, help="Wait for audio playback to complete")
+    parser.add_argument(
+        "--verbatim",
+        action="store_true",
+        help="Speak the text exactly as given, bypassing the milestone phrase mapper.",
+    )
+    parser.add_argument(
+        "--forensic-report",
+        action="store_true",
+        help="Narrate one randomised forensic report and print it as JSON.",
+    )
     args = parser.parse_args()
 
+    if args.forensic_report:
+        findings = announce_forensic_report()
+        print(json.dumps(findings, ensure_ascii=False))
+        get_announcer().close()
+        sys.exit(0)
+
     details_dict = {"etapa": args.details} if args.details else None
-    success = announce_sync(args.action, details=details_dict, priority=args.priority, wait=args.wait)
+    success = announce_sync(
+        args.action,
+        details=details_dict,
+        priority=args.priority,
+        wait=args.wait,
+        verbatim=args.verbatim,
+    )
     get_announcer().close()
     sys.exit(0 if success else 1)
 
