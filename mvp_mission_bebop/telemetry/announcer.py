@@ -602,6 +602,43 @@ class MissionAudioAnnouncer:
 
         return True
 
+    def cancel_pending(self) -> int:
+        """Drop every queued line and silence what is playing.
+
+        Stopping the playback device alone leaves the announcer's own priority
+        queue loaded, so a cancelled report went quiet and then resumed reading
+        itself over whatever came next. Callers waiting on a dropped line are
+        resolved false rather than left to time out.
+
+        Returns the number of lines dropped. The line already inside the
+        consumer is not one of them -- it is mid-synthesis and cannot be taken
+        back -- but its audio is cut by ``stop_current`` below.
+        """
+        dropped = 0
+        if self._loop is None or self._queue is None:
+            return dropped
+
+        done = threading.Event()
+
+        def drain() -> None:
+            nonlocal dropped
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except (asyncio.QueueEmpty, ValueError):
+                    break
+                self._queue.task_done()
+                dropped += 1
+                future = item[5]
+                if future is not None and not future.done():
+                    future.set_result(False)
+            done.set()
+
+        self._loop.call_soon_threadsafe(drain)
+        done.wait(timeout=2.0)
+        self.device.stop_current()
+        return dropped
+
     def close(self) -> None:
         """Terminate announcer and clean up worker threads."""
         self._active = False
