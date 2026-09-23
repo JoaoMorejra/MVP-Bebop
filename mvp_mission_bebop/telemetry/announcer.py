@@ -810,6 +810,154 @@ def announce_forensic_report(
     return findings
 
 
+# -----------------------------------------------------------------------------
+# Line daemon
+#
+# One long-lived process the ground station writes requests to, instead of a
+# fresh interpreter per sentence. Starting Python, importing `google.genai` and
+# opening a Live session costs seconds; the post-landing report wants a card
+# every two, so the session has to already be warm when the line arrives.
+#
+# Requests are JSON objects, one per line, on stdin:
+#
+#   {"id": 7, "text": "...", "priority": "NORMAL", "verbatim": true}
+#   {"op": "cancel"}   -- drop what is queued and silence the current line
+#   {"op": "quit"}
+#
+# Replies are one line each on stdout, prefixed so they survive anything the
+# libraries below decide to print:
+#
+#   BMG_SPEECH:{"id": 7, "event": "done", "ok": true}
+# -----------------------------------------------------------------------------
+
+SPEECH_EVENT_PREFIX = "BMG_SPEECH:"
+
+
+def _emit_speech_event(payload: Dict[str, Any]) -> None:
+    sys.stdout.write(SPEECH_EVENT_PREFIX + json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def serve_stdin() -> int:
+    """Run the announcer as a line-oriented daemon. Returns a process exit code.
+
+    Each request is spoken to completion before the next is taken, which is what
+    lets the caller treat ``done`` as "the operator has heard this" and only
+    then reveal the matching card.
+    """
+    announcer = get_announcer()
+    # Said once, at startup, so a station whose copilot cannot speak learns it
+    # from the handshake rather than from four silent requests.
+    _emit_speech_event(
+        {
+            "event": "ready",
+            "voice": SYNTHESIZER_VOICE,
+            "model": SYNTHESIZER_MODEL,
+            "synthesis": genai is not None and bool(announcer.auth_token),
+            "playback": announcer.device._active,
+            **announcer.device.get_level(),
+            "detail": (
+                "google-genai não instalado"
+                if genai is None
+                else "sem chave de API (SPEECH_API_KEY / GEMINI_API_KEY)"
+                if not announcer.auth_token
+                else "sem dispositivo de áudio (PortAudio)"
+                if not announcer.device._active
+                else "pronto"
+            ),
+        }
+    )
+
+    work: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+
+    def worker() -> None:
+        while True:
+            request = work.get()
+            if request is None:
+                return
+            request_id = request.get("id")
+            text = str(request.get("text") or "").strip()
+            if not text:
+                _emit_speech_event({"id": request_id, "event": "done", "ok": False})
+                continue
+            if announcer.device.get_level()["muted"]:
+                # Synthesising a line that will not be played spends an API call
+                # and several seconds on nothing. The station paces itself off
+                # its own beat when a line comes back unspoken, so reporting
+                # this immediately is both cheaper and correct.
+                _emit_speech_event({"id": request_id, "event": "done", "ok": False, "muted": True})
+                continue
+            try:
+                ok = announcer.announce(
+                    text,
+                    details=None,
+                    priority=str(request.get("priority") or "NORMAL"),
+                    wait=True,
+                    timeout=float(request.get("timeout") or 30.0),
+                    verbatim=bool(request.get("verbatim", True)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Daemon announce failure: %s", exc)
+                ok = False
+            _emit_speech_event({"id": request_id, "event": "done", "ok": bool(ok)})
+
+    thread = threading.Thread(target=worker, name="SpeechDaemonWorker", daemon=True)
+    thread.start()
+
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError:
+                # A bare line is a sentence. Nothing upstream should send one,
+                # but refusing to speak because of a missing brace would be the
+                # worse failure.
+                request = {"text": line}
+            if not isinstance(request, dict):
+                continue
+
+            op = request.get("op")
+            if op == "quit":
+                break
+            if op == "level":
+                announcer.device.set_level(
+                    volume=request.get("volume"),
+                    muted=request.get("muted"),
+                )
+                _emit_speech_event({"event": "level", **announcer.device.get_level()})
+                continue
+            if op == "cancel":
+                # Three layers hold work at this moment: this daemon's own
+                # backlog, the announcer's priority queue behind it, and the
+                # audio device. Draining only the first left the other two to
+                # finish reading a report the operator had dismissed.
+                while not work.empty():
+                    try:
+                        pending_request = work.get_nowait()
+                        if pending_request:
+                            _emit_speech_event(
+                                {"id": pending_request.get("id"), "event": "done", "ok": False}
+                            )
+                    except queue.Empty:
+                        break
+                dropped = announcer.cancel_pending()
+                _emit_speech_event({"event": "cancelled", "dropped": dropped})
+                continue
+
+            work.put(request)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        work.put(None)
+        thread.join(timeout=2.0)
+        announcer.close()
+
+    return 0
+
+
 # Compatibility aliases
 falar_acao = announce
 falar_acao_sync = announce_sync
@@ -832,11 +980,19 @@ if __name__ == "__main__":
         help="Speak the text exactly as given, bypassing the milestone phrase mapper.",
     )
     parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run as a line daemon reading JSON requests on stdin (used by the ground station).",
+    )
+    parser.add_argument(
         "--forensic-report",
         action="store_true",
         help="Narrate one randomised forensic report and print it as JSON.",
     )
     args = parser.parse_args()
+
+    if args.serve:
+        sys.exit(serve_stdin())
 
     if args.forensic_report:
         findings = announce_forensic_report()
