@@ -5,9 +5,22 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks to find real script location
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 PACKAGE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WS_DIR="$(cd "$PACKAGE_DIR/../.." && pwd)"
+
+# Fallback to standard workspace location if needed
+if [ ! -d "$WS_DIR/bebop_mission_control" ] && [ -d "$HOME/ros2_ws/bebop_mission_control" ]; then
+    WS_DIR="$HOME/ros2_ws"
+    PACKAGE_DIR="$WS_DIR/src/mvp_mission_bebop"
+fi
 
 MISSION_DIR="${PACKAGE_DIR}/mvp_mission_bebop"
 APP_DIR="${WS_DIR}/bebop_mission_control"
