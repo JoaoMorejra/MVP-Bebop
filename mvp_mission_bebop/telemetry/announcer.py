@@ -423,7 +423,7 @@ class MissionAudioAnnouncer:
             except Exception:
                 break
 
-            pri_int, seq, action, details, done_fut = item
+            pri_int, seq, action, details, verbatim, done_fut = item
 
             # Preemption on urgent priority
             if pri_int == 0:
@@ -432,12 +432,12 @@ class MissionAudioAnnouncer:
                     try:
                         q_item = self._queue.get_nowait()
                         self._queue.task_done()
-                        if q_item[4] and not q_item[4].done():
-                            q_item[4].set_result(False)
+                        if q_item[5] and not q_item[5].done():
+                            q_item[5].set_result(False)
                     except (asyncio.QueueEmpty, ValueError):
                         break
 
-            statement = _format_telemetry_statement(action, details)
+            statement = action if verbatim else _format_telemetry_statement(action, details)
             logger.info("Acoustic announcement: '%s' (Priority: %s)", statement, "URGENT" if pri_int == 0 else "NORMAL")
 
             session = self._warm_session
@@ -467,11 +467,22 @@ class MissionAudioAnnouncer:
 
             audio_buffer = bytearray()
             try:
-                instruction = (
-                    f"Vocalize this operational status in Portuguese concisely, similar to: '{statement}'. "
-                    "Speak clearly, calmly and directly as an autonomous flight copilot. "
-                    "Never add greetings, conversational filler, or address spectators."
-                )
+                if verbatim:
+                    # The station is showing this exact sentence on screen while
+                    # it is spoken. Paraphrasing would desynchronise the card
+                    # from the narration, so the line is read as written.
+                    instruction = (
+                        f"Read the following Portuguese sentence aloud, exactly as written, "
+                        f"with no additions, no preamble and no rewording: '{statement}'. "
+                        "Speak calmly and deliberately, as an autonomous flight copilot "
+                        "presenting a forensic finding."
+                    )
+                else:
+                    instruction = (
+                        f"Vocalize this operational status in Portuguese concisely, similar to: '{statement}'. "
+                        "Speak clearly, calmly and directly as an autonomous flight copilot. "
+                        "Never add greetings, conversational filler, or address spectators."
+                    )
                 await session.send_client_content(
                     turns=types.Content(
                         role="user",
@@ -513,14 +524,27 @@ class MissionAudioAnnouncer:
                     except Exception:
                         pass
 
-            if len(audio_buffer) >= 4800:
+            # Whether this line was actually spoken, as opposed to having been
+            # processed. Reaching the end of this block proves nothing: the
+            # streaming above is wrapped in a `try` that swallows every failure,
+            # so a missing API key, a dead network or an absent `google.genai`
+            # all arrive here having produced nothing at all. Reporting those as
+            # success told the ground station the operator had heard a sentence
+            # that was never uttered, and its forensic report -- which reveals a
+            # card per line read -- then flashed all four at once.
+            spoke = len(audio_buffer) >= 4800
+            if spoke:
                 if pri_int != 0:
-                    self.device.wait_until_done()
+                    # Bounded. This runs on the announcer's event loop thread,
+                    # so a playback worker wedged inside sounddevice would
+                    # otherwise stall every later line and the warm-session
+                    # task with it -- the whole copilot, on one stuck buffer.
+                    self.device.wait_until_done(timeout=20.0)
                 self.device.play_audio(bytes(audio_buffer))
 
             self._queue.task_done()
             if done_fut and not done_fut.done():
-                done_fut.set_result(True)
+                done_fut.set_result(spoke)
 
     def announce(
         self,
@@ -529,8 +553,15 @@ class MissionAudioAnnouncer:
         priority: str = "NORMAL",
         wait: bool = False,
         timeout: Optional[float] = None,
+        verbatim: bool = False,
     ) -> bool:
-        """Enqueue flight telemetry announcement asynchronously without blocking."""
+        """Enqueue flight telemetry announcement asynchronously without blocking.
+
+        ``verbatim`` suppresses the phrase mapper in
+        :func:`_format_telemetry_statement` and speaks ``action`` as written.
+        The ground station uses it for the forensic report, where the sentence
+        on screen and the sentence in the operator's ear must be identical.
+        """
         if not self._active or self._loop is None or self._queue is None:
             return False
 
@@ -555,14 +586,19 @@ class MissionAudioAnnouncer:
 
         self._loop.call_soon_threadsafe(
             self._queue.put_nowait,
-            (pri_int, seq, action, details, done_fut),
+            (pri_int, seq, action, details, verbatim, done_fut),
         )
 
         if wait and done_event:
-            success = done_event.wait(timeout=timeout or 15.0)
-            if success:
-                self.device.wait_until_done(timeout=timeout or 15.0)
-            return success
+            settled = done_event.wait(timeout=timeout or 15.0)
+            if not settled:
+                return False
+            self.device.wait_until_done(timeout=timeout or 15.0)
+            # The future carries the verdict; the event only says one arrived.
+            try:
+                return bool(done_fut.result()) if done_fut else True
+            except Exception:  # noqa: BLE001
+                return False
 
         return True
 
@@ -594,10 +630,18 @@ def announce(
     priority: str = "NORMAL",
     wait: bool = False,
     timeout: Optional[float] = None,
+    verbatim: bool = False,
 ) -> bool:
     """Emit telemetry notification."""
     try:
-        return get_announcer().announce(action, details, priority=priority, wait=wait, timeout=timeout)
+        return get_announcer().announce(
+            action,
+            details,
+            priority=priority,
+            wait=wait,
+            timeout=timeout,
+            verbatim=verbatim,
+        )
     except Exception as exc:
         logger.debug("Announce dispatch exception: %s", exc)
         return False
@@ -608,9 +652,26 @@ def announce_sync(
     details: Optional[Dict[str, Any]] = None,
     wait: bool = False,
     priority: str = "NORMAL",
+    verbatim: bool = False,
 ) -> bool:
     """Synchronous interface for mission step hooks."""
-    return announce(action, details=details, priority=priority, wait=wait)
+    return announce(action, details=details, priority=priority, wait=wait, verbatim=verbatim)
+
+
+def speak(
+    text: str,
+    priority: str = "NORMAL",
+    wait: bool = False,
+    timeout: Optional[float] = None,
+) -> bool:
+    """Say one line exactly as written.
+
+    The counterpart to :func:`announce`, which maps a mission milestone onto a
+    fixed aeronautical phrase. Here the caller already holds the sentence — the
+    ground station's forensic report, for one, where the same string is on
+    screen — so nothing rewrites it.
+    """
+    return announce(text, priority=priority, wait=wait, timeout=timeout, verbatim=True)
 
 
 # Compatibility aliases
