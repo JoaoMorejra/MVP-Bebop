@@ -111,7 +111,7 @@ class ForwardSearchStep(BaseStep):
         vision_cfg = ctx.params.vision
 
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 self._halt(ctx, profile, shaper, rate.period_sec, rate)
                 return StepStatus.ABORTED
 

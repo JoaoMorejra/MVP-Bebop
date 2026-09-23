@@ -107,7 +107,7 @@ class TakeoffStep(BaseStep):
         warmup_frames = 0
 
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 return StepStatus.ABORTED
 
             remaining = deadline.remaining_sec
@@ -179,7 +179,7 @@ class TakeoffStep(BaseStep):
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
 
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 return StepStatus.ABORTED
 
             if ctx.grab_frame(timeout_sec=0.2) is not None:
@@ -282,7 +282,7 @@ class TakeoffStep(BaseStep):
 
         with ctx.failsafe.climb_window(kinematics.max_climb_speed_mps):
             while deadline.active:
-                if ctx.emergency_event.is_set():
+                if ctx.interrupted():
                     self._halt(ctx)
                     return StepStatus.ABORTED
 

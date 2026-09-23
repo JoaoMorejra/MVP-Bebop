@@ -147,7 +147,7 @@ class VisualServoingStep(BaseStep):
         lost_cycles = 0
 
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 self._hold(ctx)
                 raise _StageInterrupted(StepStatus.ABORTED)
 

@@ -819,7 +819,7 @@ class ClosedLoopRTLStep(BaseStep):
         cycle = 0
         since_tilt = 0.0
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 self._brake(ctx, profile, shaper, rate)
                 return _PhaseOutcome.ABORTED
 
@@ -1033,7 +1033,7 @@ class ClosedLoopRTLStep(BaseStep):
         since_tilt = 0.0
         command: Optional[CenteringCommand] = None
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 self._halt_translation(ctx)
                 return _PhaseOutcome.ABORTED
 
@@ -1276,7 +1276,7 @@ class ClosedLoopRTLStep(BaseStep):
         cycle = 0
 
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 return StepStatus.ABORTED
 
             health = self._check_health(ctx)
@@ -1357,7 +1357,7 @@ class ClosedLoopRTLStep(BaseStep):
 
         command = None
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 return StepStatus.ABORTED
 
             snapshot = ctx.odom_supervisor.snapshot()
@@ -1414,7 +1414,7 @@ class ClosedLoopRTLStep(BaseStep):
         stall_elapsed = 0.0
 
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 logger.warning("Emergency raised during touchdown; continuing to command land.")
                 ctx.drone.land()
                 break

@@ -73,7 +73,7 @@ class NadirInspectionStep(BaseStep):
     def _inspect(self, ctx: MissionContext, degraded: bool) -> StepStatus:
         """Settle, capture, and hold. Called inside the altitude-hold window."""
         settled = self._await_stillness(ctx)
-        if ctx.emergency_event.is_set():
+        if ctx.interrupted():
             # ``_await_stillness`` returns False both on timeout and on an
             # emergency, and the caller could not tell them apart -- so an abort
             # raised during the settle wait was followed by a full blocking
@@ -135,7 +135,7 @@ class NadirInspectionStep(BaseStep):
         )
 
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 return False
 
             self._hold(ctx)
@@ -215,7 +215,7 @@ class NadirInspectionStep(BaseStep):
         logger.info("Holding nadir hover for %.1f s...", duration)
 
         while deadline.active:
-            if ctx.emergency_event.is_set():
+            if ctx.interrupted():
                 return StepStatus.ABORTED
 
             self._hold(ctx)
