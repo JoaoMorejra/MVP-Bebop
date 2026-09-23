@@ -11,9 +11,11 @@ import json
 import logging
 import os
 import sys
+from typing import List, Optional
 
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from std_msgs.msg import Int32
 from rclpy.qos import qos_profile_sensor_data
 
 import nectar
@@ -164,7 +166,47 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         default=None,
         help="JSON string with custom mission parameters overrides.",
     )
+    parser.add_argument(
+        "--stages",
+        default=None,
+        help=(
+            "Comma-separated subset of the five stages to execute, in the order "
+            "given (e.g. --stages 2 or --stages 1,4). Intended for benchtop "
+            "rehearsal of a single routine; omitting it flies the whole sequence."
+        ),
+    )
     return parser.parse_args()
+
+
+#: The five deterministic stages, by the number the ground station shows.
+STAGE_NUMBERS = (1, 2, 3, 4, 5)
+
+
+def parse_stage_selection(raw: Optional[str]) -> Optional[List[int]]:
+    """Read ``--stages`` into an ordered list of stage numbers.
+
+    ``None`` means the whole sequence. The selection is taken literally and in
+    the order written: a bench operator asking for stage 5 alone wants the RTL
+    routine by itself, not the four stages that normally precede it.
+    """
+    if raw is None:
+        return None
+    selection: List[int] = []
+    for token in str(raw).replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            number = int(token)
+        except ValueError as error:
+            raise SystemExit(f"--stages: '{token}' is not a stage number.") from error
+        if number not in STAGE_NUMBERS:
+            raise SystemExit(f"--stages: stage {number} does not exist (1-5).")
+        if number not in selection:
+            selection.append(number)
+    if not selection:
+        raise SystemExit("--stages was given but selects no stage.")
+    return selection
 
 
 def main() -> None:
@@ -457,19 +499,67 @@ def main() -> None:
         frame_height=frame_height,
     )
 
-    steps = [
-        TakeoffStep(),
-        ForwardSearchStep(),
-        VisualServoingStep(),
-        NadirInspectionStep(),
-        ClosedLoopRTLStep(),
-    ]
+    all_steps = {
+        1: TakeoffStep,
+        2: ForwardSearchStep,
+        3: VisualServoingStep,
+        4: NadirInspectionStep,
+        5: ClosedLoopRTLStep,
+    }
+
+    selection = parse_stage_selection(getattr(args, "stages", None))
+    if selection is None:
+        steps = [factory() for factory in all_steps.values()]
+    else:
+        steps = [all_steps[number]() for number in selection]
+        logger.warning(
+            "Partial run: stages %s only. The remaining stages are not executed, "
+            "so any state they would establish is absent.",
+            ", ".join(str(n) for n in selection),
+        )
+
+    stage_numbers = list(all_steps) if selection is None else list(selection)
 
     runner = MissionRunner(
         context=ctx,
         steps=steps,
         on_finalize=lambda: telemetry_node.destroy_node(),
+        stage_numbers=stage_numbers,
     )
+
+    # The ground station's stage control.
+    #
+    # One Int32 naming the stage the operator wants next. It lands on the same
+    # executor as the odometry subscription, sets the context's jump event, and
+    # the running step unwinds through its own abort path; the runner then reads
+    # which of the two happened and continues at the requested stage.
+    #
+    # Stage 1 is refused while the aircraft is off the ground. TakeoffStep opens
+    # by arming and climbing from a standstill, and commanding that at something
+    # already flying is the one jump in the set that is not merely unusual.
+    def _on_stage_request(message: Int32) -> None:
+        requested = int(message.data)
+        if requested not in stage_numbers:
+            logger.warning("Stage request %d ignored: not in this run.", requested)
+            return
+        if requested == 1:
+            # TakeoffStep opens by arming and climbing from a standstill.
+            # Commanding that at an airframe already in the air is the one jump
+            # in the set that is not merely unusual, so it is refused rather
+            # than flown.
+            try:
+                airborne = odom_supervisor.snapshot().relative_altitude > 0.25
+            except Exception:  # noqa: BLE001 - no reading is not a reason to allow it
+                airborne = True
+            if airborne:
+                logger.warning("Stage request 1 refused: the aircraft is already airborne.")
+                return
+        logger.info("Stage %d requested by the ground station.", requested)
+        ctx.request_stage(requested)
+
+    stage_topic = f"/{params.network.namespace.strip('/')}/mission/goto_stage"
+    telemetry_node.create_subscription(Int32, stage_topic, _on_stage_request, 10)
+    logger.info("Stage control listening on %s", stage_topic)
 
     # Registration is explicit rather than a constructor side effect, so the
     # runner can be constructed in a test off the main thread.
