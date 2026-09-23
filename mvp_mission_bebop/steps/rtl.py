@@ -507,11 +507,10 @@ class ClosedLoopRTLStep(BaseStep):
             return self._legacy_return(ctx, guidance)
 
         logger.info(
-            "RTL/ArUco engaged. Marker ID %d, dictionary %dx%d_1000, tag %.3f m, "
+            "RTL/ArUco engaged. Marker ID %d, dictionary %s, tag %.3f m, "
             "gimbal %.1f deg, reverse cruise %.3f normalized (%.3f m/s), search window "
             "%.1f s, centering window %.1f s.",
             rtl_cfg.target_aruco_id,
-            rtl_cfg.marker_dict,
             rtl_cfg.marker_dict,
             rtl_cfg.tag_size,
             rtl_cfg.camera_tilt_deg,
