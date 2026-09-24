@@ -88,6 +88,8 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   // Events
   onTelemetryUpdate: subscribe('bmg:telemetry-update'),
   onStepChange: subscribe('bmg:step-change'),
+  // Flight-script milestones, from mission.py stdout and from the launch itself.
+  onMilestone: subscribe('bmg:milestone'),
   onRawEvidenceReady: subscribe('bmg:raw-evidence-ready'),
   onMissionLog: subscribe('bmg:mission-log'),
   onDriverLog: subscribe('bmg:driver-log'),

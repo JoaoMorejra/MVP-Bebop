@@ -4,6 +4,7 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const { spawn, exec, execSync } = require('child_process');
+const { createMilestoneParser, scheduleScriptMilestones } = require('./milestones.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const MISSION_DIR = '/home/joaomoreira/ros2_ws/src/mvp_mission_bebop/mvp_mission_bebop';
@@ -2212,6 +2213,17 @@ async function startMissionProcess(options = {}) {
     missionProcess = spawn(NECTAR_ACTIVATOR, ['python3', ...args], { cwd: MISSION_DIR, env });
     missionStartedAt = Date.now();
 
+    // Flight-script milestones travel on their own channel rather than on
+    // `bmg:step-change`, which stays the five-stage contract it has always
+    // been. A bench routine is one stage out of its script, so only a full
+    // launch raises the two milestones this process owns.
+    const forwardMilestone = (message) => send('bmg:milestone', message);
+    const milestones = createMilestoneParser(forwardMilestone);
+    const fullScript = !args.includes('--stages');
+    const cancelScriptMilestones = fullScript
+      ? scheduleScriptMilestones(Number(options.countdown ?? 0), forwardMilestone)
+      : () => {};
+
     recordLog('mission', {
       type: 'stdout',
       text:
@@ -2224,6 +2236,7 @@ async function startMissionProcess(options = {}) {
     missionProcess.stdout.on('data', (data) => {
       const text = data.toString();
       recordLog('mission', { type: 'stdout', text });
+      milestones.push(text);
 
       // The stage machine. `mission.py` logs `--- [STEP N: ...] ---` from each
       // step's `execute`, on stdout, which is what makes this reliable.
@@ -2239,6 +2252,8 @@ async function startMissionProcess(options = {}) {
     });
 
     missionProcess.on('close', (code, signal) => {
+      milestones.flush();
+      cancelScriptMilestones();
       missionProcess = null;
       missionStartedAt = null;
       recordLog('mission', { type: 'exit', text: `[BMG] Missão finalizada com código ${code}\n` });

@@ -218,6 +218,20 @@ export interface MissionStepEvent {
   stepName: string;
 }
 
+/**
+ * One milestone of the flight script, on `bmg:milestone`.
+ *
+ * `key` is a pool key of the synchronisation table (`lib/copilotPhrases.ts`);
+ * it is typed as a string because it crosses a process boundary, and the
+ * renderer checks it before use. `payload` is the milestone's JSON detail.
+ */
+export interface MilestoneEvent {
+  key: string;
+  payload: Record<string, unknown>;
+  at: number;
+  source: 'mission' | 'station';
+}
+
 export interface MissionExitEvent {
   code: number | null;
   signal: string | null;
@@ -465,6 +479,7 @@ export interface BmgAPI {
 
   onTelemetryUpdate: (cb: (data: BmgTelemetry) => void) => () => void;
   onStepChange: (cb: (step: MissionStepEvent) => void) => () => void;
+  onMilestone: (cb: (event: MilestoneEvent) => void) => () => void;
   onRawEvidenceReady: (cb: (evidence: RawEvidence) => void) => () => void;
   onMissionLog: (cb: (log: LogLine) => void) => () => void;
   onDriverLog: (cb: (log: LogLine) => void) => () => void;
