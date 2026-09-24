@@ -77,10 +77,14 @@ export function useTelemetry() {
     // trail built on them jumps by the difference.
     let x: number;
     let y: number;
-    if (typeof data.odom_x_m === 'number' && typeof data.odom_y_m === 'number') {
-      if (!odomHomeRef.current) odomHomeRef.current = { x: data.odom_x_m, y: data.odom_y_m };
-      x = data.odom_x_m - odomHomeRef.current.x;
-      y = data.odom_y_m - odomHomeRef.current.y;
+    //
+    // East and north, not the raw `odom_x_m`/`odom_y_m`: the driver's frame is
+    // x north, y west, and drawing it as x east rotated the whole trail by 90
+    // degrees (`telemetry_bridge.py:odom_to_enu`).
+    if (typeof data.east_m === 'number' && typeof data.north_m === 'number') {
+      if (!odomHomeRef.current) odomHomeRef.current = { x: data.east_m, y: data.north_m };
+      x = data.east_m - odomHomeRef.current.x;
+      y = data.north_m - odomHomeRef.current.y;
     } else {
       if (!data.latitude || !data.longitude) return;
       if (!homeRef.current) {

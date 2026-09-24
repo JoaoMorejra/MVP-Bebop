@@ -45,6 +45,7 @@ export interface BmgTelemetry {
   speed: number;
   altitude: number;
   flight_time_sec: number;
+  /** Compass heading in degrees: 0 north, clockwise, [0, 360). */
   heading: number;
   latitude: number;
   longitude: number;
@@ -63,9 +64,15 @@ export interface BmgTelemetry {
   signal_source?: 'aircraft' | 'host' | 'none';
   position_source?: 'gps' | 'odometry';
   gps_fix?: boolean;
-  /** Raw `/bebop/odom` position, metres. Null while odometry is stale. */
+  /**
+   * Raw `/bebop/odom` position, metres, in the driver's frame: x north, y west.
+   * Null while odometry is stale. Draw from `east_m`/`north_m` instead.
+   */
   odom_x_m?: number | null;
   odom_y_m?: number | null;
+  /** The same position as metres east and north of the odometry origin. */
+  east_m?: number | null;
+  north_m?: number | null;
   /**
    * The real reference the flight is placed against: the aircraft's first GPS
    * fix, or the operator's cached position. False means there is none, and

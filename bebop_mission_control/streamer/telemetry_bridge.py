@@ -117,6 +117,32 @@ def _now() -> float:
 
 
 # -----------------------------------------------------------------------------
+# The driver's odometry frame
+# -----------------------------------------------------------------------------
+#
+# ``ros2_bebop_driver`` (``BebopDriverNode::publishOdometry``) takes the ARSDK
+# speed, which is NED -- speedX towards north, speedY towards east, speedZ
+# down -- negates Y and Z, and integrates it; it takes the ARSDK yaw, which is
+# the magnetic heading clockwise from north, and negates it. Its variables are
+# named ``*_enu``, but what it publishes on ``/bebop/odom`` is x north, y west,
+# z up, with yaw counter-clockwise from north. Reading x as east and y as north
+# rotated every flight 90 degrees clockwise on the tactical map, and passing
+# the yaw on as a compass heading mirrored the nose about the north-south axis.
+# These two functions are the only place that knowledge lives.
+
+
+def odom_to_enu(x: float, y: float) -> Tuple[float, float]:
+    """Driver odometry position to ``(east, north)`` metres."""
+    return -y, x
+
+
+def odom_yaw_to_compass(yaw_deg: float) -> float:
+    """Driver odometry yaw to a compass heading: 0 north, clockwise, [0, 360)."""
+    heading = (-yaw_deg) % 360.0
+    return 0.0 if heading >= 360.0 else heading
+
+
+# -----------------------------------------------------------------------------
 # Shared state
 # -----------------------------------------------------------------------------
 
@@ -332,13 +358,14 @@ class TelemetryState:
             # Position: a real GPS fix wins; otherwise project the odometry
             # offset onto the real base reference, when there is one.
             dx, dy = self.position_xy
+            east, north = odom_to_enu(dx, dy)
             if self.gps_fix and self.gps_latitude is not None:
                 latitude = round(self.gps_latitude, 7)
                 longitude = round(self.gps_longitude or 0.0, 7)
                 position_source = "gps"
             elif base is not None:
-                d_lat = dy / 111139.0
-                d_lon = dx / (111139.0 * max(1e-6, math.cos(math.radians(base.latitude))))
+                d_lat = north / 111139.0
+                d_lon = east / (111139.0 * max(1e-6, math.cos(math.radians(base.latitude))))
                 latitude = round(base.latitude + d_lat, 7)
                 longitude = round(base.longitude + d_lon, 7)
                 position_source = "odometry"
@@ -408,7 +435,7 @@ class TelemetryState:
                 "speed": round(self.speed, 2) if reachable else 0.0,
                 "altitude": round(self.altitude, 2) if reachable else 0.0,
                 "flight_time_sec": int(self.flight_time_sec) if reachable else 0,
-                "heading": round(self.heading, 1) if reachable else 0.0,
+                "heading": round(odom_yaw_to_compass(self.heading), 1) if reachable else 0.0,
                 "latitude": latitude,
                 "longitude": longitude,
                 # -- additions ----------------------------------------------
@@ -427,6 +454,10 @@ class TelemetryState:
                 # that may have switched between GPS and projection mid-flight.
                 "odom_x_m": round(dx, 3) if odom_fresh and reachable else None,
                 "odom_y_m": round(dy, 3) if odom_fresh and reachable else None,
+                # The same position in the frame the map draws in: metres east
+                # and north of the odometry origin. See `odom_to_enu`.
+                "east_m": round(east, 3) if odom_fresh and reachable else None,
+                "north_m": round(north, 3) if odom_fresh and reachable else None,
                 **base_payload,
                 # Where the camera is actually pointing, and how long ago that
                 # was commanded. Null until something has commanded it at all:
