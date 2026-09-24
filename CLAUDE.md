@@ -1,6 +1,6 @@
 # Diretrizes de Engenharia e Protocolo de Operacao (CLAUDE.md)
 
-Este documento estabelece as regras mandatorias de engenharia de software, sincronizacao de repositorio, compilacao, validacao e qualidade de codigo para qualquer sessao de desenvolvimento.
+Este documento estabelece as regras mandatorias de engenharia de software, sincronizacao de repositorio, compilacao, validacao, padroes de projeto e qualidade de codigo para qualquer sessao de desenvolvimento.
 
 ---
 
@@ -17,7 +17,26 @@ O projeto consiste no sistema autonomo completo para o drone **Parrot Bebop 2**,
 
 ---
 
-## 2. Estrutura do Repositorio e Sincronizacao Multi-Dispositivo
+## 2. Referencia Obrigatoria: Ecossistema Black Bee Drones (Nectar SDK)
+
+O repositorio oficial da **Black Bee Drones** localiza-se no workspace em:
+```text
+/home/jv/ros2_ws/src/nectar-sdk
+```
+
+### Regras de Ouro de Conhecimento e Implementacao
+1. **Analise Previa Obrigatoria:** Antes de iniciar QUALQUER nova implementacao (controle, visao, filtros, cinematica, comunicacao ou interface de sensores), o Claude DEVE obrigatoriamente inspecionar e analisar o repositorio da Black Bee Drones (`nectar-sdk`).
+2. **Fonte da Verdade Absoluta:** Se uma funcionalidade, algoritmo, filtro, modelo de dados ou metodo ja estiver implementado na Black Bee Drones, ele DEVE ser tomado como verdade absoluta e seguido fielmente.
+3. **Reutilizacao Direta:** Nao reinventar a roda. Se o `nectar-sdk` fornece a classe, rotina ou abstracao (por exemplo, `CameraCalibration`, resolvedores de dicionario ArUco/AprilTag, interfaces de drone, controladores), deve-se priorizar a importacao e utilizacao nativa do SDK.
+4. **Estilo, Trejeitos e Padrao de Codigo da Black Bee:**
+   - Toda implementacao deve ser inspirada e replicar exatamente o estilo de engenharia, arquitetura e trejeitos da Black Bee Drones.
+   - Adotar docstrings estruturadas no padrao NumPy/SciPy / reST (`Parameters`, `Returns`, `Raises`, explicacao detalhada de constantes e comportamentos de fallback).
+   - Validacao defensiva rigorosa de entradas com tratamento de tipos (`Union`, `Optional`), conversao segura de strings/inteiros e lancamento de excecoes apropriadas (`ValueError`, `TypeError`).
+   - Nomenclatura concisa, tecnica e alinhada ao vocabulario aeroespacial e robotico da equipe.
+
+---
+
+## 3. Estrutura do Repositorio e Sincronizacao Multi-Dispositivo
 
 O projeto adota a arquitetura de **Monorepo**:
 ```text
@@ -46,7 +65,7 @@ MVP-Bebop/
 
 ---
 
-## 3. Compilacao, Ambiente e Execucao
+## 4. Compilacao, Ambiente e Execucao
 
 ### Ambiente Python e ROS 2
 - O ambiente canonico e ativado atraves de:
@@ -82,9 +101,9 @@ MVP-Bebop/
 
 ---
 
-## 4. Padroes de Codigo e Diretrizes de Engenharia
+## 5. Padroes de Codigo e Diretrizes de Engenharia
 
-Toda contribuicao deve atender ao padrao de engenharia de software senior do estado da arte:
+Toda contribuicao deve atender ao mais alto nivel profissional do estado da arte:
 
 ### Tolerancia Zero a Caracteristicas de IA / LLM
 - **Sem Emojis:** E estritamente proibido o uso de emojis em arquivos de codigo, comentarios, mensagens de log, documentacao ou mensagens de commit.
