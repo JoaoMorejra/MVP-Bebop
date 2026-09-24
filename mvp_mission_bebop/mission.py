@@ -307,7 +307,8 @@ def main() -> None:
         "Active parameters: altitude=%.2fm, velocity=%.3fm/s, hover=%.1fs, "
         "search_timeout=%.1fs, confidence=%.2f, confirmation_frames=%d, "
         "classes=%s, rtl_radius=%.2fm, countdown=%.1fs, no_fly=%s, "
-        "aruco_id=%d, aruco_dict=%s, aruco_size=%.3fm",
+        "aruco_id=%d, aruco_dict=%s, aruco_size=%.3fm, stabilize=%.1fs, "
+        "search_tilt=%.0fdeg, nadir_freeze_tilt=%.0fdeg (tol %.1fdeg), rtl_timeout=%.0fs",
         params.kinematics.target_altitude_m,
         params.kinematics.forward_cruise_velocity,
         params.kinematics.hover_duration_sec,
@@ -321,6 +322,11 @@ def main() -> None:
         params.rtl.target_aruco_id,
         params.rtl.marker_dict,
         params.rtl.tag_size,
+        params.kinematics.takeoff_stabilize_duration_sec,
+        params.gimbal.search_tilt_deg,
+        params.gimbal.nadir_tilt_deg,
+        params.gimbal.nadir_tilt_tolerance_deg,
+        params.rtl.timeout_sec,
     )
 
     try:
