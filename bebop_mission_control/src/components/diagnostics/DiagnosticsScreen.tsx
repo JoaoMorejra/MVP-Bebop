@@ -1,7 +1,11 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import { ArrowDownToLine, Pause, Play, Search, Trash2 } from 'lucide-react';
-import type { LogLine, TerminalInfo } from '../../types/bmg';
+import type { LogLine } from '../../types/bmg';
 import { cn } from '../../lib/format';
+import { createLandInterceptor } from '../../lib/terminalInput';
 import { useBridge } from '../../hooks/useBridge';
 
 interface DiagnosticsScreenProps {
@@ -12,69 +16,49 @@ interface DiagnosticsScreenProps {
   missionRunning: boolean;
   /** Emergency landing: the same path as the cockpit's abort. */
   onLand: () => Promise<void> | void;
-  /** `exit` closes the terminal. */
+  /** The shell ended (`exit`, Ctrl+D): the terminal closes with it. */
   onClose?: () => void;
 }
 
 type LogSource = 'mission' | 'driver' | 'none';
 
-/** One thing the terminal printed, from the process logs or from the operator's shell. */
-type Entry =
-  | { kind: 'log'; source: 'mission' | 'driver'; type: string; text: string; at: number }
-  | { kind: 'cmd'; command: string; cwd: string; at: number }
-  | { kind: 'chunk'; job: string; stream: 'stdout' | 'stderr'; text: string; at: number }
-  | { kind: 'info'; tone: 'info' | 'ok' | 'warn' | 'error'; text: string; at: number };
-
 interface Row {
   key: string;
   text: string;
-  tone: 'plain' | 'stderr' | 'exit' | 'cmd' | 'info' | 'ok' | 'warn' | 'error';
-  /** For `cmd` rows: the prompt that preceded the command. */
-  prompt?: string;
+  tone: 'plain' | 'stderr' | 'exit' | 'warn' | 'error';
 }
 
-const PROMPT_USER = 'operator@bmg-ground-station';
-const HISTORY_KEY = 'bmg.terminal-history.v1';
-const HISTORY_LIMIT = 200;
 /** Rendering more than this makes the scroll the bottleneck, not the data. */
 const ROW_LIMIT = 2500;
 
-const HELP_TEXT = [
-  'Comandos embutidos:',
-  '  help            esta ajuda',
-  '  clear           limpa a tela (Ctrl+L)',
-  '  land            POUSO DE EMERGÊNCIA: publica /bebop/land e encerra a missão',
-  '  topics          lista os tópicos ROS 2 ativos (ros2 topic list -t)',
-  '  nodes           lista os nós ROS 2 ativos',
-  '  history         comandos anteriores',
-  '  exit            fecha o terminal',
-  '',
-  'Qualquer outro comando roda em bash, no ambiente da missão (nectar-activate):',
-  '  ros2 topic echo /bebop/odom --once',
-  '  ros2 topic hz /bebop/camera/image_raw',
-  "  ros2 topic pub --once /bebop/land std_msgs/msg/Empty '{}'",
-  '  ping -c 3 192.168.42.1',
-  '',
-  'Ctrl+C interrompe o comando em execução. Setas ↑/↓ percorrem o histórico.',
-];
+/** The station palette, for the shell's ANSI colours. */
+const TERMINAL_THEME = {
+  background: '#03090e',
+  foreground: '#dbe8e5',
+  cursor: '#01D5A3',
+  cursorAccent: '#03090e',
+  selectionBackground: '#1c3a47',
+  black: '#03090e',
+  red: '#FF6A45',
+  green: '#01D5A3',
+  yellow: '#FFC24B',
+  blue: '#4FA3FF',
+  magenta: '#C792EA',
+  cyan: '#4DE3F0',
+  white: '#dbe8e5',
+  brightBlack: '#557482',
+  brightRed: '#FF8A6B',
+  brightGreen: '#5CF2CE',
+  brightYellow: '#FFD580',
+  brightBlue: '#7FBFFF',
+  brightMagenta: '#DDB3FF',
+  brightCyan: '#8AF2FA',
+  brightWhite: '#FFFFFF',
+};
 
-function loadHistory(): string[] {
-  try {
-    const raw = window.localStorage.getItem(HISTORY_KEY);
-    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
-    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveHistory(history: string[]) {
-  try {
-    window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-HISTORY_LIMIT)));
-  } catch {
-    /* private mode: the history lives for the session only */
-  }
-}
+const BANNER =
+  '\x1b[1;32mBMG Ground Station\x1b[0m \u00b7 bash no ambiente da miss\u00e3o (nectar-activate)\r\n' +
+  '\x1b[1;33mland\x1b[0m + Enter = POUSO DE EMERG\u00caNCIA \u00b7 \x1b[1mexit\x1b[0m fecha o terminal \u00b7 Tab completa \u00b7 Ctrl+C interrompe\r\n\r\n';
 
 const TIMESTAMP_RE =
   /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?|\[\d+\.\d+\]|\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b)/;
@@ -139,25 +123,144 @@ const TONE_CLASS: Record<Row['tone'], string> = {
   plain: 'text-frost/85',
   stderr: 'text-frost/70',
   exit: 'text-mint',
-  cmd: 'text-frost',
-  info: 'text-haze',
-  ok: 'text-mint',
   warn: 'text-amber',
   error: 'text-ember',
 };
 
 /**
- * Diagnostics, as a terminal.
+ * The shell: xterm.js on a real PTY in the mission's environment.
+ *
+ * Keystrokes go to the PTY as raw bytes, so bash owns editing, history and
+ * Tab completion. The one exception is the emergency shortcut: every chunk
+ * passes through the `land` interceptor first, and `land` + Enter lands the
+ * aircraft without the Enter ever reaching the shell -- instantly, and even
+ * while a command holds the foreground.
+ */
+const ShellPane: React.FC<{ onLand: DiagnosticsScreenProps['onLand']; onExit?: () => void }> = ({
+  onLand,
+  onExit,
+}) => {
+  const bridge = useBridge();
+  const hostRef = useRef<HTMLDivElement>(null);
+  const onLandRef = useRef(onLand);
+  onLandRef.current = onLand;
+  const onExitRef = useRef(onExit);
+  onExitRef.current = onExit;
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const term = new Terminal({
+      fontFamily: '"Azeret Mono", SFMono-Regular, Menlo, Consolas, monospace',
+      fontSize: 12,
+      lineHeight: 1.2,
+      cursorBlink: true,
+      scrollback: 5000,
+      theme: TERMINAL_THEME,
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(host);
+    try {
+      fit.fit();
+    } catch {
+      // A host with no size yet; the observer below fits it once it has one.
+    }
+    term.write(BANNER);
+    term.focus();
+
+    if (!bridge) {
+      term.write('\x1b[33mSem ponte Electron: o terminal s\u00f3 abre no aplicativo desktop.\x1b[0m\r\n');
+      return () => term.dispose();
+    }
+
+    let id: string | null = null;
+    let disposed = false;
+    const interceptor = createLandInterceptor();
+
+    const offData = bridge.onTerminalData((event) => {
+      if (event.id === id) term.write(event.data);
+    });
+    const offExit = bridge.onTerminalExit((event) => {
+      if (event.id !== id) return;
+      id = null;
+      onExitRef.current?.();
+    });
+
+    const input = term.onData((data) => {
+      const { forward, land } = interceptor.feed(data);
+      if (forward && id) void bridge.terminalWrite(id, forward);
+      if (!land) return;
+      term.write('\r\n\x1b[1;33m[BMG] POUSO DE EMERG\u00caNCIA: publicando /bebop/land e encerrando a miss\u00e3o.\x1b[0m\r\n');
+      Promise.resolve()
+        .then(() => onLandRef.current())
+        .then(
+          () => term.write('\x1b[32m[BMG] Pouso comandado. Acompanhe o estado de voo na Cabine.\x1b[0m\r\n'),
+          (error: unknown) =>
+            term.write(
+              `\x1b[31m[BMG] ${error instanceof Error ? error.message : 'falha ao comandar o pouso'}\x1b[0m\r\n`
+            )
+        );
+    });
+
+    void bridge.terminalSpawn({ cols: term.cols, rows: term.rows }).then((result) => {
+      if (disposed) {
+        if (result.success) void bridge.terminalKill(result.id);
+        return;
+      }
+      if (!result.success) {
+        term.write(`\x1b[31mTerminal indispon\u00edvel: ${result.error}\x1b[0m\r\n`);
+        return;
+      }
+      id = result.id;
+      if (result.cols !== term.cols || result.rows !== term.rows) {
+        void bridge.terminalResize(result.id, term.cols, term.rows);
+      }
+    });
+
+    const observer = new ResizeObserver(() => {
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      if (id) void bridge.terminalResize(id, term.cols, term.rows);
+    });
+    observer.observe(host);
+
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      input.dispose();
+      offData();
+      offExit();
+      if (id) void bridge.terminalKill(id);
+      term.dispose();
+    };
+  }, [bridge]);
+
+  return (
+    <div
+      ref={hostRef}
+      className="h-full w-full px-3 py-2"
+      style={{ background: TERMINAL_THEME.background }}
+      aria-label="Terminal bash"
+    />
+  );
+};
+
+/**
+ * Diagnostics: the process logs, and a real shell.
  *
  * The live stdout and stderr of `mission.py` (or of the driver and bridges)
- * scroll past exactly as a shell would print them, coloured the way a log
- * highlighter would — timestamps mint, topics cyan, warnings amber, errors red —
- * and a real prompt at the foot runs commands in the mission's own environment
- * through `bmg:terminal-exec`, so `ros2 topic echo` sees the aircraft's graph.
+ * scroll past in their own pane, coloured the way a log highlighter would --
+ * timestamps mint, topics cyan, warnings amber, errors red -- and below them
+ * an interactive bash on a PTY runs in the mission's own environment, so
+ * `ros2 topic echo` sees the aircraft's graph and Tab completes natively.
  *
- * `clear` hides what is on screen without discarding the process history the
- * host keeps; the logs are evidence, and a tidy screen is not a reason to lose
- * them.
+ * `clear` in the toolbar hides the logs on screen without discarding the
+ * process history the host keeps, and clears the shell's screen; the logs are
+ * evidence, and a tidy screen is not a reason to lose them.
  */
 export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
   missionLog,
@@ -167,119 +270,30 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
   onLand,
   onClose,
 }) => {
-  const bridge = useBridge();
   const [source, setSource] = useState<LogSource>('mission');
   const [filter, setFilter] = useState('');
   const [showFilter, setShowFilter] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [clearedAt, setClearedAt] = useState(0);
-  const [session, setSession] = useState<Entry[]>([]);
-  const [input, setInput] = useState('');
-  const [history, setHistory] = useState<string[]>(loadHistory);
-  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
-  const [runningJob, setRunningJob] = useState<string | null>(null);
-  const [info, setInfo] = useState<TerminalInfo | null>(null);
-
   const scrollRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const jobSeq = useRef(0);
-  const draftRef = useRef('');
-
-  const push = useCallback((entry: Entry) => setSession((previous) => [...previous, entry].slice(-4000)), []);
-  const note = useCallback(
-    (text: string, tone: 'info' | 'ok' | 'warn' | 'error' = 'info') =>
-      push({ kind: 'info', tone, text, at: Date.now() }),
-    [push]
-  );
-
-  // Where the shell is, and a banner saying what this is.
-  useEffect(() => {
-    if (!bridge) {
-      note('Sem ponte Electron: o terminal só executa comandos no aplicativo desktop.', 'warn');
-      return;
-    }
-    void bridge
-      .getTerminalInfo()
-      .then(setInfo)
-      .catch(() => undefined);
-    void bridge
-      .getEnvInfo()
-      .then((env) =>
-        note(
-          `BMG Ground Station · ROS 2 ${env.rosDistro} · ROS_DOMAIN_ID=${env.rosDomainId} · ${env.venvPath}. Digite help.`
-        )
-      )
-      .catch(() => note('BMG Ground Station. Digite help.'));
-  }, [bridge, note]);
-
-  // Streamed output of the command that is running.
-  useEffect(() => {
-    if (!bridge) return;
-    return bridge.onTerminalOutput((event) => {
-      push({ kind: 'chunk', job: event.id, stream: event.stream, text: event.text, at: Date.now() });
-    });
-  }, [bridge, push]);
-
-  const cwd = info?.cwd ?? '/home/joaomoreira/ros2_ws';
-  const home = info?.home ?? '/home/joaomoreira';
-  const displayCwd = cwd === home ? '~' : cwd.startsWith(`${home}/`) ? `~${cwd.slice(home.length)}` : cwd;
-  const prompt = `${PROMPT_USER}:${displayCwd}$`;
 
   const rows = useMemo((): Row[] => {
-    const logs: Entry[] = [];
     const lines = source === 'mission' ? missionLog : source === 'driver' ? driverLog : [];
-    for (const line of lines) {
-      const at = line.at ?? 0;
-      if (at < clearedAt) continue;
-      logs.push({ kind: 'log', source: source === 'driver' ? 'driver' : 'mission', type: line.type, text: line.text, at });
-    }
-    const entries = [...logs, ...session.filter((e) => e.at >= clearedAt)].sort((a, b) => a.at - b.at);
-
     const out: Row[] = [];
-    let i = 0;
-    while (i < entries.length) {
-      const entry = entries[i];
-      if (entry.kind === 'chunk') {
-        // Consecutive chunks of one stream of one job are one text: a line the
-        // pipe delivered in two reads is still one line.
-        let text = entry.text;
-        let j = i + 1;
-        while (j < entries.length) {
-          const next = entries[j];
-          if (next.kind !== 'chunk' || next.job !== entry.job || next.stream !== entry.stream) break;
-          text += next.text;
-          j += 1;
-        }
-        text.replace(/\n$/, '').split('\n').forEach((part, k) => {
-          out.push({
-            key: `c${i}-${k}`,
-            text: part,
-            tone: entry.stream === 'stderr' ? toneOfLog('stderr', part) : 'plain',
-          });
+    lines.forEach((line, i) => {
+      if ((line.at ?? 0) < clearedAt) return;
+      line.text
+        .replace(/\n$/, '')
+        .split('\n')
+        .forEach((part, k) => {
+          if (part.length === 0) return;
+          out.push({ key: `l${i}-${k}`, text: part, tone: toneOfLog(line.type, part) });
         });
-        i = j;
-        continue;
-      }
-      if (entry.kind === 'log') {
-        entry.text
-          .replace(/\n$/, '')
-          .split('\n')
-          .forEach((part, k) => {
-            if (part.length === 0) return;
-            out.push({ key: `l${i}-${k}`, text: part, tone: toneOfLog(entry.type, part) });
-          });
-      } else if (entry.kind === 'cmd') {
-        out.push({ key: `p${i}`, text: entry.command, tone: 'cmd', prompt: entry.cwd });
-      } else {
-        entry.text.split('\n').forEach((part, k) => out.push({ key: `i${i}-${k}`, text: part, tone: entry.tone }));
-      }
-      i += 1;
-    }
-
+    });
     const needle = filter.trim().toLowerCase();
     const filtered = needle ? out.filter((r) => r.text.toLowerCase().includes(needle)) : out;
     return filtered.length > ROW_LIMIT ? filtered.slice(filtered.length - ROW_LIMIT) : filtered;
-  }, [source, missionLog, driverLog, session, clearedAt, filter]);
+  }, [source, missionLog, driverLog, clearedAt, filter]);
 
   useLayoutEffect(() => {
     if (autoScroll && scrollRef.current) {
@@ -297,141 +311,12 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
     };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
-  }, []);
+  }, [source]);
 
   const clearScreen = useCallback(() => {
     setClearedAt(Date.now());
-    setSession([]);
     onClearLogs();
   }, [onClearLogs]);
-
-  const runShell = useCallback(
-    async (command: string) => {
-      if (!bridge) {
-        note('Sem ponte Electron: comando não executado.', 'error');
-        return;
-      }
-      jobSeq.current += 1;
-      const id = `job-${Date.now()}-${jobSeq.current}`;
-      setRunningJob(id);
-      try {
-        const result = await bridge.terminalExec(command, id);
-        // `cd` answers without streaming; its error is only in the result.
-        if (result.stderr && !result.durationMs) note(result.stderr.replace(/\n$/, ''), 'error');
-        setInfo((previous) => (previous ? { ...previous, cwd: result.cwd } : previous));
-        if (result.signal) {
-          note(`[interrompido: ${result.signal}]`, 'warn');
-        } else if (result.exitCode !== 0 && result.exitCode !== null) {
-          note(`[código de saída ${result.exitCode}]`, 'error');
-        }
-      } catch (err) {
-        note(err instanceof Error ? err.message : 'falha ao executar', 'error');
-      } finally {
-        setRunningJob(null);
-        window.requestAnimationFrame(() => inputRef.current?.focus());
-      }
-    },
-    [bridge, note]
-  );
-
-  const execute = useCallback(
-    async (raw: string) => {
-      const command = raw.trim();
-      push({ kind: 'cmd', command: raw, cwd: prompt, at: Date.now() });
-      if (!command) return;
-
-      setHistory((previous) => {
-        const next = previous[previous.length - 1] === command ? previous : [...previous, command];
-        saveHistory(next);
-        return next.slice(-HISTORY_LIMIT);
-      });
-
-      switch (command) {
-        case 'clear':
-          clearScreen();
-          return;
-        case 'help':
-          note(HELP_TEXT.join('\n'));
-          return;
-        case 'history':
-          note(history.map((h, index) => `${String(index + 1).padStart(4, ' ')}  ${h}`).join('\n') || '(vazio)');
-          return;
-        case 'exit':
-          onClose?.();
-          return;
-        case 'land':
-          note('POUSO DE EMERGÊNCIA: publicando /bebop/land e encerrando a missão.', 'warn');
-          try {
-            await onLand();
-            note('Pouso comandado. Acompanhe o estado de voo na Cabine.', 'ok');
-          } catch (err) {
-            note(err instanceof Error ? err.message : 'falha ao comandar o pouso', 'error');
-          }
-          return;
-        case 'topics':
-          await runShell('ros2 topic list -t');
-          return;
-        case 'nodes':
-          await runShell('ros2 node list');
-          return;
-        default:
-          await runShell(command);
-      }
-    },
-    [push, prompt, clearScreen, note, history, onClose, onLand, runShell]
-  );
-
-  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (event.ctrlKey && (event.key === 'c' || event.key === 'C')) {
-      // Copy stays copy when there is a selection.
-      if (window.getSelection()?.toString()) return;
-      event.preventDefault();
-      if (runningJob && bridge) {
-        void bridge.terminalKill(runningJob);
-        note('^C', 'warn');
-      } else {
-        push({ kind: 'cmd', command: `${input}^C`, cwd: prompt, at: Date.now() });
-        setInput('');
-      }
-      return;
-    }
-    if (event.ctrlKey && (event.key === 'l' || event.key === 'L')) {
-      event.preventDefault();
-      clearScreen();
-      return;
-    }
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      if (runningJob) return;
-      const command = input;
-      setInput('');
-      setHistoryIndex(null);
-      setAutoScroll(true);
-      void execute(command);
-      return;
-    }
-    if (event.key === 'ArrowUp') {
-      event.preventDefault();
-      if (history.length === 0) return;
-      if (historyIndex === null) draftRef.current = input;
-      const next = historyIndex === null ? history.length - 1 : Math.max(0, historyIndex - 1);
-      setHistoryIndex(next);
-      setInput(history[next]);
-      return;
-    }
-    if (event.key === 'ArrowDown') {
-      event.preventDefault();
-      if (historyIndex === null) return;
-      const next = historyIndex + 1;
-      if (next >= history.length) {
-        setHistoryIndex(null);
-        setInput(draftRef.current);
-      } else {
-        setHistoryIndex(next);
-        setInput(history[next]);
-      }
-    }
-  };
 
   const followNow = () => {
     setAutoScroll(true);
@@ -442,17 +327,12 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
     <div className="flex h-full min-h-0 flex-col p-3">
       <div
         className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-panel border border-[#0f2a36] shadow-2xl"
-        style={{ background: '#03090e' }}
+        style={{ background: TERMINAL_THEME.background }}
       >
         {/* Title bar. */}
         <div className="flex h-10 shrink-0 items-center gap-3 border-b border-[#0f2a36] bg-[#061219] px-3">
-          <span className="flex items-center gap-1.5" aria-hidden>
-            <span className="h-3 w-3 rounded-full bg-[#ff5f57]" />
-            <span className="h-3 w-3 rounded-full bg-[#febc2e]" />
-            <span className="h-3 w-3 rounded-full bg-[#28c840]" />
-          </span>
-          <span className="min-w-0 flex-1 truncate text-center font-mono text-2xs text-frost/70">
-            {PROMPT_USER}: {displayCwd} — bash
+          <span className="min-w-0 flex-1 truncate font-mono text-2xs text-frost/70">
+            operator@bmg — bash (pty)
           </span>
           <span
             className={cn(
@@ -465,7 +345,7 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
           </span>
         </div>
 
-        {/* Toolbar. */}
+        {/* Toolbar: the log view only; the shell below is untouched by it. */}
         <div className="flex h-9 shrink-0 items-center gap-2 border-b border-[#0f2a36] px-3 font-mono text-3xs">
           <span className="text-haze-deep">logs:</span>
           {(
@@ -498,7 +378,6 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
                   if (e.key === 'Escape') {
                     setFilter('');
                     setShowFilter(false);
-                    inputRef.current?.focus();
                   }
                 }}
                 placeholder="filtrar linhas"
@@ -534,8 +413,8 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
             <button
               type="button"
               onClick={clearScreen}
-              aria-label="Limpar a tela"
-              title="clear (Ctrl+L)"
+              aria-label="Limpar os logs"
+              title="Limpar os logs da tela"
               className="flex items-center gap-1 rounded px-1.5 py-0.5 text-haze transition-colors hover:text-frost"
             >
               <Trash2 size={11} />
@@ -544,85 +423,48 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
           </span>
         </div>
 
-        {/* Body. A click anywhere puts the cursor back on the prompt. */}
-        <div className="relative min-h-0 flex-1">
-          <div
-            ref={scrollRef}
-            onMouseUp={() => {
-              if (!window.getSelection()?.toString()) inputRef.current?.focus();
-            }}
-            className="scroll-thin h-full overflow-y-auto px-4 py-3 font-mono text-[12px] leading-[1.5]"
-          >
-            {rows.map((row) =>
-              row.tone === 'cmd' ? (
-                <div key={row.key} className="whitespace-pre-wrap break-words">
-                  <span className="font-semibold text-mint">{row.prompt}</span>{' '}
-                  <span className="text-frost">{row.text}</span>
-                </div>
-              ) : (
-                <div key={row.key} className={cn('whitespace-pre-wrap break-words', TONE_CLASS[row.tone])}>
-                  {row.tone === 'plain' || row.tone === 'stderr' || row.tone === 'warn' || row.tone === 'error' ? (
-                    <Highlighted text={row.text} />
-                  ) : (
-                    row.text || ' '
-                  )}
-                </div>
-              )
-            )}
-
-            {/* The prompt, as the last line of the output. */}
-            <div className="flex items-center whitespace-pre">
-              <span className="shrink-0 font-semibold text-mint">{prompt}</span>
-              <span className="w-2 shrink-0" />
-              <div className="relative flex min-w-0 flex-1 items-center">
-                <input
-                  ref={inputRef}
-                  autoFocus
-                  value={input}
-                  onChange={(e) => {
-                    setInput(e.target.value);
-                    setHistoryIndex(null);
-                  }}
-                  onKeyDown={onKeyDown}
-                  spellCheck={false}
-                  autoComplete="off"
-                  aria-label="Linha de comando"
-                  className="w-full bg-transparent font-mono text-[12px] text-frost outline-none"
-                  style={{ caretColor: '#01D5A3' }}
-                />
-                {input.length === 0 && !runningJob ? (
-                  <span
-                    aria-hidden
-                    className="anim-cursor pointer-events-none absolute left-0 top-1/2 h-[15px] w-[8px] -translate-y-1/2 bg-mint"
-                  />
-                ) : null}
-              </div>
-              {runningJob ? (
-                <span className="ml-3 shrink-0 text-3xs text-amber anim-breathe">
-                  executando · Ctrl+C interrompe
-                </span>
-              ) : null}
-            </div>
-          </div>
-
-          {!autoScroll ? (
-            <button
-              type="button"
-              onClick={followNow}
-              className="absolute bottom-3 right-5 flex items-center gap-1.5 rounded border border-[#1c3a47] bg-[#061219] px-2.5 py-1.5 font-mono text-3xs text-frost transition-colors hover:border-mint/60"
+        {/* Logs, when shown: a pane of their own above the shell. */}
+        {source !== 'none' ? (
+          <div className="relative min-h-0 basis-[42%] border-b border-[#0f2a36]">
+            <div
+              ref={scrollRef}
+              className="scroll-thin h-full overflow-y-auto px-4 py-3 font-mono text-[12px] leading-[1.5]"
             >
-              <ArrowDownToLine size={12} />
-              acompanhar
-            </button>
-          ) : null}
+              {rows.length === 0 ? (
+                <div className="text-haze-deep">(sem linhas de log)</div>
+              ) : (
+                rows.map((row) => (
+                  <div key={row.key} className={cn('whitespace-pre-wrap break-words', TONE_CLASS[row.tone])}>
+                    <Highlighted text={row.text} />
+                  </div>
+                ))
+              )}
+            </div>
+            {!autoScroll ? (
+              <button
+                type="button"
+                onClick={followNow}
+                className="absolute bottom-3 right-5 flex items-center gap-1.5 rounded border border-[#1c3a47] bg-[#061219] px-2.5 py-1.5 font-mono text-3xs text-frost transition-colors hover:border-mint/60"
+              >
+                <ArrowDownToLine size={12} />
+                acompanhar
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
+        {/* The shell. */}
+        <div className="min-h-0 flex-1">
+          <ShellPane onLand={onLand} onExit={onClose} />
         </div>
 
         {/* Status line. */}
         <div className="flex h-6 shrink-0 items-center justify-between border-t border-[#0f2a36] bg-[#061219] px-3 font-mono text-[10px] text-haze-deep">
           <span>
-            {rows.length} linhas{filter ? ` · filtro "${filter}"` : ''}
+            {source === 'none' ? 'logs ocultos' : `${rows.length} linhas de log`}
+            {filter ? ` · filtro "${filter}"` : ''}
           </span>
-          <span>help · clear · land · topics · nodes · ↑↓ histórico · Ctrl+C</span>
+          <span>land = pouso de emergência · exit fecha · Tab completa · Ctrl+C interrompe</span>
         </div>
       </div>
     </div>

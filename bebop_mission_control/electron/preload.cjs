@@ -74,11 +74,13 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   getDiagnostics: () => ipcRenderer.invoke('bmg:get-diagnostics'),
   getLogHistory: () => ipcRenderer.invoke('bmg:get-log-history'),
 
-  // Diagnostics terminal: a shell in the mission's own environment. Output
-  // streams on `bmg:terminal-output`; the promise resolves when it exits.
-  terminalExec: (command, id) => ipcRenderer.invoke('bmg:terminal-exec', { command, id }),
+  // Diagnostics terminal: an interactive bash on a PTY, in the mission's own
+  // environment. Output streams on `bmg:terminal-data`; `bmg:terminal-exit`
+  // says the shell ended.
+  terminalSpawn: (options = {}) => ipcRenderer.invoke('bmg:terminal-spawn', options),
+  terminalWrite: (id, data) => ipcRenderer.invoke('bmg:terminal-write', { id, data }),
+  terminalResize: (id, cols, rows) => ipcRenderer.invoke('bmg:terminal-resize', { id, cols, rows }),
   terminalKill: (id) => ipcRenderer.invoke('bmg:terminal-kill', id),
-  getTerminalInfo: () => ipcRenderer.invoke('bmg:terminal-info'),
 
   // Forensic evidence
   listEvidence: () => ipcRenderer.invoke('bmg:list-evidence'),
@@ -98,5 +100,6 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   onAnnounceDone: subscribe('bmg:announce-done'),
   onCameraTiltChanged: subscribe('bmg:camera-tilt-changed'),
   onMissionReset: subscribe('bmg:mission-reset'),
-  onTerminalOutput: subscribe('bmg:terminal-output'),
+  onTerminalData: subscribe('bmg:terminal-data'),
+  onTerminalExit: subscribe('bmg:terminal-exit'),
 });

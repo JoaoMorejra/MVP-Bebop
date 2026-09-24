@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const { spawn, exec, execSync } = require('child_process');
 const { createMilestoneParser, scheduleScriptMilestones } = require('./milestones.cjs');
+const { createTerminalHost } = require('./terminal.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const MISSION_DIR = '/home/joaomoreira/ros2_ws/src/mvp_mission_bebop/mvp_mission_bebop';
@@ -18,7 +19,7 @@ const COMMAND_SCRIPT = path.join(STREAMER_DIR, 'command_bridge.py');
 const MJPEG_PORT = 9090;
 const DRONE_IP = '192.168.42.1';
 const BEBOP_SSID_RE = /^Bebop2?[-_]/i;
-/** Where the operator's shell starts; `cd` in the diagnostics terminal moves it. */
+/** Where the diagnostics terminal's shell starts. */
 const TERMINAL_HOME = '/home/joaomoreira/ros2_ws';
 
 // Bring-up budget: how long the aircraft gets to answer each stage of
@@ -1983,132 +1984,29 @@ ipcMain.handle('bmg:save-operator-location', async (_event, payload = {}) => {
 // -----------------------------------------------------------------------------
 // IPC: diagnostics terminal
 //
-// A real shell for the operator, in the same environment the mission runs in
-// (`nectar-activate`: ROS 2, domain, venv), so `ros2 topic echo /bebop/odom`
-// typed here sees exactly the graph the aircraft is on. Output streams back as
-// it is produced -- `ros2 topic echo` never exits on its own -- and a running
-// command can be interrupted with Ctrl+C from the renderer.
+// A real interactive bash on a pseudo-terminal, in the mission's own
+// environment (the rcfile sources nectar-activate), so `ros2 topic echo
+// /bebop/odom` typed here sees exactly the graph the aircraft is on and Tab
+// completes the way it does in any ROS terminal. Bytes flow raw both ways; see
+// electron/terminal.cjs. The emergency `land` shortcut is caught in the
+// renderer before a byte reaches the PTY.
 // -----------------------------------------------------------------------------
-const TERMINAL_OUTPUT_LIMIT = 256 * 1024;
-const terminalJobs = new Map();
-let terminalCwd = TERMINAL_HOME;
-
-function terminalEnv() {
-  return {
-    ...getNectarEnv(),
-    PYTHONUNBUFFERED: '1',
-    TERM: 'dumb',
-    // Colour codes would arrive as literal escapes; the renderer colours itself.
-    NO_COLOR: '1',
-    RCUTILS_COLORIZED_OUTPUT: '0',
-  };
-}
-
-/** `cd` changes this process's idea of the shell's directory, as a shell's builtin would. */
-function terminalChangeDirectory(argument) {
-  const raw = (argument || '').trim().replace(/^['"]|['"]$/g, '');
-  const target = !raw || raw === '~'
-    ? os.homedir()
-    : raw.startsWith('~/')
-    ? path.join(os.homedir(), raw.slice(2))
-    : path.resolve(terminalCwd, raw);
-  try {
-    if (!fs.statSync(target).isDirectory()) {
-      return { success: false, exitCode: 1, stdout: '', stderr: `cd: ${raw}: não é um diretório\n`, cwd: terminalCwd };
-    }
-  } catch {
-    return { success: false, exitCode: 1, stdout: '', stderr: `cd: ${raw}: diretório inexistente\n`, cwd: terminalCwd };
-  }
-  terminalCwd = target;
-  return { success: true, exitCode: 0, stdout: '', stderr: '', cwd: terminalCwd };
-}
-
-ipcMain.handle('bmg:terminal-exec', async (_event, payload = {}) => {
-  const command = String(typeof payload === 'string' ? payload : payload.command ?? '').trim();
-  const id = typeof payload === 'object' && payload.id != null ? String(payload.id) : String(Date.now());
-  if (!command) return { success: true, id, exitCode: 0, stdout: '', stderr: '', cwd: terminalCwd };
-
-  const cd = /^cd(?:\s+(.*))?$/.exec(command);
-  if (cd) return { id, ...terminalChangeDirectory(cd[1]) };
-
-  const startedAt = Date.now();
-  return new Promise((resolve) => {
-    let child;
-    try {
-      // Its own process group, so an interrupt reaches `ros2 topic echo` and
-      // not only the bash wrapped around it.
-      child = spawn('/bin/bash', ['-c', command], {
-        cwd: terminalCwd,
-        env: terminalEnv(),
-        detached: true,
-      });
-    } catch (err) {
-      resolve({ success: false, id, exitCode: 127, stdout: '', stderr: `${err.message}\n`, cwd: terminalCwd });
-      return;
-    }
-
-    terminalJobs.set(id, child);
-    let stdout = '';
-    let stderr = '';
-    const capture = (stream, kind) => {
-      stream.setEncoding('utf-8');
-      stream.on('data', (chunk) => {
-        if (kind === 'stdout') {
-          if (stdout.length < TERMINAL_OUTPUT_LIMIT) stdout += chunk;
-        } else if (stderr.length < TERMINAL_OUTPUT_LIMIT) {
-          stderr += chunk;
-        }
-        send('bmg:terminal-output', { id, stream: kind, text: chunk });
-      });
-    };
-    capture(child.stdout, 'stdout');
-    capture(child.stderr, 'stderr');
-
-    child.on('error', (err) => {
-      stderr += `${err.message}\n`;
-    });
-    child.on('close', (code, signal) => {
-      terminalJobs.delete(id);
-      resolve({
-        success: code === 0,
-        id,
-        exitCode: code,
-        signal: signal ?? null,
-        stdout,
-        stderr,
-        durationMs: Date.now() - startedAt,
-        cwd: terminalCwd,
-      });
-    });
-  });
+const terminalHost = createTerminalHost({
+  loadPty: () => require('node-pty'),
+  env: getNectarEnv,
+  cwd: TERMINAL_HOME,
+  activator: NECTAR_ACTIVATOR,
+  send,
 });
 
-/** Ctrl+C: SIGINT to the whole group, then SIGKILL if it will not go. */
-ipcMain.handle('bmg:terminal-kill', async (_event, id) => {
-  const child = terminalJobs.get(String(id));
-  if (!child || !child.pid) return { success: false };
-  try { process.kill(-child.pid, 'SIGINT'); } catch (e) { /* already gone */ }
-  setTimeout(() => {
-    if (terminalJobs.get(String(id)) === child) {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch (e) { /* already gone */ }
-    }
-  }, 2500).unref?.();
-  return { success: true };
-});
-
-ipcMain.handle('bmg:terminal-info', async () => ({
-  cwd: terminalCwd,
-  home: os.homedir(),
-  user: os.userInfo().username,
-  host: os.hostname(),
-}));
-
-function killTerminalJobs() {
-  for (const child of terminalJobs.values()) {
-    try { process.kill(-child.pid, 'SIGKILL'); } catch (e) { /* already gone */ }
-  }
-  terminalJobs.clear();
-}
+ipcMain.handle('bmg:terminal-spawn', async (_event, options = {}) => terminalHost.spawn(options));
+ipcMain.handle('bmg:terminal-write', async (_event, payload = {}) =>
+  terminalHost.write(payload.id, payload.data)
+);
+ipcMain.handle('bmg:terminal-resize', async (_event, payload = {}) =>
+  terminalHost.resize(payload.id, payload.cols, payload.rows)
+);
+ipcMain.handle('bmg:terminal-kill', async (_event, id) => terminalHost.kill(id));
 
 /**
  * The copilot's output level.
@@ -2641,7 +2539,7 @@ function cleanupAllProcesses() {
   stopBridgeWatchdog();
   stopTelemetryWatchdog();
   stopSpeechProcess();
-  killTerminalJobs();
+  terminalHost.killAll();
   if (locationRefreshTimer) clearInterval(locationRefreshTimer);
 
   // Capture the bridge pids before the handles are cleared: the SIGKILL

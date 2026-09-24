@@ -358,29 +358,21 @@ export interface DiagnosticsReport {
 }
 
 /** A finished command in the diagnostics terminal. */
-export interface TerminalExecResult {
-  success: boolean;
+/** `bmg:terminal-spawn`: a PTY session, or why one could not be opened. */
+export type TerminalSpawnResult =
+  | { success: true; id: string; pid: number; cols: number; rows: number }
+  | { success: false; error: string };
+
+/** Raw PTY output, escape sequences included, for xterm.js to render. */
+export interface TerminalDataEvent {
   id: string;
-  exitCode: number | null;
-  signal?: string | null;
-  stdout: string;
-  stderr: string;
-  durationMs?: number;
-  /** The shell's working directory after the command (`cd` changes it). */
-  cwd: string;
+  data: string;
 }
 
-export interface TerminalOutputEvent {
+export interface TerminalExitEvent {
   id: string;
-  stream: 'stdout' | 'stderr';
-  text: string;
-}
-
-export interface TerminalInfo {
-  cwd: string;
-  home: string;
-  user: string;
-  host: string;
+  exitCode: number;
+  signal: number | null;
 }
 
 /** Battery failsafe: land on its own when the charge reaches this level in flight. */
@@ -473,11 +465,12 @@ export interface BmgAPI {
   getDiagnostics: () => Promise<DiagnosticsReport>;
   getLogHistory: () => Promise<{ mission: LogLine[]; driver: LogLine[] }>;
 
-  /** Run one shell command; output also streams on `onTerminalOutput`. */
-  terminalExec: (command: string, id: string) => Promise<TerminalExecResult>;
-  /** Interrupt a running command (Ctrl+C). */
+  /** Open an interactive bash on a PTY, sized to the terminal on screen. */
+  terminalSpawn: (options?: { cols?: number; rows?: number }) => Promise<TerminalSpawnResult>;
+  /** Raw bytes to the PTY, Tab, arrows and control characters included. */
+  terminalWrite: (id: string, data: string) => Promise<{ success: boolean }>;
+  terminalResize: (id: string, cols: number, rows: number) => Promise<{ success: boolean }>;
   terminalKill: (id: string) => Promise<{ success: boolean }>;
-  getTerminalInfo: () => Promise<TerminalInfo>;
 
   listEvidence: () => Promise<{ success: boolean; items: EvidenceItem[]; error?: string }>;
   exportDossier: (payload: {
@@ -497,7 +490,8 @@ export interface BmgAPI {
   onAnnounceDone: (cb: (event: AnnounceDoneEvent) => void) => () => void;
   onCameraTiltChanged: (cb: (event: CameraTiltEvent) => void) => () => void;
   onMissionReset: (cb: (event: MissionResetEvent) => void) => () => void;
-  onTerminalOutput: (cb: (event: TerminalOutputEvent) => void) => () => void;
+  onTerminalData: (cb: (event: TerminalDataEvent) => void) => () => void;
+  onTerminalExit: (cb: (event: TerminalExitEvent) => void) => () => void;
 }
 
 declare global {
