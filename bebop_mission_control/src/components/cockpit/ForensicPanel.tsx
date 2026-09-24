@@ -3,6 +3,7 @@ import { Maximize2, ShieldCheck, Square } from 'lucide-react';
 import type { RawEvidence } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
 import { TOPIC_LABEL } from '../../lib/forensics';
+import { PHRASE_POOLS } from '../../lib/copilotPhrases';
 import { cn, stampLabel } from '../../lib/format';
 
 interface ForensicPanelProps {
@@ -18,6 +19,8 @@ interface ForensicPanelProps {
   report: Finding[] | null;
   /** How many of them the copilot has read so far. */
   reportRevealed: number;
+  /** The closing line as the copilot said it, so screen and voice agree. */
+  reportClosing?: string | null;
   onOpenLibrary: () => void;
   onFinish: () => void;
 }
@@ -190,6 +193,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   landed,
   report,
   reportRevealed,
+  reportClosing,
   onOpenLibrary,
   onFinish,
 }) => {
@@ -312,7 +316,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
               })}
               {reportRevealed >= report.length ? (
                 <li className="anim-rise px-1 pt-1 text-2xs text-haze">
-                  Relatório pericial emitido e pronto para exportação.
+                  {reportClosing ?? PHRASE_POOLS['inspection.outro'][0]}
                 </li>
               ) : null}
             </ul>

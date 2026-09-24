@@ -38,8 +38,30 @@ export const HISTORY_WINDOW = 5;
 /** Where the history lives. Versioned: a schema change gets a new key, not a migration. */
 export const HISTORY_STORAGE_KEY = 'bmg.copilot-history.v1';
 
+/**
+ * Choices the forensic report remembers across flights: the wording used for
+ * each topic, and the topic order (an index into the 24 permutations).
+ */
+export type FindingHistoryKey =
+  | 'finding.police'
+  | 'finding.samu'
+  | 'finding.victim'
+  | 'finding.vehicle'
+  | 'finding.order';
+
+/** Everything with cross-flight memory. */
+export type HistoryKey = MilestoneKey | FindingHistoryKey;
+
+const FINDING_HISTORY_KEYS: readonly FindingHistoryKey[] = [
+  'finding.police',
+  'finding.samu',
+  'finding.victim',
+  'finding.vehicle',
+  'finding.order',
+];
+
 /** Variant index used per key, oldest first, at most {@link HISTORY_WINDOW} entries. */
-export type HistoryStore = Partial<Record<MilestoneKey, number[]>>;
+export type HistoryStore = Partial<Record<HistoryKey, number[]>>;
 
 /** The part of `Storage` this module touches, so tests and non-browser hosts can supply one. */
 export interface StorageLike {
@@ -145,6 +167,10 @@ export function isMilestoneKey(value: string): value is MilestoneKey {
   return Object.prototype.hasOwnProperty.call(PHRASE_POOLS, value);
 }
 
+function isHistoryKey(value: string): value is HistoryKey {
+  return isMilestoneKey(value) || (FINDING_HISTORY_KEYS as readonly string[]).includes(value);
+}
+
 /**
  * Draw one variant of `key`, avoiding the ones used in the last flights.
  *
@@ -157,7 +183,7 @@ export function isMilestoneKey(value: string): value is MilestoneKey {
  * @throws RangeError when `pool` is empty.
  */
 export function pickVariant(
-  key: MilestoneKey,
+  key: HistoryKey,
   pool: readonly string[],
   history: HistoryStore,
   random: () => number = Math.random
@@ -175,7 +201,7 @@ export function pickVariant(
 }
 
 /** Append one flight's pick for `key`, dropping the oldest beyond the window. Pure. */
-export function recordVariant(history: HistoryStore, key: MilestoneKey, index: number): HistoryStore {
+export function recordVariant(history: HistoryStore, key: HistoryKey, index: number): HistoryStore {
   const entries = [...(history[key] ?? []), index].slice(-HISTORY_WINDOW);
   return { ...history, [key]: entries };
 }
@@ -209,7 +235,7 @@ export function loadHistory(storage: StorageLike | null = defaultStorage()): His
 
   const history: HistoryStore = {};
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-    if (!isMilestoneKey(key) || !Array.isArray(value)) continue;
+    if (!isHistoryKey(key) || !Array.isArray(value)) continue;
     const entries = value.filter(
       (entry): entry is number => typeof entry === 'number' && Number.isInteger(entry) && entry >= 0
     );

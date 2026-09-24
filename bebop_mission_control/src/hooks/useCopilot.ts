@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AnnouncePriority } from '../types/bmg';
 import type { Finding } from '../lib/forensics';
-import { REPORT_INTRO, REPORT_OUTRO, findingGapMs } from '../lib/forensics';
-import { alertSentence, isMilestoneKey, phraseForMilestone } from '../lib/copilotPhrases';
+import { findingGapMs } from '../lib/forensics';
+import {
+  alertSentence,
+  isMilestoneKey,
+  nextPhrase,
+  phraseForMilestone,
+} from '../lib/copilotPhrases';
 import { NarrationQueue } from '../lib/narrationQueue';
 import { useBridge } from './useBridge';
 
@@ -121,15 +126,42 @@ export function useCopilot(): Copilot {
 
 const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
 
+/** Queue group of the post-landing report's lines. */
+const REPORT_GROUP = 'forensic';
+
+/**
+ * The one narration queue the station speaks through.
+ *
+ * Shared by the flight narration and the post-landing report, so the whole
+ * script -- milestones, alerts, the touchdown call, the report -- is one FIFO
+ * with one voice, rather than two sequences each calling the copilot and
+ * talking over each other at the seam between landing and report.
+ */
+export function useNarrationQueue(copilot: Copilot): NarrationQueue {
+  const sayRef = useRef(copilot.say);
+  sayRef.current = copilot.say;
+  const cancelRef = useRef(copilot.cancel);
+  cancelRef.current = copilot.cancel;
+  const queue = useRef<NarrationQueue | null>(null);
+  if (queue.current === null) {
+    queue.current = new NarrationQueue(
+      (text, priority) => sayRef.current(text, priority),
+      () => cancelRef.current()
+    );
+  }
+  useEffect(() => () => queue.current?.reset(), []);
+  return queue.current;
+}
+
 /**
  * Narrate the flight itself, one milestone at a time.
  *
  * Driven by the milestones the flight actually crossed (`bmg:milestone`),
  * never by a timer, so the copilot cannot announce a manoeuvre the aircraft
- * did not reach. The flight does not wait for the voice: milestones go into a
- * FIFO {@link NarrationQueue} as they arrive and are spoken in that order, each
- * once the previous line has been heard, so an early detection is narrated
- * after the takeoff and scan calls it overtook rather than over them.
+ * did not reach. The flight does not wait for the voice: milestones go into
+ * the shared FIFO {@link NarrationQueue} as they arrive and are spoken in that
+ * order, each once the previous line has been heard, so an early detection is
+ * narrated after the takeoff and scan calls it overtook rather than over them.
  *
  * Each key is spoken once per flight, drawn from its phrase pool with the
  * cross-flight history in `copilotPhrases`. A flight begins at its
@@ -137,7 +169,7 @@ const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
  * The reset is keyed on the milestone and not on `flightKey` because the
  * launch timestamp is committed by a React render that can land after the
  * main process has already sent `mission.start`, and a reset then would drop
- * the flight's first line. `flightKey` returning to null — the cycle closed —
+ * the flight's first line. `flightKey` returning to null -- the cycle closed --
  * drops whatever is still queued.
  *
  * `altitudeM` is the configured target altitude, the fallback for a takeoff
@@ -149,29 +181,17 @@ const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
  * heard only if this says it: every alert preempts the narration, bench or not.
  */
 export function useFlightNarration(
-  copilot: Copilot,
+  queue: NarrationQueue,
   landed: boolean,
   enabled: boolean,
   flightKey: number | null,
   altitudeM: number = Number.NaN
 ): void {
   const bridge = useBridge();
-  const sayRef = useRef(copilot.say);
-  sayRef.current = copilot.say;
-  const cancelRef = useRef(copilot.cancel);
-  cancelRef.current = copilot.cancel;
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
   const altitude = useRef(altitudeM);
   altitude.current = altitudeM;
-
-  const queue = useRef<NarrationQueue | null>(null);
-  if (queue.current === null) {
-    queue.current = new NarrationQueue(
-      (text, priority) => sayRef.current(text, priority),
-      () => cancelRef.current()
-    );
-  }
   const spoken = useRef(new Set<string>());
   const touchdownCalled = useRef(false);
 
@@ -180,118 +200,102 @@ export function useFlightNarration(
     return bridge.onMilestone((event) => {
       if (event.kind === 'alert') {
         const payload = event.payload ?? {};
-        queue.current?.preempt(event.key, () => alertSentence(payload), 'URGENT');
+        queue.preempt(event.key, () => alertSentence(payload), 'URGENT');
         return;
       }
       if (!enabledRef.current || !isMilestoneKey(event.key)) return;
       const key = event.key;
       if (key === 'mission.start') {
-        queue.current?.reset();
+        queue.reset();
         spoken.current.clear();
         touchdownCalled.current = false;
       }
       if (spoken.current.has(key)) return;
       spoken.current.add(key);
       const payload = event.payload ?? {};
-      queue.current?.enqueue(key, () => phraseForMilestone(key, payload, altitude.current));
+      queue.enqueue(key, () => phraseForMilestone(key, payload, altitude.current));
     });
-  }, [bridge]);
+  }, [bridge, queue]);
 
   useEffect(() => {
-    if (flightKey === null) queue.current?.reset();
-  }, [flightKey]);
-
-  useEffect(() => () => queue.current?.reset(), []);
+    if (flightKey === null) queue.reset();
+  }, [flightKey, queue]);
 
   useEffect(() => {
     if (!landed || touchdownCalled.current) return;
     touchdownCalled.current = true;
-    queue.current?.enqueue('touchdown', () => TOUCHDOWN_CALL);
-  }, [landed]);
+    queue.enqueue('touchdown', () => TOUCHDOWN_CALL);
+  }, [landed, queue]);
 }
 
 /**
  * Present the preliminary report, in step with the voice.
  *
- * The sequence is: the introduction, then each finding read aloud with its card
- * appearing as the sentence lands, then the closing line. Returns how many
- * cards have been revealed so far, which is what the panel renders.
+ * The sequence is the introduction (`inspection.intro`), each finding read
+ * aloud with its card appearing as its sentence ends (`inspection.point_1..4`),
+ * then the closing line (`inspection.outro`). All of it goes through the same
+ * queue as the flight narration, behind whatever the flight still has to say
+ * -- the touchdown call first, then the report -- and a report torn down
+ * midway drops only its own lines.
  *
  * Each reveal waits for the *later* of two things: the sentence having been
- * read, and a drawn beat of roughly two seconds. That pairing is deliberate.
- * Waiting on the voice alone is what puts the card on its own sentence, but a
- * copilot that cannot speak — no API key, no network, no audio device — answers
- * every request in milliseconds, and a report paced by that answer dumps all
- * four findings in a single frame. Waiting on the beat alone would let the
- * cards run ahead of a voice still mid-sentence. Taking whichever is longer
- * gives the presentation one rhythm: narrated when there is narration, and the
- * same deliberate cadence when there is not.
+ * read, and a drawn beat of roughly two seconds. Waiting on the voice alone is
+ * what puts the card on its own sentence, but a copilot that cannot speak -- no
+ * API key, no network, no audio device -- answers every request in
+ * milliseconds, and a report paced by that answer would dump all four findings
+ * in a single frame. Taking whichever is longer gives the presentation one
+ * rhythm: narrated when there is narration, and the same deliberate cadence
+ * when there is not.
+ *
+ * Returns how many cards have been revealed, which is what the panel renders,
+ * and the closing line as spoken, so the screen shows the same sentence.
  */
 export function useForensicNarration(
-  copilot: Copilot,
+  queue: NarrationQueue,
   active: boolean,
   report: Finding[] | null
-): number {
+): { revealed: number; closing: string | null } {
   const [revealed, setRevealed] = useState(0);
+  const [closing, setClosing] = useState<string | null>(null);
   const runRef = useRef(0);
-  const { say, cancel } = copilot;
 
   useEffect(() => {
     if (!active || !report || report.length === 0) {
       setRevealed(0);
+      setClosing(null);
       return;
     }
 
-    // Each run carries a token; a run whose token has been superseded stops at
-    // its next checkpoint rather than painting over the one that replaced it.
+    // Each run carries a token; a callback from a superseded run is ignored
+    // even if it slips past the group reset.
     const token = runRef.current + 1;
     runRef.current = token;
     const live = () => runRef.current === token;
 
-    // Every pending beat is tracked with the resolver it is holding. A run torn
-    // down mid-beat must neither leave a timer armed to fire into the sequence
-    // that replaced it, nor leave its own `Promise.all` suspended forever —
-    // clearing the timer alone would park the run's closure for the life of the
-    // page. Tearing down settles them instead, and the `live()` checks after
-    // each beat stop the freed run from touching state.
-    const beats = new Map<number, () => void>();
-    const wait = (ms: number) =>
-      new Promise<void>((resolve) => {
-        const id = window.setTimeout(() => {
-          beats.delete(id);
-          resolve();
-        }, ms);
-        beats.set(id, resolve);
+    setRevealed(0);
+    const outro = nextPhrase('inspection.outro');
+    setClosing(outro);
+
+    queue.enqueue('inspection.intro', () => nextPhrase('inspection.intro'), {
+      group: REPORT_GROUP,
+      minMs: findingGapMs(),
+    });
+    report.forEach((finding, index) => {
+      queue.enqueue(`inspection.point_${index + 1}`, () => finding.speech, {
+        group: REPORT_GROUP,
+        minMs: findingGapMs(),
+        onDone: () => {
+          if (live()) setRevealed(index + 1);
+        },
       });
-
-    /** Hold for the sentence and for the beat, and continue on the later of the two. */
-    const beat = (line: string) => Promise.all([say(line), wait(findingGapMs())]);
-
-    void (async () => {
-      setRevealed(0);
-      await beat(REPORT_INTRO);
-
-      for (let index = 0; index < report.length; index++) {
-        if (!live()) return;
-        await beat(report[index].speech);
-        if (!live()) return;
-        setRevealed(index + 1);
-      }
-
-      if (!live()) return;
-      await beat(REPORT_OUTRO);
-    })();
+    });
+    queue.enqueue('inspection.outro', () => outro, { group: REPORT_GROUP, minMs: findingGapMs() });
 
     return () => {
       runRef.current = token + 1;
-      for (const [id, resolve] of beats) {
-        window.clearTimeout(id);
-        resolve();
-      }
-      beats.clear();
-      cancel();
+      queue.resetGroup(REPORT_GROUP);
     };
-  }, [active, report, say, cancel]);
+  }, [active, report, queue]);
 
-  return revealed;
+  return { revealed, closing };
 }

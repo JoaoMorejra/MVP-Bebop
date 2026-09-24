@@ -4,9 +4,10 @@
  * Four findings, one per question an adjuster has to clear before a claim can
  * be closed without sending anyone to the scene: police, ambulance, the
  * casualty, the vehicle. Each exists in several wordings and the order is drawn
- * fresh per flight, so the same aircraft over the same scene twice does not
- * produce two identical-looking reports — what the operator is watching is an
- * assessment being presented, not a slide being replayed.
+ * per flight with the copilot's cross-flight memory (`copilotPhrases`): no
+ * topic is read with the wording it had on the previous flight, and the topic
+ * order does not repeat any of the last five — what the operator is watching
+ * is an assessment being presented, not a slide being replayed.
  *
  * The same table exists in `mvp_mission_bebop/telemetry/announcer.py` for the
  * mission process to narrate on its own. This copy is the authority whenever
@@ -14,6 +15,9 @@
  * copilot the exact sentence to read, so the line in the operator's ear and the
  * line on screen are the same string rather than two renderings of one idea.
  */
+
+import type { FindingHistoryKey, StorageLike } from './copilotPhrases';
+import { loadHistory, pickVariant, recordVariant, saveHistory } from './copilotPhrases';
 
 export type FindingTopic = 'police' | 'samu' | 'victim' | 'vehicle';
 
@@ -56,8 +60,23 @@ const TOPICS: readonly FindingTopic[] = ['police', 'samu', 'victim', 'vehicle'];
 
 const ORDINALS = ['Primeiro', 'Segundo', 'Terceiro', 'Quarto'] as const;
 
-export const REPORT_INTRO = 'Inspeção do sinistro concluída. Apresentando laudo preliminar.';
-export const REPORT_OUTRO = 'Relatório pericial emitido e pronto para exportação.';
+/** Every order the four topics can be read in, in a fixed enumeration. */
+const ORDERS: readonly (readonly FindingTopic[])[] = (() => {
+  const out: FindingTopic[][] = [];
+  const permute = (rest: FindingTopic[], prefix: FindingTopic[]) => {
+    if (rest.length === 0) {
+      out.push(prefix);
+      return;
+    }
+    rest.forEach((topic, index) =>
+      permute([...rest.slice(0, index), ...rest.slice(index + 1)], [...prefix, topic])
+    );
+  };
+  permute([...TOPICS], []);
+  return out;
+})();
+
+const ORDER_LABELS: readonly string[] = ORDERS.map((order) => order.join(','));
 
 /** The label under each card, so the topic is legible without reading the wording. */
 export const TOPIC_LABEL: Record<FindingTopic, string> = {
@@ -66,19 +85,6 @@ export const TOPIC_LABEL: Record<FindingTopic, string> = {
   victim: 'Estado do acidentado',
   vehicle: 'Integridade do veículo',
 };
-
-function pick<T>(items: readonly T[]): T {
-  return items[Math.floor(Math.random() * items.length)];
-}
-
-function shuffle<T>(items: readonly T[]): T[] {
-  const out = items.slice();
-  for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [out[i], out[j]] = [out[j], out[i]];
-  }
-  return out;
-}
 
 /**
  * Lower the first letter so the line reads on after its ordinal.
@@ -92,16 +98,39 @@ function decapitalise(line: string): string {
   return line[0].toLowerCase() + line.slice(1);
 }
 
-/** Draw one report: a wording per topic, in a fresh order. */
-export function buildForensicReport(): Finding[] {
-  return shuffle(TOPICS).map((topic, index) => {
-    const card = pick(WORDINGS[topic]);
+/**
+ * Draw one report and remember it.
+ *
+ * The order is one of the 24 permutations, excluding those of the last five
+ * flights; each topic's wording excludes its recent ones, which with four
+ * wordings means never the one it had on the previous flight. The choices are
+ * recorded when drawn, once per flight, in the same history document as the
+ * copilot's milestone calls. With no storage it still draws a report, only
+ * without the memory.
+ */
+export function buildForensicReport(
+  options: { storage?: StorageLike | null; random?: () => number } = {}
+): Finding[] {
+  const storage = options.storage;
+  let history = storage === undefined ? loadHistory() : loadHistory(storage);
+
+  const order = pickVariant('finding.order', ORDER_LABELS, history, options.random);
+  history = recordVariant(history, 'finding.order', order.index);
+
+  const report = ORDERS[order.index].map((topic, index) => {
+    const key = `finding.${topic}` as FindingHistoryKey;
+    const wording = pickVariant(key, WORDINGS[topic], history, options.random);
+    history = recordVariant(history, key, wording.index);
     return {
       topic,
-      card,
-      speech: `${ORDINALS[index]}: ${decapitalise(card)}.`,
+      card: wording.text,
+      speech: `${ORDINALS[index]}: ${decapitalise(wording.text)}.`,
     };
   });
+
+  if (storage === undefined) saveHistory(history);
+  else saveHistory(history, storage);
+  return report;
 }
 
 /**

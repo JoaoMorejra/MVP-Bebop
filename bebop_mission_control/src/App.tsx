@@ -19,7 +19,12 @@ import { preflightLocked } from './lib/navigationLock';
 import { useStreamHealth } from './hooks/useStreamHealth';
 import { useEvidence } from './hooks/useEvidence';
 import { useCameraTilt } from './hooks/useCameraTilt';
-import { useCopilot, useFlightNarration, useForensicNarration } from './hooks/useCopilot';
+import {
+  useCopilot,
+  useFlightNarration,
+  useForensicNarration,
+  useNarrationQueue,
+} from './hooks/useCopilot';
 import { useVoiceLevel } from './hooks/useVoiceLevel';
 import { buildForensicReport } from './lib/forensics';
 import { getPath } from './lib/paths';
@@ -126,6 +131,7 @@ export const App: React.FC = () => {
   // control follows the mission's own stage changes and not only the operator.
   const camera = useCameraTilt(telemetry.camera_tilt_deg);
   const copilot = useCopilot();
+  const narration = useNarrationQueue(copilot);
   const voice = useVoiceLevel();
 
   const running = mission.state === 'running' || mission.state === 'arming';
@@ -158,7 +164,7 @@ export const App: React.FC = () => {
   const landed = over && mission.exitCode === 0;
 
   useFlightNarration(
-    copilot,
+    narration,
     landed && narrating,
     narrating,
     mission.startedAt,
@@ -173,8 +179,8 @@ export const App: React.FC = () => {
     setReportDismissed(false);
   }, [mission.latestCapture, benchRun]);
 
-  const reportRevealed = useForensicNarration(
-    copilot,
+  const { revealed: reportRevealed, closing: reportClosing } = useForensicNarration(
+    narration,
     (landed || over) && narrating && !reportDismissed && Boolean(mission.latestCapture),
     report
   );
@@ -543,6 +549,7 @@ export const App: React.FC = () => {
           onCameraTilt={camera.set}
           report={(landed || over) && narrating ? report : null}
           reportRevealed={reportRevealed}
+          reportClosing={reportClosing}
           onAbort={() => void abort()}
           onOpenEvidence={() => setOverlay('evidence')}
           onFinish={() => void finishMission()}
@@ -609,6 +616,7 @@ export const App: React.FC = () => {
     landed,
     narrating,
     reportRevealed,
+    reportClosing,
     reportDismissed,
     benchStage,
     benchMode,

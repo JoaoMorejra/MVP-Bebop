@@ -55,6 +55,8 @@ interface CockpitScreenProps {
   report: Finding[] | null;
   /** How many of them the copilot has read out so far. */
   reportRevealed: number;
+  /** The report's closing line as the copilot said it. */
+  reportClosing: string | null;
   onAbort: () => void;
   onOpenEvidence: () => void;
   onFinish: () => void;
@@ -103,6 +105,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   onCameraTilt,
   report,
   reportRevealed,
+  reportClosing,
   onAbort,
   onOpenEvidence,
   onFinish,
@@ -187,6 +190,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
           landed={landed}
           report={report}
           reportRevealed={reportRevealed}
+          reportClosing={reportClosing}
           onOpenLibrary={onOpenEvidence}
           onFinish={onFinish}
         />
