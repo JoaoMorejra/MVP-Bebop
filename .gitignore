@@ -35,6 +35,7 @@ Thumbs.db
 *.pt
 *.onnx
 *.engine
+*_openvino_model/
 
 # Mission runtime media and evidence captures
 *.jpg
