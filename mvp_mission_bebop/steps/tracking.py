@@ -40,13 +40,12 @@ from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.visual_servoing import ServoCommand, TrackingPhase
-from mvp_mission_bebop.engine.rate import Deadline, LoopRate
+from mvp_mission_bebop.engine.rate import MAX_INTERVAL_SEC, Deadline, LoopRate
 from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker, TrackerGains
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the runtime import out
-    import numpy as np
-    from nectar.ai.detection.core.types import Detection, DetectionResult
+    from nectar.ai.detection.core.types import Detection
 
 logger = logging.getLogger("Step3Tracking")
 
@@ -104,10 +103,16 @@ class VisualServoingStep(BaseStep):
         approach_finished = False
 
         try:
-            with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
+            with ctx.failsafe.altitude_hold_window(
+                ctx.params.governor.climb_authority
+            ), ctx.perception.session(
+                conf=vision_cfg.confidence_threshold, imgsz=vision_cfg.inference_imgsz
+            ):
                 approach_finished = self._servo(ctx, deadline, rate, tracker)
         except _StageInterrupted as interrupt:
             return interrupt.status
+        finally:
+            logger.info("Servo loop cadence: %s.", rate.cadence_report())
 
         self._hold(ctx)
         ctx.blackboard.approach_finished = approach_finished
@@ -142,9 +147,22 @@ class VisualServoingStep(BaseStep):
         # approach is declared finished, and reading it from the config here is
         # what makes the parameter sheet authoritative over this decision.
         alignment_dwell_cycles = max(1, int(vision_cfg.alignment_dwell_cycles))
+        max_age = vision_cfg.perception_max_age_sec
         approach_finished = False
         aligned_cycles = 0
         lost_cycles = 0
+        last_generation = 0
+        # Time since the controller last ran. The servoing law, the tracker and
+        # every frame counter inside the controller (centering confirmation,
+        # decentering revert, nadir exit, reacquisition hits) are defined per
+        # observation, so they advance once per new frame with the interval that
+        # actually separates two frames -- as they did when the loop ran at the
+        # inference rate. Between frames the loop re-transmits the latched
+        # command, which keeps the altitude hold, the failsafe clamps and the
+        # abort check at the full control rate without counting any observation
+        # twice.
+        pending_dt = 0.0
+        latched: Optional[ServoCommand] = None
 
         while deadline.active:
             if ctx.interrupted():
@@ -157,35 +175,46 @@ class VisualServoingStep(BaseStep):
                     ctx.failsafe.trigger_emergency_land(reason)
                     raise _StageInterrupted(StepStatus.FAILURE)
 
-            frame = ctx.grab_frame(timeout_sec=1.0)
             dt = rate.tick()
+            pending_dt += dt
+            sample = ctx.perception.get_latest(max_age)
 
-            if frame is None:
+            if sample is None:
+                latched = None
                 self._hold(ctx)
                 continue
 
+            if sample.generation == last_generation:
+                if latched is None:
+                    self._hold(ctx, dt)
+                else:
+                    self._apply(ctx, latched, dt)
+                continue
+
+            last_generation = sample.generation
+            frame_dt = min(pending_dt, MAX_INTERVAL_SEC)
+            pending_dt = 0.0
             ctx.failsafe.notify_frame_received()
-            result = ctx.detector.detect(frame, conf=vision_cfg.confidence_threshold)
-            targets = result.filter_by_class(vision_cfg.target_classes)
+            targets = sample.result.filter_by_class(vision_cfg.target_classes)
 
             center, measured = self._resolve_target(
-                targets, tracker, dt, (ctx.frame_width, ctx.frame_height)
+                targets, tracker, frame_dt, (ctx.frame_width, ctx.frame_height)
             )
             if center is None:
                 lost_cycles += 1
                 if lost_cycles < vision_cfg.lost_frames_tolerance:
                     # Still inside the tracker's coast horizon: hold and let the
                     # extrapolation do its job before escalating.
-                    self._hold(ctx, dt)
-                    ctx.publish_annotated_stream(
-                        frame, result, f"STEP 3: TARGET LOST ({lost_cycles} frames)"
-                    )
+                    latched = None
+                    self._hold(ctx, frame_dt)
+                    ctx.perception.set_status(f"STEP 3: TARGET LOST ({lost_cycles} frames)")
                     continue
 
                 # Coasting has run out. Recover rather than abandon.
-                command = controller.note_target_lost(ctx.current_tilt_deg, dt)
-                self._apply(ctx, command, dt)
-                self._publish(ctx, frame, result, command, deadline.elapsed_sec, False)
+                command = controller.note_target_lost(ctx.current_tilt_deg, frame_dt)
+                latched = command
+                self._apply(ctx, command, frame_dt)
+                self._publish(ctx, command, deadline.elapsed_sec, False)
                 if command.phase is TrackingPhase.NADIR and command.nadir_aligned:
                     aligned_cycles += 1
                     if aligned_cycles >= alignment_dwell_cycles:
@@ -209,12 +238,13 @@ class VisualServoingStep(BaseStep):
                 frame_dimensions=(ctx.frame_width, ctx.frame_height),
                 current_tilt_deg=ctx.current_tilt_deg,
                 relative_altitude_m=snapshot.relative_altitude,
-                dt=dt,
+                dt=frame_dt,
                 speed_scale=self._horizontal_scale(ctx),
             )
 
-            self._apply(ctx, command, dt)
-            self._publish(ctx, frame, result, command, deadline.elapsed_sec, measured)
+            latched = command
+            self._apply(ctx, command, frame_dt)
+            self._publish(ctx, command, deadline.elapsed_sec, measured)
 
             if command.phase is TrackingPhase.NADIR:
                 if self._nadir_dwell_earned(ctx, command):
@@ -325,7 +355,9 @@ class VisualServoingStep(BaseStep):
             ctx.drone.camera_control(tilt=command.tilt_deg, pan=0.0)
             ctx.current_tilt_deg = command.tilt_deg
 
-        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude, dt)
+        vz = ctx.governor.compute_vz(
+            ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=command.vx
+        )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(command.vx, command.vy)
         ctx.drone.move_velocity(
@@ -342,20 +374,16 @@ class VisualServoingStep(BaseStep):
     @staticmethod
     def _publish(
         ctx: MissionContext,
-        frame: "np.ndarray",
-        result: "DetectionResult",
         command: ServoCommand,
         elapsed_sec: float,
         measured: bool,
     ) -> None:
-        """Overlay servoing state onto the annotated stream."""
+        """Caption the annotated stream with the servoing state."""
         range_text = (
             f"{command.ground_range_m:.2f}m" if command.ground_range_m is not None else "n/a"
         )
         source = "" if measured else " [PREDICTED]"
-        ctx.publish_annotated_stream(
-            frame,
-            result,
+        ctx.perception.set_status(
             f"{'[NO-FLY] ' if ctx.drone.no_fly else ''}STEP 3: "
             f"{command.phase.value.upper()}{source} ({elapsed_sec:.1f}s) "
             f"| TILT: {command.tilt_deg:.1f}deg | RANGE: {range_text} "

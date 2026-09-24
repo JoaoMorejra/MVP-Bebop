@@ -25,7 +25,7 @@ blink discarded accumulated evidence.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
@@ -33,6 +33,9 @@ from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the runtime import out
+    from nectar.ai.detection.core.types import Detection
 
 logger = logging.getLogger("Step2Search")
 
@@ -83,10 +86,17 @@ class ForwardSearchStep(BaseStep):
         rate = LoopRate(kinematics_cfg.control_loop_hz)
         ctx.failsafe.notify_frame_received()
 
-        with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
-            return self._cruise_until_confirmed(
-                ctx, deadline, rate, profile, shaper, confirmer, cruise_mps, timeout
-            )
+        with ctx.failsafe.altitude_hold_window(
+            ctx.params.governor.climb_authority
+        ), ctx.perception.session(
+            conf=vision_cfg.confidence_threshold, imgsz=vision_cfg.inference_imgsz
+        ):
+            try:
+                return self._cruise_until_confirmed(
+                    ctx, deadline, rate, profile, shaper, confirmer, cruise_mps, timeout
+                )
+            finally:
+                logger.info("Search loop cadence: %s.", rate.cadence_report())
 
     # ------------------------------------------------------------ cruise loop
 
@@ -109,6 +119,9 @@ class ForwardSearchStep(BaseStep):
         axis is descent-only again before the next stage begins.
         """
         vision_cfg = ctx.params.vision
+        max_age = vision_cfg.perception_max_age_sec
+        last_generation = 0
+        targets: Sequence["Detection"] = ()
 
         while deadline.active:
             if ctx.interrupted():
@@ -121,24 +134,31 @@ class ForwardSearchStep(BaseStep):
                     ctx.failsafe.trigger_emergency_land(reason)
                     return StepStatus.FAILURE
 
-            frame = ctx.grab_frame(timeout_sec=1.0)
             dt = rate.tick()
+            sample = ctx.perception.get_latest(max_age)
 
-            if frame is None:
-                # No perception this cycle, but the drone still needs a command:
-                # the Bebop latches its last Twist indefinitely.
+            if sample is None:
+                # No usable perception this cycle, but the drone still needs a
+                # command: the Bebop latches its last Twist indefinitely.
+                targets = ()
                 self._cruise(ctx, profile, shaper, dt, cruise_mps)
                 continue
 
+            if sample.generation == last_generation:
+                # The worker has not produced a new frame since the last cycle.
+                # Keep flying the decision that frame supported, but do not feed
+                # it to the confirmer again: the hysteresis counts distinct
+                # frames, and re-counting one would confirm on a single image.
+                self._act(ctx, profile, shaper, dt, cruise_mps, targets)
+                continue
+
+            last_generation = sample.generation
             ctx.failsafe.notify_frame_received()
-            result = ctx.detector.detect(frame, conf=vision_cfg.confidence_threshold)
-            targets = result.filter_by_class(vision_cfg.target_classes)
+            targets = sample.result.filter_by_class(vision_cfg.target_classes)
             report = confirmer.update(bool(targets))
 
             snapshot = ctx.odom_supervisor.snapshot()
-            ctx.publish_annotated_stream(
-                frame,
-                result,
+            ctx.perception.set_status(
                 f"{'[NO-FLY] ' if ctx.drone.no_fly else ''}STEP 2: SEARCH "
                 f"({deadline.elapsed_sec:.1f}s/{timeout:.1f}s) "
                 f"| TILT: {ctx.current_tilt_deg:.1f}deg | ALT: {snapshot.relative_altitude:.2f}m",
@@ -172,11 +192,7 @@ class ForwardSearchStep(BaseStep):
                     best.confidence,
                     snapshot.relative_altitude,
                 )
-                # Hold station while the confirmation filter fills, rather than
-                # continuing to close on an unconfirmed target.
-                self._command(ctx, profile, shaper, dt, 0.0)
-            else:
-                self._cruise(ctx, profile, shaper, dt, cruise_mps)
+            self._act(ctx, profile, shaper, dt, cruise_mps, targets)
 
         logger.warning("Search window of %.1f s expired without confirmation.", timeout)
         ctx.blackboard.target_confirmed = False
@@ -184,6 +200,27 @@ class ForwardSearchStep(BaseStep):
         return StepStatus.SUCCESS
 
     # ---------------------------------------------------------------- motion
+
+    def _act(
+        self,
+        ctx: MissionContext,
+        profile: JerkLimitedProfile,
+        shaper: QuantizedCommandShaper,
+        dt: float,
+        cruise_mps: float,
+        targets: Sequence["Detection"],
+    ) -> None:
+        """Hold station on a visible candidate, otherwise continue the cruise.
+
+        Holding while the confirmation filter fills, rather than continuing to
+        close on an unconfirmed target, keeps the candidate in frame for the
+        frames that will confirm or release it.
+        """
+        if targets:
+            self._command(ctx, profile, shaper, dt, 0.0)
+        else:
+            self._cruise(ctx, profile, shaper, dt, cruise_mps)
+
 
     def _cruise(
         self,
@@ -247,7 +284,9 @@ class ForwardSearchStep(BaseStep):
         """Profile, convert, shape, and transmit one forward velocity command."""
         profiled = profile.step(target_mps, dt)
         vx = shaper.shape(ctx.speed_calibration.to_normalized(profiled), dt)
-        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude, dt)
+        vz = ctx.governor.compute_vz(
+            ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=vx
+        )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(max(0.0, vx), 0.0)
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)

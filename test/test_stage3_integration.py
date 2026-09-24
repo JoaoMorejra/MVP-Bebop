@@ -26,6 +26,7 @@ from mvp_mission_bebop.controllers.visual_servoing import (
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.parameters import MissionParameters
+from mvp_mission_bebop.perception.worker import SynchronousPerception
 from mvp_mission_bebop.steps import tracking as tracking_module
 from mvp_mission_bebop.steps.tracking import VisualServoingStep
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
@@ -154,7 +155,7 @@ class Governor:
     engaged = False
 
     @staticmethod
-    def compute_vz(_altitude, _dt=None):
+    def compute_vz(_altitude, _dt=None, vx_commanded=0.0):
         return 0.0
 
 
@@ -195,6 +196,9 @@ class Ctx:
         self.detector = self
         self.overlays = []
         self._dt = 1.0 / params.kinematics.control_loop_hz
+        # Inline perception: one frame, one inference, one overlay per control
+        # cycle, so the stage's frame-counting logic is exercised exactly.
+        self.perception = SynchronousPerception(self)
 
     # -- perception ------------------------------------------------------
     def grab_frame(self, timeout_sec=1.0):
@@ -418,6 +422,29 @@ def test_the_step_recovers_from_a_nadir_dropout_instead_of_ending(simulated_time
     assert ctx.scene.ground_range_m <= inspection_standoff(ctx.params) + 0.10
 
 
+def test_a_brief_occlusion_does_not_trigger_reacquisition_or_lose_progress(simulated_time):
+    """The alpha-beta coast is supposed to absorb this on its own, silently.
+
+    Ten frames at 16 Hz is well inside ConstantVelocityTracker's 1.5 s coast
+    horizon -- a glint, the airframe's own shadow, or a single bad detection,
+    not a real loss. The approach must finish exactly as if the dropout had
+    never happened: no REACQUIRING phase, no discarded progress.
+    """
+    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
+    ctx.blackout = range(60, 70)
+
+    status = VisualServoingStep().execute(ctx)
+
+    standoff = inspection_standoff(ctx.params)
+    assert status.name == "SUCCESS"
+    assert ctx.blackboard.approach_finished
+    assert not any("REACQUIRING" in line for line in ctx.overlays), (
+        "a ten-frame dropout escalated to active reacquisition; the coast layer "
+        "did not absorb it"
+    )
+    assert ctx.scene.ground_range_m <= standoff + 0.10
+
+
 def test_a_permanent_loss_still_terminates(simulated_time):
     """Recovery must be bounded: it is a retry, not a new way to hang."""
     ctx = Ctx(flight_params(), Scene(ground_range_m=3.0))
@@ -441,3 +468,84 @@ def test_recovery_never_violates_the_vertical_invariant(simulated_time):
 
     assert all(vz <= 0.0 for _vx, _vy, vz, _vyaw in ctx.drone.commands)
     assert all(vyaw == 0.0 for _vx, _vy, _vz, vyaw in ctx.drone.commands)
+
+
+class DecimatedPerception(SynchronousPerception):
+    """Camera at the loop rate, detector at a fraction of it.
+
+    Every control cycle still grabs a frame -- which is what advances the
+    simulated scene -- but only every ``stride``-th one is run through the
+    detector. The cycles in between read the previous sample back, exactly as
+    the loop does against the background worker while an inference is in
+    flight.
+    """
+
+    def __init__(self, ctx, stride):
+        super().__init__(ctx)
+        self._stride = stride
+        self._calls = 0
+
+    def get_latest(self, max_age_sec):
+        self._calls += 1
+        if self._calls % self._stride != 1 and self.slot.latest() is not None:
+            self._ctx.grab_frame(timeout_sec=self._frame_timeout)
+            return self.slot.latest()
+        return super().get_latest(max_age_sec)
+
+
+def test_the_approach_converges_when_inference_lags_the_control_loop(simulated_time):
+    """Inference at a third of the loop rate: the ground-station CPU case.
+
+    The servoing law, the tracker and the controller's frame counters run once
+    per new observation; the cycles between re-transmit the latched command.
+    The stage must reach the same standoff it reaches when every cycle carries
+    a fresh detection, and must never re-run the law on a repeated frame.
+    """
+    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
+    ctx.perception = DecimatedPerception(ctx, stride=3)
+
+    status = VisualServoingStep().execute(ctx)
+
+    standoff = inspection_standoff(ctx.params)
+    assert status.name == "SUCCESS"
+    assert ctx.blackboard.approach_finished
+    assert standoff - 0.15 <= ctx.scene.ground_range_m <= standoff + 0.10
+    assert len(ctx.overlays) * 3 <= len(ctx.drone.commands) + 3, (
+        "the control law ran on repeated observations"
+    )
+    assert all(vz <= 0.0 for _vx, _vy, vz, _vyaw in ctx.drone.commands)
+
+
+class RecordingGovernor:
+    def __init__(self):
+        self.calls = []
+
+    def compute_vz(self, altitude, dt=None, vx_commanded=0.0):
+        self.calls.append(vx_commanded)
+        return 0.0
+
+    def horizontal_scale(self):
+        return 1.0
+
+
+def test_tracking_apply_feeds_the_commanded_vx_to_the_governor():
+    """Task 6 wiring: the governor sees what the step is about to command."""
+    from mvp_mission_bebop.controllers.visual_servoing import ServoCommand, TrackingPhase
+
+    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
+    ctx.governor = RecordingGovernor()
+    command = ServoCommand(
+        vx=0.35,
+        vy=0.0,
+        tilt_deg=0.0,
+        pixel_error=0.0,
+        ground_range_m=None,
+        depression_deg=None,
+        phase=TrackingPhase.APPROACHING,
+        nadir_aligned=False,
+        note="",
+    )
+
+    VisualServoingStep()._apply(ctx, command, dt=0.05)
+
+    assert ctx.governor.calls == [0.35]
