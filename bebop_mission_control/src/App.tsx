@@ -15,6 +15,7 @@ import { useTelemetry } from './hooks/useTelemetry';
 import { useLink } from './hooks/useLink';
 import { useMissionRuntime } from './hooks/useMissionRuntime';
 import { useMissionParameters } from './hooks/useMissionParameters';
+import { preflightLocked } from './lib/navigationLock';
 import { useStreamHealth } from './hooks/useStreamHealth';
 import { useEvidence } from './hooks/useEvidence';
 import { useCameraTilt } from './hooks/useCameraTilt';
@@ -93,6 +94,12 @@ export const App: React.FC = () => {
   const [counting, setCounting] = useState(() => previewCountdown() > 0);
   const [countdownSeconds, setCountdownSeconds] = useState(() => previewCountdown() || 0);
   const [warming, setWarming] = useState(false);
+  /**
+   * A launch click is being handled. Covers the pending-edit save as well as
+   * the spawn, so a double click on the dial starts one flight and leaves no
+   * refusal message behind on the pre-flight screen.
+   */
+  const launching = useRef(false);
   const [evidenceToken, setEvidenceToken] = useState(0);
   const [selectedStamp, setSelectedStamp] = useState<string | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
@@ -124,16 +131,8 @@ export const App: React.FC = () => {
   const running = mission.state === 'running' || mission.state === 'arming';
   const over = mission.state === 'finished' || mission.state === 'faulted';
   const benchMode = Boolean(getPath(params.working ?? params.committed, 'no_fly'));
-  /**
-   * The aircraft is committed: pre-flight is locked until it is back down.
-   *
-   * Bench runs are excluded. The lock exists because the screen it blocks is
-   * the one whose single control commands a launch, and the cockpit holds the
-   * only control that stops one — neither applies to a rehearsal with the
-   * motors inert, and locking an operator out of the parameters they are on the
-   * bench to adjust would be the opposite of the point.
-   */
-  const airborne = (running || mission.state === 'aborting') && !benchMode && benchStage === null;
+  /** The aircraft is committed: pre-flight is locked until it is back down. See `preflightLocked`. */
+  const airborne = preflightLocked(mission.state, benchMode, benchStage);
 
   const committed = params.committed;
   const arrivalRadius = num(committed, 'rtl.arrival_radius_m', 0.2);
@@ -214,66 +213,72 @@ export const App: React.FC = () => {
   }, [benchStage, mission.state]);
 
   const launch = useCallback(async () => {
-    // Commit any pending edits first: the mission reads mission_config.json,
-    // so an unsaved slider would otherwise not be the flight that happens.
-    if (params.dirty) await params.save();
+    if (launching.current) return;
+    launching.current = true;
+    try {
+      // Commit any pending edits first: the mission reads mission_config.json,
+      // so an unsaved slider would otherwise not be the flight that happens.
+      if (params.dirty) await params.save();
 
-    const doc = params.working ?? params.committed;
-    // Ten seconds is the station's standard, and it is a real parameter rather
-    // than a UI flourish: the same figure goes to `mission.py --countdown`, so
-    // the overlay and the aircraft count the same window.
-    const seconds = num(doc, 'kinematics.countdown_sec', 10);
+      const doc = params.working ?? params.committed;
+      // Ten seconds is the station's standard, and it is a real parameter rather
+      // than a UI flourish: the same figure goes to `mission.py --countdown`, so
+      // the overlay and the aircraft count the same window.
+      const seconds = num(doc, 'kinematics.countdown_sec', 10);
 
-    resetTrack();
-    setLaunchError(null);
-    setReport(null);
-    setReportDismissed(false);
-    setBenchRun(false);
-    failsafeFiredRef.current = false;
-    setFailsafeTriggered(false);
-    setPendingStage(null);
-    setCountdownSeconds(seconds);
+      resetTrack();
+      setLaunchError(null);
+      setReport(null);
+      setReportDismissed(false);
+      setBenchRun(false);
+      failsafeFiredRef.current = false;
+      setFailsafeTriggered(false);
+      setPendingStage(null);
+      setCountdownSeconds(seconds);
 
-    const result = await mission.launch({
-      countdown: seconds,
-      noFly: Boolean(getPath(doc, 'no_fly')),
-      height: num(doc, 'kinematics.target_altitude_m', 1),
-      velocity: num(doc, 'kinematics.forward_cruise_velocity', 0.2),
-      rtlVelocity: num(doc, 'rtl.max_speed', 0.1),
-      searchTimeout: num(doc, 'timeouts.search_timeout_sec', 30),
-      hoverDuration: num(doc, 'kinematics.hover_duration_sec', 7),
-      confidence: num(doc, 'vision.confidence_threshold', 0.5),
-      arrivalRadius: num(doc, 'rtl.arrival_radius_m', 0.2),
-      modelPath: String(getPath(doc, 'vision.model_path') ?? 'yolov8n.pt'),
-      ip: String(getPath(doc, 'network.drone_ip') ?? '192.168.42.1'),
-      detectionTopic: String(
-        getPath(doc, 'network.detection_stream_topic') ?? '/bebop/camera/detections'
-      ),
-      paramsJson: JSON.stringify(doc ?? {}),
-    });
+      const result = await mission.launch({
+        countdown: seconds,
+        noFly: Boolean(getPath(doc, 'no_fly')),
+        height: num(doc, 'kinematics.target_altitude_m', 1),
+        velocity: num(doc, 'kinematics.forward_cruise_velocity', 0.2),
+        rtlVelocity: num(doc, 'rtl.max_speed', 0.1),
+        searchTimeout: num(doc, 'timeouts.search_timeout_sec', 30),
+        hoverDuration: num(doc, 'kinematics.hover_duration_sec', 7),
+        confidence: num(doc, 'vision.confidence_threshold', 0.5),
+        arrivalRadius: num(doc, 'rtl.arrival_radius_m', 0.2),
+        modelPath: String(getPath(doc, 'vision.model_path') ?? 'yolov8n.pt'),
+        ip: String(getPath(doc, 'network.drone_ip') ?? '192.168.42.1'),
+        detectionTopic: String(
+          getPath(doc, 'network.detection_stream_topic') ?? '/bebop/camera/detections'
+        ),
+        paramsJson: JSON.stringify(doc ?? {}),
+      });
 
-    if (!result.success) {
-      // Stay put. Throwing the operator into the cockpit hides the control they
-      // were using and gives them no way back to the thing that failed.
-      setLaunchError(result.error ?? result.message ?? 'o processo não subiu');
-      return;
-    }
+      if (!result.success) {
+        // Stay put. Throwing the operator into the cockpit hides the control they
+        // were using and gives them no way back to the thing that failed.
+        setLaunchError(result.error ?? result.message ?? 'o processo não subiu');
+        return;
+      }
 
-    // The countdown is the window in which walking away costs nothing, and it
-    // is also the window the mission spends warming YOLO and taking its ground
-    // reference. Neither applies on the bench: the motors never spin, so there
-    // is nothing to stand clear of and nothing to reconsider. The bench gets a
-    // plain loading screen instead, long enough for the mission process to have
-    // video and a detector by the time the cockpit opens.
-    if (benchMode) {
-      setWarming(true);
-      return;
-    }
+      // The countdown is the window in which walking away costs nothing, and it
+      // is also the window the mission spends warming YOLO and taking its ground
+      // reference. Neither applies on the bench: the motors never spin, so there
+      // is nothing to stand clear of and nothing to reconsider. The bench gets a
+      // plain loading screen instead, long enough for the mission process to have
+      // video and a detector by the time the cockpit opens.
+      if (benchMode) {
+        setWarming(true);
+        return;
+      }
 
-    if (seconds >= 1) {
-      setCounting(true);
-    } else {
-      setScreen('cockpit');
+      if (seconds >= 1) {
+        setCounting(true);
+      } else {
+        setScreen('cockpit');
+      }
+    } finally {
+      launching.current = false;
     }
   }, [benchMode, mission, params, resetTrack]);
 

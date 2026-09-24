@@ -37,6 +37,17 @@ export function useMissionRuntime() {
   const stageRef = useRef(0);
   /** Whether the process reported its own exit for the current run. */
   const exitSeen = useRef(false);
+  /**
+   * Whether a mission process exists or is being spawned, known synchronously.
+   *
+   * `state` cannot answer that for a second launch arriving before React has
+   * rendered the first one's `arming`. Such a launch used to be refused by the
+   * main process ("Uma missão já está em andamento") and then set `faulted`
+   * over the mission that *was* starting — releasing the pre-flight lock and
+   * sounding the fault cue mid-countdown, until its first step marker
+   * restored `running`.
+   */
+  const processUp = useRef(false);
 
   // Buffered history, so a screen mounted after launch still sees the start.
   useEffect(() => {
@@ -47,6 +58,7 @@ export function useMissionRuntime() {
     });
     void bridge.getMissionStatus().then((status) => {
       if (status.running) {
+        processUp.current = true;
         setState('running');
         setStartedAt(status.startedAt);
       }
@@ -75,6 +87,7 @@ export function useMissionRuntime() {
       }),
       bridge.onMissionExit((event) => {
         exitSeen.current = true;
+        processUp.current = false;
         setExitCode(event.code);
         setState(event.code === 0 ? 'finished' : 'faulted');
         cues.play(event.code === 0 ? 'complete' : 'fault');
@@ -85,6 +98,10 @@ export function useMissionRuntime() {
 
   const launch = useCallback(
     async (options: MissionLaunchOptions) => {
+      if (processUp.current) {
+        return { success: false, message: 'Uma missão já está em andamento.' };
+      }
+      processUp.current = true;
       setState('arming');
       setStage(0);
       stageRef.current = 0;
@@ -98,6 +115,7 @@ export function useMissionRuntime() {
       if (!bridge) {
         // Browser session: there is no mission to run, so say so instead of
         // pretending one started.
+        processUp.current = false;
         setState('faulted');
         setMissionLog((prev) =>
           appendCapped(prev, [
@@ -113,6 +131,7 @@ export function useMissionRuntime() {
 
       const result = await bridge.startMission(options);
       if (!result.success) {
+        processUp.current = false;
         setState('faulted');
         cues.play('fault');
       } else {
@@ -127,6 +146,7 @@ export function useMissionRuntime() {
     setState('aborting');
     cues.play('abort');
     if (!bridge) {
+      processUp.current = false;
       setState('idle');
       return;
     }
@@ -136,7 +156,10 @@ export function useMissionRuntime() {
     // `onMissionExit` had just set for a mission killed mid-flight, so an
     // aborted run rendered in mint with the success banner while its exit code
     // said otherwise. Only settle when nothing reported an exit at all.
-    if (!exitSeen.current) setState('finished');
+    if (!exitSeen.current) {
+      processUp.current = false;
+      setState('finished');
+    }
   }, [bridge]);
 
   /**
@@ -149,6 +172,7 @@ export function useMissionRuntime() {
    * presented over an aircraft sitting on the ground.
    */
   const reset = useCallback(() => {
+    processUp.current = false;
     setState('idle');
     setStage(0);
     stageRef.current = 0;
@@ -171,6 +195,7 @@ export function useMissionRuntime() {
    * bookkeeping `launch` does, minus the mission arguments.
    */
   const beginBenchStage = useCallback(() => {
+    processUp.current = true;
     setState('running');
     setStage(0);
     stageRef.current = 0;
