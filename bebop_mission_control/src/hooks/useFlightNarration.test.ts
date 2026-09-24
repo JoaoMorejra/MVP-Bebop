@@ -324,3 +324,103 @@ describe('early detection on the bench, replayed', () => {
     expect(arrived.get('mission.target_found')! - t0).toBeLessThan(LINE_MS * 2);
   });
 });
+
+describe('NarrationQueue item options', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('holds an item for the later of its speech and its beat, then reports it done', async () => {
+    vi.useFakeTimers();
+    const done: string[] = [];
+    let finishSlow!: (ok: boolean) => void;
+    const queue = new NarrationQueue((text) =>
+      text === 'slow'
+        ? new Promise<boolean>((resolve) => {
+            finishSlow = resolve;
+          })
+        : Promise.resolve(true)
+    );
+
+    // A copilot that answers at once still paces the card by its beat.
+    queue.enqueue('fast', () => 'fast', { minMs: 2000, onDone: () => done.push('fast') });
+    // A sentence longer than its beat paces the card by the voice.
+    queue.enqueue('slow', () => 'slow', { minMs: 2000, onDone: () => done.push('slow') });
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(done).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(done).toEqual(['fast']);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(done).toEqual(['fast']);
+    finishSlow(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(done).toEqual(['fast', 'slow']);
+  });
+
+  it('drops one group without touching the others, cutting its line if it is playing', async () => {
+    const spoken: string[] = [];
+    const pending: Array<(ok: boolean) => void> = [];
+    let interrupted = 0;
+    const done: string[] = [];
+    const queue = new NarrationQueue(
+      (text) =>
+        new Promise<boolean>((resolve) => {
+          spoken.push(text);
+          pending.push(resolve);
+        }),
+      () => {
+        interrupted += 1;
+        pending.splice(0).forEach((resolve) => resolve(false));
+      }
+    );
+
+    queue.enqueue('inspection.intro', () => 'intro', { group: 'forensic', onDone: () => done.push('intro') });
+    queue.enqueue('inspection.point_1', () => 'one', { group: 'forensic', onDone: () => done.push('one') });
+    queue.enqueue('touchdown', () => 'touchdown');
+    await flush();
+
+    queue.resetGroup('forensic');
+    await flush();
+
+    expect(interrupted).toBe(1);
+    expect(done).toEqual([]);
+    expect(spoken).toEqual(['intro', 'touchdown']);
+  });
+
+  it('leaves a playing line of another group alone', async () => {
+    let interrupted = 0;
+    const pending: Array<(ok: boolean) => void> = [];
+    const queue = new NarrationQueue(
+      () => new Promise<boolean>((resolve) => pending.push(resolve)),
+      () => {
+        interrupted += 1;
+      }
+    );
+    queue.enqueue('touchdown', () => 'touchdown');
+    queue.enqueue('inspection.intro', () => 'intro', { group: 'forensic' });
+    await flush();
+    queue.resetGroup('forensic');
+    expect(interrupted).toBe(0);
+    expect(queue.labels()).toEqual([]);
+  });
+
+  it('releases a pending beat when its item is cut', async () => {
+    vi.useFakeTimers();
+    const spoken: string[] = [];
+    const queue = new NarrationQueue(
+      async (text) => {
+        spoken.push(text);
+        return true;
+      },
+      () => undefined
+    );
+    queue.enqueue('inspection.intro', () => 'intro', { group: 'forensic', minMs: 60_000 });
+    queue.enqueue('touchdown', () => 'next');
+    await vi.advanceTimersByTimeAsync(10);
+    queue.resetGroup('forensic');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(spoken).toEqual(['intro', 'next']);
+  });
+});

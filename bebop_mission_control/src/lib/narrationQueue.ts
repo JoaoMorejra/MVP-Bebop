@@ -1,11 +1,29 @@
 import type { AnnouncePriority } from '../types/bmg';
 
+export interface EnqueueOptions {
+  /** Lines that belong together and are dropped together (`resetGroup`). */
+  group?: string;
+  /**
+   * The least time the item holds the queue, in milliseconds. It ends at the
+   * later of its sentence having been heard and this beat, so a copilot that
+   * answers at once still paces what hangs off `onDone`.
+   */
+  minMs?: number;
+  /** Called once the item ends, with whether the sentence was heard. Not called for a cut item. */
+  onDone?: (heard: boolean) => void;
+}
+
 interface Item {
   label: string;
   compose: () => string;
   priority: AnnouncePriority;
   /** Raised with `preempt`: a failure, abort or failsafe, not narration. */
   alert: boolean;
+  group: string | null;
+  minMs: number;
+  onDone?: (heard: boolean) => void;
+  /** Cut while playing; its `onDone` must not run. */
+  cancelled: boolean;
 }
 
 /**
@@ -30,6 +48,8 @@ export class NarrationQueue {
   private draining = false;
   /** The line being spoken right now, if any. */
   private current: Item | null = null;
+  /** Ends the current item's beat early when the item is cut. */
+  private releaseBeat: (() => void) | null = null;
 
   /**
    * @param speak Plays one line; resolves when it has been heard or never will be.
@@ -46,8 +66,17 @@ export class NarrationQueue {
    * phrase reflects the latest values and a line dropped by `reset` never
    * consumes a variant from the cross-flight history.
    */
-  enqueue(label: string, compose: () => string): void {
-    this.items.push({ label, compose, priority: 'NORMAL', alert: false });
+  enqueue(label: string, compose: () => string, options: EnqueueOptions = {}): void {
+    this.items.push({
+      label,
+      compose,
+      priority: 'NORMAL',
+      alert: false,
+      group: options.group ?? null,
+      minMs: Math.max(0, options.minMs ?? 0),
+      onDone: options.onDone,
+      cancelled: false,
+    });
     void this.drain();
   }
 
@@ -63,9 +92,38 @@ export class NarrationQueue {
   preempt(label: string, compose: () => string, priority: AnnouncePriority = 'URGENT'): void {
     const alerts = this.items.filter((item) => item.alert);
     this.items.length = 0;
-    this.items.push(...alerts, { label, compose, priority, alert: true });
-    if (this.current && !this.current.alert) this.interrupt();
+    this.items.push(...alerts, {
+      label,
+      compose,
+      priority,
+      alert: true,
+      group: null,
+      minMs: 0,
+      cancelled: false,
+    });
+    if (this.current && !this.current.alert) this.cutCurrent();
     void this.drain();
+  }
+
+  /**
+   * Drop every line of `group`, and cut the one playing if it is one of them.
+   *
+   * How a presentation that is torn down (the report dismissed, a new flight)
+   * leaves the queue: its remaining lines go, its callbacks never fire, and
+   * lines of other groups -- the flight's own, an alert -- are untouched.
+   */
+  resetGroup(group: string): void {
+    const kept = this.items.filter((item) => item.group !== group);
+    this.items.length = 0;
+    this.items.push(...kept);
+    if (this.current && this.current.group === group) this.cutCurrent();
+  }
+
+  private cutCurrent(): void {
+    if (!this.current) return;
+    this.current.cancelled = true;
+    this.releaseBeat?.();
+    this.interrupt();
   }
 
   /** Drop every line not yet started. The one being spoken, if any, finishes. */
@@ -101,17 +159,43 @@ export class NarrationQueue {
         }
         if (!text.trim()) continue;
         this.current = item;
+        let heard = false;
         try {
-          await this.speak(text, item.priority);
-        } catch {
-          // A voice that fails is treated as a line not heard; the next one
-          // still gets its turn.
+          heard = (await Promise.all([this.say(text, item.priority), this.beat(item.minMs)]))[0];
         } finally {
           this.current = null;
+          this.releaseBeat = null;
+        }
+        if (!item.cancelled && item.onDone) {
+          try {
+            item.onDone(heard);
+          } catch {
+            // A presentation callback must not stop the voice.
+          }
         }
       }
     } finally {
       this.draining = false;
     }
+  }
+
+  /** `speak`, with a voice that throws or rejects read as a line not heard. */
+  private say(text: string, priority: AnnouncePriority): Promise<boolean> {
+    try {
+      return this.speak(text, priority).catch(() => false);
+    } catch {
+      return Promise.resolve(false);
+    }
+  }
+
+  private beat(ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const id = setTimeout(resolve, ms);
+      this.releaseBeat = () => {
+        clearTimeout(id);
+        resolve();
+      };
+    });
   }
 }
