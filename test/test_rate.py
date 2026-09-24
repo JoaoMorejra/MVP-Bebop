@@ -114,3 +114,21 @@ def test_deadline_reset_restarts_the_countdown():
     assert deadline.expired
     deadline.reset()
     assert deadline.active
+
+
+def test_the_cadence_report_counts_overruns():
+    clock = {"now": 0.0}
+    rate = LoopRate(
+        10.0,
+        clock=lambda: clock["now"],
+        sleeper=lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    rate.tick()
+    clock["now"] += 0.5
+    rate.tick()
+
+    assert rate.cadence_report() == "2 cycles at 10.0 Hz target, 1 overruns (50.0%)"
+
+
+def test_the_cadence_report_before_any_tick():
+    assert LoopRate(15.0).cadence_report() == "0 cycles at 15.0 Hz target, 0 overruns (0.0%)"

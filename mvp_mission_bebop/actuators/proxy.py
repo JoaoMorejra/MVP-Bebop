@@ -134,7 +134,24 @@ class BenchtopDroneProxy:
         Components are normalized to [-1, 1], not metres per second: the driver
         clamps and publishes them as a Twist that the firmware interprets as a
         throttle fraction. The command is latched until another arrives.
+
+        ``vyaw`` is forced to zero here unconditionally. The mission's vertical
+        invariant is that the airframe never rotates -- the Bebop derives its
+        odometry from optical flow, and any yaw rate corrupts the horizontal
+        position estimate every guidance law in this package depends on. Every
+        guidance law was audited and none currently emits a nonzero ``vyaw``;
+        this clamp is defense in depth against a future regression, applied at
+        the single point every velocity command in the mission passes through,
+        rather than trusted to hold at every call site independently.
         """
+        if vyaw != 0.0:
+            logger.error(
+                "Rejected a nonzero vyaw=%.4f from a velocity command; the yaw "
+                "invariant forbids rotation for the whole mission. Forcing to 0.0.",
+                vyaw,
+            )
+            vyaw = 0.0
+
         if self.motion_tracker is not None:
             self.motion_tracker.command(vx=vx, vy=vy, vz=vz, vyaw=vyaw, duration=duration)
 

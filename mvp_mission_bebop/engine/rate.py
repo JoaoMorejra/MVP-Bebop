@@ -95,6 +95,19 @@ class LoopRate:
         """Number of completed ticks."""
         return self._ticks
 
+    def cadence_report(self) -> str:
+        """One-line summary of how well the loop held its period.
+
+        Logged when a closed-loop stage ends, so a flight log shows directly
+        whether anything on the control path -- inference, historically --
+        stretched the cycle past its target period.
+        """
+        share = 100.0 * self._overruns / self._ticks if self._ticks else 0.0
+        return (
+            f"{self._ticks} cycles at {self.frequency_hz:.1f} Hz target, "
+            f"{self._overruns} overruns ({share:.1f}%)"
+        )
+
     def reset(self) -> None:
         """Re-anchor the pacer to now, discarding any accumulated lateness."""
         self._last_tick = self._clock()
