@@ -9,6 +9,7 @@ import { CountdownOverlay } from './components/preflight/CountdownOverlay';
 import { CockpitScreen } from './components/cockpit/CockpitScreen';
 import { EvidenceScreen } from './components/evidence/EvidenceScreen';
 import { DiagnosticsScreen } from './components/diagnostics/DiagnosticsScreen';
+import { DiagnosticsOverlayHeader } from './components/diagnostics/DiagnosticsOverlayHeader';
 import { TabSwitch } from './components/shell/TabSwitch';
 import { useBridge } from './hooks/useBridge';
 import { useTelemetry } from './hooks/useTelemetry';
@@ -657,19 +658,21 @@ export const App: React.FC = () => {
 
       {overlay !== 'none' ? (
         <div className="fixed inset-0 z-[60] flex flex-col bg-abyss/92 backdrop-blur-sm">
-          <header className="flex h-12 shrink-0 items-center justify-between border-b border-strut-soft px-4">
-            <h2 className="font-cond text-base tracking-wide text-frost">
-              {overlay === 'evidence' ? 'Dossiê pericial' : 'Diagnóstico · Terminal'}
-            </h2>
-            <button
-              type="button"
-              onClick={() => setOverlay('none')}
-              aria-label="Fechar"
-              className="rounded-bezel p-1.5 text-haze transition-colors hover:bg-hull-raise hover:text-frost"
-            >
-              <X size={16} />
-            </button>
-          </header>
+          {overlay === 'evidence' ? (
+            <header className="flex h-12 shrink-0 items-center justify-between border-b border-strut-soft px-4">
+              <h2 className="font-cond text-base tracking-wide text-frost">Dossiê pericial</h2>
+              <button
+                type="button"
+                onClick={() => setOverlay('none')}
+                aria-label="Fechar"
+                className="rounded-bezel p-1.5 text-haze transition-colors hover:bg-hull-raise hover:text-frost"
+              >
+                <X size={16} />
+              </button>
+            </header>
+          ) : (
+            <DiagnosticsOverlayHeader title="Diagnóstico · Terminal" onClose={() => setOverlay('none')} />
+          )}
           <div className="min-h-0 flex-1">
             {overlay === 'evidence' ? (
               <EvidenceScreen
