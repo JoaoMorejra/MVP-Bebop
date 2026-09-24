@@ -25,6 +25,11 @@ class NetworkConfig:
     namespace: str = "bebop"
     camera_raw_topic: str = "/bebop/camera/image_raw"
     detection_stream_topic: str = "/bebop/camera/detections"
+    #: Lightweight overlay feed: detections and stage caption as
+    #: ``bmg.detections.v1`` JSON in ``std_msgs/String``. The GCS bridge draws
+    #: it over the 33 Hz raw stream, so the cockpit video no longer runs at the
+    #: inference rate. See :mod:`mvp_mission_bebop.perception.summary`.
+    detection_boxes_topic: str = "/bebop/camera/detection_boxes"
     odometry_topic: str = "/bebop/odom"
 
 
@@ -84,6 +89,30 @@ class VisionConfig:
 
     model_path: str = "yolov8n.pt"
     confidence_threshold: float = 0.50
+    #: Detector input size in pixels, or ``None`` for the model's native 640.
+    #:
+    #: Inference cost on the ground station's CPU falls roughly with the square
+    #: of this number (bench, one 856x480 frame, YOLOv8n .pt on CPU: 640 ~81 ms,
+    #: 480 ~47 ms, 320 ~30 ms). It also shrinks the smallest object the
+    #: detector resolves, and a target at the far end of the search track spans
+    #: few pixels already, so a reduced size is not the default until it has
+    #: been validated in the field. Must be a multiple of 32, the YOLOv8
+    #: feature stride. Bench recommendation for the first field trial: 480.
+    inference_imgsz: Optional[int] = None
+    #: Oldest detection a control loop may still act on, in seconds.
+    #:
+    #: Inference runs on its own thread and a loop reads the newest result, so
+    #: this bounds the latency between the scene and the command derived from
+    #: it. The lower bound is set by the pipeline itself: a result is published
+    #: one acquisition (<= 33 ms) plus one CPU inference (150-250 ms) after its
+    #: frame, and a bound near that figure turns every slightly slow inference
+    #: into a dropout. 0.5 s leaves two worst-case inference periods of margin.
+    #: The upper bound is set by motion: at the 0.20 search cruise and the 0.15
+    #: approach cap (m/s at the uncalibrated unit gain) a half-second-old
+    #: observation places the target 0.10 m and 0.075 m from where it is now --
+    #: under the 0.25 m nadir range threshold, and a bearing error of a few
+    #: pixels at the ranges where the approach is still translating.
+    perception_max_age_sec: float = 0.5
     target_classes: List[str] = field(default_factory=lambda: ["motorcycle", "bicycle"])
     confirmation_frames: int = 3
     #: Frames of sustained loss required before confirmation is withdrawn.
@@ -323,6 +352,20 @@ class AltitudeGovernorConfig:
     max_accel_mps2: float = 0.40
     max_jerk_mps3: float = 2.00
 
+    # ------------------------------------------------------ lift feedforward
+
+    #: Anticipatory climb command per unit of commanded horizontal speed
+    #: (normalized-to-normalized gain; both axes share the driver's [-1, 1]
+    #: command scale). The integral term already rejects the *sustained*
+    #: translation-induced sink, but only after the altitude has already
+    #: sagged enough to accumulate against it. This term requests climb
+    #: authority the instant translation begins, ahead of that lag.
+    #:
+    #: Defaults to zero -- inert -- until a field measurement of the actual
+    #: sink-per-commanded-speed relationship justifies a nonzero value. See
+    #: the design spec's "field validation required" section.
+    feedforward_gain: float = 0.0
+
     # -------------------------------------------- horizontal speed throttling
 
     #: Altitude error at which horizontal flight is throttled all the way down
@@ -356,6 +399,12 @@ class FlightKinematicsConfig:
     altitude_ceiling_margin_m: float = 0.25
     forward_cruise_velocity: float = 0.20
     max_approach_forward_speed: float = 0.15
+    #: Safety ceiling on the post-takeoff stabilization gate, in seconds.
+    #:
+    #: Was an unconditional hover of this length. The stage now leaves as soon
+    #: as the ``takeoff_settle_*`` criteria hold and waits this long only when
+    #: they never do -- which is also the previous behaviour, so a gate that
+    #: cannot be satisfied costs nothing relative to the old wait.
     takeoff_stabilize_duration_sec: float = 4.0
     hover_duration_sec: float = 7.0
     countdown_sec: float = 0.0
@@ -439,6 +488,27 @@ class FlightKinematicsConfig:
     climb_settle_min_samples: int = 5
     climb_settle_max_speed_mps: float = 0.10
     climb_settle_max_position_sigma_m: float = 0.08
+    #: Convergence gate that ends the post-takeoff stabilization early.
+    #:
+    #: The Bebop runs its own launch profile and the SDK's ``takeoff`` returns
+    #: after a fixed delay without confirming anything, so the gate watches the
+    #: airframe instead: mean ``|vz|`` and the standard deviation of altitude
+    #: over a sliding window, on the same sonar/barometer noise floor the climb
+    #: gate is tuned for (~0.05-0.08 m). Only *new* odometry samples count, so a
+    #: stalled telemetry stream reads as "not yet settled" rather than as a
+    #: perfectly still aircraft. Four samples over the window is what a 5 Hz
+    #: odometry stream delivers with margin.
+    takeoff_settle_window_sec: float = 1.00
+    takeoff_settle_min_samples: int = 4
+    takeoff_settle_max_vz_mps: float = 0.10
+    takeoff_settle_max_altitude_sigma_m: float = 0.08
+    #: Altitude below which a sample cannot be evidence of a settled hover, in
+    #: metres. Before liftoff -- motors still spooling when ``takeoff`` returns
+    #: -- the drone sits on the ground with zero ``vz`` and zero dispersion,
+    #: which is exactly what settlement looks like. Samples under this height
+    #: restart the window. Well under the ~1.0 m firmware hover height and above
+    #: the sonar's ground return.
+    takeoff_settle_min_altitude_m: float = 0.30
     #: Hard envelope on any horizontal velocity component reaching the driver,
     #: in normalized units.
     #:
@@ -662,10 +732,26 @@ class ReturnToLaunchConfig:
     max_centering_speed: float = 0.08
     #: Radial error inside which the airframe counts as centred, in metres.
     centering_tolerance_m: float = 0.04
-    #: Consecutive cycles inside :attr:`centering_tolerance_m` *at residual
-    #: speed* required before the landing is authorized. A single sample inside
-    #: the tolerance is satisfied by a drone flying through the centre at speed.
-    centering_settle_cycles: int = 4
+    #: Radial error inside which the landing is authorized, once at residual
+    #: speed for :attr:`centering_settle_cycles` consecutive cycles, in metres.
+    #:
+    #: Deliberately looser than :attr:`centering_tolerance_m`. The marker is a
+    #: 0.20 m square printed on a landing pad 0.50-1.0 m across, so a touchdown
+    #: anywhere inside this radius is still solidly on the pad. Converging
+    #: tighter than this before landing buys nothing but battery: every extra
+    #: settle cycle spent chasing the tight internal tolerance is a correction
+    #: against an error the touchdown itself absorbs. centering_tolerance_m is
+    #: retained unchanged as the internal deadband/rest-mode switch the PD
+    #: converges the approach against; this is the separate, operational
+    #: statement of when the approach is done.
+    landing_radius_m: float = 0.13
+    #: Consecutive cycles inside :attr:`landing_radius_m` *at residual speed*
+    #: required before the landing is authorized. A single sample inside the
+    #: radius is satisfied by a drone flying through it at speed; two
+    #: consecutive samples at residual speed is the minimum that distinguishes
+    #: "passing through" from "arrived", without paying for cycles beyond what
+    #: that distinction needs.
+    centering_settle_cycles: int = 2
     #: Consecutive frames carrying the target ID required before the reverse
     #: cruise brakes. Guards against a single-frame false positive committing the
     #: mission to a landing site.
@@ -679,6 +765,24 @@ class ReturnToLaunchConfig:
     #: because a settlement claim built on stale observations is exactly the
     #: claim that puts the aircraft down somewhere it was not looking.
     lost_frames_tolerance: int = 5
+    #: Bounded reverse creep commanded while the marker is lost, normalized.
+    #:
+    #: The camera_tilt_deg rear field of view is narrow by construction (see
+    #: that field's docstring), so a marker lost while the airframe was still
+    #: actively closing on it -- not already at rest over it -- is very often a
+    #: marker that has just slipped out of frame ahead or below. Holding
+    #: station and waiting out lost_frames_tolerance treats that the same as
+    #: any other dropout; creeping aft treats it as what it almost always is.
+    #: Bounded well below reverse_cruise_velocity: this is a re-framing nudge,
+    #: not a second search leg.
+    reacquire_creep_speed: float = 0.03
+    #: Duration the aft creep runs before yielding to a plain hold, in seconds.
+    reacquire_creep_sec: float = 1.0
+    #: Radial error, at the last valid sighting, below which a subsequent loss
+    #: is treated as a close-in overshoot rather than a general dropout. Losses
+    #: from well outside this range are not the narrow-FOV failure the creep
+    #: exists for, and creeping there would be aimless.
+    reacquire_creep_range_m: float = 0.30
     #: Window for the centering phase alone, in seconds.
     #:
     #: Separate from :attr:`timeout_sec`, which bounds the search. Sharing one
@@ -703,6 +807,25 @@ class CalibrationConfig:
     max_ground_dispersion_m: float = 0.15
     #: Ring buffer depth for pre-takeoff samples.
     sample_buffer_size: int = 50
+
+    # -------------------------------------------------- altitude plausibility
+
+    #: Master switch for the sonar false-climb plausibility gate applied to
+    #: live odometry. With this false the raw altitude is trusted exactly as
+    #: before this fix, which is the escape hatch for a field session where
+    #: the gate itself misbehaves.
+    plausibility_enabled: bool = True
+    #: Ceiling on the airframe's real vertical speed the gate will accept in
+    #: one cycle, in metres per second.
+    plausibility_max_speed_mps: float = 1.00
+    #: Ceiling on the airframe's real vertical acceleration, in metres per
+    #: second squared. Matches the altitude governor's own command profile
+    #: limit (``AltitudeGovernorConfig.max_accel_mps2``): a controller that
+    #: cannot command more than this cannot have produced more than this.
+    plausibility_max_accel_mps2: float = 0.40
+    #: Consecutive out-of-envelope samples required before a new regime is
+    #: accepted rather than held.
+    plausibility_reject_streak: int = 3
 
 
 @dataclass
@@ -745,6 +868,16 @@ class InspectionConfig:
     settle_min_samples: int = 5
     settle_max_speed_mps: float = 0.03
     settle_max_position_sigma_m: float = 0.04
+    #: Ceiling on the mean absolute commanded vertical speed tolerated during
+    #: the stillness window, in the same normalized units
+    #: ``AltitudeHoldGovernor.compute_vz`` returns.
+    #:
+    #: The horizontal criteria above say nothing about the vertical axis: a
+    #: hover can be statistically still in x/y while the altitude governor is
+    #: still actively correcting a sink, and the firmware's autonomous
+    #: `do_hover` mode will not engage while any nonzero `gaz_speed` is being
+    #: commanded (`bebop.cpp::Bebop::move`). This closes that gap.
+    settle_max_vertical_speed: float = 0.02
     #: Give up waiting for stillness and capture anyway after this long.
     settle_timeout_sec: float = 6.0
     #: Write a forensic metadata sidecar alongside the image pair.
