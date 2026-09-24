@@ -322,3 +322,205 @@ def test_params_json_flag_is_still_accepted(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["mission.py", "--params-json", '{"no_fly": true}'])
     arguments = parse_arguments(MissionParameters())
     assert json.loads(arguments.params_json)["no_fly"] is True
+
+
+def test_bench_flags_default_to_the_gcs_behaviour(monkeypatch):
+    """The GCS passes neither flag; both must leave the historical paths intact."""
+    from mvp_mission_bebop.mission import parse_arguments
+
+    monkeypatch.setattr(sys, "argv", ["mission.py", "--no-fly"])
+    arguments = parse_arguments(MissionParameters())
+    assert arguments.config is None
+    assert arguments.bench_frame is None
+
+    monkeypatch.setattr(
+        sys, "argv", ["mission.py", "--config", "/tmp/c.json", "--bench-frame", "/tmp/f.jpg"]
+    )
+    arguments = parse_arguments(MissionParameters())
+    assert (arguments.config, arguments.bench_frame) == ("/tmp/c.json", "/tmp/f.jpg")
+
+
+# ------------------------------------------------------------------ milestones
+
+#: The pattern the GCS matches milestone lines with (spec 2026-09-24, section 3.2).
+MILESTONE_LINE = re.compile(r"\[MILESTONE ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$")
+
+#: The GCS stage matcher, verbatim from ``electron/main.cjs``.
+STEP_LINE = re.compile(r"\[STEP ([1-5]):")
+
+#: Pool keys of the synchronisation table (spec section 4) that the mission
+#: process raises. ``mission.start`` and ``mission.countdown_3`` belong to the GCS.
+SPEC_MILESTONE_KEYS = (
+    "mission.takeoff",
+    "mission.scan_start",
+    "mission.target_found",
+    "mission.approaching",
+    "mission.capture_done",
+    "mission.rtl_start",
+    "mission.landing",
+)
+
+
+def test_the_emitted_keys_are_exactly_the_spec_pool_keys():
+    from mvp_mission_bebop.telemetry.milestones import MILESTONE_KEYS
+
+    assert MILESTONE_KEYS == SPEC_MILESTONE_KEYS
+
+
+def test_a_milestone_line_is_matched_by_the_gcs_and_never_as_a_step():
+    from mvp_mission_bebop.telemetry.milestones import encode_milestone
+
+    line = encode_milestone("mission.takeoff", {"altitude_m": 1.2})
+    rendered = f"2026-09-24 17:57:31 [INFO] [Milestone] {line}"
+
+    match = MILESTONE_LINE.search(rendered)
+    assert match is not None
+    assert match.group(1) == "mission.takeoff"
+    assert json.loads(match.group(2)) == {"altitude_m": 1.2}
+    assert STEP_LINE.search(rendered) is None
+
+
+def test_an_empty_payload_is_still_an_object():
+    from mvp_mission_bebop.telemetry.milestones import encode_milestone
+
+    assert encode_milestone("mission.rtl_start").endswith("] {}")
+
+
+def test_non_finite_values_reach_the_renderer_as_null():
+    """``JSON.parse`` rejects NaN and Infinity; one bad float must not lose the line."""
+    from mvp_mission_bebop.telemetry.milestones import encode_milestone
+
+    line = encode_milestone(
+        "mission.target_found", {"bearing_deg": float("nan"), "center_px": [float("inf"), 2.0]}
+    )
+    payload = json.loads(MILESTONE_LINE.search(line).group(2))
+    assert payload == {"bearing_deg": None, "center_px": [None, 2.0]}
+    assert "\n" not in line
+
+
+def test_a_payload_carrying_a_newline_stays_on_one_line():
+    from mvp_mission_bebop.telemetry.milestones import encode_milestone
+
+    line = encode_milestone("mission.capture_done", {"raw_image": "a\nb.png"})
+    assert "\n" not in line
+    assert json.loads(MILESTONE_LINE.search(line).group(2))["raw_image"] == "a\nb.png"
+
+
+@pytest.mark.parametrize(
+    "key, payload, error",
+    [
+        ("mission.start", None, ValueError),
+        ("mission.unknown", None, ValueError),
+        (7, None, TypeError),
+        ("mission.takeoff", ["altitude"], TypeError),
+        ("mission.takeoff", {"altitude": object()}, ValueError),
+    ],
+)
+def test_malformed_milestones_are_refused(key, payload, error):
+    from mvp_mission_bebop.telemetry.milestones import encode_milestone
+
+    with pytest.raises(error):
+        encode_milestone(key, payload)
+
+
+def test_emitting_never_raises_into_the_step(monkeypatch):
+    from mvp_mission_bebop.telemetry import milestones
+
+    warnings = []
+    monkeypatch.setattr(milestones.logger, "warning", lambda *args: warnings.append(args))
+    milestones.emit_milestone("mission.not_a_key", {"x": 1})
+    assert warnings and warnings[0][0].startswith("Milestone dropped")
+
+
+_REPO = os.path.join(os.path.dirname(__file__), "..")
+
+#: Short enough that the whole five-stage bench run completes in well under a
+#: minute; every field is a plain parameter the operator can also set.
+_SHORT_BENCH_RUN = {
+    "kinematics": {
+        "countdown_sec": 0.0,
+        "takeoff_stabilize_duration_sec": 1.0,
+        "hover_duration_sec": 1.0,
+    },
+    "timeouts": {"search_timeout_sec": 10.0, "tracking_timeout_sec": 4.0},
+    "rtl": {"timeout_sec": 4.0, "centering_timeout_sec": 3.0, "touchdown_timeout_sec": 4.0},
+}
+
+
+def _config_digest(path):
+    import hashlib
+
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def test_a_full_bench_run_crosses_every_milestone_in_flight_order(tmp_path):
+    """``--no-fly --stages 1,2,3,4,5`` on the bundled target frame.
+
+    Runs the real mission process against a bench frame with a bicycle in it,
+    in a scratch directory and on a scratch parameter store, so the evidence
+    files and the rewritten configuration never touch the operator's copies.
+    """
+    import subprocess
+
+    pytest.importorskip("rclpy")
+    operator_config = os.path.join(_REPO, "mvp_mission_bebop", "mission_config.json")
+    before = _config_digest(operator_config)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mvp_mission_bebop.mission",
+            "--no-fly",
+            "--stages",
+            "1,2,3,4,5",
+            "--config",
+            str(tmp_path / "mission_config.json"),
+            "--bench-frame",
+            os.path.join(_REPO, "test", "fixtures", "bench_target.jpg"),
+            "--model-path",
+            os.path.join(_REPO, "mvp_mission_bebop", "yolov8n.pt"),
+            "--params-json",
+            json.dumps(_SHORT_BENCH_RUN),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    assert completed.returncode == 0, completed.stdout[-4000:] + completed.stderr[-4000:]
+
+    sequence = []
+    payloads = {}
+    for line in completed.stdout.splitlines():
+        step = STEP_LINE.search(line)
+        if step:
+            sequence.append(f"STEP {step.group(1)}")
+            continue
+        milestone = MILESTONE_LINE.search(line)
+        if milestone:
+            payloads[milestone.group(1)] = json.loads(milestone.group(2))
+            sequence.append(milestone.group(1))
+
+    assert sequence == [
+        "STEP 1",
+        "mission.takeoff",
+        "STEP 2",
+        "mission.scan_start",
+        "mission.target_found",
+        "STEP 3",
+        "mission.approaching",
+        "STEP 4",
+        "mission.capture_done",
+        "STEP 5",
+        "mission.rtl_start",
+        "mission.landing",
+    ]
+    assert payloads["mission.takeoff"]["altitude_m"] == pytest.approx(
+        MissionParameters().kinematics.target_altitude_m
+    )
+    assert payloads["mission.target_found"]["class_name"] in MissionParameters().vision.target_classes
+    assert _config_digest(operator_config) == before, "the bench run rewrote the operator config"
