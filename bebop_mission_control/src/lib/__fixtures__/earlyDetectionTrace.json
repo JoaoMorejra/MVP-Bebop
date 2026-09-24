@@ -1,0 +1,34 @@
+{
+  "source": "scripts/bench_fps.py --hidden-sec 0 --tracking-sec 5, 2026-09-24; target visible from the first search frame",
+  "t0": "first line mission.py wrote to stdout",
+  "lines": [
+    {
+      "t_ms": 1188,
+      "line": "2026-09-24 19:16:33 [INFO] [Step1Takeoff] --- [STEP 1: Calibration, Takeoff & Stabilization] ---"
+    },
+    {
+      "t_ms": 1189,
+      "line": "2026-09-24 19:16:33 [INFO] [Milestone] [MILESTONE mission.takeoff] {\"altitude_m\":1.0}"
+    },
+    {
+      "t_ms": 3526,
+      "line": "2026-09-24 19:16:35 [INFO] [Step2Search] --- [STEP 2: Linear Forward Search] ---"
+    },
+    {
+      "t_ms": 3526,
+      "line": "2026-09-24 19:16:35 [INFO] [Milestone] [MILESTONE mission.scan_start] {\"cruise_mps\":0.2,\"window_sec\":20.0}"
+    },
+    {
+      "t_ms": 4482,
+      "line": "2026-09-24 19:16:36 [INFO] [Milestone] [MILESTONE mission.target_found] {\"bearing_deg\":3.6,\"center_px\":[460.0,254.0],\"class_name\":\"bicycle\",\"confidence\":0.792,\"forward_m\":2.53,\"ground_range_m\":2.54,\"lateral_m\":-0.17}"
+    },
+    {
+      "t_ms": 5321,
+      "line": "2026-09-24 19:16:37 [INFO] [Step3Tracking] --- [STEP 3: Visual Servoing & Coupled Guidance] ---"
+    },
+    {
+      "t_ms": 5321,
+      "line": "2026-09-24 19:16:37 [INFO] [Milestone] [MILESTONE mission.approaching] {\"window_sec\":5.0}"
+    }
+  ]
+}

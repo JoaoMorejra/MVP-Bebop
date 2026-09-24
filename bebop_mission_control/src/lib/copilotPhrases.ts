@@ -140,7 +140,8 @@ export const PHRASE_POOLS: Readonly<Record<MilestoneKey, readonly string[]>> = {
 
 export const MILESTONE_KEYS = Object.keys(PHRASE_POOLS) as readonly MilestoneKey[];
 
-function isMilestoneKey(value: string): value is MilestoneKey {
+/** Whether `value` names a phrase pool. Milestone keys arrive as untyped IPC strings. */
+export function isMilestoneKey(value: string): value is MilestoneKey {
   return Object.prototype.hasOwnProperty.call(PHRASE_POOLS, value);
 }
 
@@ -277,6 +278,32 @@ export function describeTargetLocation(fix: TargetFix | null | undefined): strin
     phrase += Math.abs(bearing) < ASIDE_DEG ? `, levemente ${side}` : `, ${side}`;
   }
   return phrase;
+}
+
+/**
+ * The spoken line for one milestone event, drawn with cross-flight memory.
+ *
+ * Detail comes from the milestone payload first: the altitude the mission
+ * actually commanded, the pinhole range and bearing of the target. The
+ * configured altitude is the fallback for a payload that lacks it.
+ */
+export function phraseForMilestone(
+  key: MilestoneKey,
+  payload: Readonly<Record<string, unknown>>,
+  configuredAltitudeM: number,
+  options: { storage?: StorageLike | null; random?: () => number } = {}
+): string {
+  const reported = payload.altitude_m;
+  const altitude =
+    typeof reported === 'number' && Number.isFinite(reported) ? reported : configuredAltitudeM;
+  return nextPhrase(
+    key,
+    {
+      altitude: spokenMeters(altitude),
+      location: describeTargetLocation(payload as TargetFix),
+    },
+    options
+  );
 }
 
 /**

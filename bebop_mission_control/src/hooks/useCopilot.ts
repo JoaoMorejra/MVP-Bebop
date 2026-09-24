@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AnnouncePriority } from '../types/bmg';
 import type { Finding } from '../lib/forensics';
 import { REPORT_INTRO, REPORT_OUTRO, findingGapMs } from '../lib/forensics';
-import type { MilestoneKey } from '../lib/copilotPhrases';
-import { describeTargetLocation, nextPhrase, spokenMeters } from '../lib/copilotPhrases';
+import { isMilestoneKey, phraseForMilestone } from '../lib/copilotPhrases';
+import { NarrationQueue } from '../lib/narrationQueue';
 import { useBridge } from './useBridge';
 
 /**
@@ -119,79 +119,79 @@ export function useCopilot(): Copilot {
   return { say, cancel, available: Boolean(bridge) };
 }
 
-/**
- * The phrase pool each reported stage is narrated from.
- *
- * Stage 3 begins only once Stage 2 has confirmed a target, which is why its
- * marker carries the target-found call. The stage marker holds no position, so
- * that call names the runway rather than a range.
- */
-const STAGE_MILESTONES: Record<number, MilestoneKey> = {
-  1: 'mission.takeoff',
-  2: 'mission.scan_start',
-  3: 'mission.target_found',
-  4: 'mission.capture_done',
-  5: 'mission.rtl_start',
-};
-
 const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
 
 /**
- * Narrate the flight itself.
+ * Narrate the flight itself, one milestone at a time.
  *
- * Driven by the stage the mission has actually reported, never by a timer, so
- * the copilot cannot announce a manoeuvre the aircraft did not reach. Each
- * stage is called once per flight: `mission.py` re-logging a step marker does
- * not make the copilot say it again.
+ * Driven by the milestones the flight actually crossed (`bmg:milestone`),
+ * never by a timer, so the copilot cannot announce a manoeuvre the aircraft
+ * did not reach. The flight does not wait for the voice: milestones go into a
+ * FIFO {@link NarrationQueue} as they arrive and are spoken in that order, each
+ * once the previous line has been heard, so an early detection is narrated
+ * after the takeoff and scan calls it overtook rather than over them.
  *
- * `flightKey` is what makes "per flight" mean anything — the launch timestamp,
- * which is a new value for every launch and null once the cycle is closed.
- * Keying the reset on `enabled` instead left the set of already-called stages
- * populated across an entire session, so the copilot went silent from the
- * second flight onward.
+ * Each key is spoken once per flight, drawn from its phrase pool with the
+ * cross-flight history in `copilotPhrases`. A flight begins at its
+ * `mission.start` milestone, which clears the queue and that per-flight set.
+ * The reset is keyed on the milestone and not on `flightKey` because the
+ * launch timestamp is committed by a React render that can land after the
+ * main process has already sent `mission.start`, and a reset then would drop
+ * the flight's first line. `flightKey` returning to null — the cycle closed —
+ * drops whatever is still queued.
  *
- * Each call is drawn from its phrase pool with the cross-flight history in
- * `copilotPhrases`, so consecutive flights do not repeat a wording.
- * `altitudeM` is the configured target altitude the takeoff call cites; it is
- * read when the call is made, so a later edit does not re-trigger it.
+ * `altitudeM` is the configured target altitude, the fallback for a takeoff
+ * milestone whose payload lacks one. Events are ignored while `enabled` is
+ * false, which is how bench routines stay silent.
  */
 export function useFlightNarration(
   copilot: Copilot,
-  stage: number,
   landed: boolean,
   enabled: boolean,
   flightKey: number | null,
   altitudeM: number = Number.NaN
 ): void {
-  const called = useRef(new Set<number>());
-  const touchdownCalled = useRef(false);
+  const bridge = useBridge();
+  const sayRef = useRef(copilot.say);
+  sayRef.current = copilot.say;
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
   const altitude = useRef(altitudeM);
   altitude.current = altitudeM;
-  const { say } = copilot;
+
+  const queue = useRef<NarrationQueue | null>(null);
+  if (queue.current === null) queue.current = new NarrationQueue((text) => sayRef.current(text));
+  const spoken = useRef(new Set<string>());
+  const touchdownCalled = useRef(false);
 
   useEffect(() => {
-    called.current.clear();
-    touchdownCalled.current = false;
+    if (!bridge) return;
+    return bridge.onMilestone((event) => {
+      if (!enabledRef.current || !isMilestoneKey(event.key)) return;
+      const key = event.key;
+      if (key === 'mission.start') {
+        queue.current?.reset();
+        spoken.current.clear();
+        touchdownCalled.current = false;
+      }
+      if (spoken.current.has(key)) return;
+      spoken.current.add(key);
+      const payload = event.payload ?? {};
+      queue.current?.enqueue(key, () => phraseForMilestone(key, payload, altitude.current));
+    });
+  }, [bridge]);
+
+  useEffect(() => {
+    if (flightKey === null) queue.current?.reset();
   }, [flightKey]);
 
-  useEffect(() => {
-    if (!enabled || !stage) return;
-    const key = STAGE_MILESTONES[stage];
-    if (!key || called.current.has(stage)) return;
-    called.current.add(stage);
-    void say(
-      nextPhrase(key, {
-        altitude: spokenMeters(altitude.current),
-        location: describeTargetLocation(null),
-      })
-    );
-  }, [enabled, stage, say]);
+  useEffect(() => () => queue.current?.reset(), []);
 
   useEffect(() => {
     if (!landed || touchdownCalled.current) return;
     touchdownCalled.current = true;
-    void say(TOUCHDOWN_CALL);
-  }, [landed, say]);
+    queue.current?.enqueue('touchdown', () => TOUCHDOWN_CALL);
+  }, [landed]);
 }
 
 /**

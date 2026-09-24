@@ -158,7 +158,6 @@ export const App: React.FC = () => {
 
   useFlightNarration(
     copilot,
-    mission.stage,
     landed && narrating,
     narrating,
     mission.startedAt,
