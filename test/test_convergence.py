@@ -108,3 +108,53 @@ def test_criteria_without_a_radius_ignores_distance():
     )
     report = drive(SettlementDetector(criteria), lambda i: (0.0, 0.0, 0.0, 99.0))
     assert report.settled
+
+
+def test_vertical_speed_criterion_is_optional_and_defaults_off():
+    """Existing callers that never pass `vz` are unaffected."""
+    criteria = SettlementCriteria(
+        window_sec=1.0, min_samples=5, max_speed=0.05, max_position_sigma=0.06
+    )
+    report = drive(SettlementDetector(criteria), lambda i: (0.01, -0.005, 0.01, 0.012))
+    assert report.settled, report.reason
+
+
+def test_a_governor_still_actively_climbing_blocks_settlement():
+    """The Ponto 3 defect: horizontally still, vertically still correcting."""
+    criteria = SettlementCriteria(
+        window_sec=1.0,
+        min_samples=5,
+        max_speed=0.05,
+        max_position_sigma=0.06,
+        max_vertical_speed=0.02,
+    )
+    detector = SettlementDetector(criteria)
+    report = None
+    timestamp = 0.0
+    for _ in range(40):
+        report = detector.update(
+            x=0.01, y=-0.005, speed=0.01, vz=0.06, timestamp=timestamp
+        )
+        timestamp += STEP
+    assert not report.settled
+    assert "vertical" in report.reason
+
+
+def test_settlement_resumes_once_the_governor_stops_correcting():
+    criteria = SettlementCriteria(
+        window_sec=1.0,
+        min_samples=5,
+        max_speed=0.05,
+        max_position_sigma=0.06,
+        max_vertical_speed=0.02,
+    )
+    detector = SettlementDetector(criteria)
+    timestamp = 0.0
+    for _ in range(20):
+        detector.update(x=0.01, y=-0.005, speed=0.01, vz=0.06, timestamp=timestamp)
+        timestamp += STEP
+    report = None
+    for _ in range(20):
+        report = detector.update(x=0.01, y=-0.005, speed=0.01, vz=0.0, timestamp=timestamp)
+        timestamp += STEP
+    assert report.settled, report.reason

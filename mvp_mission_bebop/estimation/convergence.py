@@ -42,6 +42,18 @@ class SettlementCriteria:
     max_position_sigma: float
     #: Optional arrival radius every sample must fall within.
     max_distance: Optional[float] = None
+    #: Optional ceiling on the mean absolute *commanded* vertical speed across
+    #: the window, in normalized units (the same units
+    #: ``AltitudeHoldGovernor.compute_vz`` returns). ``None`` disables the
+    #: check, reproducing the detector's behaviour before this field existed.
+    #:
+    #: This is deliberately the commanded value, not a measured vertical
+    #: speed: the firmware's own autonomous hover mode (``do_hover``) engages
+    #: only when the commanded ``gaz_speed`` is within 0.001 of zero
+    #: (``bebop.cpp::Bebop::move``), so what determines whether the airframe
+    #: can actually freeze is what is being asked of it, not what the noisy
+    #: altitude estimate says happened.
+    max_vertical_speed: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.window_sec <= 0.0:
@@ -61,13 +73,14 @@ class SettlementReport:
     mean_speed: float
     position_sigma: float
     max_distance: float
+    mean_vertical_speed: float
 
     def __str__(self) -> str:
         return (
             f"{'SETTLED' if self.settled else 'unsettled'} ({self.reason}): "
             f"n={self.samples} span={self.span_sec:.2f}s "
             f"v_mean={self.mean_speed:.3f} sigma_pos={self.position_sigma:.3f} "
-            f"d_max={self.max_distance:.3f}"
+            f"d_max={self.max_distance:.3f} vz_mean={self.mean_vertical_speed:.3f}"
         )
 
 
@@ -79,8 +92,8 @@ class SettlementDetector:
     def __init__(self, criteria: SettlementCriteria, *, clock: Clock = time.monotonic) -> None:
         self._criteria = criteria
         self._clock = clock
-        # (timestamp, x, y, speed, distance)
-        self._samples: Deque[Tuple[float, float, float, float, float]] = deque()
+        # (timestamp, x, y, speed, distance, vz)
+        self._samples: Deque[Tuple[float, float, float, float, float, float]] = deque()
 
     @property
     def criteria(self) -> SettlementCriteria:
@@ -103,6 +116,7 @@ class SettlementDetector:
         y: float,
         speed: float,
         distance: float = 0.0,
+        vz: float = 0.0,
         timestamp: Optional[float] = None,
     ) -> SettlementReport:
         """Add an observation and re-evaluate the settlement conditions.
@@ -116,6 +130,10 @@ class SettlementDetector:
         distance : float
             Distance to the target, in metres. Compared against
             ``criteria.max_distance`` when that is configured.
+        vz : float
+            Commanded vertical speed for this observation, in normalized
+            units. Compared against ``criteria.max_vertical_speed`` when that
+            is configured.
         timestamp : Optional[float]
             Observation time. Defaults to the injected clock, which tests
             override to drive the window deterministically.
@@ -126,7 +144,7 @@ class SettlementDetector:
             Whether settlement holds, plus the statistics behind the verdict.
         """
         now = self._clock() if timestamp is None else timestamp
-        self._samples.append((now, x, y, speed, distance))
+        self._samples.append((now, x, y, speed, distance, vz))
 
         # Retain exactly one sample at or before the horizon as the window's
         # left edge. Dropping everything older leaves the span strictly shorter
@@ -150,6 +168,7 @@ class SettlementDetector:
                 mean_speed=0.0,
                 position_sigma=0.0,
                 max_distance=0.0,
+                mean_vertical_speed=0.0,
             )
 
         span = now - self._samples[0][0]
@@ -157,6 +176,7 @@ class SettlementDetector:
         ys = [s[2] for s in self._samples]
         speeds = [s[3] for s in self._samples]
         distances = [s[4] for s in self._samples]
+        vertical_speeds = [s[5] for s in self._samples]
 
         mean_speed = statistics.fmean(speeds)
         # Isotropic positional spread: the radius of the scatter, not a
@@ -164,6 +184,7 @@ class SettlementDetector:
         # as one drifting along an axis.
         sigma = math.sqrt(statistics.pvariance(xs) + statistics.pvariance(ys))
         furthest = max(distances)
+        mean_vz = statistics.fmean(abs(v) for v in vertical_speeds)
 
         reason = "converged"
         settled = True
@@ -180,6 +201,9 @@ class SettlementDetector:
         elif mean_speed > criteria.max_speed:
             settled = False
             reason = f"mean speed {mean_speed:.3f} > {criteria.max_speed:.3f} m/s"
+        elif criteria.max_vertical_speed is not None and mean_vz > criteria.max_vertical_speed:
+            settled = False
+            reason = f"vertical speed {mean_vz:.3f} > {criteria.max_vertical_speed:.3f}"
 
         return SettlementReport(
             settled=settled,
@@ -189,4 +213,5 @@ class SettlementDetector:
             mean_speed=mean_speed,
             position_sigma=sigma,
             max_distance=furthest,
+            mean_vertical_speed=mean_vz,
         )

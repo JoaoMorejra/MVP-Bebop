@@ -27,6 +27,7 @@ from typing import Optional
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
+from mvp_mission_bebop.perception.worker import detector_kwargs
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 
 logger = logging.getLogger("Step4Inspection")
@@ -119,6 +120,7 @@ class NadirInspectionStep(BaseStep):
                 min_samples=cfg.settle_min_samples,
                 max_speed=cfg.settle_max_speed_mps,
                 max_position_sigma=cfg.settle_max_position_sigma_m,
+                max_vertical_speed=cfg.settle_max_vertical_speed,
             )
         )
         deadline = Deadline(cfg.settle_timeout_sec)
@@ -127,10 +129,11 @@ class NadirInspectionStep(BaseStep):
         report = None
 
         logger.info(
-            "Verifying motionlessness: speed <= %.3f m/s and position sigma <= %.3f m "
-            "sustained for %.1f s.",
+            "Verifying motionlessness: speed <= %.3f m/s, position sigma <= %.3f m, "
+            "commanded vz <= %.3f, sustained for %.1f s.",
             cfg.settle_max_speed_mps,
             cfg.settle_max_position_sigma_m,
+            cfg.settle_max_vertical_speed,
             cfg.settle_window_sec,
         )
 
@@ -138,7 +141,7 @@ class NadirInspectionStep(BaseStep):
             if ctx.interrupted():
                 return False
 
-            self._hold(ctx)
+            commanded_vz = self._hold(ctx)
             snapshot = ctx.odom_supervisor.snapshot()
             dt = rate.tick()
             elapsed += dt
@@ -147,6 +150,7 @@ class NadirInspectionStep(BaseStep):
                 x=snapshot.x,
                 y=snapshot.y,
                 speed=snapshot.speed,
+                vz=commanded_vz,
                 timestamp=elapsed,
             )
             if report.settled:
@@ -181,7 +185,9 @@ class NadirInspectionStep(BaseStep):
 
         ctx.failsafe.notify_frame_received()
         nadir_conf = ctx.params.inspection.nadir_confidence_threshold
-        result = ctx.detector.detect(frame, conf=nadir_conf)
+        result = ctx.detector.detect(
+            frame, **detector_kwargs(nadir_conf, ctx.params.vision.inference_imgsz)
+        )
         targets = result.filter_by_class(ctx.params.vision.target_classes)
 
         # Trigger the 14 MP onboard camera. It acknowledges nothing and returns
@@ -206,49 +212,97 @@ class NadirInspectionStep(BaseStep):
         return record.captured
 
     def _hover(self, ctx: MissionContext, already_captured: bool) -> StepStatus:
-        """Hold the nadir hover for the configured duration."""
+        """Hold the nadir hover for the configured duration.
+
+        Perception runs only while evidence is still missing. The detector used
+        to be called on every cycle of the hover, including the whole remainder
+        of the window after the capture had already been recorded -- a CPU
+        inference per cycle producing results nothing consumed. Once
+        ``captured`` holds, the pipeline is disengaged and the loop reduces to
+        station keeping: ``_hold`` and ``rate.tick``, nothing else.
+
+        The frame heartbeat stops being refreshed with it. That is safe because
+        this loop never evaluates system health, and Stage 5 re-arms the
+        heartbeat on entry before its first health check.
+
+        A capture triggered from inside the hover needs the camera and detector
+        to itself -- ``ROSCam`` serves new frames to one consumer only -- so the
+        pipeline is disengaged before it, and re-engaged only if it failed.
+        """
         duration = ctx.params.kinematics.hover_duration_sec
+        nadir_conf = ctx.params.inspection.nadir_confidence_threshold
+        imgsz = ctx.params.vision.inference_imgsz
+        max_age = ctx.params.vision.perception_max_age_sec
         deadline = Deadline(duration)
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
         captured = already_captured
+        last_generation = 0
 
-        logger.info("Holding nadir hover for %.1f s...", duration)
-
-        while deadline.active:
-            if ctx.interrupted():
-                return StepStatus.ABORTED
-
-            self._hold(ctx)
-            frame = ctx.grab_frame(timeout_sec=0.2)
-            rate.tick()
-
-            if frame is None:
-                continue
-            ctx.failsafe.notify_frame_received()
-
-            nadir_conf = ctx.params.inspection.nadir_confidence_threshold
-            result = ctx.detector.detect(frame, conf=nadir_conf)
-            targets = result.filter_by_class(ctx.params.vision.target_classes)
-            ctx.publish_annotated_stream(
-                frame,
-                result,
-                f"{'[NO-FLY] ' if ctx.drone.no_fly else ''}STEP 4: NADIR HOVER "
-                f"({deadline.elapsed_sec:.1f}s/{duration:.1f}s) | TARGETS: {len(targets)}",
+        if captured:
+            logger.info(
+                "Holding nadir hover for %.1f s; evidence already recorded, vision suspended.",
+                duration,
             )
+        else:
+            logger.info("Holding nadir hover for %.1f s, watching for a capture...", duration)
+            ctx.perception.engage(conf=nadir_conf, imgsz=imgsz)
 
-            if targets and not captured:
-                captured = self._capture(ctx, settled=True)
+        try:
+            while deadline.active:
+                if ctx.interrupted():
+                    return StepStatus.ABORTED
+
+                self._hold(ctx)
+                rate.tick()
+
+                if captured:
+                    continue
+
+                sample = ctx.perception.get_latest(max_age)
+                if sample is None or sample.generation == last_generation:
+                    continue
+                last_generation = sample.generation
+                ctx.failsafe.notify_frame_received()
+
+                targets = sample.result.filter_by_class(ctx.params.vision.target_classes)
+                ctx.perception.set_status(
+                    f"{'[NO-FLY] ' if ctx.drone.no_fly else ''}STEP 4: NADIR HOVER "
+                    f"({deadline.elapsed_sec:.1f}s/{duration:.1f}s) | TARGETS: {len(targets)}",
+                )
+
+                if targets:
+                    ctx.perception.disengage()
+                    captured = self._capture(ctx, settled=True)
+                    if captured:
+                        logger.info(
+                            "Evidence recorded %.1f s into the hover; vision suspended for "
+                            "the remaining %.1f s.",
+                            deadline.elapsed_sec,
+                            deadline.remaining_sec,
+                        )
+                    else:
+                        ctx.perception.engage(conf=nadir_conf, imgsz=imgsz)
+        finally:
+            ctx.perception.disengage()
+            logger.info("Hover loop cadence: %s.", rate.cadence_report())
 
         return StepStatus.SUCCESS
 
     # ---------------------------------------------------------------- helpers
 
     @staticmethod
-    def _hold(ctx: MissionContext, dt: Optional[float] = None) -> None:
-        """Command a stationary hover with the altitude governor engaged."""
+    def _hold(ctx: MissionContext, dt: Optional[float] = None) -> float:
+        """Command a stationary hover with the altitude governor engaged.
+
+        Returns the commanded vertical speed (post-clamp), in normalized
+        units, so callers that need to know whether the vertical axis is
+        still actively correcting -- see :meth:`_await_stillness` -- do not
+        have to recompute it.
+        """
         vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude, dt)
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
+        return safe_vz
 
     @staticmethod
     def _announce(action: str, detail: str) -> None:
