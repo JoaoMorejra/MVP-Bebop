@@ -31,6 +31,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Final, List, Optional, Sequence, Tuple
 
+from mvp_mission_bebop.estimation.altitude_plausibility import (
+    AltitudePlausibilityFilter,
+    PlausibilityLimits,
+)
 from mvp_mission_bebop.parameters import (
     CalibrationConfig,
     FlightKinematicsConfig,
@@ -191,6 +195,14 @@ class OdometrySupervisor:
         self._lock = threading.Lock()
         self.ground_reference_altitude: Optional[float] = None
         self.current_raw_altitude: float = 0.0
+        self._altitude_filter = AltitudePlausibilityFilter(
+            PlausibilityLimits(
+                max_speed_mps=self.calibration_cfg.plausibility_max_speed_mps,
+                max_accel_mps2=self.calibration_cfg.plausibility_max_accel_mps2,
+                reject_streak=self.calibration_cfg.plausibility_reject_streak,
+            )
+        )
+        self._last_filter_timestamp: Optional[float] = None
         self.current_x: float = 0.0
         self.current_y: float = 0.0
         self.current_vx: float = 0.0
@@ -209,7 +221,15 @@ class OdometrySupervisor:
     # --------------------------------------------------------------- ingestion
 
     def odometry_callback(self, msg: "Odometry") -> None:
-        """Ingest a ``nav_msgs/Odometry`` message. Runs on an executor thread."""
+        """Ingest a ``nav_msgs/Odometry`` message. Runs on an executor thread.
+
+        This is the only ingestion path gated by the altitude plausibility
+        filter (``estimation.altitude_plausibility``). ``inject_synthetic_sample``,
+        used by the benchtop kinematic simulator, is deliberately exempt: the
+        simulator is a controlled physical model that cannot produce the
+        sonar-dropout artefact the filter exists to reject, and several tests
+        drive it with intentional step changes that must keep working.
+        """
         position = msg.pose.pose.position
         twist = msg.twist.twist.linear
         orientation = msg.pose.pose.orientation
@@ -245,10 +265,24 @@ class OdometrySupervisor:
             logger.warning("Discarding odometry sample with non-finite components: %r", sample)
             return
 
+        z = sample[2]
+        if self.calibration_cfg.plausibility_enabled:
+            now = time.monotonic()
+            dt = 0.0 if self._last_filter_timestamp is None else now - self._last_filter_timestamp
+            self._last_filter_timestamp = now
+            if dt <= 0.0:
+                # First sample, or two callbacks landing on one clock tick:
+                # nothing to gate against yet. Seed the filter rather than
+                # reject, since a fresh filter has no trusted value to fall
+                # back on.
+                self._altitude_filter.reset(z)
+            else:
+                z = self._altitude_filter.update(z, dt)
+
         self._store_sample(
             x=sample[0],
             y=sample[1],
-            z=sample[2],
+            z=z,
             vx=sample[3],
             vy=sample[4],
             vz=sample[5],
