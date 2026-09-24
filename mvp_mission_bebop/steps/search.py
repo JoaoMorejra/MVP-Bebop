@@ -25,14 +25,18 @@ blink discarded accumulated evidence.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Sequence
+import math
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 
 from mvp_mission_bebop.context import MissionContext
+from mvp_mission_bebop.controllers.geometry import CameraIntrinsics, project_to_ground
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
 from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.telemetry.milestones import emit_milestone
+from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the runtime import out
     from nectar.ai.detection.core.types import Detection
@@ -85,6 +89,9 @@ class ForwardSearchStep(BaseStep):
         deadline = Deadline(timeout)
         rate = LoopRate(kinematics_cfg.control_loop_hz)
         ctx.failsafe.notify_frame_received()
+        emit_milestone(
+            "mission.scan_start", {"window_sec": timeout, "cruise_mps": round(cruise_mps, 3)}
+        )
 
         with ctx.failsafe.altitude_hold_window(
             ctx.params.governor.climb_authority
@@ -181,6 +188,7 @@ class ForwardSearchStep(BaseStep):
                 # detector blink that the confirmer would release must not be
                 # what shows the operator the first box.
                 ctx.detection_reveal_enabled = True
+                emit_milestone("mission.target_found", self._locate(ctx, best, snapshot))
                 self._announce(
                     "Acidente detectado", "alvo detectado na pista, iniciando aproximação"
                 )
@@ -295,6 +303,58 @@ class ForwardSearchStep(BaseStep):
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(max(0.0, vx), 0.0)
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
+
+    @staticmethod
+    def _locate(
+        ctx: MissionContext, target: "Detection", snapshot: OdometrySnapshot
+    ) -> Dict[str, Any]:
+        """Describe where the confirmed target lies, for the narration payload.
+
+        Uses the same exact pinhole projection as the Stage 3 guidance law, so
+        the spoken position agrees with the one the approach then flies. The
+        geometry is best-effort: a projection that is unavailable (ray near
+        the horizon, no altitude yet) or a configuration the intrinsics refuse
+        leaves the angular and metric fields as ``None`` rather than dropping
+        the milestone.
+
+        Returns
+        -------
+        Dict[str, Any]
+            ``class_name``, ``confidence``, ``center_px``, and, when the
+            geometry resolves, ``bearing_deg`` (positive right of the nose),
+            ``forward_m`` and ``lateral_m`` (body frame, FLU) and
+            ``ground_range_m``.
+        """
+        center = (float(target.center[0]), float(target.center[1]))
+        payload: Dict[str, Any] = {
+            "class_name": target.class_name,
+            "confidence": round(float(target.confidence), 3),
+            "center_px": [round(center[0], 1), round(center[1], 1)],
+            "bearing_deg": None,
+            "forward_m": None,
+            "lateral_m": None,
+            "ground_range_m": None,
+        }
+        try:
+            intrinsics = CameraIntrinsics(
+                width=int(ctx.frame_width),
+                height=int(ctx.frame_height),
+                horizontal_fov_deg=ctx.params.vision.horizontal_fov_deg,
+                vertical_fov_deg=ctx.params.vision.vertical_fov_deg,
+            )
+            theta_x, _ = intrinsics.bearing(center)
+            payload["bearing_deg"] = round(math.degrees(theta_x), 1)
+            projection = project_to_ground(
+                intrinsics, center, snapshot.relative_altitude, ctx.current_tilt_deg
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.debug("Target geometry unavailable for the milestone: %s", exc)
+            return payload
+        if projection is not None:
+            payload["forward_m"] = round(projection.forward_m, 2)
+            payload["lateral_m"] = round(projection.lateral_m, 2)
+            payload["ground_range_m"] = round(projection.ground_range_m, 2)
+        return payload
 
     @staticmethod
     def _cycles_to_rest(profile: JerkLimitedProfile, dt: float) -> int:

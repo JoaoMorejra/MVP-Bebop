@@ -43,6 +43,7 @@ from mvp_mission_bebop.controllers.visual_servoing import ServoCommand, Tracking
 from mvp_mission_bebop.engine.rate import MAX_INTERVAL_SEC, Deadline, LoopRate
 from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker, TrackerGains
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the runtime import out
     from nectar.ai.detection.core.types import Detection
@@ -98,6 +99,7 @@ class VisualServoingStep(BaseStep):
             timeouts.tracking_timeout_sec,
         )
 
+        emit_milestone("mission.approaching", {"window_sec": timeouts.tracking_timeout_sec})
         deadline = Deadline(timeouts.tracking_timeout_sec)
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
         approach_finished = False

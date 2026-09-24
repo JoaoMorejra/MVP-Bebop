@@ -22,6 +22,7 @@ later.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from mvp_mission_bebop.context import MissionContext
@@ -29,6 +30,7 @@ from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
 from mvp_mission_bebop.perception.worker import detector_kwargs
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 logger = logging.getLogger("Step4Inspection")
 
@@ -209,6 +211,14 @@ class NadirInspectionStep(BaseStep):
             snapshot=ctx.odom_supervisor.snapshot(),
         )
         ctx.blackboard.evidence = record
+        if record.captured:
+            emit_milestone(
+                "mission.capture_done",
+                {
+                    "raw_image": os.path.basename(record.raw_path) if record.raw_path else None,
+                    "settled": bool(settled),
+                },
+            )
         return record.captured
 
     def _hover(self, ctx: MissionContext, already_captured: bool) -> StepStatus:

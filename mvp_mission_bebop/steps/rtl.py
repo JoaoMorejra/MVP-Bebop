@@ -87,6 +87,7 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, TelemetryHealth
 
 logger = logging.getLogger("Step5RTL")
@@ -488,6 +489,7 @@ class ClosedLoopRTLStep(BaseStep):
         centering = self._build_centering(ctx)
 
         # ---- phase 1: attitude transition -------------------------------
+        emit_milestone("mission.rtl_start", {"marker_id": rtl_cfg.target_aruco_id})
         self._announce(
             "Iniciando Retorno à Base via ArUco",
             "iniciando retorno à base de lançamento por marcador ArUco",
@@ -1414,6 +1416,12 @@ class ClosedLoopRTLStep(BaseStep):
         logger.info(
             "Executing terminal landing at the launch origin (window %.1f s)...",
             rtl_cfg.touchdown_timeout_sec,
+        )
+        # Raised before the first land command, not on confirmed contact: the
+        # narration is an advance warning to the people around the pad.
+        emit_milestone(
+            "mission.landing",
+            {"altitude_m": round(ctx.odom_supervisor.snapshot().relative_altitude, 2)},
         )
         self._assert_land(ctx, rtl_cfg.land_burst_count)
 

@@ -15,6 +15,7 @@ from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
 from mvp_mission_bebop.perception.worker import detector_kwargs
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 logger = logging.getLogger("Step1Takeoff")
 
@@ -165,6 +166,7 @@ class TakeoffStep(BaseStep):
             )
             return StepStatus.FAILURE
 
+        emit_milestone("mission.takeoff", {"altitude_m": round(target_altitude, 2)})
         return StepStatus.SUCCESS
 
     def _stabilize(self, ctx: MissionContext) -> StepStatus:
