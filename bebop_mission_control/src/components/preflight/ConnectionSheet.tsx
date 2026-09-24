@@ -6,6 +6,7 @@ import type { TelemetryView } from '../../types/mission';
 import { Button } from '../ui/Button';
 import { BatteryCell, Dot, RfBars } from '../ui/Indicator';
 import { cn, rfBars } from '../../lib/format';
+import { bebopNetworks } from '../../lib/wifi';
 
 interface ConnectionSheetProps {
   open: boolean;
@@ -53,6 +54,11 @@ export const ConnectionSheet: React.FC<ConnectionSheetProps> = ({
   onStartDriver,
   onStopDriver,
 }) => {
+  // The scan covers every network in range, because the status bar's Wi-Fi
+  // menu is a general picker; this sheet connects to the aircraft, so it
+  // offers the aircraft's networks and nothing else.
+  const drones = bebopNetworks(networks);
+
   useEffect(() => {
     if (!open) return;
     const onKey = (event: KeyboardEvent) => {
@@ -156,13 +162,15 @@ export const ConnectionSheet: React.FC<ConnectionSheetProps> = ({
 
           {/* Networks. */}
           <section className="border-b border-strut-soft px-3 py-3">
-            {networks.length === 0 ? (
+            {drones.length === 0 ? (
               <div className="flex flex-col items-start gap-2 px-2 py-3">
                 <Wifi size={18} strokeWidth={1.5} className="text-haze-deep" />
                 <p className="text-sm leading-tight text-frost">Nenhuma rede do Bebop por perto</p>
                 <p className="max-w-[40ch] text-2xs leading-snug text-haze-deep">
                   Ligue a aeronave e espere a rede aparecer. O nome começa com
-                  <span className="font-mono text-haze"> Bebop2-</span>.
+                  <span className="font-mono text-haze"> Bebop-</span> ou
+                  <span className="font-mono text-haze"> Bebop2-</span>. Outras redes não aparecem
+                  aqui.
                 </p>
                 <Button onClick={onScan} disabled={scanning} className="mt-1">
                   {scanning ? 'Procurando' : 'Procurar de novo'}
@@ -170,7 +178,7 @@ export const ConnectionSheet: React.FC<ConnectionSheetProps> = ({
               </div>
             ) : (
               <ul className="flex flex-col gap-1">
-                {networks.map((network) => {
+                {drones.map((network) => {
                   const active = network.active || network.ssid === currentSsid;
                   return (
                     <li key={network.ssid}>

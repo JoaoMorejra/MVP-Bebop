@@ -8,6 +8,7 @@ import type {
 import { cues } from '../audio/cues';
 import { useBridge } from './useBridge';
 import { useInterval } from './useInterval';
+import { isBebopSsid } from '../lib/wifi';
 
 export type LinkPhase =
   | 'idle'
@@ -125,7 +126,7 @@ export function useLink(opts: { connected: boolean; driverRunning: boolean }) {
   const connect = useCallback(
     async (ssid: string) => {
       const target = networks.find((n) => n.ssid === ssid);
-      const isBebop = target ? target.isBebop : /^Bebop2?[-_]/i.test(ssid);
+      const isBebop = target ? target.isBebop : isBebopSsid(ssid);
       if (isBebop) {
         setCurrentSsid(ssid);
         await runEnsureLink(ssid);
