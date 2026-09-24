@@ -32,6 +32,11 @@ const STREAM_URL = 'http://127.0.0.1:9090/stream';
 const RECONNECT_DELAY_MS = 1500;
 /** The topic the mission publishes YOLO-annotated frames on. */
 const DETECTION_TOPIC = '/bebop/camera/detections';
+/**
+ * The bridge reports this source when it has drawn the mission's detection
+ * overlay onto the raw camera stream itself (`bmg.detections.v1`).
+ */
+const BOXES_TOPIC = '/bebop/camera/detection_boxes';
 
 /** Standard broadcast heights, so the operator reads a format rather than a pair of numbers. */
 function formatName(width: number, height: number): string {
@@ -91,11 +96,14 @@ const HudChip: React.FC<{
  * clusters hug the corners, clear of the optical centre where the target will
  * appear.
  *
- * The bounding boxes are drawn upstream. While the mission runs it publishes
- * annotated frames on `/bebop/camera/detections` and the bridge prefers them,
- * so the boxes arrive burned into the image already on screen — the badge
- * reports which of the two feeds is live, so it is never ambiguous whether
- * inference is actually running.
+ * The bounding boxes are drawn upstream. During the perception stages the
+ * mission publishes only the detections, on `/bebop/camera/detection_boxes`,
+ * and the bridge draws them over the raw camera stream at the camera rate;
+ * where the frame itself matters (marker HUD, evidence) it still publishes
+ * annotated frames on `/bebop/camera/detections`, which the bridge prefers.
+ * Either way the boxes arrive in the image already on screen, and the badge
+ * reports whether one of those two sources is live, so it is never ambiguous
+ * whether inference is actually running.
  */
 export const OpticalFeed: React.FC<OpticalFeedProps> = ({
   fps,
@@ -167,7 +175,7 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
   }, [bridgeUp]);
 
   const showImage = bridgeUp && !failed;
-  const annotated = source === DETECTION_TOPIC;
+  const annotated = source === DETECTION_TOPIC || source === BOXES_TOPIC;
   // Gated on the aircraft being reachable, for the same reason the status bar
   // is: neither figure expires on its own, so a powered-down drone would go on
   // reporting its last charge over a feed showing nothing.
