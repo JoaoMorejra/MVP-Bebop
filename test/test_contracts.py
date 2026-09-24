@@ -432,6 +432,32 @@ def test_emitting_never_raises_into_the_step(monkeypatch):
     assert warnings and warnings[0][0].startswith("Milestone dropped")
 
 
+#: The pattern the GCS matches alert lines with.
+ALERT_LINE = re.compile(r"\[ALERT ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$")
+
+
+def test_an_alert_line_is_matched_by_the_gcs_and_never_as_a_milestone_or_step():
+    from mvp_mission_bebop.telemetry.milestones import encode_alert
+
+    line = encode_alert("mission.failsafe", {"text": "Alerta de voo: x.", "priority": "CRITICAL"})
+    rendered = f"2026-09-24 17:57:31 [WARNING] [Milestone] {line}"
+
+    match = ALERT_LINE.search(rendered)
+    assert match is not None and match.group(1) == "mission.failsafe"
+    assert json.loads(match.group(2)) == {"text": "Alerta de voo: x.", "priority": "CRITICAL"}
+    assert MILESTONE_LINE.search(rendered) is None
+    assert STEP_LINE.search(rendered) is None
+
+
+def test_alert_keys_are_refused_as_milestones_and_vice_versa():
+    from mvp_mission_bebop.telemetry.milestones import encode_alert, encode_milestone
+
+    with pytest.raises(ValueError):
+        encode_milestone("mission.abort")
+    with pytest.raises(ValueError):
+        encode_alert("mission.takeoff")
+
+
 _REPO = os.path.join(os.path.dirname(__file__), "..")
 
 #: Short enough that the whole five-stage bench run completes in well under a

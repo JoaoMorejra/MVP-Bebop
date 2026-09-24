@@ -173,3 +173,109 @@ def test_a_silent_announcer_never_blocks_the_emergency_landing(monkeypatch):
     failsafe.trigger_emergency_land("odometria perdida")
 
     assert ("land", {}) in actuator.commands
+
+
+# ------------------------------------------------------ single voice (GCS)
+
+
+@pytest.fixture
+def station(monkeypatch):
+    """A mission launched by the ground station: no local player may exist."""
+    monkeypatch.setenv(announcer.GCS_SESSION_ENV, "1")
+
+    def forbidden():
+        raise AssertionError("a local announcer was built under the ground station")
+
+    monkeypatch.setattr(announcer, "get_announcer", forbidden)
+    alerts = []
+    from mvp_mission_bebop.telemetry import milestones
+
+    real = milestones.emit_alert
+
+    def record(key, payload=None):
+        alerts.append((key, dict(payload or {})))
+        return real(key, payload)
+
+    monkeypatch.setattr(milestones, "emit_alert", record)
+    return alerts
+
+
+def test_flight_narration_is_left_to_the_station(station):
+    for action, detail in [
+        ("Iniciando Missão", "iniciando missão, carregando parâmetros"),
+        ("Decolagem autorizada", "decolagem autorizada, iniciando voo"),
+        ("Acidente detectado", "alvo detectado na pista, iniciando aproximação"),
+        ("Pouso seguro concluído", "pouso seguro concluído na base de lançamento"),
+    ]:
+        assert announcer.announce_sync(action, details={"etapa": detail}) is False
+    assert announcer.speak("Primeiro: sem necessidade de polícia.") is False
+    assert station == []
+
+
+@pytest.mark.parametrize(
+    "action, details, priority, key",
+    [
+        ("Missão abortada", {"etapa": "missão abortada, pousando drone"}, "URGENT", "mission.abort"),
+        ("Falha na etapa", {"etapa": "falha na etapa STEP 2"}, "CRITICAL", "mission.step_failed"),
+        ("Falha de segurança", {"erro": "odometria perdida"}, "CRITICAL", "mission.failsafe"),
+        ("Falha na inicialização", {"erro": "driver ausente"}, "CRITICAL", "mission.init_failed"),
+        ("Falha na calibração", {"etapa": "calibração recusada"}, "CRITICAL", "mission.calibration_failed"),
+        ("Falha na decolagem", {"etapa": "decolagem rejeitada"}, "CRITICAL", "mission.takeoff_failed"),
+        ("Bateria crítica", {"erro": "bateria em 5 %"}, "NORMAL", "mission.alert"),
+    ],
+)
+def test_failures_reach_the_station_as_alerts_with_their_sentence(station, action, details, priority, key):
+    assert announcer.announce_sync(action, details=details, priority=priority) is True
+    assert station == [
+        (
+            key,
+            {
+                "text": _format_telemetry_statement(action, details),
+                "priority": priority if priority != "NORMAL" else "URGENT",
+            },
+        )
+    ]
+
+
+def test_the_runner_abort_becomes_an_alert_not_a_voice(station):
+    runner = MissionRunner(runner_context(), [Ends(StepStatus.ABORTED)], stage_numbers=[2])
+    runner.run()
+    assert [key for key, _ in station] == ["mission.abort"]
+
+
+def test_standalone_runs_still_speak_through_the_local_announcer(monkeypatch):
+    monkeypatch.delenv(announcer.GCS_SESSION_ENV, raising=False)
+    played = []
+    local = types.SimpleNamespace(announce=lambda action, *args, **kwargs: played.append(action) or True)
+    monkeypatch.setattr(announcer, "get_announcer", lambda: local)
+
+    assert announcer.announce_sync("Acidente detectado") is True
+    assert announcer.announce_sync("Falha de segurança", details={"erro": "x"}, priority="CRITICAL")
+    assert played == ["Acidente detectado", "Falha de segurança"]
+
+
+def test_an_alert_line_reaches_the_stdout_the_station_reads():
+    """Checked in a subprocess: the assertion is about the real stdout pipe."""
+    import os
+    import re
+    import subprocess
+    import sys
+
+    program = (
+        "import mvp_mission_bebop.mission;"
+        "from mvp_mission_bebop.telemetry.announcer import announce_sync;"
+        "announce_sync('Falha de segurança', details={'erro': 'odometria perdida'}, priority='CRITICAL');"
+        "announce_sync('Acidente detectado', details={'etapa': 'alvo detectado'})"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=dict(os.environ, BMG_GCS_SESSION="1"),
+    )
+    assert completed.returncode == 0, completed.stderr
+    alerts = re.findall(r"\[ALERT ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$", completed.stdout, re.M)
+    assert [key for key, _ in alerts] == ["mission.failsafe"]
+    assert "odometria perdida" in alerts[0][1]
+    assert "Acidente detectado" not in completed.stdout

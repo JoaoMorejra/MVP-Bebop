@@ -16,7 +16,7 @@ import random
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Final, List, Optional
 
 try:
     from google import genai
@@ -565,13 +565,7 @@ class MissionAudioAnnouncer:
         if not self._active or self._loop is None or self._queue is None:
             return False
 
-        is_urgent = (
-            priority.upper() in ("URGENT", "CRITICAL", "EMERGENCY")
-            or (details and "erro" in details)
-            or ("erro" in action.lower())
-            or ("falha" in action.lower())
-        )
-        pri_int = 0 if is_urgent else 1
+        pri_int = 0 if _is_urgent(action, details, priority) else 1
 
         with self._lock:
             self._seq += 1
@@ -652,6 +646,70 @@ _global_announcer: Optional[MissionAudioAnnouncer] = None
 _announcer_lock = threading.Lock()
 
 
+#: Priorities the playback queue serves first, and that the ground station
+#: receives as alerts rather than as nothing.
+_URGENT_PRIORITIES: Final = ("URGENT", "CRITICAL", "EMERGENCY")
+
+
+def _is_urgent(action: str, details: Optional[Dict[str, Any]], priority: str) -> bool:
+    """Whether an announcement is a failure or alert rather than narration."""
+    return (
+        priority.upper() in _URGENT_PRIORITIES
+        or bool(details and "erro" in details)
+        or "erro" in action.lower()
+        or "falha" in action.lower()
+    )
+
+
+#: Set to ``1`` by ``electron/main.cjs`` in the mission process's environment,
+#: and only there -- not in the speech daemon it also spawns.
+GCS_SESSION_ENV: Final[str] = "BMG_GCS_SESSION"
+
+#: Alert key for each urgent action a call site passes. Anything urgent not
+#: listed goes out as ``mission.alert``.
+_ALERT_KEY_BY_ACTION: Final[Dict[str, str]] = {
+    "missão abortada": "mission.abort",
+    "falha na etapa": "mission.step_failed",
+    "falha de segurança": "mission.failsafe",
+    "falha na inicialização": "mission.init_failed",
+    "falha na calibração": "mission.calibration_failed",
+    "falha na decolagem": "mission.takeoff_failed",
+}
+
+
+def station_narrates() -> bool:
+    """Whether the ground station is this mission's only voice.
+
+    Under the station the system speaks through one player, the station's
+    copilot, fed by one ordered queue. A second announcer in the mission
+    process talked over it and repeated its milestones through a second
+    synthesis session and a second hold on the audio device. So here no
+    player is ever built: flight narration is left to the milestones the
+    station already receives, and failures reach it as alerts.
+    """
+    return os.environ.get(GCS_SESSION_ENV, "").strip() == "1"
+
+
+def _hand_to_station(
+    action: str, details: Optional[Dict[str, Any]], priority: str, verbatim: bool
+) -> bool:
+    """Route one announcement to the station instead of speaking it.
+
+    Returns True when it went out as an alert, False when it was narration
+    the station's milestones already cover and was dropped.
+    """
+    if not _is_urgent(action, details, priority):
+        logger.debug("Narration left to the ground station: %s", action)
+        return False
+
+    from mvp_mission_bebop.telemetry.milestones import emit_alert
+
+    key = _ALERT_KEY_BY_ACTION.get(action.strip().lower(), "mission.alert")
+    level = priority.upper() if priority.upper() in _URGENT_PRIORITIES else "URGENT"
+    text = action if verbatim else _format_telemetry_statement(action, details)
+    return emit_alert(key, {"text": text, "priority": level})
+
+
 def get_announcer() -> MissionAudioAnnouncer:
     """Retrieve or initialize the global mission audio announcer."""
     global _global_announcer
@@ -669,7 +727,14 @@ def announce(
     timeout: Optional[float] = None,
     verbatim: bool = False,
 ) -> bool:
-    """Emit telemetry notification."""
+    """Emit telemetry notification.
+
+    Under the ground station (:func:`station_narrates`) nothing is played in
+    this process: urgent announcements become alerts on stdout, the rest is
+    dropped. Standalone, it plays through the local announcer as before.
+    """
+    if station_narrates():
+        return _hand_to_station(action, details, priority, verbatim)
     try:
         return get_announcer().announce(
             action,

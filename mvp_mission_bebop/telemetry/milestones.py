@@ -16,6 +16,16 @@ when empty), with non-finite floats replaced by ``null`` so ``JSON.parse`` in
 the renderer never rejects it. ``mission.start`` and ``mission.countdown_3``
 are raised by the Electron process before this one exists and are
 deliberately absent here.
+
+Alerts travel the same way on their own tag::
+
+    [ALERT mission.failsafe] {"priority":"CRITICAL","text":"Alerta de voo: ..."}
+
+When the ground station runs the mission it is the only voice in the system,
+so the failures, aborts and failsafe landings this process would otherwise
+speak itself are handed to it as alerts instead (see
+``announcer.station_narrates``). ``text`` is the sentence to read; the station
+speaks it ahead of any queued narration.
 """
 
 from __future__ import annotations
@@ -29,6 +39,21 @@ logger = logging.getLogger("Milestone")
 
 #: Line prefix the GCS matches. Part of the IPC contract with ``main.cjs``.
 MILESTONE_TAG: Final[str] = "MILESTONE"
+
+#: Line prefix of an alert. Part of the same contract.
+ALERT_TAG: Final[str] = "ALERT"
+
+#: Alerts this process raises. ``mission.alert`` is the catch-all for an
+#: urgent announcement no specific key covers.
+ALERT_KEYS: Final[Tuple[str, ...]] = (
+    "mission.abort",
+    "mission.step_failed",
+    "mission.failsafe",
+    "mission.init_failed",
+    "mission.calibration_failed",
+    "mission.takeoff_failed",
+    "mission.alert",
+)
 
 #: Milestones this process emits, in flight order.
 MILESTONE_KEYS: Final[Tuple[str, ...]] = (
@@ -51,6 +76,29 @@ def _sanitize(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_sanitize(item) for item in value]
     return value
+
+
+def _encode(
+    tag: str, keys: Tuple[str, ...], key: str, payload: Optional[Mapping[str, Any]]
+) -> str:
+    if not isinstance(key, str):
+        raise TypeError(f"{tag.lower()} key must be a string, got {type(key).__name__}")
+    if key not in keys:
+        raise ValueError(f"unknown {tag.lower()} key {key!r}; expected one of {keys}")
+    if payload is not None and not isinstance(payload, Mapping):
+        raise TypeError(f"{tag.lower()} payload must be a mapping, got {type(payload).__name__}")
+
+    try:
+        body = json.dumps(
+            _sanitize(dict(payload or {})),
+            separators=(",", ":"),
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{tag.lower()} payload for {key!r} is not JSON-serializable: {exc}") from exc
+    return f"[{tag} {key}] {body}"
 
 
 def encode_milestone(key: str, payload: Optional[Mapping[str, Any]] = None) -> str:
@@ -78,24 +126,16 @@ def encode_milestone(key: str, payload: Optional[Mapping[str, Any]] = None) -> s
         If ``key`` is not a known milestone, or ``payload`` holds a value
         JSON cannot serialize.
     """
-    if not isinstance(key, str):
-        raise TypeError(f"milestone key must be a string, got {type(key).__name__}")
-    if key not in MILESTONE_KEYS:
-        raise ValueError(f"unknown milestone key {key!r}; expected one of {MILESTONE_KEYS}")
-    if payload is not None and not isinstance(payload, Mapping):
-        raise TypeError(f"milestone payload must be a mapping, got {type(payload).__name__}")
+    return _encode(MILESTONE_TAG, MILESTONE_KEYS, key, payload)
 
-    try:
-        body = json.dumps(
-            _sanitize(dict(payload or {})),
-            separators=(",", ":"),
-            sort_keys=True,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"milestone payload for {key!r} is not JSON-serializable: {exc}") from exc
-    return f"[{MILESTONE_TAG} {key}] {body}"
+
+def encode_alert(key: str, payload: Optional[Mapping[str, Any]] = None) -> str:
+    """Render one alert as the log message the GCS matches.
+
+    Same contract as :func:`encode_milestone`, over :data:`ALERT_KEYS` and
+    with the ``[ALERT <key>]`` prefix.
+    """
+    return _encode(ALERT_TAG, ALERT_KEYS, key, payload)
 
 
 def emit_milestone(key: str, payload: Optional[Mapping[str, Any]] = None) -> None:
@@ -111,3 +151,20 @@ def emit_milestone(key: str, payload: Optional[Mapping[str, Any]] = None) -> Non
         logger.warning("Milestone dropped: %s", exc)
         return
     logger.info("%s", message)
+
+
+def emit_alert(key: str, payload: Optional[Mapping[str, Any]] = None) -> bool:
+    """Log one alert at WARNING on the mission's stdout. Never raises.
+
+    Returns
+    -------
+    bool
+        Whether the alert was written; False when it could not be encoded.
+    """
+    try:
+        message = encode_alert(key, payload)
+    except (TypeError, ValueError) as exc:
+        logger.warning("Alert dropped: %s", exc)
+        return False
+    logger.warning("%s", message)
+    return True
