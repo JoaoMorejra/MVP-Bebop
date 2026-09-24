@@ -176,6 +176,11 @@ class ForwardSearchStep(BaseStep):
                 ctx.blackboard.target_confirmed = True
                 ctx.blackboard.confirmed_tilt_deg = ctx.current_tilt_deg
                 ctx.blackboard.confirmed_target_px = best.center
+                # Hysteresis confirmation, not the first raw candidate, opens
+                # the reveal: it latches for the rest of the flight, so a
+                # detector blink that the confirmer would release must not be
+                # what shows the operator the first box.
+                ctx.detection_reveal_enabled = True
                 self._announce(
                     "Acidente detectado", "alvo detectado na pista, iniciando aproximação"
                 )

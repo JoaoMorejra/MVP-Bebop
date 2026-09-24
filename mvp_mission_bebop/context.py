@@ -84,6 +84,16 @@ class MissionContext:
         )
 
         self.current_tilt_deg: float = self.params.gimbal.search_tilt_deg
+        #: Whether bounding boxes reach the ground station.
+        #:
+        #: Inference runs from the takeoff countdown onwards; only rendering is
+        #: gated. Closed until Stage 2 confirms a target, then latched open for
+        #: the rest of the flight, so the first box the operator sees coincides
+        #: with the ``mission.target_found`` narration. The stream keeps its
+        #: topic and geometry across the transition: source switches on the
+        #: bridge side are what destabilised the cockpit feed before
+        #: (``useStreamHealth``).
+        self.detection_reveal_enabled: bool = False
         self.emergency_event = threading.Event()
         #: A stage jump commanded by the ground station.
         #:
@@ -235,20 +245,30 @@ class MissionContext:
     def publish_annotated_stream(
         self, frame: Optional[np.ndarray], result: Any, status_text: str
     ) -> Optional[np.ndarray]:
-        """Draw detections and telemetry overlays, then publish to ROS 2 topic."""
+        """Draw detections and telemetry overlays, then publish to ROS 2 topic.
+
+        While :attr:`detection_reveal_enabled` is closed the drawing pass is
+        skipped and the crosshair and status band are drawn over a copy of the
+        raw frame. The copy is load-bearing: Stage 4 records ``frame`` itself
+        as the raw evidence after this call, and the SDK's ``draw_detections``
+        never writes into its input either.
+        """
         if frame is None:
             return None
 
-        annotated = self.detector.draw_detections(
-            image=frame,
-            result=result,
-            show_labels=True,
-            show_confidence=True,
-            show_class=True,
-            annotator_type="box",
-            thickness=2,
-            text_scale=0.6,
-        )
+        if self.detection_reveal_enabled:
+            annotated = self.detector.draw_detections(
+                image=frame,
+                result=result,
+                show_labels=True,
+                show_confidence=True,
+                show_class=True,
+                annotator_type="box",
+                thickness=2,
+                text_scale=0.6,
+            )
+        else:
+            annotated = frame.copy()
 
         cx_int = int(self.frame_center_x)
         cy_int = int(self.frame_center_y)
@@ -284,12 +304,21 @@ class MissionContext:
         the GCS bridge composites them onto the raw camera stream at the camera
         rate. Failures are logged and swallowed; the overlay is never allowed to
         take the perception worker down.
+
+        Obeys :attr:`detection_reveal_enabled` like the annotated path: while
+        closed the summary still flows, carrying the status caption and an
+        empty box list, so the bridge keeps compositing from this source
+        instead of timing it out and falling back to the raw topic.
         """
         try:
             height, width = sample.frame.shape[:2]
             message = String()
             message.data = encode_detection_summary(
-                detections=self._describe_detections(sample.result),
+                detections=(
+                    self._describe_detections(sample.result)
+                    if self.detection_reveal_enabled
+                    else []
+                ),
                 frame_width=int(width),
                 frame_height=int(height),
                 status=status_text,

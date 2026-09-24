@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Final, List, Optional
 
 import nectar
 
@@ -22,6 +22,13 @@ _EMERGENCY_BURST_COUNT: int = 5
 
 #: Spacing between commands in that burst.
 _EMERGENCY_BURST_INTERVAL_SEC: float = 0.04
+
+#: First stage that presupposes a confirmed target. A run entering it without
+#: having confirmed one -- a partial bench run (``--stages 3,4,5``) or a stage
+#: jump from the ground station -- opens the detection reveal on entry, or the
+#: approach would fly blind on the feed and the Stage 4 annotated evidence
+#: would be recorded without its boxes.
+_DETECTION_REVEAL_STAGE: Final[int] = 3
 
 
 class MissionRunner:
@@ -87,6 +94,7 @@ class MissionRunner:
                     break
 
                 step = self.steps[index]
+                self._open_reveal_past_the_search(self.stage_numbers[index])
                 status = step.execute(self.ctx)
 
                 # A step that unwound because the operator asked for a different
@@ -120,6 +128,15 @@ class MissionRunner:
             all_succeeded = False
 
         return all_succeeded
+
+    def _open_reveal_past_the_search(self, stage: int) -> None:
+        """Latch the detection reveal open when ``stage`` follows the search."""
+        if stage < _DETECTION_REVEAL_STAGE or self.ctx.detection_reveal_enabled:
+            return
+        logger.info(
+            "Stage %d entered without a Stage 2 confirmation; revealing detections.", stage
+        )
+        self.ctx.detection_reveal_enabled = True
 
     def _take_stage_jump(self) -> Optional[int]:
         """Consume a pending stage jump and return the step index to run next.

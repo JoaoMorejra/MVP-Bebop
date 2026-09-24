@@ -237,6 +237,7 @@ def test_the_mission_context_publishes_a_decodable_overlay(bridge):
     ctx = MissionContext.__new__(MissionContext)
     ctx.boxes_pub = types.SimpleNamespace(publish=published.append)
     ctx._monotonic_to_ros_sec = 1000.0
+    ctx.detection_reveal_enabled = True
 
     sample = PerceptionSample(
         frame=np.zeros((480, 856, 3), dtype=np.uint8),
@@ -263,6 +264,7 @@ def test_an_overlay_failure_never_reaches_the_worker():
 
     ctx.boxes_pub = types.SimpleNamespace(publish=explode)
     ctx._monotonic_to_ros_sec = 0.0
+    ctx.detection_reveal_enabled = True
     sample = PerceptionSample(
         frame=np.zeros((480, 856, 3), dtype=np.uint8), result=[], stamp=0.0, generation=1
     )

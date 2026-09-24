@@ -411,6 +411,7 @@ class SearchCtx(PerceptionCtx):
         self.emergency_event = threading.Event()
         self.stage_jump_event = threading.Event()
         self.current_tilt_deg = self.params.gimbal.search_tilt_deg
+        self.detection_reveal_enabled = False
         self.perception = None
 
     def interrupted(self):
@@ -468,6 +469,7 @@ def test_one_frame_read_many_times_is_counted_once(monkeypatch):
     assert all(vx == 0.0 for vx, *_ in ctx.drone.commands), (
         "a visible candidate must keep the drone on station between frames"
     )
+    assert ctx.detection_reveal_enabled is False, "an unconfirmed candidate revealed its box"
 
 
 def test_three_distinct_frames_still_confirm():
@@ -475,6 +477,22 @@ def test_three_distinct_frames_still_confirm():
     ctx.perception = SynchronousPerception(ctx)
     ForwardSearchStep().execute(ctx)
     assert ctx.blackboard.target_confirmed is True
+
+
+def test_the_confirmation_is_what_reveals_the_box():
+    ctx = SearchCtx(search_sec=2.0)
+    ctx.perception = SynchronousPerception(ctx)
+    ForwardSearchStep().execute(ctx)
+    assert ctx.detection_reveal_enabled is True
+
+
+def test_a_search_that_confirms_nothing_keeps_the_box_hidden():
+    ctx = SearchCtx(search_sec=0.3, detections=False)
+    ctx.params.kinematics.control_loop_hz = 100.0
+    ctx.perception = SynchronousPerception(ctx)
+    ForwardSearchStep().execute(ctx)
+    assert ctx.blackboard.target_confirmed is False
+    assert ctx.detection_reveal_enabled is False
 
 
 def test_a_stale_pipeline_keeps_the_cruise_alive():
