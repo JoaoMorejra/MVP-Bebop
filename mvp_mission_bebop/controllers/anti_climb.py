@@ -100,7 +100,12 @@ class AltitudeAntiClimbGovernor:
         """
         return 1.0
 
-    def compute_vz(self, current_relative_alt: float, dt: Optional[float] = None) -> float:
+    def compute_vz(
+        self,
+        current_relative_alt: float,
+        dt: Optional[float] = None,
+        vx_commanded: float = 0.0,
+    ) -> float:
         """Corrective vertical velocity command, always ``<= 0``.
 
         Parameters
@@ -111,6 +116,11 @@ class AltitudeAntiClimbGovernor:
             Elapsed interval. Callers running a paced loop should pass the value
             from ``LoopRate.tick``; when omitted the nominal period is assumed,
             which keeps the signature compatible with existing call sites.
+        vx_commanded : float
+            Accepted and ignored. The translating steps pass it to whichever
+            governor is configured, and the lift feedforward it feeds in
+            :class:`AltitudeHoldGovernor` is a climb request, which this
+            descent-only governor has no authority to make.
         """
         interval = LoopRate.clamp_interval(dt) if dt is not None else LoopRate.clamp_interval(1.0 / 15.0)
         excess = current_relative_alt - self.target_altitude

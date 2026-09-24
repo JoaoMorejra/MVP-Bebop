@@ -19,6 +19,7 @@ import threading
 import pytest
 
 from mvp_mission_bebop.parameters import MissionParameters
+from mvp_mission_bebop.perception.worker import SynchronousPerception
 from mvp_mission_bebop.steps.base import StepStatus
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import TelemetryHealth
@@ -39,7 +40,7 @@ class ClimbingGovernor:
     altitude_error_m = 0.30
 
     @staticmethod
-    def compute_vz(_altitude, _dt=None):
+    def compute_vz(_altitude, _dt=None, vx_commanded=0.0):
         return DEMANDED_CLIMB
 
     @staticmethod
@@ -160,6 +161,9 @@ class Ctx:
         self.detector = self
         self.handler = None
         self._detections = detections
+        # Inline perception: one frame, one inference, one overlay per control
+        # cycle, so the stage's frame-counting logic is exercised exactly.
+        self.perception = SynchronousPerception(self)
 
     def interrupted(self) -> bool:
         """Mirrors MissionContext.interrupted: an abort or a commanded stage jump."""

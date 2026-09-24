@@ -414,3 +414,36 @@ def test_the_stage_one_climb_window_still_needs_an_explicit_opt_in():
             "the Stage 1 window must not grant ascent to a caller that did not ask"
         )
         assert guard.clamp_kinematics(0.20, 0.0, allow_climb=True)[0] == pytest.approx(0.20)
+
+
+def test_feedforward_is_inert_at_the_default_gain():
+    """The shipped default: no behaviour change until tuned."""
+    governor = hold()
+    with_ff = governor.compute_vz(TARGET_M, DT, vx_commanded=1.0)
+    governor2 = hold()
+    without_ff = governor2.compute_vz(TARGET_M, DT, vx_commanded=0.0)
+    assert with_ff == pytest.approx(without_ff)
+
+
+def test_feedforward_anticipates_translation_before_altitude_sags():
+    """With a nonzero gain, a horizontal command alone -- no altitude error
+    yet -- should already request some climb authority."""
+    governor = hold(feedforward_gain=0.05)
+    command = governor.compute_vz(TARGET_M, DT, vx_commanded=1.0)
+    assert command > 0.0, "feedforward did not anticipate the sink"
+
+
+def test_feedforward_is_bounded_by_the_climb_ceiling():
+    """A large commanded vx must not push the feedforward past max_climb_speed."""
+    governor = hold(feedforward_gain=10.0, max_climb_speed=0.10)
+    command = None
+    for _ in range(200):
+        command = governor.compute_vz(TARGET_M, DT, vx_commanded=1.0)
+    assert command <= 0.10 + 1e-9
+
+
+def test_feedforward_respects_positional_calls_without_vx_commanded():
+    """Existing call sites that never pass vx_commanded keep working."""
+    governor = hold(feedforward_gain=0.05)
+    command = governor.compute_vz(TARGET_M, DT)
+    assert command == pytest.approx(0.0)

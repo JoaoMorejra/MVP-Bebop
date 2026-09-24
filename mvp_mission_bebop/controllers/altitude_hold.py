@@ -151,7 +151,12 @@ class AltitudeHoldGovernor:
 
     # ------------------------------------------------------------------ cycle
 
-    def compute_vz(self, current_relative_alt: float, dt: Optional[float] = None) -> float:
+    def compute_vz(
+        self,
+        current_relative_alt: float,
+        dt: Optional[float] = None,
+        vx_commanded: float = 0.0,
+    ) -> float:
         """Corrective vertical velocity command, in normalized units.
 
         Parameters
@@ -162,6 +167,13 @@ class AltitudeHoldGovernor:
             Elapsed interval. Callers running a paced loop should pass the value
             from ``LoopRate.tick``; when omitted the nominal period is assumed,
             which keeps the signature compatible with every existing call site.
+        vx_commanded : float
+            The horizontal velocity command being issued this same cycle,
+            normalized to the driver's [-1, 1] scale. Multiplied by
+            ``config.feedforward_gain`` to anticipate the sink translation
+            induces, ahead of the integral term's reactive correction.
+            Defaults to zero, which reproduces this method's behaviour before
+            the parameter existed.
 
         Returns
         -------
@@ -174,6 +186,7 @@ class AltitudeHoldGovernor:
             dt if dt is not None else _NOMINAL_PERIOD_SEC
         )
         cfg = self.config
+        feedforward = cfg.feedforward_gain * abs(vx_commanded)
 
         if not math.isfinite(current_relative_alt):
             # An absent measurement, not a large one. Coasting on the profile's
@@ -182,7 +195,7 @@ class AltitudeHoldGovernor:
                 "Non-finite altitude %r; holding the vertical axis at rest.",
                 current_relative_alt,
             )
-            return self._release(interval, reason="altitude unavailable")
+            return self._release(interval, feedforward, reason="altitude unavailable")
 
         error = self.target_altitude - current_relative_alt
         self._error_m = error
@@ -198,7 +211,7 @@ class AltitudeHoldGovernor:
         elif error < -cfg.deadband_m:
             excursion = error + cfg.deadband_m
         else:
-            return self._release(interval)
+            return self._release(interval, feedforward)
 
         if not self._active:
             self._active = True
@@ -214,7 +227,7 @@ class AltitudeHoldGovernor:
         # a positive excursion -- the drone is low -- produce a positive, i.e.
         # ascending, demand.
         demand = self._pid.update(-excursion, interval)
-        command = self._profile.step(demand, interval)
+        command = self._profile.step(demand + feedforward, interval)
         command = max(-abs(cfg.max_descent_speed), min(abs(cfg.max_climb_speed), command))
 
         climbing = command > 0.0
@@ -229,8 +242,8 @@ class AltitudeHoldGovernor:
         self._climbing = climbing
         return command
 
-    def _release(self, interval: float, reason: str = "") -> float:
-        """Inside the deadband: unwind toward rest without abandoning the state."""
+    def _release(self, interval: float, feedforward: float = 0.0, reason: str = "") -> float:
+        """Inside the deadband: unwind toward rest, still honouring feedforward."""
         if self._active:
             logger.debug(
                 "Altitude hold released at %+.3f m of error%s.",
@@ -254,7 +267,9 @@ class AltitudeHoldGovernor:
 
         # Ramp the command down rather than dropping it: a step to zero is as
         # much of a disturbance as a step away from it.
-        return self._profile.step(0.0, interval)
+        command = self._profile.step(feedforward, interval)
+        cfg = self.config
+        return max(-abs(cfg.max_descent_speed), min(abs(cfg.max_climb_speed), command))
 
     # ------------------------------------------------- horizontal cooperation
 
