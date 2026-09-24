@@ -4,6 +4,7 @@ import type { Screen } from './types/mission';
 import type { Finding } from './lib/forensics';
 import type { BatteryFailsafe } from './types/bmg';
 import { PreflightScreen } from './components/preflight/PreflightScreen';
+import { BenchWarmupOverlay } from './components/preflight/BenchWarmupOverlay';
 import { CountdownOverlay } from './components/preflight/CountdownOverlay';
 import { CockpitScreen } from './components/cockpit/CockpitScreen';
 import { EvidenceScreen } from './components/evidence/EvidenceScreen';
@@ -91,6 +92,7 @@ export const App: React.FC = () => {
   const [overlay, setOverlay] = useState<Overlay>('none');
   const [counting, setCounting] = useState(() => previewCountdown() > 0);
   const [countdownSeconds, setCountdownSeconds] = useState(() => previewCountdown() || 0);
+  const [warming, setWarming] = useState(false);
   const [evidenceToken, setEvidenceToken] = useState(0);
   const [selectedStamp, setSelectedStamp] = useState<string | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
@@ -260,9 +262,11 @@ export const App: React.FC = () => {
     // The countdown is the window in which walking away costs nothing, and it
     // is also the window the mission spends warming YOLO and taking its ground
     // reference. Neither applies on the bench: the motors never spin, so there
-    // is nothing to stand clear of and nothing to reconsider.
+    // is nothing to stand clear of and nothing to reconsider. The bench gets a
+    // plain loading screen instead, long enough for the mission process to have
+    // video and a detector by the time the cockpit opens.
     if (benchMode) {
-      setScreen('cockpit');
+      setWarming(true);
       return;
     }
 
@@ -357,6 +361,18 @@ export const App: React.FC = () => {
     setCounting(false);
     setScreen('cockpit');
   }, []);
+
+  const finishWarmup = useCallback(() => {
+    setWarming(false);
+    setScreen('cockpit');
+  }, []);
+
+  // A bench mission that exits during the warm-up — a missing camera, a bad
+  // parameter — is shown at once rather than after the remaining seconds of a
+  // loading screen for a process that is no longer there.
+  useEffect(() => {
+    if (warming && (mission.state === 'finished' || mission.state === 'faulted')) finishWarmup();
+  }, [warming, mission.state, finishWarmup]);
 
   const cancelCountdown = useCallback(async () => {
     setCounting(false);
@@ -613,6 +629,8 @@ export const App: React.FC = () => {
         locked={airborne}
         className="fixed left-1/2 top-4 z-40 -translate-x-1/2"
       />
+
+      {warming ? <BenchWarmupOverlay onDone={finishWarmup} /> : null}
 
       {counting ? (
         <CountdownOverlay
