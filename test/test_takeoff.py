@@ -7,6 +7,7 @@ that closes the gap, and the invariant that it is the only phase allowed to.
 """
 
 import threading
+import types
 import time
 
 import pytest
@@ -292,3 +293,155 @@ def test_ascent_never_commands_more_than_the_authorized_climb_rate(monkeypatch):
     assert max(commanded) <= params.kinematics.max_climb_speed_mps + 1e-6
     assert min(commanded) >= 0.0, "the ascent must never command descent"
     assert commanded[-1] == 0.0, "the held command must be released on completion"
+
+
+# ---------------------------------------------------------------- stabilization
+#
+# The post-takeoff hover used to be a blind ``takeoff_stabilize_duration_sec``
+# wait. It is now a convergence gate with that duration as its ceiling: it must
+# leave early once the liftoff transient has decayed, and never stay longer
+# than the ceiling however unsettled the airframe is.
+
+
+def stabilize_params(ceiling=4.0):
+    params = climb_params()
+    kinematics = params.kinematics
+    kinematics.takeoff_stabilize_duration_sec = ceiling
+    kinematics.takeoff_settle_window_sec = 0.30
+    kinematics.takeoff_settle_min_samples = 4
+    return params
+
+
+class TelemetryTimer:
+    """Drives the simulator the way the mission's telemetry timer does.
+
+    ``_stabilize`` commands nothing, so without this the simulated odometry
+    would never produce a new sample and the gate would -- correctly -- refuse
+    to call the hover settled.
+    """
+
+    def __init__(self, simulator, period_sec=0.01):
+        self._simulator = simulator
+        self._period = period_sec
+        self._halt = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self._halt.wait(self._period):
+            self._simulator.integrate()
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._halt.set()
+        self._thread.join(timeout=1.0)
+
+
+class ScriptedOdometry:
+    """Odometry whose every snapshot is produced by a function of the call count."""
+
+    def __init__(self, sample):
+        self._sample = sample
+        self._calls = 0
+
+    def snapshot(self):
+        self._calls += 1
+        altitude, vz, fresh = self._sample(self._calls)
+        return types.SimpleNamespace(
+            relative_altitude=altitude,
+            vz=vz,
+            sample_count=self._calls if fresh else 1,
+            timestamp=time.monotonic(),
+        )
+
+
+def scripted_context(params, sample):
+    return ClimbContext(params, StubDrone(), ScriptedOdometry(sample), failsafe=None)
+
+
+def timed_stabilize(ctx):
+    started = time.monotonic()
+    status = TakeoffStep()._stabilize(ctx)
+    return status, time.monotonic() - started
+
+
+def test_stabilization_ends_as_soon_as_the_hover_settles(monkeypatch):
+    """The point of the change: a settled airframe does not wait out the ceiling."""
+    params = stabilize_params(ceiling=4.0)
+    ctx, simulator = airborne_context(monkeypatch, params)
+
+    with TelemetryTimer(simulator):
+        status, elapsed = timed_stabilize(ctx)
+
+    assert status is StepStatus.SUCCESS
+    assert elapsed < 1.5, f"a settled hover still waited {elapsed:.2f} s of a 4.0 s ceiling"
+    assert elapsed >= params.kinematics.takeoff_settle_window_sec, (
+        "settlement was declared before one full observation window had elapsed"
+    )
+
+
+def test_stabilization_never_outlasts_its_ceiling():
+    """An airframe that keeps moving is handed on at the ceiling, not held."""
+    params = stabilize_params(ceiling=0.5)
+    ctx = scripted_context(params, lambda n: (1.0 + 0.2 * (n % 2), 0.4, True))
+
+    status, elapsed = timed_stabilize(ctx)
+
+    assert status is StepStatus.SUCCESS
+    assert 0.5 <= elapsed < 0.8, f"stabilization took {elapsed:.2f} s against a 0.5 s ceiling"
+
+
+def test_an_aircraft_still_on_the_ground_is_not_settled():
+    """Motors spooling when ``takeoff`` returns: zero vz, zero spread, zero height."""
+    params = stabilize_params(ceiling=0.5)
+    ctx = scripted_context(params, lambda n: (0.0, 0.0, True))
+
+    _status, elapsed = timed_stabilize(ctx)
+
+    assert elapsed >= 0.5, "a grounded airframe was declared settled"
+
+
+def test_a_stalled_odometry_stream_is_not_settled():
+    """Frozen telemetry has zero variance by construction; it proves nothing."""
+    params = stabilize_params(ceiling=0.5)
+    ctx = scripted_context(params, lambda n: (1.0, 0.0, False))
+
+    _status, elapsed = timed_stabilize(ctx)
+
+    assert elapsed >= 0.5, "repeats of one odometry sample were accepted as a settled hover"
+
+
+def test_a_liftoff_transient_holds_the_gate_until_it_decays():
+    """Climbing samples first, then a steady hover: exit only after the latter."""
+    params = stabilize_params(ceiling=4.0)
+    params.kinematics.control_loop_hz = 50.0
+
+    def sample(n):
+        if n <= 25:
+            return 0.35 + 0.6 * n / 50.0, 0.6, True
+        return 0.65, 0.0, True
+
+    ctx = scripted_context(params, sample)
+    status, elapsed = timed_stabilize(ctx)
+
+    assert status is StepStatus.SUCCESS
+    transient_sec = 25 / 50.0
+    assert elapsed >= transient_sec + params.kinematics.takeoff_settle_window_sec - 0.05
+    assert elapsed < 4.0
+
+
+def test_an_emergency_aborts_the_stabilization():
+    params = stabilize_params(ceiling=4.0)
+    ctx = scripted_context(params, lambda n: (1.0, 0.4, True))
+    ctx.emergency_event.set()
+
+    assert TakeoffStep()._stabilize(ctx) is StepStatus.ABORTED
+
+
+def test_the_flat_trim_settle_is_untouched():
+    """The IMU calibration wait is not a transient gate and must stay fixed."""
+    from mvp_mission_bebop.steps import takeoff as takeoff_module
+
+    assert takeoff_module._FLAT_TRIM_SETTLE_SEC == 2.0

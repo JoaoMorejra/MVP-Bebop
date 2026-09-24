@@ -13,6 +13,7 @@ from mvp_mission_bebop.controllers.profiling import (
 )
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
+from mvp_mission_bebop.perception.worker import detector_kwargs
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 
 logger = logging.getLogger("Step1Takeoff")
@@ -115,7 +116,11 @@ class TakeoffStep(BaseStep):
             if frame is not None:
                 ctx.failsafe.notify_frame_received()
                 try:
-                    result = ctx.detector.detect(frame)
+                    # Same input size as flight: the first call at a new
+                    # shape is the expensive one, and it is what this pays for.
+                    result = ctx.detector.detect(
+                        frame, **detector_kwargs(None, ctx.params.vision.inference_imgsz)
+                    )
                     warmup_frames += 1
                     ctx.publish_annotated_stream(
                         frame, result, f"CONTAGEM REGRESSIVA: {remaining:.1f}s | YOLO PRONTO"
@@ -163,7 +168,7 @@ class TakeoffStep(BaseStep):
         return StepStatus.SUCCESS
 
     def _stabilize(self, ctx: MissionContext) -> StepStatus:
-        """Hover until the liftoff transient decays.
+        """Hover until the liftoff transient decays, bounded by a safety ceiling.
 
         This settles the airframe at whatever height the firmware's launch
         profile chose. It deliberately does *not* freeze the return origin any
@@ -171,12 +176,47 @@ class TakeoffStep(BaseStep):
         drone has not yet reached its operating altitude here, and freezing the
         origin mid-ascent would anchor the mission to a transient. That now
         happens in :meth:`_finalize`, after the climb has converged.
-        """
-        duration = ctx.params.kinematics.takeoff_stabilize_duration_sec
-        logger.info("Stabilizing in hover for %.1f s...", duration)
 
-        deadline = Deadline(duration)
-        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        The phase used to be an unconditional ``takeoff_stabilize_duration_sec``
+        wait, spent in full whether or not the airframe was still moving. It now
+        ends as soon as a :class:`SettlementDetector` over the vertical axis
+        reports convergence, and that duration is only the ceiling. The detector
+        is planar, so altitude goes in the x slot with y held at zero, exactly
+        as in :meth:`_ascend`: its isotropic sigma then reduces to the standard
+        deviation of the altitude.
+
+        Two kinds of sample are kept out of the window because they look like
+        convergence without being it: repeats of an odometry sample already
+        seen, which a stalled stream produces with zero variance forever, and
+        samples below ``takeoff_settle_min_altitude_m``, which is an airframe
+        still on the ground after ``takeoff`` returned.
+        """
+        kinematics = ctx.params.kinematics
+        ceiling_sec = kinematics.takeoff_stabilize_duration_sec
+        min_altitude = kinematics.takeoff_settle_min_altitude_m
+        settlement = SettlementDetector(
+            SettlementCriteria(
+                window_sec=kinematics.takeoff_settle_window_sec,
+                min_samples=kinematics.takeoff_settle_min_samples,
+                max_speed=kinematics.takeoff_settle_max_vz_mps,
+                max_position_sigma=kinematics.takeoff_settle_max_altitude_sigma_m,
+            )
+        )
+
+        logger.info(
+            "Stabilizing in hover: mean |vz| <= %.3f m/s and altitude sigma <= %.3f m "
+            "sustained for %.1f s above %.2f m (ceiling %.1f s)...",
+            kinematics.takeoff_settle_max_vz_mps,
+            kinematics.takeoff_settle_max_altitude_sigma_m,
+            kinematics.takeoff_settle_window_sec,
+            min_altitude,
+            ceiling_sec,
+        )
+
+        deadline = Deadline(ceiling_sec)
+        rate = LoopRate(kinematics.control_loop_hz)
+        last_sample: Optional[int] = None
+        report = None
 
         while deadline.active:
             if ctx.interrupted():
@@ -186,6 +226,37 @@ class TakeoffStep(BaseStep):
                 ctx.failsafe.notify_frame_received()
             rate.tick()
 
+            snapshot = ctx.odom_supervisor.snapshot()
+            if snapshot.sample_count == last_sample:
+                continue
+            last_sample = snapshot.sample_count
+
+            if snapshot.relative_altitude < min_altitude:
+                settlement.reset()
+                continue
+
+            report = settlement.update(
+                x=snapshot.relative_altitude,
+                y=0.0,
+                speed=abs(snapshot.vz),
+                timestamp=snapshot.timestamp,
+            )
+            if report.settled:
+                logger.info(
+                    "Liftoff transient decayed after %.2f s of the %.1f s ceiling at %.2f m: %s",
+                    deadline.elapsed_sec,
+                    ceiling_sec,
+                    snapshot.relative_altitude,
+                    report,
+                )
+                return StepStatus.SUCCESS
+
+        # Not a fault: this is the full wait the phase always used to make.
+        logger.warning(
+            "Liftoff transient did not settle within the %.1f s ceiling (%s). Continuing.",
+            ceiling_sec,
+            report if report is not None else "no airborne odometry samples",
+        )
         return StepStatus.SUCCESS
 
     # ------------------------------------------------------------------ ascent
