@@ -278,30 +278,34 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
                   <li
                     key={finding.topic}
                     className={cn(
-                      'mb-2 flex items-start gap-2.5 rounded-bezel border px-3 py-2.5 transition-all duration-500 ease-settle',
+                      'mb-2 flex items-start gap-3 rounded-bezel border px-3.5 py-3 transition-all duration-500 ease-settle',
                       shown
-                        ? 'translate-y-0 border-mint/40 bg-mint/[0.06] opacity-100'
+                        ? 'anim-finding-reveal translate-y-0 border-mint/55 bg-mint/[0.09] opacity-100 shadow-[inset_3px_0_0_#01D5A3]'
                         : 'pointer-events-none translate-y-2 border-strut-soft bg-abyss/30 opacity-0'
                     )}
                   >
                     <span
                       className={cn(
-                        'mt-[2px] flex h-4 w-4 shrink-0 items-center justify-center rounded-full border',
-                        shown ? 'border-mint/60 bg-mint/15' : 'border-strut'
+                        'mt-[1px] flex h-5 w-5 shrink-0 items-center justify-center rounded-full border',
+                        shown ? 'border-mint/70 bg-mint/20' : 'border-strut'
                       )}
                     >
                       <ShieldCheck
-                        size={9}
+                        size={11}
                         strokeWidth={2.5}
-                        className={shown ? 'text-mint' : 'text-haze-deep'}
+                        className={shown ? 'text-mint-bright' : 'text-haze-deep'}
                         aria-hidden
                       />
                     </span>
                     <span className="min-w-0">
-                      <span className="block font-cond text-3xs tracking-wide text-haze-deep">
-                        {TOPIC_LABEL[finding.topic]}
+                      <span className="flex items-baseline gap-1.5 font-cond text-2xs uppercase tracking-[0.12em] text-mint/85">
+                        <span className="tnum font-mono">{String(index + 1).padStart(2, '0')}</span>
+                        <span aria-hidden className="text-mint/40">·</span>
+                        <span>{TOPIC_LABEL[finding.topic]}</span>
                       </span>
-                      <span className="block text-sm leading-snug text-frost">{finding.card}</span>
+                      <span className="mt-0.5 block text-[15px] font-medium leading-snug text-frost">
+                        {finding.card}
+                      </span>
                     </span>
                   </li>
                 );

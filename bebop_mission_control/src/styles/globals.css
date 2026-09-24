@@ -183,6 +183,24 @@
   .anim-cursor {
     animation: cursor-blink 1.05s steps(1, end) infinite;
   }
+  /* A report finding arriving as the copilot finishes reading it: a bright
+     inset flare that settles onto the card's resting accent. Inset only, so it
+     is never clipped by the scrolling list and moves nothing around it. */
+  .anim-finding-reveal {
+    animation: finding-reveal 1.6s ease-out both;
+  }
+}
+
+@keyframes finding-reveal {
+  0%,
+  25% {
+    box-shadow: inset 3px 0 0 #5cf2ce, inset 0 0 0 1px rgba(92, 242, 206, 0.95),
+      inset 0 0 36px rgba(1, 213, 163, 0.48);
+  }
+  100% {
+    box-shadow: inset 3px 0 0 #01d5a3, inset 0 0 0 1px rgba(92, 242, 206, 0),
+      inset 0 0 32px rgba(1, 213, 163, 0);
+  }
 }
 
 @keyframes stage-glow {
@@ -312,7 +330,8 @@
   .anim-stage-glow,
   .anim-scan,
   .anim-spin-slow,
-  .anim-cursor {
+  .anim-cursor,
+  .anim-finding-reveal {
     animation: none !important;
   }
   * {
