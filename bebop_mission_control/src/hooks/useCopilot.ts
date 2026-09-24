@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AnnouncePriority } from '../types/bmg';
 import type { Finding } from '../lib/forensics';
 import { REPORT_INTRO, REPORT_OUTRO, findingGapMs } from '../lib/forensics';
+import type { MilestoneKey } from '../lib/copilotPhrases';
+import { describeTargetLocation, nextPhrase, spokenMeters } from '../lib/copilotPhrases';
 import { useBridge } from './useBridge';
 
 /**
@@ -117,13 +119,19 @@ export function useCopilot(): Copilot {
   return { say, cancel, available: Boolean(bridge) };
 }
 
-/** What the copilot says on reaching each stage, and on getting back down. */
-const STAGE_CALLS: Record<number, string> = {
-  1: 'Decolagem autorizada. Iniciando voo autônomo e subida ao teto operacional.',
-  2: 'Varredura linear em andamento. Varrendo a pista em busca de ocorrências.',
-  3: 'Alvo detectado na pista via visão computacional. Iniciando aproximação controlada.',
-  4: 'Alvo centrado sob a aeronave. Registro fotográfico em dupla fidelidade concluído.',
-  5: 'Iniciando retorno à base. Rastreando marcador de pouso.',
+/**
+ * The phrase pool each reported stage is narrated from.
+ *
+ * Stage 3 begins only once Stage 2 has confirmed a target, which is why its
+ * marker carries the target-found call. The stage marker holds no position, so
+ * that call names the runway rather than a range.
+ */
+const STAGE_MILESTONES: Record<number, MilestoneKey> = {
+  1: 'mission.takeoff',
+  2: 'mission.scan_start',
+  3: 'mission.target_found',
+  4: 'mission.capture_done',
+  5: 'mission.rtl_start',
 };
 
 const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
@@ -141,16 +149,24 @@ const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
  * Keying the reset on `enabled` instead left the set of already-called stages
  * populated across an entire session, so the copilot went silent from the
  * second flight onward.
+ *
+ * Each call is drawn from its phrase pool with the cross-flight history in
+ * `copilotPhrases`, so consecutive flights do not repeat a wording.
+ * `altitudeM` is the configured target altitude the takeoff call cites; it is
+ * read when the call is made, so a later edit does not re-trigger it.
  */
 export function useFlightNarration(
   copilot: Copilot,
   stage: number,
   landed: boolean,
   enabled: boolean,
-  flightKey: number | null
+  flightKey: number | null,
+  altitudeM: number = Number.NaN
 ): void {
   const called = useRef(new Set<number>());
   const touchdownCalled = useRef(false);
+  const altitude = useRef(altitudeM);
+  altitude.current = altitudeM;
   const { say } = copilot;
 
   useEffect(() => {
@@ -160,10 +176,15 @@ export function useFlightNarration(
 
   useEffect(() => {
     if (!enabled || !stage) return;
-    const line = STAGE_CALLS[stage];
-    if (!line || called.current.has(stage)) return;
+    const key = STAGE_MILESTONES[stage];
+    if (!key || called.current.has(stage)) return;
     called.current.add(stage);
-    void say(line);
+    void say(
+      nextPhrase(key, {
+        altitude: spokenMeters(altitude.current),
+        location: describeTargetLocation(null),
+      })
+    );
   }, [enabled, stage, say]);
 
   useEffect(() => {

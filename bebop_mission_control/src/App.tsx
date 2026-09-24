@@ -156,7 +156,14 @@ export const App: React.FC = () => {
   const narrating = !benchRun;
   const landed = over && mission.exitCode === 0;
 
-  useFlightNarration(copilot, mission.stage, landed && narrating, narrating, mission.startedAt);
+  useFlightNarration(
+    copilot,
+    mission.stage,
+    landed && narrating,
+    narrating,
+    mission.startedAt,
+    num(committed, 'kinematics.target_altitude_m', Number.NaN)
+  );
 
   // The report is drawn when the capture lands, not when it is read out: the
   // wording and the order are settled before the aircraft is back on the ground.
