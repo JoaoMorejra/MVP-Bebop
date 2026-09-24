@@ -18,7 +18,12 @@ type Cue =
 
 class CueEngine {
   private ctx: AudioContext | null = null;
-  private enabled = true;
+  /**
+   * Off: the station follows a single-voice policy, and the copilot is the only
+   * sound it makes. Every cue call site stays in place, silent, so re-enabling
+   * is one `setEnabled(true)`.
+   */
+  private enabled = false;
 
   setEnabled(on: boolean) {
     this.enabled = on;
