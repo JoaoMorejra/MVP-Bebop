@@ -966,7 +966,7 @@ class ClosedLoopRTLStep(BaseStep):
         vx = shaper.shape(ctx.speed_calibration.to_normalized(profiled), dt)
 
         snapshot = ctx.odom_supervisor.snapshot()
-        vz = ctx.governor.compute_vz(snapshot.relative_altitude, dt)
+        vz = ctx.governor.compute_vz(snapshot.relative_altitude, dt, vx_commanded=vx)
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         # The backward-only invariant, enforced where it cannot be argued with.
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(min(0.0, vx), 0.0)
@@ -1122,7 +1122,9 @@ class ClosedLoopRTLStep(BaseStep):
         odometry every other subsystem reads.
         """
         snapshot = ctx.odom_supervisor.snapshot()
-        vz = ctx.governor.compute_vz(snapshot.relative_altitude, dt)
+        vz = ctx.governor.compute_vz(
+            snapshot.relative_altitude, dt, vx_commanded=command.vx
+        )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(command.vx, command.vy)
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)

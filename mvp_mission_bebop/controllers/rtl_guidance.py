@@ -821,6 +821,14 @@ class ArucoCenteringController:
         # still outside the tolerance it is gated on, and the phase would run to
         # its timeout with the aircraft parked just off centre.
         self._deadband_m: float = min(abs(rtl_cfg.deadband_m), 0.5 * self._tolerance_m)
+        # The landing gate is judged against this radius, never against
+        # tolerance_m directly: the two answer different questions (the deadband
+        # question is "has the PD converged"; this is "is it safe to commit to
+        # the ground"), and clamping this to be no tighter than tolerance_m
+        # keeps that ordering from silently inverting under a misconfiguration.
+        self._landing_radius_m: float = max(
+            self._tolerance_m, abs(rtl_cfg.landing_radius_m)
+        )
         self._settle_target: int = max(1, int(rtl_cfg.centering_settle_cycles))
         self._lost_tolerance: int = max(0, int(rtl_cfg.lost_frames_tolerance))
         # Residual-speed gate for the settle test, reusing the same threshold the
@@ -873,6 +881,17 @@ class ArucoCenteringController:
         self._lost_frames: int = 0
         self._elapsed: float = 0.0
 
+        # State the creep decision reads: the last valid sighting's range and
+        # the speed the law was commanding when it was lost. Both None until
+        # the first observation, so the very first cycle can never creep on a
+        # loss it has no prior evidence about.
+        self._last_radial_m: Optional[float] = None
+        self._last_speed_mps: Optional[float] = None
+        self._lost_elapsed_sec: float = 0.0
+        self._creep_speed_mps: float = abs(
+            self.calibration.to_mps(rtl_cfg.reacquire_creep_speed)
+        )
+
     # ------------------------------------------------------------- properties
 
     @property
@@ -884,6 +903,11 @@ class ArucoCenteringController:
     def tolerance_m(self) -> float:
         """Radial error inside which the airframe counts as centred."""
         return self._tolerance_m
+
+    @property
+    def landing_radius_m(self) -> float:
+        """Radial error inside which the landing is authorized."""
+        return self._landing_radius_m
 
     @property
     def deadband_m(self) -> float:
@@ -918,6 +942,9 @@ class ArucoCenteringController:
         self._settle_cycles = 0
         self._lost_frames = 0
         self._elapsed = 0.0
+        self._last_radial_m = None
+        self._last_speed_mps = None
+        self._lost_elapsed_sec = 0.0
 
     def update(self, observation: Optional[MarkerObservation], dt: float) -> CenteringCommand:
         """Produce one cycle of centering guidance.
@@ -954,6 +981,7 @@ class ArucoCenteringController:
         )
         radial = math.hypot(ex_body, ey_body)
         within = radial <= self._tolerance_m
+        within_landing_gate = radial <= self._landing_radius_m
 
         if within:
             # Inside the gate the objective changes from "reduce the error" to
@@ -973,6 +1001,32 @@ class ArucoCenteringController:
             # above uses, deliberately: one reading of "error" across the module.
             longitudinal_demand = self._longitudinal.update(-ex_body, dt)
             lateral_demand = self._lateral.update(-ey_body, dt)
+            # The rear field of view at a steep camera_tilt_deg is narrow, so any
+            # forward overshoot risks losing the marker outright rather than just
+            # costing a correction cycle. A PD term alone does not guarantee the
+            # airframe can stop before it crosses the marker -- gain, filtering
+            # lag and profile inertia all sit between "demand" and "velocity
+            # actually flown". braking_velocity is the same stopping-distance
+            # feedforward RTLGuidanceController._compute_longitudinal already
+            # applies: the ceiling on how fast the airframe may move given how
+            # far it still has to travel and how hard it can decelerate. Bounding
+            # only the longitudinal channel is deliberate -- the lateral error is
+            # read off the camera's unprojected x-axis and is not starved by the
+            # tilt, so it keeps its full authority. arrival_tolerance is the
+            # deadband, not the (larger) convergence tolerance: the tolerance
+            # boundary is where the "within" branch above takes over outright,
+            # and anchoring the ceiling's zero-crossing there too would make the
+            # final approach asymptotically crawl the last few centimetres before
+            # that branch ever gets to fire.
+            longitudinal_ceiling = braking_velocity(
+                abs(ex_body),
+                self.rtl_cfg.max_accel_mps2,
+                cruise_velocity=self._max_speed_mps,
+                arrival_tolerance=self._deadband_m,
+            )
+            longitudinal_target = max(
+                -longitudinal_ceiling, min(longitudinal_ceiling, longitudinal_demand)
+            )
             # Saturated as a vector, not per axis. Clipping the two channels
             # independently lets the resultant reach sqrt(2) times the ceiling on
             # a diagonal approach -- 0.113 against a configured 0.08 -- and it
@@ -980,7 +1034,7 @@ class ArucoCenteringController:
             # exactly one axis is railed, so the aircraft crabs in on a dog-leg
             # instead of a straight line. Scaling preserves the heading.
             longitudinal_target, lateral_target = self._saturate_pair(
-                longitudinal_demand, lateral_demand
+                longitudinal_target, lateral_demand
             )
             longitudinal_mps = self._longitudinal_profile.step(longitudinal_target, dt)
             lateral_mps = self._lateral_profile.step(lateral_target, dt)
@@ -997,9 +1051,11 @@ class ArucoCenteringController:
         longitudinal_mps, lateral_mps = self._reconcile(longitudinal_mps, lateral_mps)
 
         speed_mps = math.hypot(longitudinal_mps, lateral_mps)
-        # Both conditions, every cycle. Inside the tolerance but still moving is
-        # a drone crossing the centre, not a drone over it.
-        if within and speed_mps <= self._settle_speed_mps:
+        # Both conditions, every cycle. Inside the landing radius but still
+        # moving is a drone crossing the pad, not a drone settled over it. The
+        # gate is judged against landing_radius_m, deliberately looser than the
+        # tolerance_m the PD's own rest-mode switches on above.
+        if within_landing_gate and speed_mps <= self._settle_speed_mps:
             self._settle_cycles += 1
         else:
             self._settle_cycles = 0
@@ -1007,6 +1063,10 @@ class ArucoCenteringController:
 
         vx = self._shaper_x.shape(self.calibration.to_normalized(longitudinal_mps), dt)
         vy = self._shaper_y.shape(self.calibration.to_normalized(lateral_mps), dt)
+
+        self._last_radial_m = radial
+        self._last_speed_mps = speed_mps
+        self._lost_elapsed_sec = 0.0
 
         return CenteringCommand(
             vx=vx,
@@ -1027,25 +1087,64 @@ class ArucoCenteringController:
     # ---------------------------------------------------------------- helpers
 
     def _coast(self, dt: float) -> CenteringCommand:
-        """Hold station through a cycle that carried no usable observation.
+        """Hold station -- or, close-in and mid-approach, creep aft -- through a
+        cycle that carried no usable observation.
 
-        The airframe is brought to rest rather than left on its last command,
-        because the Bebop latches the last Twist it received indefinitely: doing
-        nothing here is not "hold position", it is "keep flying the correction
-        computed for a marker position nobody can currently see".
+        A marker lost while the airframe was still actively closing on it, from
+        inside ``reacquire_creep_range_m``, is very often a marker that has just
+        slipped out of the narrow rear field of view a steep ``camera_tilt_deg``
+        produces: the classic overshoot-loses-the-tag failure. A brief, bounded
+        aft creep re-frames it directly rather than waiting out
+        ``lost_frames_tolerance`` on the chance the airframe drifts back into
+        view on its own. A marker lost while the airframe was already at rest
+        and centred is a different event entirely -- an occlusion, not an
+        overshoot -- and creeping off a good position would be exactly wrong,
+        so the creep is gated on the speed the law was commanding at the last
+        sighting, not merely on range.
+
+        Otherwise the airframe is brought to rest rather than left on its last
+        command, because the Bebop latches the last Twist it received
+        indefinitely: doing nothing here is not "hold position", it is "keep
+        flying the correction computed for a marker position nobody can
+        currently see".
         """
         self._lost_frames += 1
-        longitudinal_mps = self._longitudinal_profile.step(0.0, dt)
+        self._lost_elapsed_sec += max(0.0, dt)
+
+        # The creep's own window (reacquire_creep_sec) governs how long it runs;
+        # it is not tied to lost_frames_tolerance, which is a much shorter,
+        # unrelated bound on how long stale PD state is kept warm. Coupling the
+        # two would let whichever is shorter silently truncate the other -- at
+        # a typical control-loop rate, lost_frames_tolerance (a few tenths of a
+        # second) elapses well before a profile decelerating from cruise speed
+        # can actually cross zero into the negative creep target.
+        creeping = (
+            self._last_radial_m is not None
+            and self._last_speed_mps is not None
+            and self._last_radial_m <= self.rtl_cfg.reacquire_creep_range_m
+            and self._last_speed_mps > self._settle_speed_mps
+            and self._lost_elapsed_sec <= self.rtl_cfg.reacquire_creep_sec
+        )
+        longitudinal_target = -self._creep_speed_mps if creeping else 0.0
+        longitudinal_mps = self._longitudinal_profile.step(longitudinal_target, dt)
         lateral_mps = self._lateral_profile.step(0.0, dt)
 
         tolerated = self._lost_frames <= self._lost_tolerance
         if not tolerated:
             # Past the tolerance the PD state describes a world the camera is no
             # longer confirming. Clearing it stops a stale derivative from firing
-            # into the first frame that comes back.
+            # into the first frame that comes back. This is independent of the
+            # creep above, which is open-loop and does not read the PD state.
             self._settle_cycles = 0
             self._longitudinal.reset()
             self._lateral.reset()
+
+        if creeping:
+            note = (
+                f"marker lost {self._lost_frames} frames: creeping aft to reframe "
+                f"({self._lost_elapsed_sec:.2f}/{self.rtl_cfg.reacquire_creep_sec:.2f} s)"
+            )
+        elif not tolerated:
             note = f"marker lost for {self._lost_frames} frames: holding station"
         else:
             note = f"marker absent ({self._lost_frames}/{self._lost_tolerance}): coasting"

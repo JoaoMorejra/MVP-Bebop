@@ -397,7 +397,7 @@ def test_the_law_converges_from_a_combined_offset():
     ex, ey, history = fly_to_centre(controller, 0.60, -0.45)
 
     assert history[-1].settled, "never authorized the landing"
-    assert math.hypot(ex, ey) <= controller.tolerance_m
+    assert math.hypot(ex, ey) <= controller.landing_radius_m
 
 
 @pytest.mark.parametrize(
@@ -410,7 +410,7 @@ def test_the_law_converges_from_every_quadrant(ex, ey):
     residual_x, residual_y, history = fly_to_centre(controller, ex, ey)
 
     assert history[-1].settled, f"did not settle from ({ex}, {ey})"
-    assert math.hypot(residual_x, residual_y) <= controller.tolerance_m
+    assert math.hypot(residual_x, residual_y) <= controller.landing_radius_m
 
 
 def test_the_first_command_opposes_the_error_on_both_axes():
@@ -497,10 +497,11 @@ def test_saturation_preserves_the_commanded_heading():
 def test_the_law_converges_under_pose_noise():
     """Centimetre-scale pose jitter is the normal condition, not a fault."""
     controller = law()
-    ex, ey, history = fly_to_centre(controller, 0.50, 0.35, noise=0.01, cycles=1500)
+    noise = 0.01
+    ex, ey, history = fly_to_centre(controller, 0.50, 0.35, noise=noise, cycles=1500)
 
     assert history[-1].settled
-    assert math.hypot(ex, ey) <= 3.0 * controller.tolerance_m
+    assert math.hypot(ex, ey) <= controller.landing_radius_m + 3.0 * noise
 
 
 def test_noise_inside_the_deadband_does_not_produce_sustained_motion():
@@ -526,6 +527,114 @@ def test_the_deadband_stays_strictly_inside_the_convergence_gate():
     # inherited deadband, which is the case that would silently invert it.
     tight = law(centering_tolerance_m=0.02)
     assert 0.0 < tight.deadband_m < tight.tolerance_m
+
+
+def test_the_longitudinal_channel_never_commands_more_speed_than_it_can_arrest():
+    """The overshoot invariant, checked every cycle rather than at one distance.
+
+    A commanded speed that cannot be brought to rest within the remaining
+    body-x distance is, by definition, a speed that will carry the airframe
+    across the marker -- and under the -80 deg tilt, across the edge of the
+    rear field of view that would otherwise have kept it in frame. The bound
+    is the same feedforward physics RTLGuidanceController already flies:
+    v <= sqrt(2 * max_accel * (distance - tolerance)), saturated at the
+    centering speed ceiling.
+    """
+    controller = law()
+    params = MissionParameters()
+    from mvp_mission_bebop.controllers.profiling import braking_velocity
+
+    ex, ey = 0.55, -0.05
+    command = None
+    for _ in range(300):
+        command = controller.update(sighting(ex, ey), DT)
+        ceiling = braking_velocity(
+            abs(command.ex_body_m),
+            params.rtl.max_accel_mps2,
+            cruise_velocity=controller.max_speed_mps,
+            arrival_tolerance=controller.deadband_m,
+        )
+        # A small margin absorbs the sigma-delta shaper's dither and the two
+        # independent profiles' transient combination that _reconcile already
+        # bounds onto max_speed_mps -- the same margin test_the_speed_ceiling_
+        # bounds_the_resultant_and_not_the_axes uses for the same reason.
+        margin = 1.5 * params.rtl.quantization_step * math.sqrt(2.0)
+        assert command.commanded_speed_mps <= ceiling + margin, (
+            f"commanded {command.commanded_speed_mps:.4f} m/s at "
+            f"{command.ex_body_m:.4f} m out, which arrests in more distance "
+            f"than remains: overshoot is possible"
+        )
+        ex -= command.vx * DT
+        ey -= command.vy * DT
+        if command.settled:
+            break
+    assert command.settled, "never converged under the new ceiling"
+
+
+def test_an_aggressive_gain_with_weak_deceleration_authority_still_cannot_overshoot():
+    """The ceiling is the safety net for exactly the case tuning drift creates.
+
+    The PID's own output_limits already cap the raw demand at
+    max_centering_speed, which is why the default gains never actually railed
+    against the ceiling above: kp_x=0.25 is conservative enough that the
+    proportional term drops below the ceiling well before either would matter.
+    An order-of-magnitude-aggressive kp_x together with a weak max_accel_mps2
+    -- the kind of combination a runaway tuning pass or a bad unit conversion
+    would produce -- keeps the raw demand railed at the flat cruise cap right
+    up near the tolerance edge, where the remaining distance can no longer
+    arrest it under the weaker deceleration authority. Only the physical
+    ceiling, not the flat output limit, catches that.
+    """
+    controller = law(centering_kp_x=2.0, centering_kd_x=0.01, max_accel_mps2=0.02)
+    params = MissionParameters()
+    from mvp_mission_bebop.controllers.profiling import braking_velocity
+
+    ex = 0.30
+    command = None
+    margin = 1.5 * params.rtl.quantization_step * math.sqrt(2.0)
+    for _ in range(600):
+        command = controller.update(sighting(ex, 0.0), DT)
+        ceiling = braking_velocity(
+            abs(command.ex_body_m),
+            controller.rtl_cfg.max_accel_mps2,
+            cruise_velocity=controller.max_speed_mps,
+            arrival_tolerance=controller.deadband_m,
+        )
+        assert command.commanded_speed_mps <= ceiling + margin, (
+            f"commanded {command.commanded_speed_mps:.4f} m/s at "
+            f"{command.ex_body_m:.4f} m out under an aggressive gain and weak "
+            f"deceleration authority: overshoot is possible"
+        )
+        ex -= command.vx * DT
+        if command.settled:
+            break
+    assert command.settled, "never converged under the new ceiling"
+
+
+def test_the_landing_gate_is_looser_than_the_convergence_tolerance():
+    """The two radii serve different purposes and must not collapse into one.
+
+    centering_tolerance_m is the internal deadband/rest-mode switch: tight,
+    because it is what the PD converges the *approach* against. landing_radius_m
+    is the operational statement "this is close enough to put a 0.20 m tag on a
+    0.50-1.0 m pad down safely" -- looser on purpose, because past it every
+    further correction cycle spends battery on precision the touchdown itself
+    does not need.
+    """
+    controller = law()
+    assert controller.landing_radius_m >= controller.tolerance_m
+
+
+def test_settling_is_authorized_before_reaching_the_tight_tolerance():
+    """The whole point of the decoupled gate: land sooner, not more precisely."""
+    controller = law(landing_radius_m=0.13, centering_tolerance_m=0.04)
+    ex, ey, history = fly_to_centre(controller, 0.30, 0.0)
+
+    assert history[-1].settled
+    residual = math.hypot(ex, ey)
+    assert residual <= controller.landing_radius_m
+    # The settlement is not required to have reached the tight internal
+    # tolerance; that would defeat the decoupling this task exists to add.
 
 
 # ──────────────────────────────────────────────────────── the landing gate
@@ -645,6 +754,102 @@ def test_a_lost_marker_brakes_rather_than_leaving_the_last_command_latched():
     assert stopping.vx == 0.0 and stopping.vy == 0.0
 
 
+def test_a_loss_mid_approach_creeps_aft_to_reframe_the_marker():
+    """The flight failure: overshoot loses the tag, then the drone just hovers.
+
+    The narrow rear field of view at a steep camera_tilt_deg means a marker
+    lost while the airframe was still closing in -- not already parked over it
+    -- is very often a marker that has just slipped out of frame ahead or
+    below, exactly the direction a small aft creep re-frames.
+    """
+    controller = law()
+    moving = None
+    for _ in range(40):
+        moving = controller.update(sighting(0.30, 0.0), DT)
+    assert moving.commanded_speed_mps > controller.rtl_cfg.settle_max_speed_mps, (
+        "the approach never built up real speed; the test does not exercise the case"
+    )
+
+    # The profile was tracking a real cruise speed; jerk and acceleration
+    # limits mean it takes several cycles to decelerate through zero into the
+    # negative creep target, not one. The window this must happen within is
+    # reacquire_creep_sec, not the first post-loss cycle. The bound carries the
+    # same 1.5-step dither margin as the speed-ceiling tests above, for the
+    # same reason: the sigma-delta shaper's correction can momentarily overshot
+    # its target by up to 1.5 quantization steps on a single axis.
+    creep_ceiling = abs(
+        controller.calibration.to_normalized(controller.rtl_cfg.reacquire_creep_speed)
+    ) + 1.5 * controller.rtl_cfg.quantization_step
+    crept_negative = False
+    command = None
+    for _ in range(int(controller.rtl_cfg.reacquire_creep_sec / DT) + 1):
+        command = controller.update(None, DT)
+        assert command.vx >= -creep_ceiling - 1e-6, "the creep authority must stay bounded"
+        if command.vx < 0.0:
+            crept_negative = True
+    assert crept_negative, "the recovery must actually creep aft within the creep window"
+
+
+def test_the_creep_is_bounded_in_time_and_then_holds():
+    controller = law()
+    for _ in range(40):
+        controller.update(sighting(0.30, 0.0), DT)
+
+    cfg = MissionParameters().rtl
+    elapsed = 0.0
+    creeping_seen = False
+    command = None
+    while elapsed < cfg.reacquire_creep_sec + 1.0:
+        command = controller.update(None, DT)
+        if command.vx < 0.0:
+            creeping_seen = True
+        elapsed += DT
+
+    assert creeping_seen, "the creep never engaged at all"
+    assert command.vx == pytest.approx(0.0, abs=1e-6), (
+        "the creep must end and the airframe come to rest, not creep indefinitely"
+    )
+
+
+def test_a_loss_while_already_parked_over_the_marker_does_not_creep():
+    """Creeping off a good position to chase a marker occluded at rest is the
+    opposite of the fix: the airframe was not overshooting anything, so there
+    is nothing for a directional creep to correct.
+    """
+    controller = law()
+    for _ in range(5):
+        controller.update(sighting(0.0, 0.0), DT)
+
+    for _ in range(10):
+        command = controller.update(None, DT)
+        assert command.vx == 0.0, "an at-rest loss must hold station, not creep"
+
+
+def test_a_loss_from_far_out_does_not_creep():
+    """Creep is a close-in remedy; a marker lost well outside landing range is
+    not the overshoot case this recovery exists for. The airframe was cruising
+    toward the marker at speed, so the first cycles after loss are still a
+    positive-vx deceleration -- the assertion is that it decays cleanly to
+    zero rather than being railed at the (much smaller) creep authority.
+    """
+    controller = law()
+    for _ in range(60):
+        controller.update(sighting(2.0, 1.5), DT)
+
+    creep_floor = -abs(
+        controller.calibration.to_normalized(controller.rtl_cfg.reacquire_creep_speed)
+    ) - 1e-6
+    command = None
+    for _ in range(400):
+        command = controller.update(None, DT)
+        assert command.vx >= creep_floor, (
+            "a far-range loss must never creep past the bounded reacquire authority"
+        )
+        if command.commanded_speed_mps == 0.0:
+            break
+    assert command.commanded_speed_mps == pytest.approx(0.0, abs=1e-9)
+
+
 def test_the_law_has_no_rotational_output_at_all():
     """Structural, not asserted: yaw would corrupt the optical-flow estimate
     that the altitude governor and the failsafe supervisor both still read."""
@@ -683,7 +888,7 @@ class ClimbingGovernor:
     altitude_error_m = 0.30
 
     @staticmethod
-    def compute_vz(_altitude, _dt=None):
+    def compute_vz(_altitude, _dt=None, vx_commanded=0.0):
         return DEMANDED_CLIMB
 
     @staticmethod
@@ -966,7 +1171,12 @@ def test_sighting_the_marker_leads_to_centering_and_a_landing():
 
     assert status is StepStatus.SUCCESS
     assert ctx.blackboard.rtl_marker_sighted
-    assert sensor.residual_m <= 3.0 * ctx.params.rtl.centering_tolerance_m, (
+    # The landing gate is judged against landing_radius_m, not the tighter
+    # centering_tolerance_m -- settling is authorized well before the PD has
+    # converged onto the millimetric tolerance, per the decoupled gate. A small
+    # margin absorbs the one integration step between the settle decision and
+    # this residual being sampled.
+    assert sensor.residual_m <= ctx.params.rtl.landing_radius_m + 0.01, (
         f"centering left {sensor.residual_m:.3f} m of residual offset"
     )
     assert ctx.drone.land_calls > 0
@@ -1244,18 +1454,27 @@ def test_the_aruco_block_round_trips_through_mission_config():
         params.rtl.tag_size = 0.35
         params.rtl.camera_tilt_deg = -85.0
         params.rtl.centering_kp_y = 0.44
+        params.rtl.landing_radius_m = 0.15
+        params.rtl.reacquire_creep_speed = 0.04
+        params.rtl.reacquire_creep_sec = 1.5
+        params.rtl.reacquire_creep_range_m = 0.40
         params.save_to_file(path)
 
         with open(path, "r", encoding="utf-8") as stream:
             on_disk = json.load(stream)
         assert on_disk["rtl"]["target_aruco_id"] == 21
         assert on_disk["rtl"]["tag_size"] == 0.35
+        assert on_disk["rtl"]["landing_radius_m"] == 0.15
 
         reloaded = MissionParameters.load_from_file(path)
         assert reloaded.rtl.target_aruco_id == 21
         assert reloaded.rtl.marker_dict == 6
         assert reloaded.rtl.camera_tilt_deg == -85.0
         assert reloaded.rtl.centering_kp_y == 0.44
+        assert reloaded.rtl.landing_radius_m == 0.15
+        assert reloaded.rtl.reacquire_creep_speed == 0.04
+        assert reloaded.rtl.reacquire_creep_sec == 1.5
+        assert reloaded.rtl.reacquire_creep_range_m == 0.40
 
 
 def test_a_config_written_before_the_aruco_fields_existed_still_loads():
@@ -1268,6 +1487,8 @@ def test_a_config_written_before_the_aruco_fields_existed_still_loads():
     assert params.rtl.arrival_radius_m == 0.18
     assert params.rtl.target_aruco_id == MissionParameters().rtl.target_aruco_id
     assert params.rtl.tag_size == MissionParameters().rtl.tag_size
+    assert params.rtl.landing_radius_m == MissionParameters().rtl.landing_radius_m
+    assert params.rtl.reacquire_creep_speed == MissionParameters().rtl.reacquire_creep_speed
 
 
 def test_the_step_name_still_carries_the_prefix_the_gcs_matches():
@@ -1662,3 +1883,39 @@ def test_the_sensor_survives_whichever_opencv_the_interpreter_has():
     assert sensor.observe(None) is None
     # Whatever the runtime does with a real marker, it must not raise out.
     sensor.observe(render_marker(7, 428, 240, 200, (617, 597)))
+
+
+class RecordingGovernor:
+    def __init__(self):
+        self.calls = []
+
+    def compute_vz(self, altitude, dt=None, vx_commanded=0.0):
+        self.calls.append(vx_commanded)
+        return 0.0
+
+    def horizontal_scale(self):
+        return 1.0
+
+
+def test_cruise_backward_feeds_the_commanded_vx_to_the_governor():
+    from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
+    from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
+
+    ctx = Ctx()
+    ctx.governor = RecordingGovernor()
+    profile = JerkLimitedProfile(ProfileLimits(max_velocity=0.3, max_accel=0.4, max_jerk=2.0))
+    shaper = QuantizedCommandShaper(0.06, 0.01)
+
+    step = ClosedLoopRTLStep(sensor=ScriptedSensor(ctx.drone))
+
+    # Several cycles, so the jerk-limited profile leaves standstill: on the
+    # first one it still commands zero, which the default would satisfy too.
+    sent = [
+        step._cruise_backward(ctx, profile, shaper, dt=0.05, cruise_mps=0.2)
+        for _ in range(40)
+    ]
+
+    assert len(ctx.governor.calls) == len(sent)
+    assert all(fed <= 0.0 for fed in ctx.governor.calls), "the reverse cruise must feed a non-positive vx"
+    assert any(fed < 0.0 for fed in ctx.governor.calls), "the governor never saw the cruise"
+    assert ctx.governor.calls == pytest.approx(sent)
