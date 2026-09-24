@@ -4,6 +4,13 @@ import type { TrackPoint } from '../../types/mission';
 import { useReverseGeocode } from '../../hooks/useReverseGeocode';
 import { useOperatorLocation } from '../../hooks/useOperatorLocation';
 import { fromEnu, isValidCoordinate, niceGridStep } from '../../lib/geo';
+import {
+  accuracyIsCoarse,
+  displayZoom,
+  formatAccuracy,
+  pixelsPerMetre,
+  tileZoom,
+} from '../../lib/mapView';
 import { cn, degreesToCardinal } from '../../lib/format';
 
 interface TacticalMapProps {
@@ -43,6 +50,8 @@ interface TileSource {
   id: string;
   url: (s: string, z: number, x: number, y: number) => string;
   subdomains: readonly string[];
+  /** Deepest zoom the source serves; the map overzooms past it. */
+  maxZoom: number;
   filter: string;
   attribution: string;
 }
@@ -63,6 +72,7 @@ const TILE_SOURCES: readonly TileSource[] = (() => {
         url: (_s: string, z: number, x: number, y: number) =>
           `https://api.mapbox.com/styles/v1/mapbox/dark-v11/tiles/256/${z}/${x}/${y}?access_token=${MAP_API_KEY}`,
         subdomains: ['a', 'b', 'c', 'd'],
+        maxZoom: 20,
         filter: 'brightness(1.05) contrast(1.05)',
         attribution: '© Mapbox · © OpenStreetMap',
       });
@@ -72,6 +82,7 @@ const TILE_SOURCES: readonly TileSource[] = (() => {
         url: (_s: string, z: number, x: number, y: number) =>
           `https://api.maptiler.com/maps/dataviz-dark/${z}/${x}/${y}.png?key=${MAP_API_KEY}`,
         subdomains: ['a', 'b', 'c', 'd'],
+        maxZoom: 20,
         filter: 'brightness(1.02) contrast(1.05)',
         attribution: '© MapTiler · © OpenStreetMap',
       });
@@ -84,6 +95,7 @@ const TILE_SOURCES: readonly TileSource[] = (() => {
     url: (s: string, z: number, x: number, y: number) =>
       `https://${s}.tile.openstreetmap.org/${z}/${x}/${y}.png`,
     subdomains: ['a', 'b', 'c'],
+    maxZoom: 19,
     filter: 'invert(1) hue-rotate(180deg) brightness(0.82) contrast(1.08) saturate(0.55)',
     attribution: '© OpenStreetMap',
   });
@@ -93,10 +105,13 @@ const TILE_SOURCES: readonly TileSource[] = (() => {
 
 /** Failures within one source before the next is tried. */
 const SOURCE_FAILURE_BUDGET = 6;
-/** Close enough to read street geometry at the scale this aircraft flies. */
-const ZOOM = 18;
 /** Never zoom the overlay closer than this, or a stationary aircraft fills it. */
 const MIN_EXTENT_M = 12;
+/**
+ * Drawn size of the aircraft marker relative to its geometry. The marker is
+ * what the operator's eye goes to first, across the room from the station.
+ */
+const MARKER_SCALE = 1.45;
 
 /** Web Mercator, in fractional tiles. */
 function project(lat: number, lng: number, zoom: number) {
@@ -105,11 +120,6 @@ function project(lat: number, lng: number, zoom: number) {
   const latRad = (lat * Math.PI) / 180;
   const y = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
   return { x, y };
-}
-
-/** Ground resolution in metres per pixel, for the scale bar and the overlay. */
-function metresPerPixel(lat: number, zoom: number) {
-  return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / 2 ** zoom;
 }
 
 /** Without a single tile loaded in this long, the basemap is treated as offline. */
@@ -244,6 +254,15 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   }, [gpsFix, latitude, longitude, operator.location, baseLatitude, baseLongitude, baseSource, droneEast, droneNorth]);
 
   const geoKnown = geo.source !== 'none';
+  /**
+   * How far the base itself may be from where it is drawn. A network-derived
+   * position is a city centroid, kilometres from the launch point, and the
+   * flight is then registered to the wrong streets however exact the odometry
+   * on top of it is; saying so is the only honest fix available without a fix.
+   */
+  const operatorBased = geo.source === 'device' || geo.source === 'host' || geo.source === 'cache';
+  const baseAccuracy = operatorBased && operator.location ? operator.location.accuracyM : null;
+  const baseCoarse = baseAccuracy !== null && accuracyIsCoarse(baseAccuracy);
   // With nothing to centre on, there is no tile worth requesting.
   const basemapUsable = geoKnown && tilesOk !== false;
 
@@ -259,36 +278,40 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
 
   const place = useReverseGeocode(geo.lat, geo.lng, geoKnown && tilesOk === true);
 
-  const mpp = metresPerPixel(geoKnown ? geo.lat : 0, ZOOM);
-
   /**
    * Both layers are centred on the aircraft, so the basemap scrolls under a
-   * fixed marker the way a navigation map does. The overlay uses the same
-   * metres-per-pixel as the tiles whenever they are present, which is what
-   * keeps the trail registered to the streets under it.
+   * fixed marker the way a navigation map does.
+   *
+   * The scale fits the flight: the launch point and the whole trail stay in
+   * view with a margin. With tiles, that fit picks a display zoom, and the
+   * tiles are requested at the deepest zoom their source serves and scaled to
+   * it, so the overlay and the streets share one metres-per-pixel. Without
+   * tiles the overlay fits the flight directly.
    */
   const view = useMemo(() => {
-    const centre = project(geo.lat, geo.lng, ZOOM);
-    const scale = basemapUsable ? 1 / mpp : null;
-
-    // Without tiles the overlay falls back to fitting the flight, so a bench
-    // run with no basemap still reads.
-    let fallbackScale = 1;
-    if (scale === null) {
-      let extent = MIN_EXTENT_M;
-      for (const p of track) {
-        extent = Math.max(
-          extent,
-          Math.abs(p.x - droneEast) * 2.4,
-          Math.abs(p.y - droneNorth) * 2.4,
-          Math.abs(p.x) * 2.4,
-          Math.abs(p.y) * 2.4
-        );
-      }
-      fallbackScale = Math.min(size.width, size.height) / Math.max(extent, MIN_EXTENT_M);
+    let extent = MIN_EXTENT_M;
+    for (const p of track) {
+      extent = Math.max(
+        extent,
+        Math.abs(p.x - droneEast) * 2.4,
+        Math.abs(p.y - droneNorth) * 2.4,
+        Math.abs(p.x) * 2.4,
+        Math.abs(p.y) * 2.4
+      );
     }
 
-    const pxPerMetre = scale ?? fallbackScale;
+    let pxPerMetre: number;
+    let tile = { z: 0, scale: 1 };
+    let centre = { x: 0, y: 0 };
+    if (basemapUsable) {
+      const zoom = displayZoom(extent, size, geo.lat);
+      tile = tileZoom(zoom, source.maxZoom);
+      centre = project(geo.lat, geo.lng, tile.z);
+      pxPerMetre = pixelsPerMetre(zoom, geo.lat);
+    } else {
+      pxPerMetre = Math.min(size.width, size.height) / Math.max(extent, MIN_EXTENT_M);
+    }
+
     const cx = size.width / 2;
     const cy = size.height / 2;
 
@@ -296,8 +319,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     const sx = (east: number) => cx + (east - droneEast) * pxPerMetre;
     const sy = (north: number) => cy - (north - droneNorth) * pxPerMetre;
 
-    return { centre, pxPerMetre, cx, cy, sx, sy };
-  }, [geo.lat, geo.lng, mpp, basemapUsable, size, track, droneEast, droneNorth]);
+    return { centre, tile, tileSize: TILE_SIZE * tile.scale, pxPerMetre, cx, cy, sx, sy };
+  }, [geo.lat, geo.lng, basemapUsable, size, track, droneEast, droneNorth, source.maxZoom]);
 
   // Offline, probe one tile now and then; the first that loads brings the
   // basemap back without a flicker through a half-loaded grid.
@@ -313,24 +336,24 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         setSourceIndex(0);
         setTilesOk(null);
       };
-      probe.src = `${first.url(first.subdomains[0], ZOOM, tx, ty)}${
-        first.url(first.subdomains[0], ZOOM, tx, ty).includes('?') ? '&' : '?'
-      }probe=${Date.now()}`;
+      const z = view.tile.z;
+      const url = first.url(first.subdomains[0], z, tx, ty);
+      probe.src = `${url}${url.includes('?') ? '&' : '?'}probe=${Date.now()}`;
     }, TILE_PROBE_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [tilesOk, geoKnown, view.centre.x, view.centre.y]);
+  }, [tilesOk, geoKnown, view.centre.x, view.centre.y, view.tile.z]);
 
   // Tile grid covering the viewport, centred on the aircraft.
   const tiles = useMemo(() => {
     if (!basemapUsable) return [];
-    const { centre } = view;
-    const cols = Math.ceil(size.width / TILE_SIZE) + 2;
-    const rows = Math.ceil(size.height / TILE_SIZE) + 2;
+    const { centre, tile, tileSize } = view;
+    const cols = Math.ceil(size.width / tileSize) + 2;
+    const rows = Math.ceil(size.height / tileSize) + 2;
     const originX = Math.floor(centre.x) - Math.floor(cols / 2);
     const originY = Math.floor(centre.y) - Math.floor(rows / 2);
-    const n = 2 ** ZOOM;
+    const n = 2 ** tile.z;
 
-    const out: { key: string; url: string; left: number; top: number }[] = [];
+    const out: { key: string; url: string; left: number; top: number; size: number }[] = [];
     for (let row = 0; row < rows; row++) {
       for (let col = 0; col < cols; col++) {
         const tx = originX + col;
@@ -340,10 +363,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         // keeps the same host across re-renders and stays in the browser cache.
         const shard = source.subdomains[Math.abs(tx + ty) % source.subdomains.length];
         out.push({
-          key: `${source.id}-${tx}-${ty}`,
-          url: source.url(shard, ZOOM, tx, ty),
-          left: view.cx + (tx - centre.x) * TILE_SIZE,
-          top: view.cy + (ty - centre.y) * TILE_SIZE,
+          // The zoom is part of the identity: a tile at z18 and one at z19
+          // share coordinates only by coincidence.
+          key: `${source.id}-${tile.z}-${tx}-${ty}`,
+          url: source.url(shard, tile.z, tx, ty),
+          left: view.cx + (tx - centre.x) * tileSize,
+          top: view.cy + (ty - centre.y) * tileSize,
+          size: tileSize,
         });
       }
     }
@@ -380,11 +406,16 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             className={geo.source === 'gps' ? 'text-mint' : geoKnown ? 'text-frost' : 'text-haze-deep'}
           />
           <span className="font-cond text-2xs font-semibold tracking-wide text-frost">MAPA TÁTICO</span>
-          <span className="truncate font-cond text-3xs tracking-wide text-haze">
+          <span
+            className={cn(
+              'truncate font-cond text-3xs tracking-wide',
+              baseCoarse ? 'text-amber' : 'text-haze'
+            )}
+            title={baseCoarse ? 'Referência da base imprecisa: a posição sobre as ruas não é confiável' : undefined}
+          >
             {GEO_LABEL[geo.source]}
-            {geo.source === 'device' && operator.location
-              ? ` ±${Math.round(operator.location.accuracyM)} m`
-              : ''}
+            {baseAccuracy !== null ? ` ${formatAccuracy(baseAccuracy)}` : ''}
+            {baseCoarse ? ' · base aproximada' : ''}
             {!geoKnown && operator.status === 'locating' ? ' · localizando a estação' : ''}
           </span>
         </span>
@@ -423,8 +454,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
                 style={{
                   left: tile.left,
                   top: tile.top,
-                  width: TILE_SIZE,
-                  height: TILE_SIZE,
+                  width: tile.size,
+                  height: tile.size,
                   filter: source.filter,
                 }}
               />
@@ -435,7 +466,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               className="absolute inset-0"
               style={{
                 background:
-                  'linear-gradient(rgba(0,26,47,0.42), rgba(0,26,47,0.42)), radial-gradient(75% 75% at 50% 50%, transparent 45%, rgba(0,19,31,0.6) 100%)',
+                  'linear-gradient(rgba(0,26,47,0.2), rgba(0,26,47,0.2)), radial-gradient(80% 80% at 50% 50%, transparent 55%, rgba(0,19,31,0.45) 100%)',
               }}
             />
           </div>
@@ -464,22 +495,34 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           <circle
             cx={homeX}
             cy={homeY}
-            r={Math.max(arrivalRadius * view.pxPerMetre, 5)}
+            r={Math.max(arrivalRadius * view.pxPerMetre, 7)}
             fill="#01D5A3"
-            fillOpacity="0.06"
+            fillOpacity="0.08"
             stroke="#5CF2CE"
-            strokeOpacity="0.55"
-            strokeWidth="1"
-            strokeDasharray="3 3"
+            strokeOpacity="0.7"
+            strokeWidth="1.5"
+            strokeDasharray="4 3"
           />
 
+          {/* A dark casing under the trail keeps it legible over bright tiles. */}
+          {fullPath ? (
+            <path
+              d={fullPath}
+              fill="none"
+              stroke="#001A2F"
+              strokeOpacity="0.6"
+              strokeWidth="7.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          ) : null}
           {fullPath ? (
             <path
               d={fullPath}
               fill="none"
               stroke="#01D5A3"
-              strokeOpacity="0.35"
-              strokeWidth="2.5"
+              strokeOpacity="0.5"
+              strokeWidth="4"
               strokeLinecap="round"
               strokeLinejoin="round"
             />
@@ -490,7 +533,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               fill="none"
               stroke="#5CF2CE"
               strokeOpacity="0.95"
-              strokeWidth="2.5"
+              strokeWidth="4.5"
               strokeLinecap="round"
               strokeLinejoin="round"
             />
@@ -498,47 +541,51 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
 
           {/* Launch point. */}
           <g transform={`translate(${homeX}, ${homeY})`}>
-            <circle r="6" fill="#001A2F" stroke="#E8F2F0" strokeWidth="2" />
-            <circle r="2" fill="#E8F2F0" />
+            <circle r="9" fill="#001A2F" stroke="#E8F2F0" strokeWidth="2.5" />
+            <circle r="3" fill="#E8F2F0" />
           </g>
           <text
             x={homeX}
-            y={homeY + 20}
+            y={homeY + 27}
             textAnchor="middle"
-            className="fill-frost/75 font-cond"
-            fontSize="10"
-            style={{ paintOrder: 'stroke', stroke: '#001A2F', strokeWidth: 3 }}
+            className="fill-frost/85 font-cond"
+            fontSize="12.5"
+            style={{ paintOrder: 'stroke', stroke: '#001A2F', strokeWidth: 3.5 }}
           >
             BASE · DECOLAGEM (0, 0)
           </text>
 
           {/* The aircraft, fixed at the centre with the ground moving under it. */}
           <g transform={`translate(${view.cx}, ${view.cy})`} opacity={stale ? 0.45 : 1}>
-            <circle r="30" fill={`url(#${uid}-halo)`} />
-            <Quadcopter heading={compass} spinning={!stale} />
+            <circle r="44" fill={`url(#${uid}-halo)`} />
+            <g transform={`scale(${MARKER_SCALE})`}>
+              <Quadcopter heading={compass} spinning={!stale} />
+            </g>
           </g>
           <text
             x={view.cx}
-            y={view.cy - 34}
+            y={view.cy - 50}
             textAnchor="middle"
             className="fill-mint font-mono"
-            fontSize="9.5"
-            style={{ paintOrder: 'stroke', stroke: '#001A2F', strokeWidth: 3 }}
+            fontSize="12"
+            style={{ paintOrder: 'stroke', stroke: '#001A2F', strokeWidth: 3.5 }}
           >
             {`E ${droneEast.toFixed(1)} · N ${droneNorth.toFixed(1)} m`}
           </text>
 
           {/* Tactical compass: north fixed, heading needle live. */}
-          <TacticalCompass x={size.width - 34} y={34} heading={compass} stale={stale} />
+          <g transform={`translate(${size.width - 46}, 46) scale(1.35)`}>
+            <TacticalCompass x={0} y={0} heading={compass} stale={stale} />
+          </g>
 
           {/* Scale. */}
-          <g transform={`translate(18, ${size.height - 16})`}>
-            <rect x={-6} y={-20} width={scaleBarPx + 12} height={26} rx={3} fill="#001A2F" fillOpacity="0.55" />
-            <line x1="0" y1="0" x2={scaleBarPx} y2="0" stroke="#E8F2F0" strokeOpacity="0.7" strokeWidth="1.5" />
-            <line x1={scaleBarPx / 2} y1="-2.5" x2={scaleBarPx / 2} y2="2.5" stroke="#E8F2F0" strokeOpacity="0.5" strokeWidth="1" />
-            <line x1="0" y1="-4" x2="0" y2="4" stroke="#E8F2F0" strokeOpacity="0.7" strokeWidth="1.5" />
-            <line x1={scaleBarPx} y1="-4" x2={scaleBarPx} y2="4" stroke="#E8F2F0" strokeOpacity="0.7" strokeWidth="1.5" />
-            <text x={scaleBarPx / 2} y="-7" textAnchor="middle" className="fill-frost/80 font-mono" fontSize="9.5">
+          <g transform={`translate(20, ${size.height - 18})`}>
+            <rect x={-8} y={-25} width={scaleBarPx + 16} height={33} rx={4} fill="#001A2F" fillOpacity="0.62" />
+            <line x1="0" y1="0" x2={scaleBarPx} y2="0" stroke="#E8F2F0" strokeOpacity="0.8" strokeWidth="2" />
+            <line x1={scaleBarPx / 2} y1="-3" x2={scaleBarPx / 2} y2="3" stroke="#E8F2F0" strokeOpacity="0.6" strokeWidth="1.2" />
+            <line x1="0" y1="-5" x2="0" y2="5" stroke="#E8F2F0" strokeOpacity="0.8" strokeWidth="2" />
+            <line x1={scaleBarPx} y1="-5" x2={scaleBarPx} y2="5" stroke="#E8F2F0" strokeOpacity="0.8" strokeWidth="2" />
+            <text x={scaleBarPx / 2} y="-9" textAnchor="middle" className="fill-frost/90 font-mono" fontSize="11.5">
               {scaleLabel}
             </text>
           </g>
@@ -696,8 +743,8 @@ const LocalGrid: React.FC<{
       <text
         x={12}
         y={18}
-        className="fill-frost/45 font-cond"
-        fontSize="10"
+        className="fill-frost/55 font-cond"
+        fontSize="12"
         style={{ letterSpacing: '0.08em' }}
       >
         GRADE TÁTICA LOCAL · {step >= 1 ? `${step} m` : `${(step * 100).toFixed(0)} cm`}
