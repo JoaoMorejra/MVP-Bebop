@@ -12,6 +12,11 @@ build/
 install/
 log/
 
+# Frontend (bebop_mission_control)
+bebop_mission_control/node_modules/
+bebop_mission_control/dist/
+bebop_mission_control/.gstack/
+
 # IDE & Editor files
 .vscode/
 .idea/
@@ -37,6 +42,11 @@ Thumbs.db
 *.png
 *.mp4
 *.avi
+
+# Allow UI brand assets in bebop_mission_control
+!bebop_mission_control/public/assets/*.png
+!bebop_mission_control/public/assets/*.jpg
+!bebop_mission_control/public/assets/*.mp4
 
 # Dynamic runtime configuration outputs
 mission_config.json

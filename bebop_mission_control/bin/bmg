@@ -1,0 +1,42 @@
+#!/usr/bin/env bash 
+# ==============================================================================
+# BMG: Bebop Mission GUI - Desktop Mission Control Launcher
+# Target Context: /home/joaomoreira/ros2_ws/src/mvp_mission_bebop/mvp_mission_bebop
+# ==============================================================================
+
+set -e
+
+MISSION_DIR="/home/joaomoreira/ros2_ws/src/mvp_mission_bebop/mvp_mission_bebop"
+APP_DIR="/home/joaomoreira/ros2_ws/bebop_mission_control"
+
+# 1. Activate Nectar SDK and ROS 2 environment via canonical nectar-activate
+if [ -f "/home/joaomoreira/ros2_ws/bin/nectar-activate" ]; then
+    source "/home/joaomoreira/ros2_ws/bin/nectar-activate"
+elif [ -f "/home/joaomoreira/ros2_ws/.venv/bin/activate" ]; then
+    source "/home/joaomoreira/ros2_ws/.venv/bin/activate"
+fi
+
+# 3. Ensure DISPLAY is available
+if [ -z "$DISPLAY" ]; then
+    export DISPLAY=":0"
+fi
+
+# 4. Check if production build exists; if not, build it
+if [ ! -f "$APP_DIR/dist/index.html" ]; then
+    echo "[BMG] Initializing production build..."
+    (cd "$APP_DIR" && npm run build)
+fi
+
+echo "================================================================="
+echo " Parrot Bebop 2: Mission Control & Forensic Inspection (BMG)"
+echo " Context Directory: $MISSION_DIR"
+echo " Target Script:     $MISSION_DIR/mission.py"
+echo "================================================================="
+
+# 5. Navigate to the mission directory so all operations run in the native mission context
+cd "$MISSION_DIR"
+
+# 6. Launch Desktop Application via Electron with unprivileged user namespace compatibility
+ELECTRON_BIN="$APP_DIR/node_modules/.bin/electron"
+
+exec "$ELECTRON_BIN" --no-sandbox --disable-gpu-sandbox --disable-dev-shm-usage "$APP_DIR" "$@"
