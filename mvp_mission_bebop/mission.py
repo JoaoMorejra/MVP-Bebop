@@ -185,6 +185,22 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
             "rehearsal of a single routine; omitting it flies the whole sequence."
         ),
     )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Parameter store to load and rewrite (default: mission_config.json "
+            "beside this module, which is the file the GCS reads)."
+        ),
+    )
+    parser.add_argument(
+        "--bench-frame",
+        default=None,
+        help=(
+            "Image served as the camera under --no-fly when no video arrives "
+            "(default: the bundled benchtop frame, else a black frame)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -221,9 +237,9 @@ def parse_stage_selection(raw: Optional[str]) -> Optional[List[int]]:
 
 def main() -> None:
     """CLI initialization and mission lifecycle execution."""
-    config_file = os.path.join(os.path.dirname(__file__), "mission_config.json")
+    args = parse_arguments(MissionParameters())
+    config_file = args.config or os.path.join(os.path.dirname(__file__), "mission_config.json")
     params = MissionParameters.load_from_file(config_file)
-    args = parse_arguments(params)
 
     if args.params_json:
         # A malformed payload is fatal, not a warning. This carries the whole
@@ -437,8 +453,12 @@ def main() -> None:
             logger.info("[NO-FLY BENCHTOP] Physical camera not available. Utilizing benchtop test frame.")
             import cv2
             import numpy as np
-            test_img_path = os.path.join(os.path.dirname(__file__), "accident_raw_20260903_033713.png")
+            test_img_path = args.bench_frame or os.path.join(
+                os.path.dirname(__file__), "accident_raw_20260903_033713.png"
+            )
             if not os.path.exists(test_img_path):
+                if args.bench_frame:
+                    logger.warning("Bench frame %s not found.", args.bench_frame)
                 test_img_path = os.path.join(os.path.dirname(__file__), "accident_capture_20260901_031108.jpg")
             if os.path.exists(test_img_path):
                 sample_frame = cv2.imread(test_img_path)

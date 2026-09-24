@@ -49,6 +49,9 @@ Thumbs.db
 !bebop_mission_control/public/assets/*.jpg
 !bebop_mission_control/public/assets/*.mp4
 
+# Benchtop fixture frames exercised by the test suite
+!test/fixtures/*.jpg
+
 # Dynamic runtime configuration outputs
 mission_config.json
 active_config.json
