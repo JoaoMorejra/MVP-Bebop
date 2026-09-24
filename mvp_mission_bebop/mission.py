@@ -33,6 +33,7 @@ from mvp_mission_bebop.engine.runner import MissionRunner
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
 from mvp_mission_bebop.parameters import MissionParameters
+from mvp_mission_bebop.perception.worker import PerceptionWorker, normalize_imgsz
 from mvp_mission_bebop.steps import (
     ClosedLoopRTLStep,
     ForwardSearchStep,
@@ -404,8 +405,21 @@ def main() -> None:
         nectar.shutdown()
         sys.exit(1)
 
-    # Initialize perception
-    logger.info("Loading YOLO detector: %s...", params.vision.model_path)
+    # Initialize perception. The input size is normalized here, before takeoff,
+    # so a malformed value from the parameter sheet costs a log line on the
+    # ground instead of an exception inside a flight stage. Falling back to the
+    # native size is the conservative choice: it is the validated detector
+    # configuration, only slower.
+    try:
+        params.vision.inference_imgsz = normalize_imgsz(params.vision.inference_imgsz)
+    except (TypeError, ValueError) as exc:
+        logger.error("Invalid vision.inference_imgsz (%s); using the model's native size.", exc)
+        params.vision.inference_imgsz = None
+    logger.info(
+        "Loading YOLO detector: %s (input size %s)...",
+        params.vision.model_path,
+        params.vision.inference_imgsz or "native",
+    )
     detector = Detector(params.vision.model_path, confidence_threshold=params.vision.confidence_threshold)
     detector.load()
 
@@ -513,6 +527,18 @@ def main() -> None:
         frame_height=frame_height,
     )
 
+    # Inference off the control thread. The worker idles until a stage engages
+    # it, so the countdown warmup and the Stage 4 capture keep exclusive use of
+    # the camera and detector, and the Stage 5 marker search is not competing
+    # with it for frames.
+    perception = PerceptionWorker(ctx)
+    ctx.perception = perception
+    perception.start()
+
+    def _release_mission_resources() -> None:
+        perception.stop()
+        telemetry_node.destroy_node()
+
     all_steps = {
         1: TakeoffStep,
         2: ForwardSearchStep,
@@ -537,7 +563,7 @@ def main() -> None:
     runner = MissionRunner(
         context=ctx,
         steps=steps,
-        on_finalize=lambda: telemetry_node.destroy_node(),
+        on_finalize=_release_mission_resources,
         stage_numbers=stage_numbers,
     )
 

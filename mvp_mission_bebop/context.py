@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
 from nectar.ai.detection import Detector
 from nectar.vision import ImageHandler
@@ -26,6 +27,12 @@ from mvp_mission_bebop.controllers.visual_servoing import VisualServoingControll
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
 from mvp_mission_bebop.parameters import MissionParameters
+from mvp_mission_bebop.perception.summary import encode_detection_summary
+from mvp_mission_bebop.perception.worker import (
+    PerceptionPipeline,
+    PerceptionSample,
+    SynchronousPerception,
+)
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, OdometrySupervisor
 
@@ -66,6 +73,15 @@ class MissionContext:
         self.image_pub = self.handler.node.create_publisher(
             Image, self.params.network.detection_stream_topic, 1
         )
+        self.boxes_pub = self.handler.node.create_publisher(
+            String, self.params.network.detection_boxes_topic, 1
+        )
+        # Offset from the monotonic clock the perception samples are stamped
+        # with to ROS time, fixed once so the overlay stamp is comparable with
+        # the raw image headers the bridge draws it on.
+        self._monotonic_to_ros_sec = (
+            self.handler.node.get_clock().now().nanoseconds * 1e-9 - time.monotonic()
+        )
 
         self.current_tilt_deg: float = self.params.gimbal.search_tilt_deg
         self.emergency_event = threading.Event()
@@ -90,6 +106,16 @@ class MissionContext:
         # Whether the camera can be asked for a *new* frame rather than for
         # whatever it last received. See :meth:`grab_frame`.
         self._camera_blocks_for_new_frames = self._probe_frame_waiting()
+
+        #: Perception pipeline the closed-loop stages read detections from.
+        #:
+        #: Inline by default, which reproduces the original one-frame-per-cycle
+        #: timing. ``mission.py`` replaces it with a started
+        #: :class:`~mvp_mission_bebop.perception.worker.PerceptionWorker` so
+        #: inference runs off the control thread. ``detector`` stays exposed
+        #: for the one-off calls that need exclusive use of it: the countdown
+        #: warmup and the Stage 4 evidence capture.
+        self.perception: PerceptionPipeline = SynchronousPerception(self)
 
     # -------------------------------------------------------------- estimation
 
@@ -248,6 +274,31 @@ class MissionContext:
             logger.warning("Annotated stream publishing exception: %s", exc)
 
         return annotated
+
+    def publish_detection_summary(self, sample: PerceptionSample, status_text: str) -> None:
+        """Publish one inference result as the lightweight GCS overlay.
+
+        The counterpart of :meth:`publish_annotated_stream` for the continuous
+        perception stages: the boxes and caption travel as a few hundred bytes
+        of ``bmg.detections.v1`` JSON instead of a re-encoded 1.2 MB frame, and
+        the GCS bridge composites them onto the raw camera stream at the camera
+        rate. Failures are logged and swallowed; the overlay is never allowed to
+        take the perception worker down.
+        """
+        try:
+            height, width = sample.frame.shape[:2]
+            message = String()
+            message.data = encode_detection_summary(
+                detections=self._describe_detections(sample.result),
+                frame_width=int(width),
+                frame_height=int(height),
+                status=status_text,
+                stamp_sec=sample.stamp + self._monotonic_to_ros_sec,
+                inference_ms=sample.inference_sec * 1000.0,
+            )
+            self.boxes_pub.publish(message)
+        except Exception as exc:  # noqa: BLE001 - the overlay is never flight-critical
+            logger.warning("Detection overlay publishing exception: %s", exc)
 
     def record_photographic_evidence(
         self,
