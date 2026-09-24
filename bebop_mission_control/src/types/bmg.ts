@@ -233,6 +233,8 @@ export interface MissionStepEvent {
  * renderer checks it before use. `payload` is the milestone's JSON detail.
  */
 export interface MilestoneEvent {
+  /** Narration, or an alert (failure, abort, failsafe) spoken ahead of it. */
+  kind: 'milestone' | 'alert';
   key: string;
   payload: Record<string, unknown>;
   at: number;

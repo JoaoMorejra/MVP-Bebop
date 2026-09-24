@@ -2159,7 +2159,12 @@ ipcMain.handle('bmg:get-voice-level', async () => ({ volume: voiceVolume, muted:
 async function startMissionProcess(options = {}) {
   if (missionProcess) return { success: false, message: 'Uma missão já está em andamento.' };
 
-  const env = getNectarEnv();
+  // Single voice: the station's copilot is the only speaker in the system. The
+  // flag tells mission.py to build no audio player of its own and to hand its
+  // failures over as `[ALERT ...]` lines (`announcer.station_narrates`). Set
+  // here and only here: the speech daemon is this process's own voice and
+  // must keep its player.
+  const env = { ...getNectarEnv(), BMG_GCS_SESSION: '1' };
   const scriptPath = path.join(MISSION_DIR, 'mission.py');
   const args = [scriptPath];
 

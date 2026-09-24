@@ -135,6 +135,96 @@ describe('NarrationQueue', () => {
   });
 });
 
+describe('NarrationQueue preemption', () => {
+  it('cuts the current line, drops the backlog and speaks the alert next, at its priority', async () => {
+    const spoken: Array<{ text: string; priority?: string }> = [];
+    const pending: Array<(ok: boolean) => void> = [];
+    let interrupted = 0;
+    const queue = new NarrationQueue(
+      (text, priority) =>
+        new Promise<boolean>((resolve) => {
+          spoken.push({ text, priority });
+          pending.push(resolve);
+        }),
+      () => {
+        interrupted += 1;
+        // Copilot.cancel settles every pending line as not heard.
+        pending.splice(0).forEach((resolve) => resolve(false));
+      }
+    );
+
+    queue.enqueue('mission.scan_start', () => 'scan');
+    queue.enqueue('mission.target_found', () => 'target');
+    queue.enqueue('mission.approaching', () => 'approach');
+    await flush();
+    expect(spoken.map((line) => line.text)).toEqual(['scan']);
+
+    queue.preempt('mission.failsafe', () => 'Alerta de voo: odometria perdida.', 'URGENT');
+    await flush();
+
+    expect(interrupted).toBe(1);
+    expect(spoken).toEqual([
+      { text: 'scan', priority: 'NORMAL' },
+      { text: 'Alerta de voo: odometria perdida.', priority: 'URGENT' },
+    ]);
+    expect(queue.labels()).toEqual([]);
+
+    // Narration after the alert resumes normally behind it.
+    queue.enqueue('mission.landing', () => 'landing');
+    pending.shift()!(true);
+    await flush();
+    expect(spoken.map((line) => line.text)).toEqual(['scan', 'Alerta de voo: odometria perdida.', 'landing']);
+  });
+
+  it('speaks an alert at once when nothing is playing, without interrupting anything', async () => {
+    const spoken: string[] = [];
+    let interrupted = 0;
+    const queue = new NarrationQueue(
+      async (text) => {
+        spoken.push(text);
+        return true;
+      },
+      () => {
+        interrupted += 1;
+      }
+    );
+    queue.preempt('mission.abort', () => 'Missão abortada, pousando drone', 'URGENT');
+    await flush();
+    expect(spoken).toEqual(['Missão abortada, pousando drone']);
+    expect(interrupted).toBe(0);
+  });
+
+  it('never cuts one alert with another, and keeps them in order ahead of narration', async () => {
+    const spoken: string[] = [];
+    const pending: Array<(ok: boolean) => void> = [];
+    let interrupted = 0;
+    const queue = new NarrationQueue(
+      (text) =>
+        new Promise<boolean>((resolve) => {
+          spoken.push(text);
+          pending.push(resolve);
+        }),
+      () => {
+        interrupted += 1;
+        pending.splice(0).forEach((resolve) => resolve(false));
+      }
+    );
+    queue.preempt('mission.step_failed', () => 'first', 'URGENT');
+    await flush();
+    queue.enqueue('mission.landing', () => 'landing');
+    queue.preempt('mission.abort', () => 'second', 'URGENT');
+    await flush();
+
+    expect(interrupted).toBe(0);
+    expect(spoken).toEqual(['first']);
+    expect(queue.labels()).toEqual(['mission.abort']);
+
+    pending.shift()!(true);
+    await flush();
+    expect(spoken).toEqual(['first', 'second']);
+  });
+});
+
 describe('phraseForMilestone', () => {
   const noStorage: { storage: StorageLike | null; random: () => number } = {
     storage: null,

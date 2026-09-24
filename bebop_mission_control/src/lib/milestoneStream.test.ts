@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  ALERT_LINE,
   COUNTDOWN_CALL_SEC,
   MILESTONE_LINE,
   createMilestoneParser,
@@ -23,8 +24,8 @@ describe('mission stdout milestone parser', () => {
     parser.push(line('mission.takeoff', { altitude_m: 1.2 }) + line('mission.scan_start'));
 
     expect(seen).toEqual([
-      { key: 'mission.takeoff', payload: { altitude_m: 1.2 }, at: 1000, source: 'mission' },
-      { key: 'mission.scan_start', payload: {}, at: 1000, source: 'mission' },
+      { kind: 'milestone', key: 'mission.takeoff', payload: { altitude_m: 1.2 }, at: 1000, source: 'mission' },
+      { kind: 'milestone', key: 'mission.scan_start', payload: {}, at: 1000, source: 'mission' },
     ]);
   });
 
@@ -85,6 +86,30 @@ describe('mission stdout milestone parser', () => {
   });
 });
 
+describe('mission alerts', () => {
+  it('matches the pattern the mission contract test pins', () => {
+    // test/test_contracts.py::ALERT_LINE, verbatim.
+    expect(ALERT_LINE.source).toBe('\\[ALERT ([a-z]+\\.[a-z0-9_]+)\\] (\\{.*\\})$');
+  });
+
+  it('tells alerts from milestones on the same stream, in order', () => {
+    const seen: MilestoneMessage[] = [];
+    const parser = createMilestoneParser((message) => seen.push(message), () => 7);
+    const alert = { priority: 'CRITICAL', text: 'Alerta de voo: odometria perdida.' };
+
+    parser.push(line('mission.scan_start'));
+    parser.push(`2026-09-24 [WARNING] [Milestone] [ALERT mission.failsafe] ${JSON.stringify(alert)}\n`);
+    parser.push(line('mission.landing'));
+
+    expect(seen.map((message) => [message.kind, message.key])).toEqual([
+      ['milestone', 'mission.scan_start'],
+      ['alert', 'mission.failsafe'],
+      ['milestone', 'mission.landing'],
+    ]);
+    expect(seen[1].payload).toEqual(alert);
+  });
+});
+
 describe('station-owned script milestones', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -124,8 +149,8 @@ describe('station-owned script milestones', () => {
     scheduleScriptMilestones(8, (message) => seen.push(message), () => 5);
     vi.advanceTimersByTime(8000);
     expect(seen).toEqual([
-      { key: 'mission.start', payload: { countdown_sec: 8 }, at: 5, source: 'station' },
-      { key: 'mission.countdown_3', payload: { countdown_sec: 8 }, at: 5, source: 'station' },
+      { kind: 'milestone', key: 'mission.start', payload: { countdown_sec: 8 }, at: 5, source: 'station' },
+      { kind: 'milestone', key: 'mission.countdown_3', payload: { countdown_sec: 8 }, at: 5, source: 'station' },
     ]);
   });
 

@@ -306,6 +306,19 @@ export function phraseForMilestone(
   );
 }
 
+/** Said when an alert arrives without a sentence of its own. */
+const ALERT_FALLBACK = 'Alerta de voo. Executando pouso seguro.';
+
+/**
+ * The sentence for a mission alert: the one the mission composed for it, which
+ * carries the specific fault ("Alerta de voo: odometria perdida. ..."), or a
+ * generic call when the payload has none.
+ */
+export function alertSentence(payload: Readonly<Record<string, unknown>> | null | undefined): string {
+  const text = payload?.text;
+  return typeof text === 'string' && text.trim() ? text.trim() : ALERT_FALLBACK;
+}
+
 /**
  * Pick, render and remember one line for `key`, in a single call.
  *

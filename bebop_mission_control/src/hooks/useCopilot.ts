@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AnnouncePriority } from '../types/bmg';
 import type { Finding } from '../lib/forensics';
 import { REPORT_INTRO, REPORT_OUTRO, findingGapMs } from '../lib/forensics';
-import { isMilestoneKey, phraseForMilestone } from '../lib/copilotPhrases';
+import { alertSentence, isMilestoneKey, phraseForMilestone } from '../lib/copilotPhrases';
 import { NarrationQueue } from '../lib/narrationQueue';
 import { useBridge } from './useBridge';
 
@@ -141,8 +141,12 @@ const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
  * drops whatever is still queued.
  *
  * `altitudeM` is the configured target altitude, the fallback for a takeoff
- * milestone whose payload lacks one. Events are ignored while `enabled` is
+ * milestone whose payload lacks one. Milestones are ignored while `enabled` is
  * false, which is how bench routines stay silent.
+ *
+ * Alerts are not. Under the station the mission has no voice of its own
+ * (`announcer.station_narrates`), so a failure, abort or failsafe it reports is
+ * heard only if this says it: every alert preempts the narration, bench or not.
  */
 export function useFlightNarration(
   copilot: Copilot,
@@ -154,19 +158,31 @@ export function useFlightNarration(
   const bridge = useBridge();
   const sayRef = useRef(copilot.say);
   sayRef.current = copilot.say;
+  const cancelRef = useRef(copilot.cancel);
+  cancelRef.current = copilot.cancel;
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
   const altitude = useRef(altitudeM);
   altitude.current = altitudeM;
 
   const queue = useRef<NarrationQueue | null>(null);
-  if (queue.current === null) queue.current = new NarrationQueue((text) => sayRef.current(text));
+  if (queue.current === null) {
+    queue.current = new NarrationQueue(
+      (text, priority) => sayRef.current(text, priority),
+      () => cancelRef.current()
+    );
+  }
   const spoken = useRef(new Set<string>());
   const touchdownCalled = useRef(false);
 
   useEffect(() => {
     if (!bridge) return;
     return bridge.onMilestone((event) => {
+      if (event.kind === 'alert') {
+        const payload = event.payload ?? {};
+        queue.current?.preempt(event.key, () => alertSentence(payload), 'URGENT');
+        return;
+      }
       if (!enabledRef.current || !isMilestoneKey(event.key)) return;
       const key = event.key;
       if (key === 'mission.start') {

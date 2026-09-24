@@ -1,3 +1,13 @@
+import type { AnnouncePriority } from '../types/bmg';
+
+interface Item {
+  label: string;
+  compose: () => string;
+  priority: AnnouncePriority;
+  /** Raised with `preempt`: a failure, abort or failsafe, not narration. */
+  alert: boolean;
+}
+
 /**
  * First-in, first-out narration: one line at a time, each only once the
  * previous one has been heard.
@@ -16,10 +26,20 @@
  * silent copilot drains the queue immediately rather than stalling it.
  */
 export class NarrationQueue {
-  private readonly items: Array<{ label: string; compose: () => string }> = [];
+  private readonly items: Item[] = [];
   private draining = false;
+  /** The line being spoken right now, if any. */
+  private current: Item | null = null;
 
-  constructor(private readonly speak: (text: string) => Promise<boolean>) {}
+  /**
+   * @param speak Plays one line; resolves when it has been heard or never will be.
+   * @param interrupt Cuts the line currently playing so that `speak` resolves
+   *   at once (`Copilot.cancel`). Used only by {@link preempt}.
+   */
+  constructor(
+    private readonly speak: (text: string, priority?: AnnouncePriority) => Promise<boolean>,
+    private readonly interrupt: () => void = () => undefined
+  ) {}
 
   /**
    * Queue one line. `compose` runs when the line is reached, not now, so the
@@ -27,7 +47,24 @@ export class NarrationQueue {
    * consumes a variant from the cross-flight history.
    */
   enqueue(label: string, compose: () => string): void {
-    this.items.push({ label, compose });
+    this.items.push({ label, compose, priority: 'NORMAL', alert: false });
+    void this.drain();
+  }
+
+  /**
+   * Speak an alert ahead of all narration.
+   *
+   * The station is the system's only voice, so a failure the mission reports
+   * cannot wait behind the flight script it has just made obsolete: pending
+   * narration is dropped, the narration line playing now is cut, and the alert
+   * is next. Alerts never cut or drop each other; a second one waits for the
+   * first, so "step failed" followed by "aborting" is heard in full, in order.
+   */
+  preempt(label: string, compose: () => string, priority: AnnouncePriority = 'URGENT'): void {
+    const alerts = this.items.filter((item) => item.alert);
+    this.items.length = 0;
+    this.items.push(...alerts, { label, compose, priority, alert: true });
+    if (this.current && !this.current.alert) this.interrupt();
     void this.drain();
   }
 
@@ -63,11 +100,14 @@ export class NarrationQueue {
           continue;
         }
         if (!text.trim()) continue;
+        this.current = item;
         try {
-          await this.speak(text);
+          await this.speak(text, item.priority);
         } catch {
           // A voice that fails is treated as a line not heard; the next one
           // still gets its turn.
+        } finally {
+          this.current = null;
         }
       }
     } finally {

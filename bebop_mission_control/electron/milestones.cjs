@@ -16,6 +16,14 @@
 /** A milestone line on the mission's stdout. IPC contract with `milestones.py`. */
 const MILESTONE_LINE = /\[MILESTONE ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$/;
 
+/**
+ * An alert line: a failure, abort or failsafe the mission hands to the station
+ * to speak, because under the station it has no voice of its own
+ * (`announcer.station_narrates`). Same contract, pinned by
+ * `test/test_contracts.py::ALERT_LINE`.
+ */
+const ALERT_LINE = /\[ALERT ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$/;
+
 /** Seconds before liftoff at which the countdown call is made. */
 const COUNTDOWN_CALL_SEC = 3;
 
@@ -39,7 +47,9 @@ function createMilestoneParser(emit, now = Date.now) {
 
   const matchLine = (raw) => {
     const text = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
-    const match = MILESTONE_LINE.exec(text);
+    const milestone = MILESTONE_LINE.exec(text);
+    const alert = milestone ? null : ALERT_LINE.exec(text);
+    const match = milestone || alert;
     if (!match) return;
     let payload = {};
     try {
@@ -48,7 +58,7 @@ function createMilestoneParser(emit, now = Date.now) {
     } catch (_error) {
       payload = {};
     }
-    emit({ key: match[1], payload, at: now(), source: 'mission' });
+    emit({ kind: milestone ? 'milestone' : 'alert', key: match[1], payload, at: now(), source: 'mission' });
   };
 
   return {
@@ -77,12 +87,12 @@ function createMilestoneParser(emit, now = Date.now) {
 function scheduleScriptMilestones(countdownSec, emit, now = Date.now) {
   const countdown = Number.isFinite(Number(countdownSec)) ? Math.max(0, Number(countdownSec)) : 0;
   const payload = { countdown_sec: countdown };
-  emit({ key: 'mission.start', payload, at: now(), source: 'station' });
+  emit({ kind: 'milestone', key: 'mission.start', payload, at: now(), source: 'station' });
 
   const delayMs = Math.max(0, countdown - COUNTDOWN_CALL_SEC) * 1000;
   let timer = setTimeout(() => {
     timer = null;
-    emit({ key: 'mission.countdown_3', payload, at: now(), source: 'station' });
+    emit({ kind: 'milestone', key: 'mission.countdown_3', payload, at: now(), source: 'station' });
   }, delayMs);
 
   return () => {
@@ -92,6 +102,7 @@ function scheduleScriptMilestones(countdownSec, emit, now = Date.now) {
 }
 
 module.exports = {
+  ALERT_LINE,
   COUNTDOWN_CALL_SEC,
   MILESTONE_LINE,
   createMilestoneParser,

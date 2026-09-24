@@ -1,4 +1,6 @@
 export interface MilestoneMessage {
+  /** A narration milestone, or an alert the station speaks ahead of narration. */
+  kind: 'milestone' | 'alert';
   key: string;
   payload: Record<string, unknown>;
   /** Epoch milliseconds at which the main process saw it. */
@@ -8,6 +10,7 @@ export interface MilestoneMessage {
 }
 
 export declare const MILESTONE_LINE: RegExp;
+export declare const ALERT_LINE: RegExp;
 export declare const COUNTDOWN_CALL_SEC: number;
 
 export interface MilestoneParser {
