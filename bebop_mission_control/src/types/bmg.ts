@@ -360,8 +360,18 @@ export interface DiagnosticsReport {
 /** A finished command in the diagnostics terminal. */
 /** `bmg:terminal-spawn`: a PTY session, or why one could not be opened. */
 export type TerminalSpawnResult =
-  | { success: true; id: string; pid: number; cols: number; rows: number }
+  | ({ success: true; id: string; pid: number; cols: number; rows: number } & TerminalIdentity)
   | { success: false; error: string };
+
+/** Where a session's shell started and who it runs as, for its title. */
+export interface TerminalIdentity {
+  cwd: string;
+  /** Basename of the shell binary, e.g. `bash`. */
+  shell: string;
+  user: string;
+  host: string;
+  home: string;
+}
 
 /** Raw PTY output, escape sequences included, for xterm.js to render. */
 export interface TerminalDataEvent {

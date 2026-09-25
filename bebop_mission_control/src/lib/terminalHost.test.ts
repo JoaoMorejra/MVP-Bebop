@@ -47,6 +47,7 @@ function host() {
     cwd: '/home/op/ros2_ws',
     activator: '/home/op/ros2_ws/bin/nectar-activate',
     send: (channel, payload) => sent.push([channel, payload as Record<string, unknown>]),
+    identity: { user: 'op', host: 'gcs', home: '/home/op' },
   });
   return { terminal, pty, sent };
 }
@@ -66,6 +67,28 @@ describe('terminal host', () => {
       TERM: 'xterm-256color',
       BMG_NECTAR_ACTIVATE: '/home/op/ros2_ws/bin/nectar-activate',
     });
+  });
+
+  it('reports where each session starts and who it runs as, for its title', () => {
+    const { terminal } = host();
+    expect(terminal.spawn()).toMatchObject({
+      cwd: '/home/op/ros2_ws',
+      shell: 'bash',
+      user: 'op',
+      host: 'gcs',
+      home: '/home/op',
+    });
+  });
+
+  it('gives every session its own id and PTY', () => {
+    const { terminal, pty } = host();
+    const ids = [terminal.spawn(), terminal.spawn(), terminal.spawn()].map((r) => (r as { id: string }).id);
+    expect(ids).toEqual(['pty-1', 'pty-2', 'pty-3']);
+    terminal.write('pty-2', 'ls\r');
+    expect(pty.spawned.map((s) => s.term.written)).toEqual([[], ['ls\r'], []]);
+    terminal.kill('pty-2');
+    expect(pty.spawned.map((s) => s.term.killed)).toEqual([false, true, false]);
+    expect([...terminal.sessions.keys()]).toEqual(['pty-1', 'pty-3']);
   });
 
   it('writes raw bytes, Tab, arrows and Ctrl+C included', () => {

@@ -15,7 +15,10 @@
  * reports why it cannot open.
  */
 
-const RC_FILE = require('path').join(__dirname, 'terminal-rc.bash');
+const os = require('os');
+const path = require('path');
+
+const RC_FILE = path.join(__dirname, 'terminal-rc.bash');
 
 /** Bounds on a terminal size the renderer may ask for. */
 const MIN_COLS = 20;
@@ -28,6 +31,17 @@ const clamp = (value, lo, hi, fallback) => {
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
 };
 
+/** Who the shell runs as, and where `~` points. Never throws. */
+function localIdentity() {
+  let user = process.env.USER || 'user';
+  try {
+    user = os.userInfo().username || user;
+  } catch (_error) {
+    // No passwd entry for the uid: keep the environment's answer.
+  }
+  return { user, host: os.hostname().split('.')[0] || 'localhost', home: os.homedir() };
+}
+
 /**
  * @param {object} options
  * @param {() => {spawn: Function}} options.loadPty  Returns the node-pty module.
@@ -35,8 +49,19 @@ const clamp = (value, lo, hi, fallback) => {
  * @param {string} options.cwd  Where each shell starts.
  * @param {string} options.activator  nectar-activate, sourced by the rcfile.
  * @param {(channel: string, payload: object) => void} options.send  To the renderer.
+ * @param {{user: string, host: string, home: string}} [options.identity]  Reported
+ *   with each session so the renderer can title it the way the prompt reads.
  */
-function createTerminalHost({ loadPty, env, cwd, activator, send, shell = '/bin/bash', rcFile = RC_FILE }) {
+function createTerminalHost({
+  loadPty,
+  env,
+  cwd,
+  activator,
+  send,
+  shell = '/bin/bash',
+  rcFile = RC_FILE,
+  identity = localIdentity(),
+}) {
   const sessions = new Map();
   let seq = 0;
 
@@ -76,7 +101,18 @@ function createTerminalHost({ loadPty, env, cwd, activator, send, shell = '/bin/
       sessions.delete(id);
       send('bmg:terminal-exit', { id, exitCode, signal: signal || null });
     });
-    return { success: true, id, pid: term.pid, cols, rows };
+    return {
+      success: true,
+      id,
+      pid: term.pid,
+      cols,
+      rows,
+      cwd,
+      shell: path.basename(shell),
+      user: identity.user,
+      host: identity.host,
+      home: identity.home,
+    };
   }
 
   function write(id, data) {

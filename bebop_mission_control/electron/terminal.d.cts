@@ -11,7 +11,18 @@ export interface PtyLike {
 
 export interface TerminalHost {
   spawn(options?: { cols?: number; rows?: number }):
-    | { success: true; id: string; pid: number; cols: number; rows: number }
+    | {
+        success: true;
+        id: string;
+        pid: number;
+        cols: number;
+        rows: number;
+        cwd: string;
+        shell: string;
+        user: string;
+        host: string;
+        home: string;
+      }
     | { success: false; error: string };
   write(id: string, data: string): { success: boolean };
   resize(id: string, cols: number, rows: number): { success: boolean; error?: string };
@@ -30,4 +41,5 @@ export declare function createTerminalHost(options: {
   send: (channel: string, payload: object) => void;
   shell?: string;
   rcFile?: string;
+  identity?: { user: string; host: string; home: string };
 }): TerminalHost;

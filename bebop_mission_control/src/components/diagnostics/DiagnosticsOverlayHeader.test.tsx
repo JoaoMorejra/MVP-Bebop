@@ -34,18 +34,31 @@ describe('DiagnosticsOverlayHeader', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it('puts the red circle first, at the top-left, before the title', () => {
+  it('draws red, yellow and green at the top-left, before the title', () => {
     act(() => root.render(<DiagnosticsOverlayHeader title="Diagnóstico · Terminal" onClose={() => undefined} />));
 
     const header = container.querySelector('header')!;
-    const [first, second] = Array.from(header.children);
-    expect(first.tagName).toBe('BUTTON');
-    expect(first.getAttribute('aria-label')).toBe('Fechar diagnóstico');
-    expect(second.textContent).toBe('Diagnóstico · Terminal');
+    const [lights, title] = Array.from(header.children);
+    expect(lights.hasAttribute('data-traffic-lights')).toBe(true);
+    expect(title.textContent).toBe('Diagnóstico · Terminal');
     expect(header.className).toContain('justify-start');
-    const circle = first.querySelector('[data-close-circle]') as HTMLElement;
-    expect(circle.className).toContain('rounded-full');
-    expect(circle.style.backgroundColor).toBe('rgb(255, 95, 87)');
+
+    const [red, yellow, green] = Array.from(lights.children);
+    expect(red.tagName).toBe('BUTTON');
+    expect(red.getAttribute('aria-label')).toBe('Fechar diagnóstico');
+    const colour = (el: Element, selector: string) => (el.querySelector(selector) as HTMLElement).style.backgroundColor;
+    expect(colour(red, '[data-close-circle]')).toBe('rgb(255, 95, 87)');
+    expect(colour(yellow, '[data-minimize-circle]')).toBe('rgb(254, 188, 46)');
+    expect(colour(green, '[data-zoom-circle]')).toBe('rgb(40, 200, 64)');
+  });
+
+  it('keeps yellow and green out of the accessibility tree and the tab order', () => {
+    act(() => root.render(<DiagnosticsOverlayHeader title="Diagnóstico · Terminal" onClose={() => undefined} />));
+    const [, yellow, green] = Array.from(container.querySelector('[data-traffic-lights]')!.children);
+    for (const light of [yellow, green]) {
+      expect(light.getAttribute('aria-hidden')).toBe('true');
+      expect(light.tagName).not.toBe('BUTTON');
+    }
   });
 
   it('carries no X icon of its own in the top-right corner', () => {
