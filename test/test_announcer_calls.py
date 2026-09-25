@@ -415,3 +415,10 @@ def test_the_mission_side_report_has_no_pause_parameter():
     import inspect
 
     assert "gap_sec" not in inspect.signature(announcer.announce_forensic_report).parameters
+
+
+@pytest.mark.parametrize("verbatim", [True, False])
+def test_every_synthesis_prompt_asks_for_a_brisk_presenter_pace(verbatim):
+    instruction = announcer.synthesis_instruction("Decolagem autorizada.", verbatim)
+    assert "20 percent faster" in instruction
+    assert "never robotic" in instruction
