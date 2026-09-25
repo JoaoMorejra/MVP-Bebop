@@ -22,6 +22,8 @@ interface ForensicPanelProps {
   reportClosing?: string | null;
   onOpenLibrary: () => void;
   onFinish: () => void;
+  /** A mission is up or over, or an aircraft is airborne without one. */
+  canFinish: boolean;
 }
 
 /**
@@ -150,6 +152,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   reportClosing,
   onOpenLibrary,
   onFinish,
+  canFinish,
 }) => {
   const [arrived, setArrived] = useState(false);
 
@@ -282,9 +285,13 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
         <button
           type="button"
           onClick={onFinish}
+          disabled={!canFinish}
+          title={canFinish ? undefined : 'Disponível após iniciar uma missão'}
           className={cn(
             'ml-auto flex items-center gap-2 rounded-bezel border px-4 py-2 text-sm font-semibold transition-colors',
-            missionOver
+            !canFinish
+              ? 'cursor-not-allowed border-strut bg-hull text-haze-deep'
+              : missionOver
               ? 'border-mint bg-mint text-abyss hover:bg-mint-bright'
               : 'border-ember/70 bg-ember/15 text-ember hover:bg-ember hover:text-abyss'
           )}

@@ -6,6 +6,7 @@ import { StageBar } from './StageBar';
 import { OpticalFeed } from './OpticalFeed';
 import { TacticalMap } from './TacticalMap';
 import { ForensicPanel } from './ForensicPanel';
+import { isAirborne } from '../../lib/flightState';
 import { AbortControl } from './AbortControl';
 import { cn } from '../../lib/format';
 
@@ -112,6 +113,9 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
 }) => {
   const running = missionState === 'running' || missionState === 'arming';
   const over = missionState === 'finished' || missionState === 'faulted';
+  // Nothing to finish before a mission starts, unless an aircraft is in the air
+  // without one: ending the cycle is also what lands it (`bmg:end-mission`).
+  const canFinish = missionState !== 'idle' || isAirborne(telemetry.flying_state);
 
   const gimbalTilt = useMemo(() => {
     if (!running) return null;
@@ -192,6 +196,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
           reportClosing={reportClosing}
           onOpenLibrary={onOpenEvidence}
           onFinish={onFinish}
+          canFinish={canFinish}
         />
       </div>
 

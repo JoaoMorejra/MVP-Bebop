@@ -17,6 +17,7 @@ import { useLink } from './hooks/useLink';
 import { useMissionRuntime } from './hooks/useMissionRuntime';
 import { useMissionParameters } from './hooks/useMissionParameters';
 import { preflightLocked } from './lib/navigationLock';
+import { isAirborne } from './lib/flightState';
 import { useStreamHealth } from './hooks/useStreamHealth';
 import { useEvidence } from './hooks/useEvidence';
 import { useCameraTilt } from './hooks/useCameraTilt';
@@ -64,8 +65,6 @@ function initialScreen(): Screen {
 const FAILSAFE_KEY = 'bmg.battery-failsafe.v1';
 const FAILSAFE_DEFAULT: BatteryFailsafe = { enabled: true, thresholdPct: 20 };
 
-/** ARSDK flying states in which the airframe is in the air and able to land. */
-const AIRBORNE_FLYING_STATES = new Set([1, 2, 3, 6]);
 
 function loadFailsafe(): BatteryFailsafe {
   try {
@@ -430,7 +429,7 @@ export const App: React.FC = () => {
    */
   const inFlight =
     ((running && !benchMode && benchStage === null) ||
-      AIRBORNE_FLYING_STATES.has(telemetry.flying_state ?? -1)) &&
+      isAirborne(telemetry.flying_state)) &&
     Boolean(telemetry.connected);
 
   // Read inside the return watchdog, which outlives the render that armed it.
