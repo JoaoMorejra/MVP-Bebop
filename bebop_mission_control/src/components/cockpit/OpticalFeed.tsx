@@ -87,6 +87,39 @@ const HudChip: React.FC<{
   </span>
 );
 
+/** What the feed panel shows: the stream, or why there is none. */
+export type FeedState = 'image' | 'no-link' | 'no-bridge' | 'stalled';
+
+/**
+ * Decide the feed panel's content.
+ *
+ * `live` is required for the image. An `<img>` on an MJPEG stream keeps its
+ * last decoded frame on screen for as long as the connection stays open and
+ * raises no error, so a camera that stops sending while the bridge answers
+ * used to leave a frozen frame that read as live video. The reason given
+ * follows the chain from the aircraft inward: no link first, then a bridge
+ * that does not answer, then a bridge that answers with no frames.
+ */
+export function feedState(signal: {
+  bridgeUp: boolean;
+  failed: boolean;
+  live: boolean;
+  connected: boolean;
+}): FeedState {
+  if (signal.bridgeUp && !signal.failed && signal.live) return 'image';
+  if (!signal.connected) return 'no-link';
+  if (!signal.bridgeUp || signal.failed) return 'no-bridge';
+  return 'stalled';
+}
+
+const FEED_MESSAGE: Record<Exclude<FeedState, 'image'>, string> = {
+  'no-link':
+    'Sem enlace com a aeronave. Conecte-se à rede publicada pelo Bebop para receber vídeo e telemetria.',
+  'no-bridge': 'A ponte MJPEG na porta 9090 não respondeu. Os logs do serviço mjpeg estão em Diagnóstico.',
+  stalled:
+    'A ponte de vídeo está no ar, mas a câmera parou de enviar quadros. Verifique o driver e o enlace com a aeronave.',
+};
+
 /**
  * The live feed, with the flight instruments painted onto it.
  *
@@ -174,7 +207,12 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
     setNonce((n) => n + 1);
   }, [bridgeUp]);
 
-  const showImage = bridgeUp && !failed;
+  // Frames resuming after a stall get a fresh connection: the old one was
+  // unmounted with the frozen image, and a reused URL could hand it back.
+  useEffect(() => {
+    if (live) setNonce((n) => n + 1);
+  }, [live]);
+
   const annotated = source === DETECTION_TOPIC || source === BOXES_TOPIC;
   // Gated on the aircraft being reachable, for the same reason the status bar
   // is: neither figure expires on its own, so a powered-down drone would go on
@@ -183,10 +221,11 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
   const known = connected && Boolean(telemetry.battery_known);
   const charge = known ? telemetry.battery_pct : 0;
   const bars = connected ? rfBars(telemetry.wifi_signal_dbm) : 0;
+  const state = feedState({ bridgeUp, failed, live, connected });
 
   return (
     <div className="relative h-full w-full overflow-hidden rounded-panel border border-strut-soft bg-black">
-      {showImage ? (
+      {state === 'image' ? (
         <img
           key={nonce}
           src={`${STREAM_URL}?t=${nonce}`}
@@ -198,10 +237,8 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
         <div className="mesh-fine absolute inset-0 flex flex-col items-center justify-center gap-3">
           <VideoOff size={26} strokeWidth={1.4} className="text-haze-deep" aria-hidden />
           <p className="text-sm text-haze">Sem sinal óptico</p>
-          <p className="max-w-[38ch] text-center text-2xs leading-relaxed text-haze-deep">
-            {connected
-              ? 'A ponte MJPEG na porta 9090 não respondeu. Os logs do serviço mjpeg estão em Diagnóstico.'
-              : 'Sem enlace com a aeronave. Conecte-se à rede publicada pelo Bebop para receber vídeo e telemetria.'}
+          <p data-feed-state={state} className="max-w-[38ch] text-center text-2xs leading-relaxed text-haze-deep">
+            {FEED_MESSAGE[state]}
           </p>
         </div>
       )}

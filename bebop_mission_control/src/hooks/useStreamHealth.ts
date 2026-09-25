@@ -18,8 +18,8 @@ const DOWN: StreamStatus = {
  * Health of the MJPEG bridge on port 9090.
  *
  * Asked over IPC rather than fetched from the renderer: the page is served
- * from an ephemeral localhost port, so a direct `fetch` to 9090 is a
- * cross-origin request and fails silently.
+ * from its own localhost port, so a direct `fetch` to 9090 is a cross-origin
+ * request and fails silently.
  *
  * `running` and `live` are different facts and the cockpit needs both. The
  * bridge process can be perfectly healthy while the aircraft sends no video,
