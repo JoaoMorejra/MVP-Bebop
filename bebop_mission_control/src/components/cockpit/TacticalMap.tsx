@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useMemo, useState } from 'react';
-import { Building2, Compass, Crosshair, MapPin, Signpost, WifiOff } from 'lucide-react';
+import { Building2, Compass, Crosshair, MapPin, Signpost } from 'lucide-react';
 import type { TrackPoint } from '../../types/mission';
 import { useReverseGeocode } from '../../hooks/useReverseGeocode';
 import { useOperatorLocation } from '../../hooks/useOperatorLocation';
@@ -387,6 +387,17 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const homeX = view.sx(0);
   const homeY = view.sy(0);
   const distance = Math.hypot(droneEast, droneNorth);
+  const basemapState =
+    tilesOk === true && geoKnown ? 'mapa online' : tilesOk === null && geoKnown ? 'carregando mapa' : 'grade offline';
+  const mapStatus = [
+    `${GEO_LABEL[geo.source]}${baseAccuracy !== null ? ` ${formatAccuracy(baseAccuracy)}` : ''}`,
+    baseCoarse ? 'base aproximada: a posição sobre as ruas não é confiável' : null,
+    !geoKnown && operator.status === 'locating' ? 'localizando a estação' : null,
+    basemapState,
+    `${distance.toFixed(1)} m da base`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   // A round number of metres near a fifth of the panel.
   const scaleMetres = niceGridStep((size.width / Math.max(view.pxPerMetre, 0.0001)) * 0.9);
@@ -397,42 +408,29 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
 
   return (
     <div className="flex min-h-0 flex-col overflow-hidden rounded-panel border border-strut-soft bg-hull-deep">
-      {/* How the position was obtained, and whether the basemap is live. */}
-      <div className="flex h-9 shrink-0 items-center justify-between gap-3 border-b border-strut-soft px-3">
-        <span className="flex min-w-0 items-center gap-2">
-          <Crosshair
-            size={12}
-            strokeWidth={2}
-            className={geo.source === 'gps' ? 'text-mint' : geoKnown ? 'text-frost' : 'text-haze-deep'}
-          />
-          <span className="font-cond text-2xs font-semibold tracking-wide text-frost">MAPA TÁTICO</span>
-          <span
-            className={cn(
-              'truncate font-cond text-3xs tracking-wide',
-              baseCoarse ? 'text-amber' : 'text-haze'
-            )}
-            title={baseCoarse ? 'Referência da base imprecisa: a posição sobre as ruas não é confiável' : undefined}
-          >
-            {GEO_LABEL[geo.source]}
-            {baseAccuracy !== null ? ` ${formatAccuracy(baseAccuracy)}` : ''}
-            {baseCoarse ? ' · base aproximada' : ''}
-            {!geoKnown && operator.status === 'locating' ? ' · localizando a estação' : ''}
-          </span>
-        </span>
-        <span className="flex shrink-0 items-center gap-3">
-          <span
-            className={cn(
-              'flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-3xs',
-              tilesOk === true && geoKnown
-                ? 'border-mint/40 text-mint'
-                : 'border-strut text-haze'
-            )}
-          >
-            {tilesOk === true && geoKnown ? null : <WifiOff size={9} strokeWidth={2} />}
-            {tilesOk === true && geoKnown ? 'mapa online' : tilesOk === null && geoKnown ? 'carregando mapa' : 'grade offline'}
-          </span>
-          <span className="tnum font-mono text-2xs text-haze">{distance.toFixed(1)} m da base</span>
-        </span>
+      {/* The panel's name only. How the position was obtained, whether the
+          basemap is live and the range to the base stay available on hover:
+          they are diagnostics, not something the operator reads in flight. */}
+      <div
+        className="flex h-9 shrink-0 items-center gap-2 border-b border-strut-soft px-3"
+        title={mapStatus}
+      >
+        <Crosshair
+          size={12}
+          strokeWidth={2}
+          aria-hidden
+          className={
+            baseCoarse
+              ? 'text-amber'
+              : geo.source === 'gps'
+              ? 'text-mint'
+              : geoKnown
+              ? 'text-frost'
+              : 'text-haze-deep'
+          }
+        />
+        <span className="font-cond text-2xs font-semibold tracking-wide text-frost">MAPA TÁTICO</span>
+        <span className="sr-only">{mapStatus}</span>
       </div>
 
       <div ref={hostRef} className="relative min-h-0 flex-1 overflow-hidden bg-hull-deep">
