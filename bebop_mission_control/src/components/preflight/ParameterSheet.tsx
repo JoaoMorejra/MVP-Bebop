@@ -235,8 +235,8 @@ const GroupCard: React.FC<{
               nadirDeg={readNumber(working, group.items[1])}
             />
             <p className="text-3xs leading-relaxed text-haze">
-              A câmera desce do ângulo de varredura até o ângulo nadir durante o rastreamento. Ao
-              atingi-lo, a velocidade horizontal é zerada e a inspeção começa.
+              A câmera desce do ângulo de varredura até apontar totalmente para baixo durante o
+              rastreamento. Nessa posição, a velocidade horizontal é zerada e a inspeção começa.
             </p>
           </div>
         ) : null}

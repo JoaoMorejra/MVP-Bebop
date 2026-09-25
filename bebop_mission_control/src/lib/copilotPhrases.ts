@@ -121,7 +121,7 @@ export const PHRASE_POOLS: Readonly<Record<MilestoneKey, readonly string[]>> = {
   'mission.scan_start': [
     'Varredura linear iniciada. Buscando ocorrências na pista.',
     'Iniciando varredura da pista. Visão computacional ativa.',
-    'Cruzeiro de busca engajado. Monitorando a pista.',
+    'Deslocamento de busca iniciado. Monitorando a área.',
     'Varredura em andamento. Procurando sinistro ao longo da pista.',
     'Busca iniciada. Detector de objetos em operação.',
     'Iniciando busca retilínea. Câmera apontada para a pista.',

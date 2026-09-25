@@ -186,7 +186,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
               ? `${reportRevealed}/${report.length} constatações`
               : latest
               ? `${count} ${count === 1 ? 'captura nesta missão' : 'capturas nesta missão'}`
-              : 'aguardando sobrevoo nadir'}
+              : 'aguardando câmera na posição vertical'}
           </span>
         </header>
 
@@ -208,7 +208,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
                 // The original photograph, not the annotated copy: the boxes are
                 // the detector's opinion, and the assessment is of the scene.
                 src={latest.rawUrl ?? latest.url}
-                alt="Captura pericial da visada nadir"
+                alt="Captura pericial com a câmera na posição vertical"
                 className="h-full w-full object-contain"
               />
               <div className="absolute inset-x-0 bottom-0 flex items-end justify-between gap-3 bg-gradient-to-t from-black/90 to-transparent px-4 pb-3 pt-10">

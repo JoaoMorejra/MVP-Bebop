@@ -48,13 +48,13 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
   {
     id: 'envelope',
     title: 'Envelope de Voo',
-    summary: 'Altitude, cruzeiro e estabilização após a decolagem',
+    summary: 'Altitude, velocidade de deslocamento e estabilização após a decolagem',
     items: [
       {
         kind: 'number',
         path: 'kinematics.target_altitude_m',
         label: 'Altitude de Voo',
-        hint: 'Altitude de cruzeiro e teto de segurança estabilizado.',
+        hint: 'Altitude de voo e teto de segurança estabilizado.',
         min: 0.5,
         max: 4,
         step: 0.1,
@@ -65,7 +65,7 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
       {
         kind: 'number',
         path: 'kinematics.forward_cruise_velocity',
-        label: 'Velocidade de Cruzeiro',
+        label: 'Velocidade de Deslocamento',
         hint: 'Velocidade retilínea de busca na etapa de varredura.',
         min: 0.05,
         max: 0.6,
@@ -108,7 +108,7 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
       {
         kind: 'number',
         path: 'gimbal.nadir_tilt_deg',
-        label: 'Ângulo da Inclinação Nadir',
+        label: 'Ângulo da Câmera Apontada para Baixo',
         hint: 'Inclinação final da câmera sobre o alvo. Ao atingir este ângulo, o drone congela o movimento horizontal para captura.',
         min: -90,
         max: -50,

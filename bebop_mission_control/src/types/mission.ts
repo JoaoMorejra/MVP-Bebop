@@ -17,8 +17,8 @@ export interface MissionStage {
 
 export const MISSION_STAGES: MissionStage[] = [
   { step: 1, name: 'Decolagem', detail: 'Referência de solo, armamento e subida ao teto operacional' },
-  { step: 2, name: 'Varredura', detail: 'Cruzeiro retilíneo com detecção YOLOv8 na câmera frontal' },
-  { step: 3, name: 'Acidente detectado', detail: 'Aproximação IBVS até o ângulo nadir, governador anti-climb ativo' },
+  { step: 2, name: 'Varredura', detail: 'Deslocamento em linha reta com detecção YOLOv8 na câmera frontal' },
+  { step: 3, name: 'Acidente detectado', detail: 'Aproximação até a câmera apontar para baixo, proteção contra subida indevida ativa' },
   { step: 4, name: 'Inspeção', detail: 'Pairado imóvel sobre o sinistro, captura em dupla fidelidade' },
   { step: 5, name: 'Retornando base', detail: 'Retorno à origem e pouso sobre o marcador ArUco' },
 ];
