@@ -33,7 +33,7 @@ from mvp_mission_bebop.engine.runner import MissionRunner
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
 from mvp_mission_bebop.parameters import MissionParameters
-from mvp_mission_bebop.perception.worker import PerceptionWorker, normalize_imgsz
+from mvp_mission_bebop.perception.worker import PerceptionWorker, detector_kwargs, normalize_imgsz
 from mvp_mission_bebop.steps import (
     ClosedLoopRTLStep,
     ForwardSearchStep,
@@ -475,6 +475,17 @@ def main() -> None:
             sys.exit(1)
 
     frame_height, frame_width = sample_frame.shape[:2]
+
+    # Pre-flight detector warmup: the first inference allocates torch
+    # runtime layers/kernels and takes several seconds on CPU. Paying
+    # that cost here on the ground prevents search loop timeouts.
+    logger.info("Executing pre-flight detector warmup...")
+    try:
+        kwargs = detector_kwargs(None, params.vision.inference_imgsz)
+        detector.detect(sample_frame, **kwargs)
+        logger.info("Pre-flight detector warmup completed.")
+    except Exception as exc:  # noqa: BLE001 - warmup is best-effort
+        logger.debug("Pre-flight detector warmup notice: %s", exc)
 
     # Telemetry gets its own node rather than riding on the camera handler's.
     # Both are registered with the same shared Nectar executor, so this adds no
