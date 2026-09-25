@@ -720,9 +720,6 @@ export const App: React.FC = () => {
               />
             ) : (
               <DiagnosticsScreen
-                missionLog={mission.missionLog}
-                driverLog={mission.driverLog}
-                onClearLogs={mission.clearLogs}
                 missionRunning={running}
                 onLand={land}
                 onClose={() => setOverlay('none')}

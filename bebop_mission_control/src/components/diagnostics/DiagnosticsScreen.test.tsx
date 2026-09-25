@@ -96,9 +96,6 @@ async function render(onClose = vi.fn()) {
   act(() =>
     root.render(
       <DiagnosticsScreen
-        missionLog={[]}
-        driverLog={[]}
-        onClearLogs={() => undefined}
         missionRunning={false}
         onLand={() => undefined}
         onClose={onClose}
@@ -138,6 +135,13 @@ describe('DiagnosticsScreen shell tabs', () => {
     expect(title()).toBe('op@gcs: ~/ros2_ws — bash');
     expect(tabs()[0].textContent).toContain('ros2_ws');
     expect(button('Fechar aba 1')).toBeNull();
+  });
+
+  it('draws only the terminal: no log pane, no log source selector', async () => {
+    await render();
+    expect(container.textContent).not.toContain('logs:');
+    expect(container.textContent).not.toContain('sem linhas de log');
+    expect(container.querySelectorAll('[aria-label="Terminal bash"]')).toHaveLength(1);
   });
 
   it('gives every new tab its own PTY and selects it', async () => {
