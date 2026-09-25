@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { TRACKED_PATHS } from '../lib/parameterSchema';
+import { ALL_PARAMETERS, TRACKED_PATHS } from '../lib/parameterSchema';
 import { deepEqual, getPath, setPath } from '../lib/paths';
 import { useBridge } from './useBridge';
 
@@ -7,6 +7,20 @@ export type ParamsDoc = Record<string, unknown>;
 
 const LOCAL_PRESET_KEY = 'bmg.operator-preset.v2';
 const LOCAL_WORKING_KEY = 'bmg.working-parameters.v2';
+
+/**
+ * Whether `working` holds the operator's preset.
+ *
+ * Compared over the six flight parameters the preset is about, not the whole
+ * document: `mission.py` rewrites calibration statistics into the file on
+ * every run, and `no_fly` is the arming mode rather than a tuning, so either
+ * would make a preset read as inactive while every value the operator set is
+ * still in place.
+ */
+export function matchesPreset(working: ParamsDoc | null, preset: ParamsDoc | null): boolean {
+  if (!working || !preset) return false;
+  return ALL_PARAMETERS.every((spec) => deepEqual(getPath(working, spec.path), getPath(preset, spec.path)));
+}
 
 /**
  * Reads, edits and persists the whole `MissionParameters` document.
@@ -119,6 +133,8 @@ export function useMissionParameters() {
 
   const dirty = changedPaths.size > 0;
 
+  const isPresetActive = useMemo(() => matchesPreset(working, preset), [working, preset]);
+
   const save = useCallback(async () => {
     if (!working) return false;
     setStatus('saving');
@@ -173,6 +189,7 @@ export function useMissionParameters() {
     error,
     dirty,
     changedPaths,
+    isPresetActive,
     edit,
     save,
     discard,

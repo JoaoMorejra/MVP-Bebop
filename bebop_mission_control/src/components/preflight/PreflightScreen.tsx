@@ -11,6 +11,7 @@ import { StatusBar } from '../shell/StatusBar';
 import { LaunchDial } from './LaunchDial';
 import { ConnectionSheet } from './ConnectionSheet';
 import { ParameterSheet } from './ParameterSheet';
+import { DiscardChangesDialog } from './DiscardChangesDialog';
 import { cn } from '../../lib/format';
 
 interface PreflightScreenProps {
@@ -36,6 +37,7 @@ interface PreflightScreenProps {
   changedPaths: Set<string>;
   dirty: boolean;
   hasPreset: boolean;
+  presetActive: boolean;
   onEdit: (path: string, value: unknown) => void;
   onSave: () => void;
   onDiscard: () => void;
@@ -85,6 +87,20 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
   } = props;
 
   const [sheet, setSheet] = useState<'none' | 'link' | 'params'>('none');
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false);
+
+  // Closing the parameter sheet with edits pending asks first; confirming
+  // restores the last saved document. Launching still commits a pending draft
+  // silently (App.launch), which this deliberately leaves alone.
+  const closeParams = () => {
+    if (dirty) setConfirmingDiscard(true);
+    else setSheet('none');
+  };
+  const discardAndClose = () => {
+    props.onDiscard();
+    setConfirmingDiscard(false);
+    setSheet('none');
+  };
 
   const benchMode = Boolean(getPath(params, 'no_fly'));
   const missingTopics = readiness?.missing ?? [];
@@ -258,13 +274,13 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
           <button
             type="button"
             aria-label="Fechar"
-            onClick={() => setSheet('none')}
+            onClick={closeParams}
             className="absolute inset-0 cursor-default bg-abyss/70 backdrop-blur-[3px]"
           />
           <div className="anim-rise relative flex h-full max-h-[780px] w-full max-w-[1120px] flex-col">
             <button
               type="button"
-              onClick={() => setSheet('none')}
+              onClick={closeParams}
               aria-label="Fechar"
               className="absolute -top-10 right-0 rounded-bezel p-1.5 text-haze transition-colors hover:bg-hull-raise hover:text-frost"
             >
@@ -278,6 +294,7 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
                 dirty={dirty}
                 saving={paramsStatus === 'saving'}
                 hasPreset={props.hasPreset}
+                presetActive={props.presetActive}
                 onEdit={props.onEdit}
                 onSave={props.onSave}
                 onDiscard={props.onDiscard}
@@ -294,6 +311,9 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
               </div>
             )}
           </div>
+          {confirmingDiscard ? (
+            <DiscardChangesDialog onConfirm={discardAndClose} onCancel={() => setConfirmingDiscard(false)} />
+          ) : null}
         </div>
       ) : null}
     </div>

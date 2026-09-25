@@ -581,6 +581,7 @@ export const App: React.FC = () => {
         changedPaths={params.changedPaths}
         dirty={params.dirty}
         hasPreset={Boolean(params.preset)}
+        presetActive={params.isPresetActive}
         onEdit={params.edit}
         onSave={() => void params.save()}
         onDiscard={params.discard}

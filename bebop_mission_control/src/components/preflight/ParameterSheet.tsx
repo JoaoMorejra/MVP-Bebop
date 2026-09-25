@@ -17,6 +17,8 @@ interface ParameterSheetProps {
   dirty: boolean;
   saving: boolean;
   hasPreset: boolean;
+  /** The working values are the operator's preset: the star is filled. */
+  presetActive: boolean;
   onEdit: (path: string, value: unknown) => void;
   onSave: () => void;
   onDiscard: () => void;
@@ -266,6 +268,7 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
   dirty,
   saving,
   hasPreset,
+  presetActive,
   onEdit,
   onSave,
   onDiscard,
@@ -285,9 +288,6 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
           <h2 className="font-cond text-lg font-semibold tracking-wide text-frost">Parâmetros de voo</h2>
           <p className="text-2xs text-haze">Seis ajustes que definem o comportamento da missão.</p>
         </div>
-        <span className="rounded-full border border-strut px-2.5 py-1 font-mono text-3xs text-haze-deep">
-          mission_config.json
-        </span>
       </div>
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto p-4 lg:grid-cols-3">
@@ -315,7 +315,20 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
         >
           Meu ajuste
         </Button>
-        <Button variant="ghost" onClick={onSavePreset} icon={<Star size={13} />}>
+        <Button
+          variant="ghost"
+          onClick={onSavePreset}
+          aria-pressed={presetActive}
+          title={presetActive ? 'Os valores atuais são o seu ajuste salvo' : undefined}
+          className={presetActive ? 'text-amber hover:text-amber' : undefined}
+          icon={
+            <Star
+              size={13}
+              data-preset-star={presetActive ? 'filled' : 'outline'}
+              fill={presetActive ? 'currentColor' : 'none'}
+            />
+          }
+        >
           Salvar como meu ajuste
         </Button>
 
