@@ -514,7 +514,9 @@ const WifiWidget: React.FC<{
    */
   const connected = Boolean(telemetry.connected);
   const hostSsid = currentSsid || telemetry.wifi_ssid;
-  const bars = connected
+  // The aircraft's RSSI only while its driver is publishing; otherwise the
+  // host's own reading of the network it is on, which is live either way.
+  const bars = telemetry.data_fresh
     ? rfBars(telemetry.wifi_signal_dbm)
     : levelFromPercent(networks.find((n) => n.active)?.signal ?? 0);
   const label = connected ? telemetry.wifi_ssid || hostSsid || 'Conectado' : hostSsid || 'Desconectado';
@@ -541,8 +543,10 @@ const WifiWidget: React.FC<{
         aria-expanded={open}
         aria-label="Redes Wi-Fi"
         title={
-          connected
+          telemetry.data_fresh
             ? `${label} · ${telemetry.wifi_signal_dbm} dBm`
+            : connected
+            ? `${label} · sem dados do driver`
             : `Aeronave fora de alcance${hostSsid ? ` (a estação está em ${hostSsid})` : ''}`
         }
         className={cn(PILL, open && 'border-mint/45')}

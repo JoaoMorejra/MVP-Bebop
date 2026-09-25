@@ -260,7 +260,7 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
       {/* Top-left: how long, and in what format. */}
       <div className="pointer-events-none absolute left-3 top-3 z-30 flex items-center gap-2">
         <HudChip icon={<Timer size={11} strokeWidth={2} />} tone={running ? 'mint' : 'default'}>
-          {duration(telemetry.flight_time_sec)}
+          {connected ? duration(telemetry.flight_time_sec) : '—'}
         </HudChip>
         <HudChip icon={<Video size={11} strokeWidth={2} />} tone={live && fps < 8 ? 'amber' : 'default'}>
           {live ? `${formatName(width, height)} · ${fps} FPS` : 'sem vídeo'}
@@ -297,8 +297,10 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
             bars <= 1 && telemetry.connected && 'border-amber/35'
           )}
           title={
-            connected
+            telemetry.data_fresh
               ? `Enlace com a aeronave: ${telemetry.wifi_signal_dbm} dBm`
+              : connected
+              ? 'Na rede da aeronave, sem dados do driver'
               : 'Sem enlace com a aeronave'
           }
         >
@@ -333,8 +335,8 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
       {/* Bottom-left: the airframe's own state. Quieter than the corners above,
           because these change every frame and must not pull the eye. */}
       <div className="pointer-events-none absolute bottom-3 left-3 z-30 flex items-end gap-4">
-        <Figure label="alt" value={telemetry.altitude.toFixed(2)} unit="m" />
-        <Figure label="vel" value={telemetry.speed.toFixed(2)} unit="m/s" />
+        <Figure label="alt" value={telemetry.data_fresh ? telemetry.altitude.toFixed(2) : '—'} unit="m" />
+        <Figure label="vel" value={telemetry.data_fresh ? telemetry.speed.toFixed(2) : '—'} unit="m/s" />
         {gimbalTilt !== null ? (
           <Figure label="gimbal" value={gimbalTilt.toFixed(0)} unit="°" />
         ) : null}

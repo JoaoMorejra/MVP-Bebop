@@ -52,6 +52,12 @@ export interface BmgTelemetry {
 
   /** Epoch milliseconds the sample was rendered by the bridge. */
   at?: number;
+  /**
+   * The driver is publishing (`/bebop/odom` fresh) and the aircraft is
+   * reachable. Stricter than `connected`, which a ping to the access point
+   * satisfies while the driver is dead: flight readouts follow this one.
+   */
+  data_fresh?: boolean;
   drone_ip?: string;
   /**
    * Whether `battery_pct` is a measurement at all. The bridge reports 0 for

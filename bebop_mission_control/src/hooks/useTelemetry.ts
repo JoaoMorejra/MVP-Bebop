@@ -156,6 +156,8 @@ export function useTelemetry() {
   const connected = Boolean(raw.connected && !bridgeSilent);
   const batteryKnown = connected && Boolean(raw.battery_known);
   const stale = !connected || !raw.driver_running;
+  // A bridge older than `data_fresh` is read through its own odometry watchdog.
+  const dataFresh = connected && Boolean(raw.data_fresh ?? raw.driver_running);
 
   const view: TelemetryView = {
     ...raw,
@@ -163,9 +165,18 @@ export function useTelemetry() {
     battery_known: batteryKnown,
     battery_pct: batteryKnown ? raw.battery_pct : 0,
     wifi_ssid: connected ? raw.wifi_ssid : '',
-    wifi_signal_dbm: connected ? raw.wifi_signal_dbm : -100,
+    wifi_signal_dbm: dataFresh ? raw.wifi_signal_dbm : -100,
     driver_running: connected && Boolean(raw.driver_running),
-    gps_fix: connected && Boolean(raw.gps_fix),
+    gps_fix: dataFresh && Boolean(raw.gps_fix),
+    data_fresh: dataFresh,
+    // Second line of defence behind the bridge's own gating: nothing measured
+    // on the airframe is shown once the bridge or the aircraft goes quiet.
+    altitude: dataFresh ? raw.altitude : 0,
+    speed: dataFresh ? raw.speed : 0,
+    heading: dataFresh ? raw.heading : 0,
+    flight_time_sec: connected ? raw.flight_time_sec : 0,
+    latitude: connected ? raw.latitude : 0,
+    longitude: connected ? raw.longitude : 0,
     source: bridge ? 'hardware' : 'synthetic',
     ageSec,
   };

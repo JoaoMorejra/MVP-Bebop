@@ -131,13 +131,13 @@ export const ConnectionSheet: React.FC<ConnectionSheetProps> = ({
               </div>
 
               <div className="flex items-center gap-2.5">
-                <RfBars bars={telemetry.connected ? rfBars(telemetry.wifi_signal_dbm) : 0} />
+                <RfBars bars={telemetry.data_fresh ? rfBars(telemetry.wifi_signal_dbm) : 0} />
                 <div>
                   <div className="font-cond text-3xs tracking-wide text-haze-deep">
                     {telemetry.signal_source === 'aircraft' ? 'sinal (aeronave)' : 'sinal (estação)'}
                   </div>
                   <div className="tnum font-mono text-base text-frost">
-                    {telemetry.connected ? `${telemetry.wifi_signal_dbm} dBm` : '—'}
+                    {telemetry.data_fresh ? `${telemetry.wifi_signal_dbm} dBm` : '—'}
                   </div>
                 </div>
               </div>
@@ -147,14 +147,16 @@ export const ConnectionSheet: React.FC<ConnectionSheetProps> = ({
                   {telemetry.gps_fix ? 'posição (GPS)' : 'posição (odometria)'}
                 </div>
                 <div className="tnum font-mono text-xs text-frost">
-                  {telemetry.latitude.toFixed(5)}, {telemetry.longitude.toFixed(5)}
+                  {telemetry.data_fresh
+                    ? `${telemetry.latitude.toFixed(5)}, ${telemetry.longitude.toFixed(5)}`
+                    : '—'}
                 </div>
               </div>
 
               <div>
                 <div className="font-cond text-3xs tracking-wide text-haze-deep">altitude</div>
                 <div className="tnum font-mono text-base text-frost">
-                  {telemetry.altitude.toFixed(2)} m
+                  {telemetry.data_fresh ? `${telemetry.altitude.toFixed(2)} m` : '—'}
                 </div>
               </div>
             </div>
