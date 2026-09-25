@@ -107,7 +107,7 @@ export const PHRASE_POOLS: Readonly<Record<MilestoneKey, readonly string[]>> = {
     'Configuração validada. Iniciando voo em três segundos.',
     'Parâmetros de voo prontos. Três segundos para a decolagem.',
     'Perfil de voo carregado. Decolagem iminente.',
-    'Sistemas prontos. Início do voo em três segundos.',
+    'Parâmetros confirmados. Início do voo em três segundos.',
     'Parâmetros aplicados. Afastem-se, decolagem em três segundos.',
   ],
   'mission.takeoff': [

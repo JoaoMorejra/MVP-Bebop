@@ -185,7 +185,7 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
               A aeronave está se preparando para decolar
             </h1>
             <p className="mt-2 max-w-[46ch] text-sm leading-relaxed text-haze">
-              Afaste-se do raio das hélices. Cancelar agora interrompe o processo antes que
+              Afaste-se do raio das hélices. Abortar agora interrompe o processo antes que
               os motores sejam armados.
             </p>
           </div>
@@ -248,7 +248,7 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
             )}
           >
             <X size={18} strokeWidth={2.5} />
-            Cancelar decolagem
+            Abortar missão
             <span className="font-mono text-2xs font-normal opacity-70">Esc</span>
           </button>
         </div>
