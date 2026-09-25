@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useMemo, useState } from 'react';
-import { Building2, Compass, Crosshair, MapPin, Signpost } from 'lucide-react';
+import { Building2, Crosshair, MapPin, Signpost } from 'lucide-react';
 import type { TrackPoint } from '../../types/mission';
 import { useReverseGeocode } from '../../hooks/useReverseGeocode';
 import { useOperatorLocation } from '../../hooks/useOperatorLocation';
@@ -11,7 +11,7 @@ import {
   pixelsPerMetre,
   tileZoom,
 } from '../../lib/mapView';
-import { cn, degreesToCardinal } from '../../lib/format';
+import { cn } from '../../lib/format';
 
 interface TacticalMapProps {
   track: TrackPoint[];
@@ -34,12 +34,14 @@ const TILE_SIZE = 256;
 /**
  * Tile sources, in the order they are tried.
  *
- * CartoDB's dark basemap leads because it is already the tone the station needs
- * and arrives without the CSS inversion the standard tiles require. OSM's own
- * raster is the fallback, inverted in CSS — the hosted dark styles that are not
- * on this list all want an API key, and one that expires or rate-limits
- * mid-flight answers with a watermark and a 200, which no error handler can
- * catch: the map would look like it worked while showing nothing.
+ * Satellite imagery only, darkened in CSS into the station's palette. Every
+ * street basemap this map could reach bakes street and place names into the
+ * raster, where no CSS can remove them: MapTiler `dataviz-dark` and
+ * `backdrop-dark` on the station's key, Mapbox `dark-v11`, OSM's standard
+ * tiles, and Esri's dark gray base; CartoDB's label-free variant now answers
+ * without a key with an "API KEY REQUIRED" watermark and a 200, which no error
+ * handler can catch. Imagery carries no labels at all. Without a source that
+ * answers, the panel falls back to the offline tactical grid.
  *
  * Each entry lists its subdomains. A tile is requested from the shard its own
  * coordinates select, which is what keeps a viewport's worth of tiles from
@@ -62,43 +64,38 @@ const MAP_API_KEY =
   import.meta.env.VITE_MAPTILER_KEY ||
   'gfppK5Nhedqq438PCaw7';
 
+/**
+ * Imagery toned down until the overlay reads over it: dimmed, most of its
+ * colour taken out, a little contrast back so roads and roofs stay legible.
+ */
+const IMAGERY_FILTER = 'brightness(0.5) saturate(0.35) contrast(1.15)';
+
 const TILE_SOURCES: readonly TileSource[] = (() => {
   const sources: TileSource[] = [];
 
-  if (MAP_API_KEY) {
-    if (MAP_API_KEY.startsWith('pk.')) {
-      sources.push({
-        id: 'mapbox-dark',
-        url: (_s: string, z: number, x: number, y: number) =>
-          `https://api.mapbox.com/styles/v1/mapbox/dark-v11/tiles/256/${z}/${x}/${y}?access_token=${MAP_API_KEY}`,
-        subdomains: ['a', 'b', 'c', 'd'],
-        maxZoom: 20,
-        filter: 'brightness(1.05) contrast(1.05)',
-        attribution: '© Mapbox · © OpenStreetMap',
-      });
-    } else {
-      sources.push({
-        id: 'maptiler-dark',
-        url: (_s: string, z: number, x: number, y: number) =>
-          `https://api.maptiler.com/maps/dataviz-dark/${z}/${x}/${y}.png?key=${MAP_API_KEY}`,
-        subdomains: ['a', 'b', 'c', 'd'],
-        maxZoom: 20,
-        filter: 'brightness(1.02) contrast(1.05)',
-        attribution: '© MapTiler · © OpenStreetMap',
-      });
-    }
+  if (MAP_API_KEY.startsWith('pk.')) {
+    sources.push({
+      id: 'mapbox-satellite',
+      url: (_s: string, z: number, x: number, y: number) =>
+        `https://api.mapbox.com/v4/mapbox.satellite/${z}/${x}/${y}.jpg?access_token=${MAP_API_KEY}`,
+      subdomains: ['a'],
+      maxZoom: 19,
+      filter: IMAGERY_FILTER,
+      attribution: '© Mapbox · © Maxar',
+    });
+  } else if (MAP_API_KEY) {
+    // satellite-v2 advertises zoom 22, but its tiles shrink past 20 where the
+    // imagery is upsampled; overzooming locally past 20 costs nothing.
+    sources.push({
+      id: 'maptiler-satellite',
+      url: (_s: string, z: number, x: number, y: number) =>
+        `https://api.maptiler.com/tiles/satellite-v2/${z}/${x}/${y}.jpg?key=${MAP_API_KEY}`,
+      subdomains: ['a'],
+      maxZoom: 20,
+      filter: IMAGERY_FILTER,
+      attribution: '© MapTiler · © OpenStreetMap',
+    });
   }
-
-  // Fallback para OpenStreetMap limpo invertido (sem marca d'água) caso offline/falha
-  sources.push({
-    id: 'osm',
-    url: (s: string, z: number, x: number, y: number) =>
-      `https://${s}.tile.openstreetmap.org/${z}/${x}/${y}.png`,
-    subdomains: ['a', 'b', 'c'],
-    maxZoom: 19,
-    filter: 'invert(1) hue-rotate(180deg) brightness(0.82) contrast(1.08) saturate(0.55)',
-    attribution: '© OpenStreetMap',
-  });
 
   return sources;
 })();
@@ -619,13 +616,6 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         />
         <GeoField icon={<Signpost size={11} strokeWidth={2} />} label="Rua" value={place.road} />
 
-        <span className="ml-auto flex shrink-0 items-center gap-1.5">
-          <Compass size={11} strokeWidth={2} className="text-haze" />
-          <span className="font-cond text-3xs tracking-wide text-haze-deep">PROA</span>
-          <span className={cn('tnum font-mono text-2xs', stale ? 'text-haze-deep' : 'text-frost')}>
-            {stale ? '—' : `${Math.round(compass)}° ${degreesToCardinal(compass)}`}
-          </span>
-        </span>
       </div>
     </div>
   );
