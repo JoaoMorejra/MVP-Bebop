@@ -946,7 +946,34 @@ FORENSIC_FINDINGS: Dict[str, List[str]] = {
     ],
 }
 
-FORENSIC_ORDINALS = ("Primeiro", "Segundo", "Terceiro", "Quarto")
+#: What leads each finding when read, so the report is talked through rather
+#: than listed. Same pools as ``src/lib/forensics.ts``; every finding is a
+#: clearance, so the connectors add and never contrast.
+FORENSIC_OPENERS: Final[tuple] = (
+    "Para começar,",
+    "De início,",
+    "Logo de cara,",
+    "Começando pelo essencial,",
+    "De saída,",
+    "Abrindo a análise,",
+)
+FORENSIC_LINKERS: Final[tuple] = (
+    "Além disso,",
+    "Na sequência,",
+    "Somado a isso,",
+    "Em seguida,",
+    "Outro ponto:",
+    "Também observamos:",
+    "E mais:",
+)
+FORENSIC_CLOSERS: Final[tuple] = (
+    "Por fim,",
+    "Para fechar,",
+    "Para arrematar,",
+    "E, para concluir,",
+    "Encerrando,",
+    "Por último,",
+)
 
 
 def _decapitalise(line: str) -> str:
@@ -966,20 +993,27 @@ def build_forensic_report(seed: Optional[int] = None) -> List[Dict[str, str]]:
     """Draw one report: a wording per topic, in a shuffled order.
 
     Returns one dict per finding with ``topic``, ``card`` (the line the station
-    displays) and ``speech`` (the same line, ordinal-prefixed, as the copilot
-    reads it).
+    displays) and ``speech`` (the same line as the copilot reads it, led by an
+    opener, a linker or a closer; the two linkers of a report differ).
     """
     rng = random.Random(seed)
     topics = list(FORENSIC_FINDINGS)
     rng.shuffle(topics)
+    linkers = rng.sample(FORENSIC_LINKERS, max(0, len(topics) - 2))
     report: List[Dict[str, str]] = []
     for index, topic in enumerate(topics):
         card = rng.choice(FORENSIC_FINDINGS[topic])
+        if index == 0:
+            connector = rng.choice(FORENSIC_OPENERS)
+        elif index == len(topics) - 1:
+            connector = rng.choice(FORENSIC_CLOSERS)
+        else:
+            connector = linkers[index - 1]
         report.append(
             {
                 "topic": topic,
                 "card": card,
-                "speech": f"{FORENSIC_ORDINALS[index]}: {_decapitalise(card)}.",
+                "speech": f"{connector} {_decapitalise(card)}.",
             }
         )
     return report
@@ -987,7 +1021,6 @@ def build_forensic_report(seed: Optional[int] = None) -> List[Dict[str, str]]:
 
 def announce_forensic_report(
     report: Optional[List[Dict[str, str]]] = None,
-    gap_sec: float = 2.0,
 ) -> List[Dict[str, str]]:
     """Read a whole report aloud, one finding at a time.
 
@@ -998,11 +1031,15 @@ def announce_forensic_report(
     report with one call.
     """
     findings = report if report is not None else build_forensic_report()
-    speak(FORENSIC_INTRO, wait=True, timeout=25.0)
-    for finding in findings:
-        speak(finding["speech"], wait=True, timeout=25.0)
-        time.sleep(gap_sec)
-    speak(FORENSIC_OUTRO, wait=True, timeout=25.0)
+    lines = [FORENSIC_INTRO, *(finding["speech"] for finding in findings), FORENSIC_OUTRO]
+    # No pause between lines: the next two are synthesized while one plays, as
+    # the station does, so the report runs on without dead air.
+    narrating_locally = not station_narrates()
+    for index, line in enumerate(lines):
+        if narrating_locally:
+            for ahead in lines[index + 1 : index + 3]:
+                get_announcer().prefetch(ahead)
+        speak(line, wait=True, timeout=25.0)
     return findings
 
 

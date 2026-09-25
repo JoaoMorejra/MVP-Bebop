@@ -25,7 +25,7 @@ export interface Finding {
   topic: FindingTopic;
   /** The line as the card shows it. */
   card: string;
-  /** The same line, ordinal-prefixed, as the copilot reads it. */
+  /** The same line as the copilot reads it, led by a connector that ties it to the one before. */
   speech: string;
 }
 
@@ -58,7 +58,38 @@ const WORDINGS: Record<FindingTopic, readonly string[]> = {
 
 const TOPICS: readonly FindingTopic[] = ['police', 'samu', 'victim', 'vehicle'];
 
-const ORDINALS = ['Primeiro', 'Segundo', 'Terceiro', 'Quarto'] as const;
+/**
+ * What leads each finding when it is read, so the report sounds like one
+ * assessment being talked through rather than a numbered list. Every finding
+ * is a clearance ("sem necessidade de polícia"), so the connectors add; none
+ * contrasts. Each pool is longer than the history window, so no connector
+ * repeats the previous flight's in the same position.
+ */
+const OPENERS = [
+  'Para começar,',
+  'De início,',
+  'Logo de cara,',
+  'Começando pelo essencial,',
+  'De saída,',
+  'Abrindo a análise,',
+] as const;
+const LINKERS = [
+  'Além disso,',
+  'Na sequência,',
+  'Somado a isso,',
+  'Em seguida,',
+  'Outro ponto:',
+  'Também observamos:',
+  'E mais:',
+] as const;
+const CLOSERS = [
+  'Por fim,',
+  'Para fechar,',
+  'Para arrematar,',
+  'E, para concluir,',
+  'Encerrando,',
+  'Por último,',
+] as const;
 
 /** Every order the four topics can be read in, in a fixed enumeration. */
 const ORDERS: readonly (readonly FindingTopic[])[] = (() => {
@@ -87,7 +118,7 @@ export const TOPIC_LABEL: Record<FindingTopic, string> = {
 };
 
 /**
- * Lower the first letter so the line reads on after its ordinal.
+ * Lower the first letter so the line reads on after its connector.
  *
  * An acronym is left standing: "SAMU dispensado" must not become "sAMU".
  */
@@ -117,14 +148,27 @@ export function buildForensicReport(
   const order = pickVariant('finding.order', ORDER_LABELS, history, options.random);
   history = recordVariant(history, 'finding.order', order.index);
 
-  const report = ORDERS[order.index].map((topic, index) => {
+  const topics = ORDERS[order.index];
+  const report = topics.map((topic, index) => {
     const key = `finding.${topic}` as FindingHistoryKey;
     const wording = pickVariant(key, WORDINGS[topic], history, options.random);
     history = recordVariant(history, key, wording.index);
+
+    // Two linkers in one report are drawn one after the other, each recorded
+    // before the next, so they never repeat within the report either.
+    const [connectorKey, pool]: [FindingHistoryKey, readonly string[]] =
+      index === 0
+        ? ['finding.opener', OPENERS]
+        : index === topics.length - 1
+        ? ['finding.closer', CLOSERS]
+        : ['finding.linker', LINKERS];
+    const connector = pickVariant(connectorKey, pool, history, options.random);
+    history = recordVariant(history, connectorKey, connector.index);
+
     return {
       topic,
       card: wording.text,
-      speech: `${ORDINALS[index]}: ${decapitalise(wording.text)}.`,
+      speech: `${connector.text} ${decapitalise(wording.text)}.`,
     };
   });
 

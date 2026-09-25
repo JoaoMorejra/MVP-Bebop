@@ -12,10 +12,10 @@ declare global {
 }
 
 const REPORT: Finding[] = [
-  { topic: 'police', card: 'Sem necessidade de polícia', speech: 'Primeiro: sem necessidade de polícia.' },
-  { topic: 'vehicle', card: 'Veículo não danificado', speech: 'Segundo: veículo não danificado.' },
-  { topic: 'victim', card: 'Estado do acidentado não é grave', speech: 'Terceiro: estado do acidentado não é grave.' },
-  { topic: 'samu', card: 'Sem necessidade de Samu', speech: 'Quarto: sem necessidade de Samu.' },
+  { topic: 'police', card: 'Sem necessidade de polícia', speech: 'Para começar, sem necessidade de polícia.' },
+  { topic: 'vehicle', card: 'Veículo não danificado', speech: 'Além disso, veículo não danificado.' },
+  { topic: 'victim', card: 'Estado do acidentado não é grave', speech: 'Na sequência, estado do acidentado não é grave.' },
+  { topic: 'samu', card: 'Sem necessidade de Samu', speech: 'Por fim, sem necessidade de Samu.' },
 ];
 
 /** A voice the test finishes line by line. */

@@ -392,3 +392,26 @@ def test_prefetch_rejects_what_is_not_text(offline_announcer):
     with pytest.raises(TypeError):
         instance.prefetch(None)
     assert instance.prefetch("   ") is False
+
+
+# ------------------------------------------------------- forensic report
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_the_mission_side_report_is_talked_through_not_numbered(seed):
+    report = announcer.build_forensic_report(seed=seed)
+
+    assert sorted(f["topic"] for f in report) == sorted(announcer.FORENSIC_FINDINGS)
+    for finding in report:
+        assert not any(word in finding["speech"] for word in ("Primeiro", "Segundo", "Terceiro", "Quarto"))
+        assert finding["speech"].endswith(".")
+    assert report[0]["speech"].startswith(announcer.FORENSIC_OPENERS)
+    assert report[-1]["speech"].startswith(announcer.FORENSIC_CLOSERS)
+    middle = [f["speech"].split(" ")[0] + f["speech"].split(" ")[1] for f in report[1:-1]]
+    assert len(set(middle)) == len(middle)
+
+
+def test_the_mission_side_report_has_no_pause_parameter():
+    import inspect
+
+    assert "gap_sec" not in inspect.signature(announcer.announce_forensic_report).parameters

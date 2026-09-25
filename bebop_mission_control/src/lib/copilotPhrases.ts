@@ -71,7 +71,10 @@ export type FindingHistoryKey =
   | 'finding.samu'
   | 'finding.victim'
   | 'finding.vehicle'
-  | 'finding.order';
+  | 'finding.order'
+  | 'finding.opener'
+  | 'finding.linker'
+  | 'finding.closer';
 
 /** Everything with cross-flight memory. */
 export type HistoryKey = MilestoneKey | FindingHistoryKey;
@@ -82,6 +85,9 @@ const FINDING_HISTORY_KEYS: readonly FindingHistoryKey[] = [
   'finding.victim',
   'finding.vehicle',
   'finding.order',
+  'finding.opener',
+  'finding.linker',
+  'finding.closer',
 ];
 
 /** Variant index used per key, oldest first, at most {@link HISTORY_WINDOW} entries. */
