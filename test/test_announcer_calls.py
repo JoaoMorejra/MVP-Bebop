@@ -279,3 +279,30 @@ def test_an_alert_line_reaches_the_stdout_the_station_reads():
     assert [key for key, _ in alerts] == ["mission.failsafe"]
     assert "odometria perdida" in alerts[0][1]
     assert "Acidente detectado" not in completed.stdout
+
+
+# ------------------------------------------------------- synthesis prompt
+
+
+@pytest.mark.parametrize("verbatim", [True, False])
+def test_every_synthesis_prompt_pins_brazilian_portuguese(verbatim):
+    instruction = announcer.synthesis_instruction("Decolagem autorizada.", verbatim)
+
+    assert "pt-BR" in instruction
+    assert "never use European Portuguese" in instruction
+    assert "'Decolagem autorizada.'" in instruction
+
+
+def test_a_verbatim_prompt_forbids_rewording_and_a_free_one_bounds_its_length():
+    assert "exactly as written" in announcer.synthesis_instruction("Pousando.", verbatim=True)
+    assert "at most twelve words" in announcer.synthesis_instruction("Pousando.", verbatim=False)
+
+
+def test_the_synthesis_session_is_opened_in_the_brazilian_locale():
+    assert announcer.SYNTHESIZER_LANGUAGE == "pt-BR"
+
+
+@pytest.mark.parametrize("statement, error", [(None, TypeError), (3, TypeError), ("", ValueError), ("  ", ValueError)])
+def test_the_synthesis_prompt_rejects_a_missing_statement(statement, error):
+    with pytest.raises(error):
+        announcer.synthesis_instruction(statement, verbatim=True)

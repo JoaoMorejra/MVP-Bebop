@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DESCRIPTIVE_KEYS,
+  FLIGHT_CALL_MAX_SECONDS,
   HISTORY_STORAGE_KEY,
   HISTORY_WINDOW,
   MILESTONE_KEYS,
@@ -8,6 +10,7 @@ import {
   type MilestoneKey,
   type StorageLike,
   describeTargetLocation,
+  estimateSpeechSeconds,
   loadHistory,
   nextPhrase,
   pickVariant,
@@ -79,11 +82,35 @@ describe('phrase pools', () => {
     for (const line of PHRASE_POOLS['mission.target_found']) expect(line).toContain('{location}');
   });
 
+  it('keep every flight call within four spoken seconds at its longest rendering', () => {
+    const longest = {
+      altitude: spokenMeters(12.5),
+      location: describeTargetLocation({ forward_m: 12.5, bearing_deg: 5 }),
+    };
+    for (const key of MILESTONE_KEYS) {
+      if (DESCRIPTIVE_KEYS.includes(key)) continue;
+      for (const line of PHRASE_POOLS[key]) {
+        const rendered = renderPhrase(line, longest);
+        expect(estimateSpeechSeconds(rendered), `${key}: ${rendered}`).toBeLessThanOrEqual(
+          FLIGHT_CALL_MAX_SECONDS
+        );
+      }
+    }
+  });
+
   it('leave no placeholder unresolved in keys that take none', () => {
     for (const key of MILESTONE_KEYS) {
       if (key === 'mission.takeoff' || key === 'mission.target_found') continue;
       for (const line of PHRASE_POOLS[key]) expect(line, key).not.toMatch(/\{[a-z_]+\}/);
     }
+  });
+});
+
+describe('estimateSpeechSeconds', () => {
+  it('counts words at two and a half per second', () => {
+    expect(estimateSpeechSeconds('Iniciando retorno à base.')).toBe(1.6);
+    expect(estimateSpeechSeconds('  um   dois\ttres \n')).toBe(1.2);
+    expect(estimateSpeechSeconds('')).toBe(0);
   });
 });
 

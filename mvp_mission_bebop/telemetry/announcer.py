@@ -32,6 +32,62 @@ PCM_CHANNELS = 1
 PCM_DTYPE = "int16"
 SYNTHESIZER_MODEL = os.environ.get("SPEECH_MODEL", "gemini-3.1-flash-live-preview")
 SYNTHESIZER_VOICE = os.environ.get("SPEECH_VOICE", "Orbit")
+SYNTHESIZER_LANGUAGE: Final[str] = "pt-BR"
+
+# The Live model infers accent from the prompt as much as from the session
+# locale, and without an explicit ban it drifts to European Portuguese on
+# short, formal sentences. Both constraints are therefore stated in-prompt.
+_ACCENT_DIRECTIVE: Final[str] = (
+    "Speak in Brazilian Portuguese (pt-BR) with a native Brazilian accent and cadence; "
+    "never use European Portuguese pronunciation, vocabulary or rhythm. "
+    "Sound natural and fluent, never robotic, at a steady and direct pace without drawn-out pauses."
+)
+
+def synthesis_instruction(statement: str, verbatim: bool) -> str:
+    """Build the prompt that makes the Live model speak one statement.
+
+    Parameters
+    ----------
+    statement : str
+        Sentence to be spoken, already in Portuguese.
+    verbatim : bool
+        When true the sentence is read exactly as written. The station shows
+        that same string on screen while it is spoken, so any paraphrase would
+        desynchronise the card from the narration. When false the model may
+        rephrase the operational status, bounded to a flight-call length.
+
+    Returns
+    -------
+    str
+        Instruction sent as the user turn of the synthesis session.
+
+    Raises
+    ------
+    TypeError
+        If ``statement`` is not a string.
+    ValueError
+        If ``statement`` is empty or whitespace.
+    """
+    if not isinstance(statement, str):
+        raise TypeError(f"statement must be str, got {type(statement).__name__}")
+    if not statement.strip():
+        raise ValueError("statement must not be empty")
+
+    if verbatim:
+        return (
+            f"Read the following sentence aloud, exactly as written, "
+            f"with no additions, no preamble and no rewording: '{statement}'. "
+            f"{_ACCENT_DIRECTIVE} Speak as an autonomous flight copilot."
+        )
+    # Spoken pt-BR at this register runs near 2.5 words per second, so twelve
+    # words keep a flight call within three to four seconds.
+    return (
+        f"Vocalize this operational status concisely, similar to: '{statement}'. "
+        f"{_ACCENT_DIRECTIVE} Use at most twelve words, three to four seconds of speech. "
+        "Speak as an autonomous flight copilot. "
+        "Never add greetings, conversational filler, or address spectators."
+    )
+
 
 _cached_client: Optional[Any] = None
 _client_lock = threading.Lock()
@@ -357,7 +413,8 @@ class MissionAudioAnnouncer:
                 speech_config=types.SpeechConfig(
                     voice_config=types.VoiceConfig(
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=SYNTHESIZER_VOICE)
-                    )
+                    ),
+                    language_code=SYNTHESIZER_LANGUAGE,
                 ),
             )
         else:
@@ -467,22 +524,7 @@ class MissionAudioAnnouncer:
 
             audio_buffer = bytearray()
             try:
-                if verbatim:
-                    # The station is showing this exact sentence on screen while
-                    # it is spoken. Paraphrasing would desynchronise the card
-                    # from the narration, so the line is read as written.
-                    instruction = (
-                        f"Read the following Portuguese sentence aloud, exactly as written, "
-                        f"with no additions, no preamble and no rewording: '{statement}'. "
-                        "Speak calmly and deliberately, as an autonomous flight copilot "
-                        "presenting a forensic finding."
-                    )
-                else:
-                    instruction = (
-                        f"Vocalize this operational status in Portuguese concisely, similar to: '{statement}'. "
-                        "Speak clearly, calmly and directly as an autonomous flight copilot. "
-                        "Never add greetings, conversational filler, or address spectators."
-                    )
+                instruction = synthesis_instruction(statement, verbatim)
                 await session.send_client_content(
                     turns=types.Content(
                         role="user",

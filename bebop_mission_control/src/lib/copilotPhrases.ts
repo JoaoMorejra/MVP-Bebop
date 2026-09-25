@@ -32,6 +32,30 @@ export type MilestoneKey =
   | 'inspection.intro'
   | 'inspection.outro';
 
+/**
+ * Rate of spoken pt-BR at the copilot's register, in words per second. Used
+ * only to bound phrase length; the synthesizer sets the real pace.
+ */
+export const SPEECH_WORDS_PER_SECOND = 2.5;
+
+/** Longest a flight call may run, so it never overlaps the next milestone. */
+export const FLIGHT_CALL_MAX_SECONDS = 4;
+
+/** Pools exempt from {@link FLIGHT_CALL_MAX_SECONDS}: the post-landing report is descriptive by design. */
+export const DESCRIPTIVE_KEYS: readonly MilestoneKey[] = ['inspection.intro', 'inspection.outro'];
+
+/**
+ * Estimated spoken duration of `text`, in seconds.
+ *
+ * Word count over {@link SPEECH_WORDS_PER_SECOND}. Numbers written as digits
+ * count as one word, which slightly underestimates "1,5 metro"; the bound is
+ * a lint on phrase length, not a timing source.
+ */
+export function estimateSpeechSeconds(text: string): number {
+  const words = text.trim().split(/\s+/).filter(Boolean).length;
+  return words / SPEECH_WORDS_PER_SECOND;
+}
+
 /** Flights of memory per key. */
 export const HISTORY_WINDOW = 5;
 
@@ -103,12 +127,12 @@ export const PHRASE_POOLS: Readonly<Record<MilestoneKey, readonly string[]>> = {
     'Iniciando busca retilínea. Câmera apontada para a pista.',
   ],
   'mission.target_found': [
-    'Sinistro detectado {location}. Confirmando alvo.',
+    'Sinistro detectado {location}.',
     'Alvo identificado {location}.',
-    'Ocorrência localizada {location}. Preparando aproximação.',
+    'Ocorrência localizada {location}.',
     'Detecção confirmada {location}.',
-    'Veículo sinistrado avistado {location}.',
-    'Alvo adquirido pela visão computacional {location}.',
+    'Sinistro avistado {location}.',
+    'Alvo avistado {location}.',
   ],
   'mission.approaching': [
     'Iniciando aproximação controlada ao alvo.',
