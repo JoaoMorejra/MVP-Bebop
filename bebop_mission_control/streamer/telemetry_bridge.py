@@ -297,11 +297,20 @@ class TelemetryState:
     # -- readers -------------------------------------------------------------
 
     def battery_is_live_from_aircraft(self) -> bool:
-        """True while the ARSDK battery value is recent enough to trust."""
+        """True while the ARSDK battery value is recent enough to trust.
+
+        The ARSDK value arrives through the driver, the same pipe as the
+        odometry, so it is only live while the odometry is. Without that
+        condition a dead driver left its last charge standing for the full
+        ``BATTERY_STALE_SEC`` and held off the console probe, which reads the
+        charge over Wi-Fi independently of the driver.
+        """
         with self._lock:
             if self.battery_source != "aircraft" or self.battery_at is None:
                 return False
-            return _now() - self.battery_at < BATTERY_STALE_SEC
+            now = _now()
+            odom_fresh = self.odom_at is not None and now - self.odom_at < ODOM_STALE_SEC
+            return odom_fresh and now - self.battery_at < BATTERY_STALE_SEC
 
     def odom_age(self) -> Optional[float]:
         with self._lock:
@@ -423,19 +432,31 @@ class TelemetryState:
             # network the *host* joined, which is some other network entirely
             # once the operator has left the drone's.
             reachable = bool(self.connected)
-            battery_known = battery_known and reachable
+            # `reachable` is a ping to the aircraft's access point, which keeps
+            # answering while the driver is dead or wedged; it says the host is
+            # on the drone's network, not that anything is coming out of it.
+            # Flight data is gated on the stricter fact that the driver is
+            # actually publishing, as the position fields always were. The
+            # console battery probe is exempt: it is read over Wi-Fi, not
+            # through the driver, and ages out on its own window.
+            data_fresh = odom_fresh and reachable
+            battery_known = (
+                battery_known
+                and reachable
+                and (self.battery_source != "aircraft" or odom_fresh)
+            )
 
             return {
                 # -- legacy contract, unchanged shape ------------------------
                 "connected": reachable,
-                "driver_running": bool(odom_fresh and self.node_present and reachable),
+                "driver_running": bool(data_fresh and self.node_present),
                 "battery_pct": int(self.battery_pct) if battery_known else 0,
-                "wifi_ssid": self.wifi_ssid if reachable else "",
-                "wifi_signal_dbm": int(signal_dbm) if reachable else -100,
-                "speed": round(self.speed, 2) if reachable else 0.0,
-                "altitude": round(self.altitude, 2) if reachable else 0.0,
+                "wifi_ssid": self.wifi_ssid if data_fresh else "",
+                "wifi_signal_dbm": int(signal_dbm) if data_fresh else -100,
+                "speed": round(self.speed, 2) if data_fresh else 0.0,
+                "altitude": round(self.altitude, 2) if data_fresh else 0.0,
                 "flight_time_sec": int(self.flight_time_sec) if reachable else 0,
-                "heading": round(odom_yaw_to_compass(self.heading), 1) if reachable else 0.0,
+                "heading": round(odom_yaw_to_compass(self.heading), 1) if data_fresh else 0.0,
                 "latitude": latitude,
                 "longitude": longitude,
                 # -- additions ----------------------------------------------
@@ -448,16 +469,16 @@ class TelemetryState:
                 ),
                 "signal_source": signal_source,
                 "position_source": position_source,
-                "gps_fix": bool(self.gps_fix) and reachable,
+                "gps_fix": bool(self.gps_fix) and data_fresh,
                 # Raw /bebop/odom position, metres in the odometry frame. The
                 # station draws the trail from these, never from a latitude
                 # that may have switched between GPS and projection mid-flight.
-                "odom_x_m": round(dx, 3) if odom_fresh and reachable else None,
-                "odom_y_m": round(dy, 3) if odom_fresh and reachable else None,
+                "odom_x_m": round(dx, 3) if data_fresh else None,
+                "odom_y_m": round(dy, 3) if data_fresh else None,
                 # The same position in the frame the map draws in: metres east
                 # and north of the odometry origin. See `odom_to_enu`.
-                "east_m": round(east, 3) if odom_fresh and reachable else None,
-                "north_m": round(north, 3) if odom_fresh and reachable else None,
+                "east_m": round(east, 3) if data_fresh else None,
+                "north_m": round(north, 3) if data_fresh else None,
                 **base_payload,
                 # Where the camera is actually pointing, and how long ago that
                 # was commanded. Null until something has commanded it at all:
@@ -472,15 +493,16 @@ class TelemetryState:
                     and not math.isnan(self.sonar_altitude)
                     else None
                 ),
-                "flying_state": self.flying_state if reachable else None,
+                "flying_state": self.flying_state if data_fresh else None,
                 "flying_state_label": (
                     FLYING_STATE_LABELS.get(
                         self.flying_state if self.flying_state is not None else -1,
                         "unknown",
                     )
-                    if reachable
+                    if data_fresh
                     else "disconnected"
                 ),
+                "data_fresh": bool(data_fresh),
                 "odom_age_sec": (
                     round(odom_age, 2) if odom_age is not None else None
                 ),
