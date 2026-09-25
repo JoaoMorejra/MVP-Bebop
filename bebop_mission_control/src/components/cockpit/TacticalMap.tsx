@@ -109,13 +109,13 @@ const TILE_SOURCES: readonly TileSource[] = (() => {
 /** Failures within one source before the next is tried. */
 const SOURCE_FAILURE_BUDGET = 6;
 /** Never zoom the overlay closer than this, or a stationary aircraft fills it. */
-const MIN_EXTENT_M = 12;
+const MIN_EXTENT_M = 40;
 /**
  * Extent framed before a mission, in metres: wide enough to read the site on
  * the imagery. Once a mission starts the view fits the flight again, down to
  * {@link MIN_EXTENT_M}.
  */
-const OVERVIEW_EXTENT_M = 100;
+const OVERVIEW_EXTENT_M = 300;
 /**
  * Drawn size of the aircraft marker relative to its geometry. The marker is
  * what the operator's eye goes to first, across the room from the station.
