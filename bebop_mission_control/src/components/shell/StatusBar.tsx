@@ -19,6 +19,7 @@ import type {
 } from '../../types/bmg';
 import type { LinkPhase } from '../../hooks/useLink';
 import { cn, rfBars } from '../../lib/format';
+import { FAILSAFE_MAX_PCT, FAILSAFE_MIN_PCT } from '../../lib/batteryFailsafe';
 
 interface StatusBarProps {
   telemetry: TelemetryView;
@@ -297,6 +298,8 @@ const BatteryWidget: React.FC<{
   const charge = known ? telemetry.battery_pct : 0;
   const critical = known && (charge < 25 || (failsafe.enabled && charge <= failsafe.thresholdPct));
   const low = known && charge <= 40;
+  const thresholdRatio =
+    (failsafe.thresholdPct - FAILSAFE_MIN_PCT) / (FAILSAFE_MAX_PCT - FAILSAFE_MIN_PCT);
   const level = !known ? 'Sem leitura' : critical ? 'Crítica' : low ? 'Baixa' : 'Normal';
   const source =
     telemetry.battery_source === 'aircraft'
@@ -420,15 +423,15 @@ const BatteryWidget: React.FC<{
 
             <div className={cn('mt-3 transition-opacity', failsafe.enabled ? 'opacity-100' : 'opacity-45')}>
               <div className="flex items-baseline justify-between">
-                <span className="text-2xs text-haze">Nível crítico para pouso imediato (%)</span>
+                <span className="text-2xs text-haze">Nível crítico para retorno e pouso (%)</span>
                 <span className="tnum font-mono text-sm text-frost">{failsafe.thresholdPct}%</span>
               </div>
               <div className="group relative mt-1.5 h-4">
                 <input
                   type="range"
-                  aria-label="Nível crítico para pouso imediato"
-                  min={10}
-                  max={40}
+                  aria-label="Nível crítico para retorno e pouso"
+                  min={FAILSAFE_MIN_PCT}
+                  max={FAILSAFE_MAX_PCT}
                   step={1}
                   value={failsafe.thresholdPct}
                   disabled={!failsafe.enabled}
@@ -438,22 +441,23 @@ const BatteryWidget: React.FC<{
                 <div className="pointer-events-none absolute left-0 right-0 top-1/2 h-[2px] -translate-y-1/2 rounded-full bg-frost/15" />
                 <div
                   className="pointer-events-none absolute left-0 top-1/2 h-[2px] -translate-y-1/2 rounded-full bg-amber"
-                  style={{ width: `${((failsafe.thresholdPct - 10) / 30) * 100}%` }}
+                  style={{ width: `${thresholdRatio * 100}%` }}
                 />
                 <div
                   className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-amber bg-hull-deep"
-                  style={{ left: `${((failsafe.thresholdPct - 10) / 30) * 100}%` }}
+                  style={{ left: `${thresholdRatio * 100}%` }}
                 />
               </div>
               <div className="mt-0.5 flex justify-between font-mono text-3xs text-haze-deep">
-                <span>10%</span>
-                <span>40%</span>
+                <span>{FAILSAFE_MIN_PCT}%</span>
+                <span>{FAILSAFE_MAX_PCT}%</span>
               </div>
             </div>
 
             <p className="mt-2.5 text-2xs leading-relaxed text-haze">
               Quando ativado, caso a bateria atinja ou caia abaixo deste nível durante o voo, a
-              estação emitirá o comando imediato de pouso (Land) para segurança da aeronave.
+              aeronave interrompe a etapa atual e retorna à base para o pouso de precisão no
+              marcador. Na decolagem, ou sem missão em execução, pousa no local.
             </p>
             {triggered ? (
               <p className="mt-2 rounded-bezel border border-ember/40 bg-ember/10 px-2.5 py-1.5 text-2xs text-ember">

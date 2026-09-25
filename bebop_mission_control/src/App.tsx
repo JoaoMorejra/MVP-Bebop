@@ -3,6 +3,7 @@ import { X } from 'lucide-react';
 import type { Screen } from './types/mission';
 import type { Finding } from './lib/forensics';
 import type { BatteryFailsafe } from './types/bmg';
+import { RTL_ACK_TIMEOUT_MS, RTL_STAGE, clampThreshold, failsafeAction } from './lib/batteryFailsafe';
 import { PreflightScreen } from './components/preflight/PreflightScreen';
 import { BenchWarmupOverlay } from './components/preflight/BenchWarmupOverlay';
 import { CountdownOverlay } from './components/preflight/CountdownOverlay';
@@ -56,12 +57,9 @@ function loadFailsafe(): BatteryFailsafe {
     const raw = window.localStorage.getItem(FAILSAFE_KEY);
     if (!raw) return FAILSAFE_DEFAULT;
     const parsed = JSON.parse(raw) as Partial<BatteryFailsafe>;
-    const threshold = Number(parsed.thresholdPct);
     return {
       enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : FAILSAFE_DEFAULT.enabled,
-      thresholdPct: Number.isFinite(threshold)
-        ? Math.min(40, Math.max(10, Math.round(threshold)))
-        : FAILSAFE_DEFAULT.thresholdPct,
+      thresholdPct: clampThreshold(parsed.thresholdPct) ?? FAILSAFE_DEFAULT.thresholdPct,
     };
   } catch {
     return FAILSAFE_DEFAULT;
@@ -436,6 +434,53 @@ export const App: React.FC = () => {
       AIRBORNE_FLYING_STATES.has(telemetry.flying_state ?? -1)) &&
     Boolean(telemetry.connected);
 
+  // Read inside the return watchdog, which outlives the render that armed it.
+  const stageRef = useRef(mission.stage);
+  stageRef.current = mission.stage;
+  const landRef = useRef(land);
+  landRef.current = land;
+  const rtlWatchdogRef = useRef<number | null>(null);
+
+  const clearRtlWatchdog = useCallback(() => {
+    if (rtlWatchdogRef.current !== null) window.clearTimeout(rtlWatchdogRef.current);
+    rtlWatchdogRef.current = null;
+  }, []);
+
+  useEffect(() => clearRtlWatchdog, [clearRtlWatchdog]);
+
+  /**
+   * Bring the aircraft home on a critical charge (`lib/batteryFailsafe.ts`).
+   *
+   * The return is asked for, not assumed: a jump the mission refuses or never
+   * reports within {@link RTL_ACK_TIMEOUT_MS} lands the aircraft where it is,
+   * the landing this failsafe always made before it could fly a return.
+   */
+  const returnOnCriticalBattery = useCallback(async () => {
+    const action = failsafeAction(stageRef.current, running);
+    copilot.cancel();
+    if (action === 'none') {
+      void copilot.say('Bateria crítica. Retorno à base já em curso.', 'URGENT');
+      return;
+    }
+    if (action === 'land' || !bridge) {
+      void copilot.say('Bateria crítica. Pouso de emergência iniciado.', 'URGENT');
+      await landRef.current();
+      return;
+    }
+
+    void copilot.say('Bateria crítica. Retornando à base para pouso.', 'URGENT');
+    const jump = await bridge.gotoStage(RTL_STAGE).catch(() => ({ success: false }));
+    if (!jump.success) {
+      await landRef.current();
+      return;
+    }
+    clearRtlWatchdog();
+    rtlWatchdogRef.current = window.setTimeout(() => {
+      rtlWatchdogRef.current = null;
+      if (stageRef.current !== RTL_STAGE) void landRef.current();
+    }, RTL_ACK_TIMEOUT_MS);
+  }, [bridge, clearRtlWatchdog, copilot, running]);
+
   useEffect(() => {
     if (!failsafe.enabled || !inFlight || failsafeFiredRef.current) return;
     if (!telemetry.battery_known) return;
@@ -443,20 +488,14 @@ export const App: React.FC = () => {
 
     failsafeFiredRef.current = true;
     setFailsafeTriggered(true);
-    copilot.cancel();
-    void copilot.say(
-      'Atenção: Nível crítico de bateria atingido. Pouso de emergência iniciado.',
-      'URGENT'
-    );
-    void land();
+    void returnOnCriticalBattery();
   }, [
     failsafe.enabled,
     failsafe.thresholdPct,
     inFlight,
     telemetry.battery_known,
     telemetry.battery_pct,
-    copilot,
-    land,
+    returnOnCriticalBattery,
   ]);
 
   /**
