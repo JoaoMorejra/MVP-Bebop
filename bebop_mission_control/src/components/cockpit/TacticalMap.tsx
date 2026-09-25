@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useMemo, useState } from 'react';
-import { Building2, Crosshair, MapPin, Signpost } from 'lucide-react';
+import { Building2, Crosshair, MapPin } from 'lucide-react';
 import type { TrackPoint } from '../../types/mission';
 import { useReverseGeocode } from '../../hooks/useReverseGeocode';
 import { useOperatorLocation } from '../../hooks/useOperatorLocation';
@@ -27,6 +27,12 @@ interface TacticalMapProps {
   baseSource?: string;
   arrivalRadius: number;
   stale: boolean;
+  /**
+   * No mission yet: frame the surroundings rather than the trail. The trail is
+   * not empty before a launch (odometry accumulates until the launch resets
+   * it), so this is keyed to the mission, not to the track.
+   */
+  overview?: boolean;
 }
 
 const TILE_SIZE = 256;
@@ -105,6 +111,12 @@ const SOURCE_FAILURE_BUDGET = 6;
 /** Never zoom the overlay closer than this, or a stationary aircraft fills it. */
 const MIN_EXTENT_M = 12;
 /**
+ * Extent framed before a mission, in metres: wide enough to read the site on
+ * the imagery. Once a mission starts the view fits the flight again, down to
+ * {@link MIN_EXTENT_M}.
+ */
+const OVERVIEW_EXTENT_M = 100;
+/**
  * Drawn size of the aircraft marker relative to its geometry. The marker is
  * what the operator's eye goes to first, across the room from the station.
  */
@@ -167,6 +179,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   baseSource,
   arrivalRadius,
   stale,
+  overview = false,
 }) => {
   const uid = useId().replace(/:/g, '');
   const [size, setSize] = useState({ width: 640, height: 320 });
@@ -286,7 +299,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
    * tiles the overlay fits the flight directly.
    */
   const view = useMemo(() => {
-    let extent = MIN_EXTENT_M;
+    let extent = overview ? OVERVIEW_EXTENT_M : MIN_EXTENT_M;
     for (const p of track) {
       extent = Math.max(
         extent,
@@ -306,7 +319,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       centre = project(geo.lat, geo.lng, tile.z);
       pxPerMetre = pixelsPerMetre(zoom, geo.lat);
     } else {
-      pxPerMetre = Math.min(size.width, size.height) / Math.max(extent, MIN_EXTENT_M);
+      pxPerMetre = Math.min(size.width, size.height) / extent;
     }
 
     const cx = size.width / 2;
@@ -317,7 +330,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     const sy = (north: number) => cy - (north - droneNorth) * pxPerMetre;
 
     return { centre, tile, tileSize: TILE_SIZE * tile.scale, pxPerMetre, cx, cy, sx, sy };
-  }, [geo.lat, geo.lng, basemapUsable, size, track, droneEast, droneNorth, source.maxZoom]);
+  }, [geo.lat, geo.lng, basemapUsable, size, track, droneEast, droneNorth, source.maxZoom, overview]);
 
   // Offline, probe one tile now and then; the first that loads brings the
   // basemap back without a flicker through a half-loaded grid.
@@ -614,7 +627,6 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           label="Cidade"
           value={place.city ?? (geoKnown ? operator.location?.city ?? null : null)}
         />
-        <GeoField icon={<Signpost size={11} strokeWidth={2} />} label="Rua" value={place.road} />
 
       </div>
     </div>

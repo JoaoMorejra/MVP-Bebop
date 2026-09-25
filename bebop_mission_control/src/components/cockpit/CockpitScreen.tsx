@@ -181,6 +181,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
             baseSource={telemetry.base_source}
             arrivalRadius={arrivalRadius}
             stale={stale}
+            overview={missionState === 'idle'}
           />
         </div>
 
