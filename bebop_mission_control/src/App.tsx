@@ -5,7 +5,6 @@ import type { Finding } from './lib/forensics';
 import type { BatteryFailsafe } from './types/bmg';
 import { RTL_ACK_TIMEOUT_MS, RTL_STAGE, clampThreshold, failsafeAction } from './lib/batteryFailsafe';
 import { PreflightScreen } from './components/preflight/PreflightScreen';
-import { BenchWarmupOverlay } from './components/preflight/BenchWarmupOverlay';
 import { CountdownOverlay } from './components/preflight/CountdownOverlay';
 import { CockpitScreen } from './components/cockpit/CockpitScreen';
 import { EvidenceScreen } from './components/evidence/EvidenceScreen';
@@ -35,6 +34,22 @@ const num = (doc: unknown, path: string, fallback: number): number => {
   const v = getPath(doc, path);
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 };
+
+/** The launch countdown when the document does not ask for a longer one, in seconds. */
+const STATION_COUNTDOWN_SEC = 10;
+
+/**
+ * The launch countdown for `doc`.
+ *
+ * `mission.py` persists `kinematics.countdown_sec` on every run, and its own
+ * default is 0 (no countdown for a CLI run), so the stored figure is 0 unless
+ * someone set it. Read literally, that skipped the countdown for every launch
+ * from the station. A non-positive value therefore means the station standard.
+ */
+function launchCountdownSec(doc: unknown): number {
+  const stored = num(doc, 'kinematics.countdown_sec', 0);
+  return stored > 0 ? stored : STATION_COUNTDOWN_SEC;
+}
 
 /** The station is two tabs; these open over whichever one is current. */
 type Overlay = 'none' | 'evidence' | 'diagnostics';
@@ -97,7 +112,6 @@ export const App: React.FC = () => {
   const [overlay, setOverlay] = useState<Overlay>('none');
   const [counting, setCounting] = useState(() => previewCountdown() > 0);
   const [countdownSeconds, setCountdownSeconds] = useState(() => previewCountdown() || 0);
-  const [warming, setWarming] = useState(false);
   /**
    * A launch click is being handled. Covers the pending-edit save as well as
    * the spawn, so a double click on the dial starts one flight and leaves no
@@ -108,7 +122,6 @@ export const App: React.FC = () => {
   const [selectedStamp, setSelectedStamp] = useState<string | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [benchStage, setBenchStage] = useState<number | null>(null);
-  const [benchRun, setBenchRun] = useState(false);
   const [pendingStage, setPendingStage] = useState<number | null>(null);
   const [report, setReport] = useState<Finding[] | null>(null);
   const [reportDismissed, setReportDismissed] = useState(false);
@@ -145,27 +158,17 @@ export const App: React.FC = () => {
   const searchTilt = num(committed, 'gimbal.search_tilt_deg', -20);
 
   /**
-   * The copilot narrates a flight, not a bench rehearsal.
-   *
-   * A stage run on the bench reports the same `[STEP N:` markers as the real
-   * thing, and a voice announcing "decolagem autorizada" at a drone sitting
-   * inert on a desk is the kind of thing that teaches an operator to stop
-   * listening to it.
-   *
-   * `benchRun` outlives `benchStage` deliberately. The stage clears the moment
-   * its process exits, which is also the moment the mission reads as finished
-   * with a capture on disk — keying the copilot off the stage alone meant a
-   * bench rehearsal ended by announcing a safe landing and reading out a full
-   * forensic report. This flag marks the whole cycle and is cleared only by a
-   * real launch or by finishing the mission.
+   * The copilot narrates every run the same way: a real flight, a bench
+   * mission and a single bench routine alike, touchdown call and forensic
+   * report included, as the operator asked for the bench to rehearse exactly
+   * what the audience will hear.
    */
-  const narrating = !benchRun;
   const landed = over && mission.exitCode === 0;
 
   useFlightNarration(
     narration,
-    landed && narrating,
-    narrating,
+    landed,
+    true,
     mission.startedAt,
     num(committed, 'kinematics.target_altitude_m', Number.NaN)
   );
@@ -173,14 +176,14 @@ export const App: React.FC = () => {
   // The report is drawn when the capture lands, not when it is read out: the
   // wording and the order are settled before the aircraft is back on the ground.
   useEffect(() => {
-    if (!mission.latestCapture || benchRun) return;
+    if (!mission.latestCapture) return;
     setReport(buildForensicReport());
     setReportDismissed(false);
-  }, [mission.latestCapture, benchRun]);
+  }, [mission.latestCapture]);
 
   const { revealed: reportRevealed, closing: reportClosing } = useForensicNarration(
     narration,
-    (landed || over) && narrating && !reportDismissed && Boolean(mission.latestCapture),
+    (landed || over) && !reportDismissed && Boolean(mission.latestCapture),
     report
   );
 
@@ -208,8 +211,7 @@ export const App: React.FC = () => {
    * The cockpit stays open, the parameters stay as they were, and the operator
    * can pick another stage immediately — which is the whole point of a bench.
    * Only `benchStage` clears, because that is the one thing that stopped being
-   * true; `benchRun` stays set so the copilot does not narrate a rehearsal's
-   * end as a safe landing.
+   * true.
    */
   useEffect(() => {
     if (benchStage !== null && (mission.state === 'finished' || mission.state === 'faulted')) {
@@ -226,16 +228,15 @@ export const App: React.FC = () => {
       if (params.dirty) await params.save();
 
       const doc = params.working ?? params.committed;
-      // Ten seconds is the station's standard, and it is a real parameter rather
-      // than a UI flourish: the same figure goes to `mission.py --countdown`, so
-      // the overlay and the aircraft count the same window.
-      const seconds = num(doc, 'kinematics.countdown_sec', 10);
+      // A real parameter rather than a UI flourish: the same figure goes to
+      // `mission.py --countdown`, so the overlay and the aircraft count the
+      // same window.
+      const seconds = launchCountdownSec(doc);
 
       resetTrack();
       setLaunchError(null);
       setReport(null);
       setReportDismissed(false);
-      setBenchRun(false);
       failsafeFiredRef.current = false;
       setFailsafeTriggered(false);
       setPendingStage(null);
@@ -268,15 +269,8 @@ export const App: React.FC = () => {
 
       // The countdown is the window in which walking away costs nothing, and it
       // is also the window the mission spends warming YOLO and taking its ground
-      // reference. Neither applies on the bench: the motors never spin, so there
-      // is nothing to stand clear of and nothing to reconsider. The bench gets a
-      // plain loading screen instead, long enough for the mission process to have
-      // video and a detector by the time the cockpit opens.
-      if (benchMode) {
-        setWarming(true);
-        return;
-      }
-
+      // reference. The bench runs the same one, checklist and abort included, so
+      // a rehearsal looks and sounds like the flight it rehearses.
       if (seconds >= 1) {
         setCounting(true);
       } else {
@@ -285,9 +279,13 @@ export const App: React.FC = () => {
     } finally {
       launching.current = false;
     }
-  }, [benchMode, mission, params, resetTrack]);
+  }, [mission, params, resetTrack]);
 
-  /** One routine on the bench: same process, motors inert, no countdown, no cockpit. */
+  /**
+   * One routine on the bench: same process, motors inert, and the same
+   * countdown as a launch. The host spawns the routine when the countdown ends
+   * (`bmg:start-bench-stage`), so a later stage does not start behind it.
+   */
   const runBenchStage = useCallback(
     async (stage: number) => {
       if (!bridge) return;
@@ -301,9 +299,9 @@ export const App: React.FC = () => {
         await bridge.endMission().catch(() => undefined);
       }
 
+      const seconds = launchCountdownSec(doc);
       setLaunchError(null);
       setBenchStage(stage);
-      setBenchRun(true);
       setPendingStage(null);
       resetTrack();
       // The runtime is told a process is starting; without this the strip would
@@ -318,6 +316,7 @@ export const App: React.FC = () => {
           getPath(doc, 'network.detection_stream_topic') ?? '/bebop/camera/detections'
         ),
         paramsJson: JSON.stringify(doc ?? {}),
+        countdown: seconds,
       });
 
       if (!result.success) {
@@ -325,8 +324,13 @@ export const App: React.FC = () => {
         setLaunchError(result.error ?? result.message ?? 'a rotina de bancada não subiu');
         return;
       }
-      // The rehearsal's own feed is the point of watching it.
-      setScreen('cockpit');
+      if (seconds >= 1) {
+        setCountdownSeconds(seconds);
+        setCounting(true);
+      } else {
+        // The rehearsal's own feed is the point of watching it.
+        setScreen('cockpit');
+      }
     },
     [bridge, copilot, mission, params.working, params.committed, resetTrack]
   );
@@ -372,17 +376,12 @@ export const App: React.FC = () => {
     setScreen('cockpit');
   }, []);
 
-  const finishWarmup = useCallback(() => {
-    setWarming(false);
-    setScreen('cockpit');
-  }, []);
-
-  // A bench mission that exits during the warm-up — a missing camera, a bad
-  // parameter — is shown at once rather than after the remaining seconds of a
-  // loading screen for a process that is no longer there.
+  // A mission that exits during the countdown — a missing camera, a refused
+  // ground calibration — is shown at once rather than after the remaining
+  // seconds of a countdown for a process that is no longer there.
   useEffect(() => {
-    if (warming && (mission.state === 'finished' || mission.state === 'faulted')) finishWarmup();
-  }, [warming, mission.state, finishWarmup]);
+    if (counting && (mission.state === 'finished' || mission.state === 'faulted')) finishCountdown();
+  }, [counting, mission.state, finishCountdown]);
 
   const cancelCountdown = useCallback(async () => {
     setCounting(false);
@@ -523,7 +522,6 @@ export const App: React.FC = () => {
     resetTrack();
     camera.reset();
     setBenchStage(null);
-    setBenchRun(false);
     setPendingStage(null);
     setReport(null);
     setReportDismissed(false);
@@ -575,7 +573,7 @@ export const App: React.FC = () => {
           // A flight that faulted produced no assessment. The capture still
           // rises and holds — it is evidence either way — but there is no
           // report under it to reveal.
-          landed={(landed || over) && narrating}
+          landed={landed || over}
           benchMode={benchMode}
           benchStage={benchStage}
           onRunStage={(stage) => void runBenchStage(stage)}
@@ -587,7 +585,7 @@ export const App: React.FC = () => {
           cameraTilt={camera.tilt}
           cameraAvailable={camera.available}
           onCameraTilt={camera.set}
-          report={(landed || over) && narrating ? report : null}
+          report={landed || over ? report : null}
           reportRevealed={reportRevealed}
           reportClosing={reportClosing}
           onAbort={() => void abort()}
@@ -655,7 +653,6 @@ export const App: React.FC = () => {
     finishMission,
     report,
     landed,
-    narrating,
     reportRevealed,
     reportClosing,
     reportDismissed,
@@ -684,13 +681,12 @@ export const App: React.FC = () => {
         className="fixed left-1/2 top-4 z-40 -translate-x-1/2"
       />
 
-      {warming ? <BenchWarmupOverlay onDone={finishWarmup} /> : null}
 
       {counting ? (
         <CountdownOverlay
           seconds={countdownSeconds}
           stageReached={mission.stage >= 1}
-          linkReady={link.flightReady}
+          linkReady={benchMode || benchStage !== null ? link.driverRunning : link.flightReady}
           onDone={finishCountdown}
           onCancel={() => void cancelCountdown()}
         />

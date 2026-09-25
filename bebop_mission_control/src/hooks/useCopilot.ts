@@ -174,7 +174,7 @@ export function useNarrationQueue(copilot: Copilot): NarrationQueue {
  *
  * `altitudeM` is the configured target altitude, the fallback for a takeoff
  * milestone whose payload lacks one. Milestones are ignored while `enabled` is
- * false, which is how bench routines stay silent.
+ * false.
  *
  * Alerts are not. Under the station the mission has no voice of its own
  * (`announcer.station_narrates`), so a failure, abort or failsafe it reports is

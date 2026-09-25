@@ -6,6 +6,7 @@ const os = require('os');
 const { spawn, exec, execSync } = require('child_process');
 const { createMilestoneParser, scheduleScriptMilestones } = require('./milestones.cjs');
 const { createTerminalHost } = require('./terminal.cjs');
+const { deferBenchSpawn } = require('./benchCountdown.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const MISSION_DIR = '/home/joaomoreira/ros2_ws/src/mvp_mission_bebop/mvp_mission_bebop';
@@ -88,6 +89,8 @@ let server = null;
 let driverProcess = null;
 let missionProcess = null;
 let missionStartedAt = null;
+/** Cancels a bench routine still counting down to its spawn (`deferBenchSpawn`). */
+let pendingBenchStage = null;
 let mjpegProcess = null;
 let telemetryProcess = null;
 let speechProcess = null;
@@ -2056,6 +2059,7 @@ ipcMain.handle('bmg:get-voice-level', async () => ({ volume: voiceVolume, muted:
  */
 async function startMissionProcess(options = {}) {
   if (missionProcess) return { success: false, message: 'Uma missão já está em andamento.' };
+  if (pendingBenchStage) return { success: false, message: 'Uma rotina de bancada está em contagem regressiva.' };
 
   // Single voice: the station's copilot is the only speaker in the system. The
   // flag tells mission.py to build no audio player of its own and to hand its
@@ -2185,8 +2189,43 @@ ipcMain.handle('bmg:start-bench-stage', async (_event, options = {}) => {
   if (!Number.isInteger(stage) || stage < 1 || stage > 5) {
     return { success: false, error: `Etapa inválida: ${options.stage}` };
   }
-  return startMissionProcess({ ...options, stages: [stage], noFly: true, countdown: 0 });
+  cancelPendingBenchStage();
+
+  const spawnOptions = { ...options, stages: [stage], noFly: true, countdown: 0 };
+  const countdown = Math.max(0, Number(options.countdown) || 0);
+  if (countdown <= 0) return startMissionProcess(spawnOptions);
+
+  // A later stage has no countdown hold of its own, so the station counts and
+  // spawns at zero; see electron/benchCountdown.cjs.
+  ensureSpeechProcess();
+  pendingBenchStage = deferBenchSpawn(countdown, {
+    emit: (message) => send('bmg:milestone', message),
+    spawn: async () => {
+      pendingBenchStage = null;
+      const result = await startMissionProcess(spawnOptions);
+      if (!result.success) {
+        recordLog('mission', {
+          type: 'stderr',
+          text: `[BMG] A rotina de bancada não subiu: ${result.error ?? result.message ?? 'erro desconhecido'}\n`,
+        });
+        send('bmg:mission-exit', { code: -1, signal: null });
+      }
+    },
+  });
+  recordLog('mission', {
+    type: 'stdout',
+    text: `[BMG] Rotina de bancada da etapa ${stage} em contagem regressiva (${countdown} s).\n`,
+  });
+  return { success: true, deferred: true, stage };
 });
+
+/** Drop a bench routine still counting down, with its countdown milestones. */
+function cancelPendingBenchStage() {
+  if (!pendingBenchStage) return false;
+  const cancel = pendingBenchStage;
+  pendingBenchStage = null;
+  return cancel();
+}
 
 const STEP_NAMES = {
   1: 'Decolagem',
@@ -2235,6 +2274,9 @@ const PUB_TIMEOUT_MS = 20000;
  * handle once the process has reported that it is gone.
  */
 function stopMissionProcess(grace = 1200) {
+  if (cancelPendingBenchStage()) {
+    recordLog('mission', { type: 'stdout', text: '[BMG] Rotina de bancada cancelada antes de iniciar.\n' });
+  }
   const child = missionProcess;
   if (!child) return Promise.resolve(false);
 
