@@ -219,8 +219,18 @@ const MIME_TYPES = {
   '.ttf': 'font/ttf',
 };
 
+/**
+ * The renderer's origin port. Fixed because Chromium keys `localStorage` by
+ * origin, and the operator's settings live there (battery failsafe, preset,
+ * copilot history): on a port chosen per launch every restart opened a new,
+ * empty store. Served over HTTP rather than `file://` because the page fetches
+ * the MJPEG bridge, map tiles and the reverse geocoder, which a `null` origin
+ * would put behind CORS, and serves evidence from outside `dist/`.
+ */
+const UI_PORT = 47823;
+
 function createStaticServer() {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     server = http.createServer((req, res) => {
       let reqPath = decodeURIComponent(req.url.split('?')[0]);
 
@@ -276,7 +286,8 @@ function createStaticServer() {
       }
     });
 
-    server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+    server.once('error', reject);
+    server.listen(UI_PORT, '127.0.0.1', () => resolve(server.address().port));
   });
 }
 
@@ -2635,7 +2646,25 @@ function cleanupAllProcesses() {
 }
 
 app.whenReady().then(async () => {
-  const port = await createStaticServer();
+  let port;
+  try {
+    port = await createStaticServer();
+  } catch (error) {
+    // Falling back to another port would silently open an empty settings
+    // store. Stopping here, before the services start, also keeps a second
+    // instance from reaping the bridges of the one already running.
+    const busy = error && error.code === 'EADDRINUSE';
+    dialog.showErrorBox(
+      'BMG não pôde iniciar',
+      busy
+        ? `A porta ${UI_PORT} já está em uso, provavelmente por outra janela do BMG aberta. ` +
+            'Feche-a e abra de novo. Para ver qual processo ocupa a porta: ' +
+            `ss -ltnp | grep ${UI_PORT}`
+        : `Falha ao abrir o servidor local da interface: ${error?.message ?? error}`
+    );
+    app.quit();
+    return;
+  }
   startBackgroundServices();
   startBridgeWatchdog();
   startTelemetryWatchdog();
