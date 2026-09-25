@@ -22,6 +22,8 @@ const SPEECH_CEILING_MS = 14000;
 export interface Copilot {
   /** Speak one line. Resolves when the operator has heard it, or when it is clear they will not. */
   say: (text: string, priority?: AnnouncePriority) => Promise<boolean>;
+  /** Synthesize the line that will be said next, so it starts without delay. */
+  prepare: (text: string) => void;
   /** Drop whatever is queued and silence the current line. */
   cancel: () => void;
   /** Whether there is a voice bridge at all. False in a browser session. */
@@ -121,7 +123,14 @@ export function useCopilot(): Copilot {
     if (bridge) void bridge.cancelSpeech().catch(() => undefined);
   }, [bridge]);
 
-  return { say, cancel, available: Boolean(bridge) };
+  const prepare = useCallback(
+    (text: string) => {
+      if (bridge && text.trim()) void bridge.prepareSpeech(text).catch(() => undefined);
+    },
+    [bridge]
+  );
+
+  return { say, prepare, cancel, available: Boolean(bridge) };
 }
 
 const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
@@ -142,11 +151,14 @@ export function useNarrationQueue(copilot: Copilot): NarrationQueue {
   sayRef.current = copilot.say;
   const cancelRef = useRef(copilot.cancel);
   cancelRef.current = copilot.cancel;
+  const prepareRef = useRef(copilot.prepare);
+  prepareRef.current = copilot.prepare;
   const queue = useRef<NarrationQueue | null>(null);
   if (queue.current === null) {
     queue.current = new NarrationQueue(
       (text, priority) => sayRef.current(text, priority),
-      () => cancelRef.current()
+      () => cancelRef.current(),
+      (text) => prepareRef.current(text)
     );
   }
   useEffect(() => () => queue.current?.reset(), []);

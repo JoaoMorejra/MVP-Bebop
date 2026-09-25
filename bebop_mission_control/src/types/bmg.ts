@@ -441,6 +441,8 @@ export interface BmgAPI {
   /** Speak one line. Resolves when it is queued; `onAnnounceDone` says when it was heard. */
   announce: (text: string | AnnounceRequest, priority?: AnnouncePriority) => Promise<AnnounceResult>;
   cancelSpeech: () => Promise<{ success: boolean; cancelled?: boolean; error?: string }>;
+  /** Synthesize `text` ahead of its `announce`, which then plays without waiting on synthesis. */
+  prepareSpeech: (text: string) => Promise<{ success: boolean; error?: string }>;
   setVoiceLevel: (level: Partial<VoiceLevel>) => Promise<{ success: boolean } & VoiceLevel>;
   getVoiceLevel: () => Promise<VoiceLevel>;
 

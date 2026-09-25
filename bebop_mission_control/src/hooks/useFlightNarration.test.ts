@@ -424,3 +424,56 @@ describe('NarrationQueue item options', () => {
     expect(spoken).toEqual(['intro', 'next']);
   });
 });
+
+describe('NarrationQueue preparing the next line', () => {
+  it('hands the next two lines to prepare as soon as the current one starts', async () => {
+    const voice = controlledVoice();
+    const prepared: string[] = [];
+    const queue = new NarrationQueue(voice.say, () => undefined, (text) => prepared.push(text));
+
+    for (const line of ['first', 'second', 'third', 'fourth']) queue.enqueue(line, () => line);
+    await flush();
+    expect(voice.spoken).toEqual(['first']);
+    expect(prepared).toEqual(['second', 'third']);
+
+    await voice.finish();
+    expect(voice.spoken).toEqual(['first', 'second']);
+    expect(prepared).toEqual(['second', 'third', 'fourth']);
+  });
+
+  it('prepares a line that arrives while another is being spoken', async () => {
+    const voice = controlledVoice();
+    const prepared: string[] = [];
+    const queue = new NarrationQueue(voice.say, () => undefined, (text) => prepared.push(text));
+
+    queue.enqueue('a', () => 'first');
+    await flush();
+    expect(prepared).toEqual([]);
+    queue.enqueue('b', () => 'late');
+    expect(prepared).toEqual(['late']);
+  });
+
+  it('speaks exactly the sentence it prepared, composing it once', async () => {
+    const voice = controlledVoice();
+    let composed = 0;
+    const queue = new NarrationQueue(voice.say, () => undefined, () => undefined);
+
+    queue.enqueue('a', () => 'first');
+    queue.enqueue('b', () => `variant-${++composed}`);
+    await flush();
+    await voice.finish();
+    expect(voice.spoken).toEqual(['first', 'variant-1']);
+    expect(composed).toBe(1);
+  });
+
+  it('never prepares an alert, which cuts rather than waits its turn', async () => {
+    const voice = controlledVoice();
+    const prepared: string[] = [];
+    const queue = new NarrationQueue(voice.say, () => undefined, (text) => prepared.push(text));
+
+    queue.enqueue('a', () => 'first');
+    await flush();
+    queue.preempt('alert', () => 'falha');
+    expect(prepared).toEqual([]);
+  });
+});

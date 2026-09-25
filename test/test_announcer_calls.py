@@ -11,7 +11,9 @@ hears when something goes wrong.
 
 from __future__ import annotations
 
+import asyncio
 import threading
+import time
 import types
 
 import pytest
@@ -306,3 +308,87 @@ def test_the_synthesis_session_is_opened_in_the_brazilian_locale():
 def test_the_synthesis_prompt_rejects_a_missing_statement(statement, error):
     with pytest.raises(error):
         announcer.synthesis_instruction(statement, verbatim=True)
+
+
+# ------------------------------------------------------------ prefetch
+
+
+class _SilentDevice:
+    """Playback stand-in: records what would be played, plays nothing."""
+
+    _active = True
+
+    def __init__(self):
+        self.played = []
+
+    def play_audio(self, pcm):
+        self.played.append(pcm)
+
+    def wait_until_done(self, timeout=None):
+        return True
+
+    def stop_current(self):
+        pass
+
+    def get_level(self):
+        return {"volume": 1.0, "muted": False}
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def offline_announcer(monkeypatch):
+    """A real announcer loop whose synthesis is a counter, not a network call."""
+    device = _SilentDevice()
+    monkeypatch.setattr(announcer, "get_audio_playback_device", lambda: device)
+    calls = []
+
+    async def fake_synthesize(self, statement, verbatim):
+        calls.append(statement)
+        return b"\x01\x00" * 4800
+
+    monkeypatch.setattr(announcer.MissionAudioAnnouncer, "_synthesize", fake_synthesize)
+    instance = announcer.MissionAudioAnnouncer()
+    if instance.session_config is None:
+        pytest.skip("google-genai not installed")
+    instance._ensure_warm_session = lambda: asyncio.sleep(0)
+    yield instance, calls, device
+    instance.close()
+
+
+def test_a_prefetched_line_is_synthesized_once_and_played_on_request(offline_announcer):
+    instance, calls, device = offline_announcer
+
+    assert instance.prefetch("Iniciando retorno à base.") is True
+    deadline = time.monotonic() + 2.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert instance.announce("Iniciando retorno à base.", wait=True, timeout=5.0, verbatim=True) is True
+
+    assert calls == ["Iniciando retorno à base."]
+    assert len(device.played) == 1
+
+
+def test_a_line_without_prefetch_is_synthesized_on_request(offline_announcer):
+    instance, calls, _ = offline_announcer
+    assert instance.announce("Pouso iminente.", wait=True, timeout=5.0, verbatim=True) is True
+    assert calls == ["Pouso iminente."]
+
+
+def test_cancel_drops_prefetched_audio(offline_announcer):
+    instance, calls, _ = offline_announcer
+    instance.prefetch("Linha descartada.")
+    deadline = time.monotonic() + 2.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    instance.cancel_pending()
+    assert instance.announce("Linha descartada.", wait=True, timeout=5.0, verbatim=True) is True
+    assert calls == ["Linha descartada.", "Linha descartada."]
+
+
+def test_prefetch_rejects_what_is_not_text(offline_announcer):
+    instance, _, _ = offline_announcer
+    with pytest.raises(TypeError):
+        instance.prefetch(None)
+    assert instance.prefetch("   ") is False

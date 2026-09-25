@@ -24,6 +24,8 @@ interface Item {
   onDone?: (heard: boolean) => void;
   /** Cut while playing; its `onDone` must not run. */
   cancelled: boolean;
+  /** The line, once composed: early when it was prepared ahead of its turn. */
+  text?: string;
 }
 
 /**
@@ -43,6 +45,13 @@ interface Item {
  * never to be (`Copilot.say`, which is bounded by its own ceiling), so a
  * silent copilot drains the queue immediately rather than stalling it.
  */
+/**
+ * Lines synthesized ahead of the one playing. One is not enough: a short line
+ * (1.5 s of audio) ends before the next has finished its ~2 s synthesis, so
+ * the line after that has to be under way already.
+ */
+const PREPARE_AHEAD = 2;
+
 export class NarrationQueue {
   private readonly items: Item[] = [];
   private draining = false;
@@ -55,10 +64,17 @@ export class NarrationQueue {
    * @param speak Plays one line; resolves when it has been heard or never will be.
    * @param interrupt Cuts the line currently playing so that `speak` resolves
    *   at once (`Copilot.cancel`). Used only by {@link preempt}.
+   * @param prepare Synthesizes the next line while the current one plays
+   *   (`Copilot.prepare`), so the gap between two lines is not the next
+   *   line's synthesis time. With it, the next sentence is composed when the
+   *   current one starts rather than when reached, which spends its variant
+   *   even if a reset then drops it: one variant, against two seconds of
+   *   silence per line. Without it, lines are composed when reached.
    */
   constructor(
     private readonly speak: (text: string, priority?: AnnouncePriority) => Promise<boolean>,
-    private readonly interrupt: () => void = () => undefined
+    private readonly interrupt: () => void = () => undefined,
+    private readonly prepare?: (text: string) => void
   ) {}
 
   /**
@@ -77,7 +93,28 @@ export class NarrationQueue {
       onDone: options.onDone,
       cancelled: false,
     });
+    if (this.current && this.items.length <= PREPARE_AHEAD) this.prepareNext();
     void this.drain();
+  }
+
+  /** Compose the next lines and have them synthesized while the current one plays. */
+  private prepareNext(): void {
+    if (!this.prepare) return;
+    for (const next of this.items.slice(0, PREPARE_AHEAD)) {
+      if (next.alert) return;
+      if (next.text !== undefined) continue;
+      try {
+        next.text = next.compose();
+      } catch {
+        return;
+      }
+      if (!next.text.trim()) continue;
+      try {
+        this.prepare(next.text);
+      } catch {
+        // Preparing is an optimisation; the line is still said on its turn.
+      }
+    }
   }
 
   /**
@@ -153,12 +190,13 @@ export class NarrationQueue {
       for (let item = this.items.shift(); item; item = this.items.shift()) {
         let text: string;
         try {
-          text = item.compose();
+          text = item.text ?? item.compose();
         } catch {
           continue;
         }
         if (!text.trim()) continue;
         this.current = item;
+        this.prepareNext();
         let heard = false;
         try {
           heard = (await Promise.all([this.say(text, item.priority), this.beat(item.minMs)]))[0];

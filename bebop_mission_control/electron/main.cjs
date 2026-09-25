@@ -1691,6 +1691,24 @@ ipcMain.handle('bmg:announce', async (_event, payload = {}) => {
 });
 
 /** Drop whatever is queued and silence the line being spoken. */
+/**
+ * Synthesize the next line while the current one plays. The narration is read
+ * one line at a time, each requested once the previous has been heard, so
+ * without this every line opened with its own synthesis latency as silence.
+ * Fire-and-forget: the line is still requested, and heard, through
+ * `bmg:announce`; this only lets that request find the audio ready.
+ */
+ipcMain.handle('bmg:prepare-speech', async (_event, text) => {
+  const line = String(text ?? '').trim();
+  if (!line || !speechProcess) return { success: false };
+  try {
+    speechProcess.stdin.write(JSON.stringify({ op: 'prepare', text: line }) + '\n');
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
 ipcMain.handle('bmg:cancel-speech', async () => {
   if (!speechProcess) return { success: true, cancelled: false };
   try {

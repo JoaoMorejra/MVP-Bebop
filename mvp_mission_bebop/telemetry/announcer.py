@@ -16,7 +16,7 @@ import random
 import sys
 import threading
 import time
-from typing import Any, Dict, Final, List, Optional
+from typing import Any, Dict, Final, List, Optional, Tuple
 
 try:
     from google import genai
@@ -33,6 +33,18 @@ PCM_DTYPE = "int16"
 SYNTHESIZER_MODEL = os.environ.get("SPEECH_MODEL", "gemini-3.1-flash-live-preview")
 SYNTHESIZER_VOICE = os.environ.get("SPEECH_VOICE", "Orbit")
 SYNTHESIZER_LANGUAGE: Final[str] = "pt-BR"
+
+#: Least audio that counts as a spoken line: 0.1 s of 24 kHz mono int16.
+_MIN_AUDIO_BYTES: Final[int] = 4800
+#: Wait for a line's first audio chunk. Measured first-chunk latency is 1.6 to
+#: 3.2 s; a session that has said nothing after 6 s is stalled, and a fresh
+#: one answers sooner than it would.
+_FIRST_AUDIO_TIMEOUT_SEC: Final[float] = 6.0
+#: Wait between chunks once audio is flowing. Server gaps of 1.3 s were
+#: measured mid-sentence, which the former 1.5 s cut left no margin for.
+_CHUNK_GAP_TIMEOUT_SEC: Final[float] = 3.0
+#: Lines synthesized ahead of their turn, oldest evicted first.
+_PREFETCH_LIMIT: Final[int] = 4
 
 # The Live model infers accent from the prompt as much as from the session
 # locale, and without an explicit ban it drifts to European Portuguese on
@@ -406,6 +418,9 @@ class MissionAudioAnnouncer:
         self._lock = threading.Lock()
         self._seq: int = 0
         self._active: bool = True
+        #: Lines synthesized ahead of their request, by statement. Touched only
+        #: on the announcer's event loop thread.
+        self._prefetched: Dict[str, "asyncio.Future[bytes]"] = {}
 
         if types is not None:
             self.session_config = types.LiveConnectConfig(
@@ -471,6 +486,137 @@ class MissionAudioAnnouncer:
         finally:
             self._is_warming = False
 
+    async def _open_session(self) -> Tuple[Optional[Any], Optional[Any]]:
+        """Take the warm session, or open one. Returns ``(session, ctx)`` or ``(None, None)``."""
+        session, ctx = self._warm_session, self._warm_ctx
+        self._warm_session = None
+        self._warm_ctx = None
+        asyncio.create_task(self._ensure_warm_session())
+        if session is not None:
+            return session, ctx
+
+        token = self.auth_token or _resolve_auth_token()
+        if not token:
+            return None, None
+        try:
+            client = _get_synthesis_client(token)
+            ctx = client.aio.live.connect(model=SYNTHESIZER_MODEL, config=self.session_config)
+            session = await ctx.__aenter__()
+        except Exception as exc:  # noqa: BLE001 - reported as an unspoken line
+            logger.debug("Speech synthesis session failure: %s", exc)
+            return None, None
+        return session, ctx
+
+    async def _synthesize_once(self, statement: str, verbatim: bool) -> Tuple[bytes, str]:
+        """One Live turn for ``statement``. Returns the PCM and why the read ended."""
+        session, ctx = await self._open_session()
+        if session is None:
+            return b"", "no_session"
+
+        audio = bytearray()
+        reason = "error"
+        try:
+            await session.send_client_content(
+                turns=types.Content(
+                    role="user",
+                    parts=[types.Part(text=synthesis_instruction(statement, verbatim))],
+                ),
+                turn_complete=True,
+            )
+            stream = session.receive()
+            while True:
+                timeout = _CHUNK_GAP_TIMEOUT_SEC if len(audio) >= _MIN_AUDIO_BYTES else _FIRST_AUDIO_TIMEOUT_SEC
+                try:
+                    response = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    reason = "timeout"
+                    break
+                except StopAsyncIteration:
+                    reason = "closed"
+                    break
+                if response.go_away:
+                    reason = "go_away"
+                    break
+                sc = response.server_content
+                if not sc:
+                    continue
+                if sc.model_turn and sc.model_turn.parts:
+                    for part in sc.model_turn.parts:
+                        if part.inline_data and part.inline_data.data:
+                            if "audio" in (part.inline_data.mime_type or "audio/pcm"):
+                                audio.extend(part.inline_data.data)
+                if sc.turn_complete or sc.generation_complete:
+                    reason = "complete"
+                    break
+        except Exception as exc:  # noqa: BLE001 - reported as an unspoken line
+            logger.debug("Speech streaming exception: %s", exc)
+        finally:
+            if ctx is not None:
+                try:
+                    await ctx.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+        return bytes(audio), reason
+
+    async def _synthesize(self, statement: str, verbatim: bool) -> bytes:
+        """Synthesize ``statement``, retrying once on a fresh session if it produced nothing.
+
+        A Live session occasionally stalls before its first chunk; waiting it
+        out cost a silent line after 12 s. One retry on a new session answers
+        in the usual two seconds when it does.
+        """
+        audio, reason = await self._synthesize_once(statement, verbatim)
+        if len(audio) < _MIN_AUDIO_BYTES and reason != "no_session":
+            logger.debug("Synthesis produced no audio (%s); retrying on a fresh session.", reason)
+            audio, reason = await self._synthesize_once(statement, verbatim)
+        logger.debug("Synthesis ended: %s, %d bytes.", reason, len(audio))
+        return audio
+
+    def prefetch(self, text: str) -> bool:
+        """Synthesize a verbatim line ahead of its request.
+
+        The station reads one line at a time and asks for the next only once
+        the current one has been heard, so every line used to open with its
+        own synthesis latency as dead air. Asking for the next line here while
+        the current one plays lets its request find the audio ready.
+
+        Parameters
+        ----------
+        text : str
+            The exact sentence the next ``announce(..., verbatim=True)`` will carry.
+
+        Returns
+        -------
+        bool
+            False when synthesis is unavailable and nothing was scheduled.
+
+        Raises
+        ------
+        TypeError
+            If ``text`` is not a string.
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"text must be str, got {type(text).__name__}")
+        statement = text.strip()
+        if not statement or self._loop is None or self.session_config is None or not self._active:
+            return False
+
+        def start() -> None:
+            if statement in self._prefetched:
+                return
+            while len(self._prefetched) >= _PREFETCH_LIMIT:
+                oldest = next(iter(self._prefetched))
+                self._prefetched.pop(oldest).cancel()
+            self._prefetched[statement] = asyncio.ensure_future(self._synthesize(statement, True))
+
+        self._loop.call_soon_threadsafe(start)
+        return True
+
+    def _drop_prefetched(self) -> None:
+        for future in self._prefetched.values():
+            future.cancel()
+        self._prefetched.clear()
+
     async def _consumer_worker(self) -> None:
         await self._ensure_warm_session()
 
@@ -497,74 +643,16 @@ class MissionAudioAnnouncer:
             statement = action if verbatim else _format_telemetry_statement(action, details)
             logger.info("Acoustic announcement: '%s' (Priority: %s)", statement, "URGENT" if pri_int == 0 else "NORMAL")
 
-            session = self._warm_session
-            ctx = self._warm_ctx
-            self._warm_session = None
-            self._warm_ctx = None
-
-            asyncio.create_task(self._ensure_warm_session())
-
-            if session is None:
-                token = self.auth_token or _resolve_auth_token()
-                if not token:
-                    self._queue.task_done()
-                    if done_fut and not done_fut.done():
-                        done_fut.set_result(False)
-                    continue
+            prefetched = self._prefetched.pop(statement, None) if verbatim else None
+            audio: bytes = b""
+            if prefetched is not None:
                 try:
-                    client = _get_synthesis_client(token)
-                    ctx = client.aio.live.connect(model=SYNTHESIZER_MODEL, config=self.session_config)
-                    session = await ctx.__aenter__()
-                except Exception as exc:
-                    logger.debug("Speech synthesis session failure: %s", exc)
-                    self._queue.task_done()
-                    if done_fut and not done_fut.done():
-                        done_fut.set_result(False)
-                    continue
-
-            audio_buffer = bytearray()
-            try:
-                instruction = synthesis_instruction(statement, verbatim)
-                await session.send_client_content(
-                    turns=types.Content(
-                        role="user",
-                        parts=[types.Part(text=instruction)],
-                    ),
-                    turn_complete=True,
-                )
-
-                async def _read_audio() -> None:
-                    stream = session.receive()
-                    while True:
-                        step_timeout = 1.5 if len(audio_buffer) >= 4800 else 12.0
-                        try:
-                            response = await asyncio.wait_for(stream.__anext__(), timeout=step_timeout)
-                        except (asyncio.TimeoutError, StopAsyncIteration):
-                            break
-
-                        if response.go_away:
-                            break
-                        sc = response.server_content
-                        if not sc:
-                            continue
-                        if sc.model_turn and sc.model_turn.parts:
-                            for part in sc.model_turn.parts:
-                                if part.inline_data and part.inline_data.data:
-                                    if "audio" in (part.inline_data.mime_type or "audio/pcm"):
-                                        audio_buffer.extend(part.inline_data.data)
-                        if sc.turn_complete or sc.generation_complete:
-                            break
-
-                await _read_audio()
-
-            except Exception as exc:
-                logger.debug("Speech streaming exception: %s", exc)
-            finally:
-                if ctx is not None:
-                    try:
-                        await ctx.__aexit__(None, None, None)
-                    except Exception:
-                        pass
+                    audio = await prefetched
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    audio = b""
+            if len(audio) < _MIN_AUDIO_BYTES:
+                audio = await self._synthesize(statement, verbatim)
+            audio_buffer = audio
 
             # Whether this line was actually spoken, as opposed to having been
             # processed. Reaching the end of this block proves nothing: the
@@ -574,7 +662,7 @@ class MissionAudioAnnouncer:
             # success told the ground station the operator had heard a sentence
             # that was never uttered, and its forensic report -- which reveals a
             # card per line read -- then flashed all four at once.
-            spoke = len(audio_buffer) >= 4800
+            spoke = len(audio_buffer) >= _MIN_AUDIO_BYTES
             if spoke:
                 if pri_int != 0:
                     # Bounded. This runs on the announcer's event loop thread,
@@ -668,6 +756,7 @@ class MissionAudioAnnouncer:
                 future = item[5]
                 if future is not None and not future.done():
                     future.set_result(False)
+            self._drop_prefetched()
             done.set()
 
         self._loop.call_soon_threadsafe(drain)
@@ -1035,6 +1124,11 @@ def serve_stdin() -> int:
                     muted=request.get("muted"),
                 )
                 _emit_speech_event({"event": "level", **announcer.device.get_level()})
+                continue
+            if op == "prepare":
+                text = request.get("text")
+                if isinstance(text, str) and text.strip() and not announcer.device.get_level()["muted"]:
+                    announcer.prefetch(text)
                 continue
             if op == "cancel":
                 # Three layers hold work at this moment: this daemon's own
