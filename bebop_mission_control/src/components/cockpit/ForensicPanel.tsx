@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Maximize2, ShieldCheck, Square } from 'lucide-react';
+import { Camera, Maximize2, ShieldCheck, Square } from 'lucide-react';
 import type { RawEvidence } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
 import { TOPIC_LABEL } from '../../lib/forensics';
@@ -11,7 +11,6 @@ interface ForensicPanelProps {
   count: number;
   /** 1–5. The nadir capture happens in stage 4. */
   stage: number;
-  nadirTilt: number;
   missionOver: boolean;
   /** The aircraft is down from a flight that completed: the report may be read. */
   landed: boolean;
@@ -25,36 +24,15 @@ interface ForensicPanelProps {
   onFinish: () => void;
 }
 
-/** One HUD corner bracket. */
-const Corner: React.FC<{ position: 'tl' | 'tr' | 'bl' | 'br'; live: boolean }> = ({ position, live }) => (
-  <span
-    aria-hidden
-    className={cn(
-      'pointer-events-none absolute h-7 w-7 transition-colors duration-500',
-      live ? 'border-mint' : 'border-mint/60',
-      position === 'tl' && 'left-2 top-2 border-l-2 border-t-2',
-      position === 'tr' && 'right-2 top-2 border-r-2 border-t-2',
-      position === 'bl' && 'bottom-2 left-2 border-b-2 border-l-2',
-      position === 'br' && 'bottom-2 right-2 border-b-2 border-r-2'
-    )}
-  />
-);
-
 /**
- * The evidence wall before the capture: an optical HUD on standby.
+ * The evidence wall before the capture: the scanner on standby.
  *
- * Corner brackets, a technical grid, a scan line and a reticle make it read as
- * the sensor it is waiting on rather than as an empty box. One sentence and
- * nothing else — the operator needs to know what arrives here, not a paragraph
- * about how.
+ * Only the motion survives: a grid, a scan line and a turning reticle around a
+ * camera glyph, so the panel reads as the sensor it is waiting on. One sentence
+ * says what arrives here.
  */
-const EvidenceStandby: React.FC<{ inspecting: boolean; stage: number; nadirTilt: number }> = ({
-  inspecting,
-  stage,
-  nadirTilt,
-}) => (
+const EvidenceStandby: React.FC<{ inspecting: boolean }> = ({ inspecting }) => (
   <div className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-bezel border border-strut-soft bg-abyss/70">
-    {/* Technical grid: fine lattice under a coarse rule. */}
     <div
       aria-hidden
       className="pointer-events-none absolute inset-0 opacity-70"
@@ -65,13 +43,11 @@ const EvidenceStandby: React.FC<{ inspecting: boolean; stage: number; nadirTilt:
         backgroundPosition: 'center center',
       }}
     />
-    {/* Vignette, so the centre carries the eye. */}
     <div
       aria-hidden
       className="pointer-events-none absolute inset-0"
       style={{ background: 'radial-gradient(60% 60% at 50% 50%, transparent 40%, rgba(0,19,31,0.85) 100%)' }}
     />
-    {/* Scan line. */}
     <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
       <div
         className="anim-scan absolute inset-x-0 top-0 h-full"
@@ -82,28 +58,6 @@ const EvidenceStandby: React.FC<{ inspecting: boolean; stage: number; nadirTilt:
       />
     </div>
 
-    <Corner position="tl" live={inspecting} />
-    <Corner position="tr" live={inspecting} />
-    <Corner position="bl" live={inspecting} />
-    <Corner position="br" live={inspecting} />
-
-    {/* Sensor status, top edge. */}
-    <div className="pointer-events-none absolute inset-x-11 top-3 flex items-center justify-between font-mono text-3xs tracking-[0.14em]">
-      <span className={cn('flex items-center gap-1.5', inspecting ? 'text-mint' : 'text-mint/70')}>
-        <span className={cn('h-1.5 w-1.5 rounded-full', inspecting ? 'bg-mint anim-breathe' : 'bg-mint/50')} />
-        SENSOR RAW 14MP // {inspecting ? 'ARMED' : 'STANDBY'}
-      </span>
-      <span className="text-haze-deep">EO-CAM · NADIR {nadirTilt.toFixed(0)}°</span>
-    </div>
-
-    {/* Readouts, bottom edge. */}
-    <div className="pointer-events-none absolute inset-x-11 bottom-3 flex items-center justify-between font-mono text-3xs tracking-[0.14em] text-haze-deep">
-      <span>ETAPA {stage > 0 ? stage : '—'}/5</span>
-      <span>PNG LOSSLESS · JPG ANOTADO</span>
-      <span>{inspecting ? 'CAPTURA IMINENTE' : 'AGUARDANDO'}</span>
-    </div>
-
-    {/* Reticle. */}
     <div className="relative flex flex-col items-center gap-5">
       <div className="relative grid h-32 w-32 place-items-center">
         <svg viewBox="0 0 128 128" className="absolute inset-0 h-full w-full" aria-hidden>
@@ -129,11 +83,6 @@ const EvidenceStandby: React.FC<{ inspecting: boolean; stage: number; nadirTilt:
               transform={`rotate(${deg} 64 64)`}
             />
           ))}
-          <line x1="44" y1="64" x2="58" y2="64" stroke="#5CF2CE" strokeWidth="1.2" />
-          <line x1="70" y1="64" x2="84" y2="64" stroke="#5CF2CE" strokeWidth="1.2" />
-          <line x1="64" y1="44" x2="64" y2="58" stroke="#5CF2CE" strokeWidth="1.2" />
-          <line x1="64" y1="70" x2="64" y2="84" stroke="#5CF2CE" strokeWidth="1.2" />
-          <circle cx="64" cy="64" r="2" fill="#5CF2CE" />
         </svg>
         <svg viewBox="0 0 128 128" className="anim-spin-slow absolute inset-0 h-full w-full" aria-hidden>
           <path
@@ -144,14 +93,20 @@ const EvidenceStandby: React.FC<{ inspecting: boolean; stage: number; nadirTilt:
             strokeLinecap="round"
           />
         </svg>
+        <Camera
+          size={36}
+          strokeWidth={1.5}
+          aria-hidden
+          className={cn('relative', inspecting ? 'text-mint anim-breathe' : 'text-mint/80')}
+        />
       </div>
       <p
         className={cn(
-          'hud-legible font-mono text-base tracking-[0.12em]',
+          'hud-legible text-base tracking-wide',
           inspecting ? 'text-mint anim-breathe' : 'text-frost/90'
         )}
       >
-        Aguardo foto da evidencia
+        Aguardando foto da evidência
       </p>
     </div>
   </div>
@@ -188,7 +143,6 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   latest,
   count,
   stage,
-  nadirTilt,
   missionOver,
   landed,
   report,
@@ -270,7 +224,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
               </div>
             </button>
           ) : (
-            <EvidenceStandby inspecting={inspecting} stage={stage} nadirTilt={nadirTilt} />
+            <EvidenceStandby inspecting={inspecting} />
           )}
 
           {/* The findings, in the space the image gave up. */}

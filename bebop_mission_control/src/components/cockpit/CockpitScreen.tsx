@@ -185,7 +185,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
           latest={latestCapture}
           count={captureCount}
           stage={stage}
-          nadirTilt={nadirTilt}
           missionOver={over}
           landed={landed}
           report={report}
