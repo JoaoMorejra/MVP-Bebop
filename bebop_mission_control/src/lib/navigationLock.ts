@@ -10,15 +10,10 @@ import type { MissionState } from '../types/mission';
  * only control that stops one, so neither may be one tab away from the other
  * while an aircraft is committed.
  *
- * Bench runs are excluded, whole missions (`benchMode`) and single routines
- * (`benchStage`) alike: the motors are inert, and locking the operator out of
- * the parameters they are on the bench to adjust would defeat the bench.
+ * The bench is no exception, a whole mission or a single routine: it rehearses
+ * the flight, so it holds the operator in the cockpit the same way. The tab
+ * frees as soon as the process reports its exit.
  */
-export function preflightLocked(
-  state: MissionState,
-  benchMode: boolean,
-  benchStage: number | null
-): boolean {
-  const committed = state === 'arming' || state === 'running' || state === 'aborting';
-  return committed && !benchMode && benchStage === null;
+export function preflightLocked(state: MissionState): boolean {
+  return state === 'arming' || state === 'running' || state === 'aborting';
 }

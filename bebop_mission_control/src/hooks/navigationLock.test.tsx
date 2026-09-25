@@ -69,15 +69,7 @@ interface Probe {
   runtime: ReturnType<typeof useMissionRuntime>;
 }
 
-function Station({
-  probe,
-  benchMode = false,
-  benchStage = null,
-}: {
-  probe: Probe;
-  benchMode?: boolean;
-  benchStage?: number | null;
-}) {
+function Station({ probe }: { probe: Probe }) {
   const runtime = useMissionRuntime();
   probe.runtime = runtime;
   return (
@@ -85,7 +77,7 @@ function Station({
       screen="cockpit"
       onNavigate={() => undefined}
       live={runtime.state === 'running'}
-      locked={preflightLocked(runtime.state, benchMode, benchStage)}
+      locked={preflightLocked(runtime.state)}
     />
   );
 }
@@ -115,8 +107,8 @@ const homeTab = () =>
 const homeAvailable = () => !homeTab().disabled;
 const flush = () => act(async () => undefined);
 
-async function mount(props: { benchMode?: boolean; benchStage?: number | null } = {}) {
-  await act(async () => root.render(<Station probe={probe} {...props} />));
+async function mount() {
+  await act(async () => root.render(<Station probe={probe} />));
 }
 
 /**
@@ -211,19 +203,26 @@ describe('pre-flight lock across a real flight', () => {
 });
 
 describe('pre-flight lock on the bench', () => {
-  it('never locks a bench mission', async () => {
-    await mount({ benchMode: true });
-    const launch = await clickLaunch();
-    expect(homeAvailable()).toBe(true);
+  it('locks a bench mission from the launch click until its process exits', async () => {
+    await mount();
+    let settled!: Promise<{ success: boolean }>;
+    await act(async () => {
+      settled = probe.runtime.launch({ countdown: 10, noFly: true });
+    });
+    expect(homeAvailable()).toBe(false);
     await act(async () => bridge.spawn(true));
-    await launch.settled;
+    await settled;
     await act(async () => bridge.step(2));
+    expect(homeAvailable()).toBe(false);
+    await act(async () => bridge.exit(0));
     expect(homeAvailable()).toBe(true);
   });
 
-  it('never locks a bench routine', async () => {
-    await mount({ benchStage: 4 });
+  it('locks a bench routine, its countdown included, until the routine exits', async () => {
+    await mount();
     await act(async () => probe.runtime.beginBenchStage());
+    expect(homeAvailable()).toBe(false);
+    await act(async () => bridge.exit(0));
     expect(homeAvailable()).toBe(true);
   });
 });
@@ -231,18 +230,11 @@ describe('pre-flight lock on the bench', () => {
 describe('preflightLocked', () => {
   const states: MissionState[] = ['idle', 'arming', 'running', 'aborting', 'finished', 'faulted'];
 
-  it('locks exactly while a real mission is arming, running or aborting', () => {
-    expect(states.filter((state) => preflightLocked(state, false, null))).toEqual([
+  it('locks exactly while a mission is arming, running or aborting', () => {
+    expect(states.filter((state) => preflightLocked(state))).toEqual([
       'arming',
       'running',
       'aborting',
     ]);
-  });
-
-  it('never locks for the bench', () => {
-    for (const state of states) {
-      expect(preflightLocked(state, true, null)).toBe(false);
-      expect(preflightLocked(state, false, 3)).toBe(false);
-    }
   });
 });

@@ -150,7 +150,7 @@ export const App: React.FC = () => {
   const over = mission.state === 'finished' || mission.state === 'faulted';
   const benchMode = Boolean(getPath(params.working ?? params.committed, 'no_fly'));
   /** The aircraft is committed: pre-flight is locked until it is back down. See `preflightLocked`. */
-  const airborne = preflightLocked(mission.state, benchMode, benchStage);
+  const airborne = preflightLocked(mission.state);
 
   const committed = params.committed;
   const arrivalRadius = num(committed, 'rtl.arrival_radius_m', 0.2);
