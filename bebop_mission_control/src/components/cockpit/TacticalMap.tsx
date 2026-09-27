@@ -875,8 +875,8 @@ const LocalGrid: React.FC<{
 /**
  * The airframe, drawn as what it is.
  *
- * A Bebop 2 seen from above: four arms off a central body, a rotor disc at each
- * tip, and a nose the operator can read at a glance. The generic dot and cone
+ * A Bebop 2 seen from above: four arms off a central body, a guarded rotor at
+ * each tip, and a nose the operator can read at a glance. The generic dot and cone
  * this replaces told you where the aircraft was but not which way it was
  * pointing — on a map where the whole point is the heading relative to the
  * street under it, the marker has to carry its own orientation.
@@ -925,10 +925,13 @@ const Quadcopter: React.FC<{ heading: number; spinning: boolean }> = ({ heading,
         />
       ))}
 
-      {/* Rotor discs. */}
+      {/* Rotors inside their guards: the guard ring is the Bebop 2's
+          silhouette from above, the inner disc the rotor that spins. */}
       {arms.map(([x, y], index) => (
         <g key={`rotor-${x}-${y}`} transform={`translate(${x}, ${y})`}>
-          <circle r="6.5" fill="#001A2F" fillOpacity="0.85" stroke="#01D5A3" strokeWidth="1.5" />
+          <circle r="7.5" fill="none" stroke="#001A2F" strokeWidth="3.6" />
+          <circle r="7.5" fill="none" stroke="#01D5A3" strokeWidth="1.6" />
+          <circle r="5.6" fill="#001A2F" fillOpacity="0.85" stroke="#01D5A3" strokeOpacity="0.55" strokeWidth="0.8" />
           <g>
             <line
               x1="-4.5"
