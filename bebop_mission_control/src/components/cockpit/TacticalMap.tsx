@@ -136,10 +136,11 @@ const TILE_LOAD_TIMEOUT_MS = 8000;
 /** How often an offline map probes for the tiles coming back. */
 const TILE_PROBE_INTERVAL_MS = 45000;
 
-type GeoSource = 'gps' | 'device' | 'host' | 'cache' | 'bridge' | 'none';
+type GeoSource = 'gps' | 'site' | 'device' | 'host' | 'cache' | 'bridge' | 'none';
 
 const GEO_LABEL: Record<GeoSource, string> = {
   gps: 'GPS da aeronave',
+  site: 'odometria + base fixa do local',
   device: 'odometria + posição do operador',
   host: 'odometria + posição aproximada pela rede',
   cache: 'odometria + base em cache',
@@ -400,7 +401,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const basemapState =
     tilesOk === true && geoKnown ? 'mapa online' : tilesOk === null && geoKnown ? 'carregando mapa' : 'grade offline';
   const mapStatus = [
-    `${GEO_LABEL[geo.source]}${baseAccuracy !== null ? ` ${formatAccuracy(baseAccuracy)}` : ''}`,
+    `${GEO_LABEL[geo.source]}${geo.source === 'site' && operator.location?.city ? ` (${operator.location.city})` : ''}${baseAccuracy !== null ? ` ${formatAccuracy(baseAccuracy)}` : ''}`,
     baseCoarse ? 'base aproximada: a posição sobre as ruas não é confiável' : null,
     !geoKnown && operator.status === 'locating' ? 'localizando a estação' : null,
     basemapState,
@@ -440,6 +441,17 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           }
         />
         <span className="font-cond text-2xs font-semibold tracking-wide text-frost">MAPA TÁTICO</span>
+        {/* The one status that stays on screen: a network-derived base can
+            put the flight kilometres from where it is, and the operator has to
+            be able to see that without hovering for it. */}
+        {baseCoarse ? (
+          <span
+            data-coarse-base
+            className="ml-auto flex items-center gap-1 rounded-full border border-amber/45 bg-amber/10 px-2 py-0.5 font-cond text-3xs tracking-wide text-amber"
+          >
+            posição aproximada {baseAccuracy !== null ? formatAccuracy(baseAccuracy) : ''}
+          </span>
+        ) : null}
         <span className="sr-only">{mapStatus}</span>
       </div>
 

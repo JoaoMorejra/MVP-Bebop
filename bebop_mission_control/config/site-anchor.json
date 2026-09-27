@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "name": "Transamerica Expo Center",
+  "latitude": -23.6488913,
+  "longitude": -46.7187124,
+  "accuracyM": 25,
+  "reference": "OpenStreetMap relation 1676407 (Expo Center Transamérica), centroid of the complex, which spans about 420 x 300 m"
+}

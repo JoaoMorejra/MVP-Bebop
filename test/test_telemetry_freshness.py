@@ -114,3 +114,65 @@ def test_losing_the_network_still_drops_everything(bridge):
     assert payload["connected"] is False
     assert payload["battery_known"] is False
     assert payload["altitude"] == 0.0
+
+
+# ------------------------------------------------------------- base anchor
+
+
+def _write_cache(path, age_sec, lat=-22.42, lng=-45.45):
+    import json
+    import time
+
+    path.write_text(json.dumps({"latitude": lat, "longitude": lng, "at": (time.time() - age_sec) * 1000.0}))
+
+
+def test_a_configured_site_overrides_the_cached_position(bridge, monkeypatch, tmp_path):
+    cache = tmp_path / "operator-location.json"
+    _write_cache(cache, age_sec=10)
+    monkeypatch.setenv("BMG_BASE_FILE", str(cache))
+    monkeypatch.setenv("BMG_BASE_LAT", "-23.6488913")
+    monkeypatch.setenv("BMG_BASE_LNG", "-46.7187124")
+
+    base = bridge.BaseResolver().current()
+
+    assert (base.latitude, base.longitude, base.source) == (-23.6488913, -46.7187124, "configured")
+
+
+def test_a_recent_cached_position_is_the_base(bridge, monkeypatch, tmp_path):
+    cache = tmp_path / "operator-location.json"
+    _write_cache(cache, age_sec=10 * 60)
+    monkeypatch.setenv("BMG_BASE_FILE", str(cache))
+    monkeypatch.delenv("BMG_BASE_LAT", raising=False)
+    monkeypatch.delenv("BMG_BASE_LNG", raising=False)
+
+    base = bridge.BaseResolver().current()
+
+    assert base is not None and base.source == "operator-cache"
+
+
+def test_a_cached_position_older_than_an_hour_is_not_a_base(bridge, monkeypatch, tmp_path):
+    cache = tmp_path / "operator-location.json"
+    _write_cache(cache, age_sec=2 * 3600)
+    monkeypatch.setenv("BMG_BASE_FILE", str(cache))
+    monkeypatch.delenv("BMG_BASE_LAT", raising=False)
+    monkeypatch.delenv("BMG_BASE_LNG", raising=False)
+
+    assert bridge.BaseResolver().current() is None
+
+
+def test_a_cache_refreshed_after_expiring_is_read_again(bridge, monkeypatch, tmp_path):
+    import os
+
+    cache = tmp_path / "operator-location.json"
+    _write_cache(cache, age_sec=2 * 3600)
+    monkeypatch.setenv("BMG_BASE_FILE", str(cache))
+    monkeypatch.delenv("BMG_BASE_LAT", raising=False)
+    monkeypatch.delenv("BMG_BASE_LNG", raising=False)
+    resolver = bridge.BaseResolver()
+    assert resolver.current() is None
+
+    _write_cache(cache, age_sec=5, lat=-23.0)
+    os.utime(cache, (cache.stat().st_atime, cache.stat().st_mtime + 10))
+    bridge.clock["t"] += resolver.RELOAD_SEC + 1
+
+    assert resolver.current().latitude == -23.0

@@ -744,12 +744,17 @@ class BaseResolver:
     """
 
     RELOAD_SEC = 5.0
+    #: Oldest cached position used as the base, matching the station's own
+    #: limit (``LOCATION_CACHE_MAX_AGE_MS`` in ``main.cjs``): an older one may
+    #: have been taken at another site. ``at`` is epoch milliseconds.
+    CACHE_MAX_AGE_SEC = 3600.0
 
     def __init__(self) -> None:
         self._path = os.environ.get("BMG_BASE_FILE", "")
         self._checked_at = 0.0
         self._mtime: Optional[float] = None
         self._cached: Optional[BaseReference] = None
+        self._cached_at_ms: Optional[float] = None
         lat = _env_float("BMG_BASE_LAT")
         lng = _env_float("BMG_BASE_LNG")
         self._override = (
@@ -772,6 +777,8 @@ class BaseResolver:
                         data = json.load(stream)
                     lat = float(data.get("latitude"))
                     lng = float(data.get("longitude"))
+                    stamp = data.get("at")
+                    self._cached_at_ms = float(stamp) if isinstance(stamp, (int, float)) else None
                     self._cached = (
                         BaseReference(lat, lng, "operator-cache")
                         if _valid_coordinate(lat, lng)
@@ -779,6 +786,9 @@ class BaseResolver:
                     )
             except (OSError, ValueError, TypeError, AttributeError):
                 pass
+        if self._cached is not None and self._cached_at_ms is not None:
+            if time.time() - self._cached_at_ms / 1000.0 > self.CACHE_MAX_AGE_SEC:
+                return None
         return self._cached
 
 

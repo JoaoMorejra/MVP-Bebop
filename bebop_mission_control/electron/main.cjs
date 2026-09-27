@@ -7,6 +7,7 @@ const { spawn, exec, execSync } = require('child_process');
 const { createMilestoneParser, scheduleScriptMilestones } = require('./milestones.cjs');
 const { createTerminalHost } = require('./terminal.cjs');
 const { deferBenchSpawn } = require('./benchCountdown.cjs');
+const { readSiteAnchorFile } = require('./siteAnchor.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const MISSION_DIR = '/home/joaomoreira/ros2_ws/src/mvp_mission_bebop/mvp_mission_bebop';
@@ -309,14 +310,21 @@ const serviceRestartTimers = new Map();
  * telemetry bridge mid-flight otherwise takes battery, altitude and link state
  * off the screen permanently.
  */
+function siteAnchorEnv() {
+  const site = readSiteAnchor();
+  return site ? { BMG_BASE_LAT: String(site.latitude), BMG_BASE_LNG: String(site.longitude) } : {};
+}
+
 function superviseService(name, scriptArgs, onStdoutLine) {
   const env = {
     ...getNectarEnv(),
     LC_ALL: 'C',
     LANG: 'C',
     // The telemetry bridge projects odometry onto the operator's real,
-    // cached position instead of a hard-coded city.
+    // cached position instead of a hard-coded city, or onto the configured
+    // site, which it takes as an explicit override.
     BMG_BASE_FILE: locationCachePath(),
+    ...siteAnchorEnv(),
   };
   let attempts = 0;
 
@@ -1823,8 +1831,21 @@ ipcMain.handle('bmg:goto-stage', async (_event, payload = {}) => {
 // -----------------------------------------------------------------------------
 /** A network (IP) fix is replaced by a newer one only after this long. */
 const LOCATION_IP_REFRESH_MS = 6 * 60 * 60 * 1000;
+/**
+ * Oldest cached position still offered as the map's anchor. The cache is
+ * kept so a station on the aircraft's Wi-Fi, with no route, still has one;
+ * but once it is older than this it may have been taken at another site
+ * altogether, and a map drawn over the wrong neighbourhood is worse than the
+ * local grid the station falls back to without one.
+ */
+const LOCATION_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
+const SITE_ANCHOR_PATH = path.join(__dirname, '..', 'config', 'site-anchor.json');
 const LOCATION_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 let locationRefreshTimer = null;
+
+function readSiteAnchor() {
+  return readSiteAnchorFile(SITE_ANCHOR_PATH);
+}
 
 function locationCachePath() {
   return path.join(app.getPath('userData'), 'operator-location.json');
@@ -1925,6 +1946,13 @@ async function resolveNetworkLocation() {
 }
 
 function startLocationRefresh() {
+  const site = readSiteAnchor();
+  if (site) {
+    recordLog('driver', {
+      type: 'stdout',
+      text: `[geo] base fixa configurada: ${site.name} (${site.latitude.toFixed(5)}, ${site.longitude.toFixed(5)})\n`,
+    });
+  }
   // Resolved at start-up, while the station is most likely still on a network
   // with internet, and refreshed so a station carried to a new site catches up.
   void resolveNetworkLocation().then((entry) => {
@@ -1958,6 +1986,22 @@ function startLocationRefresh() {
  * aircraft's own Wi-Fi.
  */
 ipcMain.handle('bmg:get-host-location', async () => {
+  const site = readSiteAnchor();
+  if (site) {
+    return {
+      success: true,
+      latitude: site.latitude,
+      longitude: site.longitude,
+      accuracyM: site.accuracyM,
+      city: site.name,
+      region: null,
+      cached: false,
+      cachedAt: Date.now(),
+      source: 'site',
+      siteName: site.name,
+    };
+  }
+
   const live = await resolveNetworkLocation();
   if (live) {
     return {
@@ -1973,7 +2017,8 @@ ipcMain.handle('bmg:get-host-location', async () => {
   }
 
   const cached = readLocationCache();
-  if (cached) {
+  const cachedAge = cached ? Date.now() - Number(cached.at || 0) : Infinity;
+  if (cached && cachedAge <= LOCATION_CACHE_MAX_AGE_MS) {
     return {
       success: true,
       latitude: cached.latitude,
@@ -1987,7 +2032,12 @@ ipcMain.handle('bmg:get-host-location', async () => {
     };
   }
 
-  return { success: false, error: 'sem rota para o serviço de geolocalização e sem posição em cache' };
+  return {
+    success: false,
+    error: cached
+      ? 'sem rota para o serviço de geolocalização e a posição em cache expirou'
+      : 'sem rota para o serviço de geolocalização e sem posição em cache',
+  };
 });
 
 /** A device-level fix from the renderer, kept for the next time there is no internet. */

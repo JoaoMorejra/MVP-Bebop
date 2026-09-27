@@ -8,11 +8,13 @@ export interface OperatorLocation {
   accuracyM: number;
   at: number;
   /**
-   * `device` is the laptop's own positioning; `host` is the coarse network
-   * fallback; `cache` is the last of either, kept on disk for when the station
-   * is on the aircraft's Wi-Fi and has no route to ask again.
+   * `site` is the configured demonstration site, known in advance and ranked
+   * above every automatic source; `device` is the laptop's own positioning;
+   * `host` is the coarse network fallback; `cache` is the last of either, kept
+   * on disk for when the station is on the aircraft's Wi-Fi and has no route
+   * to ask again.
    */
-  source: 'device' | 'host' | 'cache';
+  source: 'site' | 'device' | 'host' | 'cache';
   city?: string | null;
 }
 
@@ -22,14 +24,25 @@ const LOCAL_CACHE_KEY = 'bmg.operator-location.v1';
 /** A device fix is persisted to the host again only after moving or ageing this much. */
 const PERSIST_MIN_MOVE_M = 50;
 const PERSIST_MIN_AGE_MS = 10 * 60 * 1000;
+/**
+ * Oldest cached position offered at start-up. Settings now survive restarts
+ * (the renderer's origin is stable), so without a limit a position taken at
+ * the office would still anchor the map at the next site. Past it the hook
+ * waits for a fresh answer instead; the host applies the same limit.
+ */
+export const LOCAL_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
 
-function readLocalCache(): OperatorLocation | null {
+/** The cached position, if it is recent enough to still describe where the station is. */
+export function readLocalCache(now: number = Date.now()): OperatorLocation | null {
   try {
     const raw = window.localStorage.getItem(LOCAL_CACHE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as OperatorLocation;
     if (!Number.isFinite(parsed.latitude) || !Number.isFinite(parsed.longitude)) return null;
-    return { ...parsed, source: 'cache' };
+    if (!Number.isFinite(parsed.at) || now - parsed.at > LOCAL_CACHE_MAX_AGE_MS) return null;
+    // A site read back from the cache is still the site: it outranks a later
+    // coarse answer until the host says otherwise.
+    return { ...parsed, source: parsed.source === 'site' ? 'site' : 'cache' };
   } catch {
     return null;
   }
@@ -76,6 +89,8 @@ export function useOperatorLocation(enabled: boolean) {
   );
   /** Set once the browser produces a real fix, so the fallback stands down. */
   const deviceFixed = useRef(false);
+  /** Set once the host reports a configured site, which no device fix replaces. */
+  const siteConfigured = useRef(false);
   const lastPersisted = useRef<{ lat: number; lng: number; at: number } | null>(null);
 
   useEffect(() => {
@@ -104,17 +119,20 @@ export function useOperatorLocation(enabled: boolean) {
         setStatus((previous) => (previous === 'ready' ? previous : 'unavailable'));
         return;
       }
+      const site = result.source === 'site';
       const next: OperatorLocation = {
         latitude: result.latitude,
         longitude: result.longitude,
         accuracyM: result.accuracyM ?? 5000,
         at: result.cachedAt ?? Date.now(),
-        source: result.cached ? 'cache' : 'host',
+        source: site ? 'site' : result.cached ? 'cache' : 'host',
         city: result.city ?? null,
       };
-      // A device fix, if one arrived while this was in flight, is the better
-      // answer and must not be overwritten by the coarse one.
-      setLocation((previous) => (previous?.source === 'device' ? previous : next));
+      if (site) siteConfigured.current = true;
+      // The configured site wins outright. Otherwise a device fix, if one
+      // arrived while this was in flight, is the better answer and must not
+      // be overwritten by the coarse one.
+      setLocation((previous) => (site || previous?.source !== 'device' ? next : previous));
       if (!result.cached) writeLocalCache(next);
       setStatus((previous) => (previous === 'denied' ? previous : 'ready'));
     };
@@ -129,6 +147,11 @@ export function useOperatorLocation(enabled: boolean) {
 
     setStatus((prev) => (prev === 'ready' ? prev : 'locating'));
 
+    // The host is asked at once as well: it is the one that knows about a
+    // configured site, and waiting out the browser's window first left the
+    // map on whatever the cache held for six seconds.
+    void askHost();
+
     // The browser gets a bounded window to answer. Electron's provider can sit
     // on a request indefinitely rather than erroring, and a map waiting forever
     // on a fix that is not coming is the same as a map with no fix.
@@ -138,7 +161,7 @@ export function useOperatorLocation(enabled: boolean) {
 
     watchId = navigator.geolocation.watchPosition(
       (position) => {
-        if (cancelled) return;
+        if (cancelled || siteConfigured.current) return;
         deviceFixed.current = true;
         const next: OperatorLocation = {
           latitude: position.coords.latitude,

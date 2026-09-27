@@ -468,6 +468,9 @@ export interface BmgAPI {
     cached?: boolean;
     cachedAt?: number | null;
     cachedSource?: 'device' | 'ip';
+    /** `site`: the configured demonstration site (`config/site-anchor.json`). */
+    source?: 'site';
+    siteName?: string;
     error?: string;
   }>;
   /** Persist a device-level fix so it survives the station losing internet. */
