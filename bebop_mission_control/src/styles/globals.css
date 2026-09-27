@@ -172,12 +172,27 @@
   .anim-stage-glow {
     animation: stage-glow 2.2s ease-in-out infinite;
   }
-  /* The forensic HUD's scan line, travelling the frame while it waits. */
-  .anim-scan {
-    animation: scan 3.6s linear infinite;
+  /* The forensic panel's autofocus: the frame hunting for focus while the
+     flight is on its way, locking tighter and faster over the target, and a
+     ring pulsing out from the camera in the same rhythm. SVG children scale
+     about their own centre, not the viewport's corner. */
+  .anim-focus-hunt,
+  .anim-focus-lock,
+  .anim-focus-pulse {
+    transform-box: fill-box;
+    transform-origin: center;
   }
-  .anim-spin-slow {
-    animation: dial-sweep 14s linear infinite;
+  .anim-focus-hunt {
+    animation: focus-hunt 2.8s ease-in-out infinite;
+  }
+  .anim-focus-lock {
+    animation: focus-lock 1.4s ease-in-out infinite;
+  }
+  .anim-focus-pulse {
+    animation: focus-pulse 2.8s ease-out infinite;
+  }
+  .anim-focus-fast {
+    animation-duration: 1.4s;
   }
   /* The terminal's cursor. */
   .anim-cursor {
@@ -213,19 +228,41 @@
   }
 }
 
-@keyframes scan {
+@keyframes focus-hunt {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+  35% {
+    transform: scale(0.9);
+    opacity: 1;
+  }
+  65% {
+    transform: scale(1.04);
+    opacity: 0.9;
+  }
+}
+
+@keyframes focus-lock {
+  0%,
+  100% {
+    transform: scale(0.86);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(0.82);
+    opacity: 0.75;
+  }
+}
+
+@keyframes focus-pulse {
   0% {
-    transform: translateY(-100%);
-    opacity: 0;
-  }
-  10% {
-    opacity: 1;
-  }
-  90% {
-    opacity: 1;
+    transform: scale(0.8);
+    opacity: 0.7;
   }
   100% {
-    transform: translateY(100%);
+    transform: scale(1.55);
     opacity: 0;
   }
 }
@@ -328,8 +365,9 @@
   .anim-tick,
   .anim-slide-in,
   .anim-stage-glow,
-  .anim-scan,
-  .anim-spin-slow,
+  .anim-focus-hunt,
+  .anim-focus-lock,
+  .anim-focus-pulse,
   .anim-cursor,
   .anim-finding-reveal {
     animation: none !important;

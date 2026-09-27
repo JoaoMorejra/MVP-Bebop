@@ -26,74 +26,53 @@ interface ForensicPanelProps {
   canFinish: boolean;
 }
 
+/** One corner of the autofocus frame, as an L drawn from its outer point. */
+const FOCUS_CORNERS: readonly string[] = [
+  'M 18 38 L 18 18 L 38 18',
+  'M 90 18 L 110 18 L 110 38',
+  'M 110 90 L 110 110 L 90 110',
+  'M 38 110 L 18 110 L 18 90',
+];
+
 /**
- * The evidence wall before the capture: the scanner on standby.
+ * The evidence wall before the capture: a camera finding its focus.
  *
- * Only the motion survives: a grid, a scan line and a turning reticle around a
- * camera glyph, so the panel reads as the sensor it is waiting on. One sentence
- * says what arrives here.
+ * One gesture instead of the four the panel used to layer (grid, vignette,
+ * static reticle, turning arc): an autofocus frame that hunts, closing and
+ * opening around the camera glyph, and a focus ring that pulses out from it.
+ * While the aircraft is over the target (`inspecting`) the frame locks: it
+ * sits tighter, brightens and beats faster, which is the moment the capture is
+ * about to happen. Both stop under `prefers-reduced-motion`.
  */
 const EvidenceStandby: React.FC<{ inspecting: boolean }> = ({ inspecting }) => (
-  <div className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-bezel border border-strut-soft bg-abyss/70">
-    <div
-      aria-hidden
-      className="pointer-events-none absolute inset-0 opacity-70"
-      style={{
-        backgroundImage:
-          'linear-gradient(rgba(1,213,163,0.07) 1px, transparent 1px), linear-gradient(90deg, rgba(1,213,163,0.07) 1px, transparent 1px), linear-gradient(rgba(124,153,164,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(124,153,164,0.05) 1px, transparent 1px)',
-        backgroundSize: '64px 64px, 64px 64px, 16px 16px, 16px 16px',
-        backgroundPosition: 'center center',
-      }}
-    />
-    <div
-      aria-hidden
-      className="pointer-events-none absolute inset-0"
-      style={{ background: 'radial-gradient(60% 60% at 50% 50%, transparent 40%, rgba(0,19,31,0.85) 100%)' }}
-    />
-    <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
-      <div
-        className="anim-scan absolute inset-x-0 top-0 h-full"
-        style={{
-          background:
-            'linear-gradient(180deg, transparent 0%, transparent 88%, rgba(1,213,163,0.07) 97%, rgba(92,242,206,0.35) 99.6%, transparent 100%)',
-        }}
-      />
-    </div>
-
+  <div
+    data-focus-state={inspecting ? 'locking' : 'hunting'}
+    className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-bezel border border-strut-soft bg-abyss/70"
+  >
     <div className="relative flex flex-col items-center gap-5">
       <div className="relative grid h-32 w-32 place-items-center">
-        <svg viewBox="0 0 128 128" className="absolute inset-0 h-full w-full" aria-hidden>
-          <circle cx="64" cy="64" r="60" fill="none" stroke="rgba(1,213,163,0.25)" strokeWidth="1" />
+        <svg viewBox="0 0 128 128" className="absolute inset-0 h-full w-full overflow-visible" aria-hidden>
           <circle
             cx="64"
             cy="64"
-            r="46"
+            r="34"
             fill="none"
-            stroke={inspecting ? '#01D5A3' : 'rgba(1,213,163,0.55)'}
+            stroke={inspecting ? '#5CF2CE' : '#01D5A3'}
             strokeWidth="1.5"
-            strokeDasharray="6 5"
+            className={cn('anim-focus-pulse', inspecting && 'anim-focus-fast')}
           />
-          {[0, 90, 180, 270].map((deg) => (
-            <line
-              key={deg}
-              x1="64"
-              y1="2"
-              x2="64"
-              y2="16"
-              stroke={inspecting ? '#5CF2CE' : 'rgba(92,242,206,0.7)'}
-              strokeWidth="1.5"
-              transform={`rotate(${deg} 64 64)`}
-            />
-          ))}
-        </svg>
-        <svg viewBox="0 0 128 128" className="anim-spin-slow absolute inset-0 h-full w-full" aria-hidden>
-          <path
-            d="M 64 4 A 60 60 0 0 1 124 64"
+          <g
             fill="none"
-            stroke={inspecting ? '#5CF2CE' : 'rgba(92,242,206,0.55)'}
-            strokeWidth="2"
+            stroke={inspecting ? '#5CF2CE' : 'rgba(1,213,163,0.75)'}
+            strokeWidth={inspecting ? 2.4 : 2}
             strokeLinecap="round"
-          />
+            strokeLinejoin="round"
+            className={cn(inspecting ? 'anim-focus-lock' : 'anim-focus-hunt')}
+          >
+            {FOCUS_CORNERS.map((d) => (
+              <path key={d} d={d} />
+            ))}
+          </g>
         </svg>
         <Camera
           size={36}
