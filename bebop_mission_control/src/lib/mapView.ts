@@ -43,6 +43,36 @@ export function displayZoom(
   return Math.min(MAX_DISPLAY_ZOOM, Math.max(MIN_DISPLAY_ZOOM, stepped));
 }
 
+/** One press of a zoom button, in display-zoom levels. */
+export const ZOOM_STEP = 0.5;
+
+/** A display zoom held inside the range the map is drawn at. */
+export function clampDisplayZoom(zoom: number): number {
+  if (!Number.isFinite(zoom)) return MIN_DISPLAY_ZOOM;
+  return Math.min(MAX_DISPLAY_ZOOM, Math.max(MIN_DISPLAY_ZOOM, zoom));
+}
+
+/** The display zoom whose ground resolution is `pxPerMetre` at `latitude`. */
+export function zoomForPixelsPerMetre(pxPerMetre: number, latitude: number): number {
+  return Math.log2(pxPerMetre * EQUATOR_MPP_Z0 * Math.cos((latitude * Math.PI) / 180));
+}
+
+/**
+ * Wheel input as a zoom change. One mouse notch (`deltaY` 100 pixels) is one
+ * button step; a trackpad's small deltas zoom continuously. Line-mode deltas
+ * (Firefox) are about 33 pixels a line.
+ */
+export function wheelZoom(zoom: number, deltaY: number, deltaMode = 0): number {
+  const pixels = deltaMode === 1 ? deltaY * 33 : deltaMode === 2 ? deltaY * 800 : deltaY;
+  return clampDisplayZoom(zoom - (pixels / 100) * ZOOM_STEP);
+}
+
+/** Pinch as a zoom change: doubling the fingers' spread is one zoom level in. */
+export function pinchZoom(startZoom: number, startDistance: number, distance: number): number {
+  if (!(startDistance > 0) || !(distance > 0)) return clampDisplayZoom(startZoom);
+  return clampDisplayZoom(startZoom + Math.log2(distance / startDistance));
+}
+
 /**
  * The tile zoom to request for a display zoom, and how much to scale it.
  *

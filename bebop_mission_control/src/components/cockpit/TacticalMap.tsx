@@ -1,15 +1,22 @@
-import React, { useEffect, useId, useMemo, useState } from 'react';
-import { Building2, Crosshair, MapPin } from 'lucide-react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Building2, Crosshair, LocateFixed, MapPin, Minus, Plus } from 'lucide-react';
 import type { TrackPoint } from '../../types/mission';
 import { useReverseGeocode } from '../../hooks/useReverseGeocode';
 import { useOperatorLocation } from '../../hooks/useOperatorLocation';
 import { fromEnu, isValidCoordinate, niceGridStep } from '../../lib/geo';
 import {
+  MAX_DISPLAY_ZOOM,
+  MIN_DISPLAY_ZOOM,
+  ZOOM_STEP,
   accuracyIsCoarse,
+  clampDisplayZoom,
   displayZoom,
   formatAccuracy,
+  pinchZoom,
   pixelsPerMetre,
   tileZoom,
+  wheelZoom,
+  zoomForPixelsPerMetre,
 } from '../../lib/mapView';
 import { cn } from '../../lib/format';
 
@@ -189,6 +196,12 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const [sourceIndex, setSourceIndex] = useState(0);
   const failures = React.useRef(0);
   const hostRef = React.useRef<HTMLDivElement | null>(null);
+  /**
+   * The operator's zoom, in display-zoom levels; null while the view fits the
+   * flight on its own. Set by the buttons, the wheel and a pinch, and cleared
+   * by the recentre control, which hands the view back to the trajectory fit.
+   */
+  const [manualZoom, setManualZoom] = useState<number | null>(null);
 
   const source = TILE_SOURCES[Math.min(sourceIndex, TILE_SOURCES.length - 1)];
 
@@ -314,13 +327,18 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     let pxPerMetre: number;
     let tile = { z: 0, scale: 1 };
     let centre = { x: 0, y: 0 };
+    let zoom: number;
     if (basemapUsable) {
-      const zoom = displayZoom(extent, size, geo.lat);
+      zoom = manualZoom ?? displayZoom(extent, size, geo.lat);
       tile = tileZoom(zoom, source.maxZoom);
       centre = project(geo.lat, geo.lng, tile.z);
       pxPerMetre = pixelsPerMetre(zoom, geo.lat);
+    } else if (manualZoom !== null) {
+      zoom = manualZoom;
+      pxPerMetre = pixelsPerMetre(zoom, geo.lat);
     } else {
       pxPerMetre = Math.min(size.width, size.height) / extent;
+      zoom = zoomForPixelsPerMetre(pxPerMetre, geo.lat);
     }
 
     const cx = size.width / 2;
@@ -330,8 +348,52 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     const sx = (east: number) => cx + (east - droneEast) * pxPerMetre;
     const sy = (north: number) => cy - (north - droneNorth) * pxPerMetre;
 
-    return { centre, tile, tileSize: TILE_SIZE * tile.scale, pxPerMetre, cx, cy, sx, sy };
-  }, [geo.lat, geo.lng, basemapUsable, size, track, droneEast, droneNorth, source.maxZoom, overview]);
+    return { centre, tile, tileSize: TILE_SIZE * tile.scale, pxPerMetre, cx, cy, sx, sy, zoom };
+  }, [geo.lat, geo.lng, basemapUsable, size, track, droneEast, droneNorth, source.maxZoom, overview, manualZoom]);
+
+  // The zoom on screen, read by input handlers that outlive a render.
+  const zoomRef = useRef(view.zoom);
+  zoomRef.current = view.zoom;
+
+  const zoomBy = useCallback((levels: number) => {
+    setManualZoom(clampDisplayZoom(zoomRef.current + levels));
+  }, []);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    // Not passive: the wheel over the map zooms it, and must not also scroll
+    // the cockpit it sits in.
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      setManualZoom(wheelZoom(zoomRef.current, event.deltaY, event.deltaMode));
+    };
+    host.addEventListener('wheel', onWheel, { passive: false });
+    return () => host.removeEventListener('wheel', onWheel);
+  }, []);
+
+  // Two pointers down pinch-zoom around the aircraft, which stays centred.
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef<{ distance: number; zoom: number } | null>(null);
+  const spread = () => {
+    const [a, b] = Array.from(pointers.current.values());
+    return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
+  };
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pointers.current.size === 2) pinch.current = { distance: spread(), zoom: zoomRef.current };
+  };
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!pointers.current.has(event.pointerId)) return;
+    pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pinch.current && pointers.current.size === 2) {
+      setManualZoom(pinchZoom(pinch.current.zoom, pinch.current.distance, spread()));
+    }
+  };
+  const onPointerEnd = (event: React.PointerEvent<HTMLDivElement>) => {
+    pointers.current.delete(event.pointerId);
+    if (pointers.current.size < 2) pinch.current = null;
+  };
 
   // Offline, probe one tile now and then; the first that loads brings the
   // basemap back without a flicker through a half-loaded grid.
@@ -455,7 +517,14 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         <span className="sr-only">{mapStatus}</span>
       </div>
 
-      <div ref={hostRef} className="relative min-h-0 flex-1 overflow-hidden bg-hull-deep">
+      <div
+        ref={hostRef}
+        className="relative min-h-0 flex-1 touch-none overflow-hidden bg-hull-deep"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerEnd}
+        onPointerCancel={onPointerEnd}
+      >
         {/* Basemap. */}
         {basemapUsable ? (
           <div aria-hidden className="absolute inset-0">
@@ -610,6 +679,44 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             </text>
           </g>
         </svg>
+
+        {/* Manual zoom, under the compass. */}
+        <div className="absolute right-2 top-[92px] z-10 flex flex-col overflow-hidden rounded-bezel border border-strut-soft bg-abyss/75 backdrop-blur-sm">
+          <button
+            type="button"
+            onClick={() => zoomBy(ZOOM_STEP)}
+            disabled={view.zoom >= MAX_DISPLAY_ZOOM}
+            aria-label="Aproximar o mapa"
+            title="Aproximar"
+            className="grid h-7 w-7 place-items-center text-frost transition-colors hover:bg-hull-raise disabled:cursor-not-allowed disabled:text-haze-deep"
+          >
+            <Plus size={14} strokeWidth={2} />
+          </button>
+          <button
+            type="button"
+            onClick={() => zoomBy(-ZOOM_STEP)}
+            disabled={view.zoom <= MIN_DISPLAY_ZOOM}
+            aria-label="Afastar o mapa"
+            title="Afastar"
+            className="grid h-7 w-7 place-items-center border-t border-strut-soft text-frost transition-colors hover:bg-hull-raise disabled:cursor-not-allowed disabled:text-haze-deep"
+          >
+            <Minus size={14} strokeWidth={2} />
+          </button>
+          <button
+            type="button"
+            onClick={() => setManualZoom(null)}
+            disabled={manualZoom === null}
+            aria-label="Voltar ao enquadramento automático"
+            aria-pressed={manualZoom === null}
+            title={manualZoom === null ? 'Enquadramento automático ativo' : 'Voltar ao enquadramento automático'}
+            className={cn(
+              'grid h-7 w-7 place-items-center border-t border-strut-soft transition-colors hover:bg-hull-raise disabled:cursor-default',
+              manualZoom === null ? 'text-mint' : 'text-amber'
+            )}
+          >
+            <LocateFixed size={13} strokeWidth={2} />
+          </button>
+        </div>
 
         {/* Attribution is a condition of using the tileset. */}
         {tilesOk && geoKnown ? (
