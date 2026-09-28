@@ -26,6 +26,7 @@ import {
 } from './hooks/useCopilot';
 import { useVoiceLevel } from './hooks/useVoiceLevel';
 import { buildForensicReport } from './lib/forensics';
+import { LAUNCH_KEYS, reserveLaunchPhrase } from './lib/copilotPhrases';
 import { getPath } from './lib/paths';
 
 const num = (doc: unknown, path: string, fallback: number): number => {
@@ -194,9 +195,27 @@ export const App: React.FC = () => {
     }
   }, [benchStage, mission.state]);
 
+  /**
+   * Draw the two launch lines and have them synthesized now.
+   *
+   * mission.start fires when the process spawns and mission.countdown_3
+   * three seconds before liftoff; either synthesized on demand opened with
+   * about two seconds of silence even on a warm session. Done when the
+   * station comes to rest and again at the click, it leaves both ready.
+   */
+  const prepareSpeech = copilot.prepare;
+  const primeLaunchPhrases = useCallback(() => {
+    for (const key of LAUNCH_KEYS) prepareSpeech(reserveLaunchPhrase(key));
+  }, [prepareSpeech]);
+
+  useEffect(() => {
+    if (mission.state === 'idle') primeLaunchPhrases();
+  }, [mission.state, primeLaunchPhrases]);
+
   const launch = useCallback(async () => {
     if (launching.current) return;
     launching.current = true;
+    primeLaunchPhrases();
     try {
       // Commit any pending edits first: the mission reads mission_config.json,
       // so an unsaved slider would otherwise not be the flight that happens.
@@ -254,7 +273,7 @@ export const App: React.FC = () => {
     } finally {
       launching.current = false;
     }
-  }, [mission, params, resetTrack]);
+  }, [mission, params, primeLaunchPhrases, resetTrack]);
 
   /**
    * One routine on the bench: same process, motors inert, and the same
@@ -264,6 +283,7 @@ export const App: React.FC = () => {
   const runBenchStage = useCallback(
     async (stage: number) => {
       if (!bridge) return;
+      primeLaunchPhrases();
       const doc = params.working ?? params.committed;
 
       // Only one mission process may exist, so switching routines means ending
@@ -307,7 +327,7 @@ export const App: React.FC = () => {
         setScreen('cockpit');
       }
     },
-    [bridge, copilot, mission, params.working, params.committed, resetTrack]
+    [bridge, copilot, mission, params.working, params.committed, primeLaunchPhrases, resetTrack]
   );
 
   /**

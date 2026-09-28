@@ -15,6 +15,8 @@ import {
   nextPhrase,
   pickVariant,
   recordVariant,
+  reserveLaunchPhrase,
+  takeLaunchPhrase,
   renderPhrase,
   saveHistory,
   spokenMeters,
@@ -270,5 +272,29 @@ describe('rendering', () => {
     expect(describeTargetLocation({ forward_m: 1.2, bearing_deg: 0.5 })).toBe('a 1,2 metro à frente');
     expect(describeTargetLocation({ forward_m: null, bearing_deg: null })).toBe('na pista');
     expect(describeTargetLocation(undefined)).toBe('na pista');
+  });
+});
+
+describe('launch phrase reservation', () => {
+  it('holds one drawn line per launch key until the milestone takes it', () => {
+    const storage = memoryStorage();
+    const first = reserveLaunchPhrase('mission.countdown_3', { storage, random: seeded(1) });
+    expect(PHRASE_POOLS['mission.countdown_3']).toContain(first);
+    expect(reserveLaunchPhrase('mission.countdown_3', { storage, random: seeded(2) })).toBe(first);
+    expect(takeLaunchPhrase('mission.countdown_3')).toBe(first);
+    expect(takeLaunchPhrase('mission.countdown_3')).toBeUndefined();
+  });
+
+  it('records the draw in the cross-flight history once', () => {
+    const storage = memoryStorage();
+    reserveLaunchPhrase('mission.start', { storage, random: seeded(3) });
+    reserveLaunchPhrase('mission.start', { storage, random: seeded(4) });
+    const history = loadHistory(storage);
+    expect(history['mission.start']).toHaveLength(1);
+    takeLaunchPhrase('mission.start');
+  });
+
+  it('never hands over a line for a key with placeholders', () => {
+    expect(takeLaunchPhrase('mission.takeoff')).toBeUndefined();
   });
 });

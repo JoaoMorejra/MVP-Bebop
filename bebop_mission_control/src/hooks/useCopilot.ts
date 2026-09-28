@@ -7,6 +7,7 @@ import {
   isMilestoneKey,
   nextPhrase,
   phraseForMilestone,
+  takeLaunchPhrase,
 } from '../lib/copilotPhrases';
 import { NarrationQueue } from '../lib/narrationQueue';
 import { useBridge } from './useBridge';
@@ -225,7 +226,10 @@ export function useFlightNarration(
       if (spoken.current.has(key)) return;
       spoken.current.add(key);
       const payload = event.payload ?? {};
-      queue.enqueue(key, () => phraseForMilestone(key, payload, altitude.current));
+      // A launch line drawn ahead (`reserveLaunchPhrase`) is spoken as drawn,
+      // so the audio synthesized for it at the click is the audio played.
+      const launchLine = takeLaunchPhrase(key);
+      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, altitude.current));
     });
   }, [bridge, queue]);
 

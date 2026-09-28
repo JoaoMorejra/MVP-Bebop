@@ -286,6 +286,42 @@ export function saveHistory(history: HistoryStore, storage: StorageLike | null =
   }
 }
 
+/**
+ * The two station-owned lines of a launch, which carry no placeholder and can
+ * therefore be drawn before the milestone that speaks them.
+ */
+export const LAUNCH_KEYS = ['mission.start', 'mission.countdown_3'] as const;
+export type LaunchKey = (typeof LAUNCH_KEYS)[number];
+
+const reserved = new Map<LaunchKey, string>();
+
+/**
+ * The line `key` will be spoken with at the next launch, drawn now if it has
+ * not been yet.
+ *
+ * Drawn ahead so its audio can be synthesized before it is needed: once the
+ * milestone fires, the line plays with no synthesis wait. The draw is recorded
+ * in the cross-flight history when made, as `nextPhrase` does.
+ */
+export function reserveLaunchPhrase(
+  key: LaunchKey,
+  options: { storage?: StorageLike | null; random?: () => number } = {}
+): string {
+  const held = reserved.get(key);
+  if (held !== undefined) return held;
+  const text = nextPhrase(key, {}, options);
+  reserved.set(key, text);
+  return text;
+}
+
+/** The reserved line for `key`, handed over once; undefined when none was drawn. */
+export function takeLaunchPhrase(key: MilestoneKey): string | undefined {
+  if (!(LAUNCH_KEYS as readonly string[]).includes(key)) return undefined;
+  const text = reserved.get(key as LaunchKey);
+  reserved.delete(key as LaunchKey);
+  return text;
+}
+
 /** Replace `{name}` placeholders. Unknown placeholders are left as written. */
 export function renderPhrase(template: string, values: Readonly<Record<string, string>> = {}): string {
   return template.replace(/\{([a-z_]+)\}/g, (match, name: string) =>
