@@ -556,7 +556,6 @@ export const App: React.FC = () => {
           missionState={mission.state}
           stage={mission.stage}
           stageName={mission.stageName}
-          exitCode={mission.exitCode}
           streamFps={Math.round(stream.fps)}
           streamBridgeUp={stream.running}
           streamLive={stream.live}

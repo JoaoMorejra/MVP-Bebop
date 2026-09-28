@@ -17,7 +17,6 @@ interface CockpitScreenProps {
   missionState: MissionState;
   stage: number;
   stageName: string;
-  exitCode: number | null;
   streamFps: number;
   streamBridgeUp: boolean;
   streamLive: boolean;
@@ -79,7 +78,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   missionState,
   stage,
   stageName,
-  exitCode,
   streamFps,
   streamBridgeUp,
   streamLive,
@@ -201,38 +199,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
         />
       </div>
 
-      {over ? (
-        <div
-          className="anim-rise pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2"
-          role="status"
-        >
-          <div
-            className={cn(
-              'pointer-events-auto flex items-center gap-3 rounded-full border px-5 py-2.5 backdrop-blur-md',
-              missionState === 'finished'
-                ? 'border-mint/45 bg-mint/10'
-                : 'border-ember/50 bg-ember/10'
-            )}
-          >
-            <span
-              className={cn(
-                'h-1.5 w-1.5 rounded-full',
-                missionState === 'finished' ? 'bg-mint' : 'bg-ember'
-              )}
-            />
-            <span className="text-sm text-frost">
-              {missionState === 'finished'
-                ? 'Missão encerrada'
-                : `Missão interrompida${exitCode !== null ? ` (código ${exitCode})` : ''}`}
-            </span>
-            <span className="text-2xs text-haze">
-              {captureCount > 0
-                ? `${captureCount} ${captureCount === 1 ? 'evidência registrada' : 'evidências registradas'}`
-                : 'nenhuma evidência registrada'}
-            </span>
-          </div>
-        </div>
-      ) : null}
     </div>
   );
 };
