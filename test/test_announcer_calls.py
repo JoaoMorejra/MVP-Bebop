@@ -422,3 +422,99 @@ def test_every_synthesis_prompt_asks_for_a_brisk_presenter_pace(verbatim):
     instruction = announcer.synthesis_instruction("Decolagem autorizada.", verbatim)
     assert "20 percent faster" in instruction
     assert "never robotic" in instruction
+
+
+# ---------------------------------------------------------- warm session
+
+
+class _FakeLive:
+    """A Live client whose sessions are numbered and whose closes are counted."""
+
+    def __init__(self):
+        self.opened = 0
+        self.closed = []
+
+    def connect(self, model=None, config=None):
+        live = self
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                live.opened += 1
+                self_inner.number = live.opened
+                return f"session-{live.opened}"
+
+            async def __aexit__(self_inner, *exc):
+                live.closed.append(self_inner.number)
+
+        return _Ctx()
+
+
+@pytest.fixture
+def live_announcer(monkeypatch):
+    device = _SilentDevice()
+    monkeypatch.setattr(announcer, "get_audio_playback_device", lambda: device)
+    live = _FakeLive()
+    client = types.SimpleNamespace(aio=types.SimpleNamespace(live=live))
+    monkeypatch.setattr(announcer, "_get_synthesis_client", lambda token: client)
+    monkeypatch.setattr(announcer, "_resolve_auth_token", lambda: "test-token")
+    instance = announcer.MissionAudioAnnouncer()
+    if instance.session_config is None:
+        pytest.skip("google-genai not installed")
+    instance.auth_token = "test-token"
+    yield instance, live
+    instance.close()
+
+
+def _run(instance, coroutine):
+    return asyncio.run_coroutine_threadsafe(coroutine, instance._loop).result(timeout=5)
+
+
+def test_a_fresh_warm_session_is_handed_to_the_next_line(live_announcer):
+    instance, live = live_announcer
+    _run(instance, instance._ensure_warm_session())
+    warm = instance._warm_session
+
+    session, _ = _run(instance, instance._open_session())
+
+    assert session == warm
+
+
+def test_a_warm_session_past_its_refresh_window_is_closed_not_used(live_announcer):
+    instance, live = live_announcer
+    _run(instance, instance._ensure_warm_session())
+    stale = instance._warm_session
+    instance._warm_session_time -= announcer._WARM_MAX_AGE_SEC + announcer._WARM_REFRESH_SEC + 1
+
+    session, _ = _run(instance, instance._open_session())
+
+    assert session != stale
+    assert int(stale.split("-")[1]) in live.closed
+
+
+def test_the_idle_refresh_recycles_an_aged_warm_session(live_announcer):
+    instance, live = live_announcer
+    _run(instance, instance._ensure_warm_session())
+    first = instance._warm_session
+    instance._warm_session_time -= announcer._WARM_MAX_AGE_SEC + 1
+
+    _run(instance, instance._ensure_warm_session())
+
+    assert instance._warm_session != first
+    assert int(first.split("-")[1]) in live.closed
+
+
+def test_a_failed_warm_up_is_reported_once_per_streak(live_announcer, monkeypatch):
+    instance, live = live_announcer
+    warnings = []
+    monkeypatch.setattr(announcer.logger, "warning", lambda msg, *a: warnings.append(msg % a if a else msg))
+
+    def broken(model=None, config=None):
+        raise ConnectionError("no route")
+
+    monkeypatch.setattr(live, "connect", broken)
+    for _ in range(3):
+        instance._warm_session = None
+        instance._warm_ctx = None
+        _run(instance, instance._ensure_warm_session())
+
+    assert len([w for w in warnings if "warm-up failed" in w]) == 1

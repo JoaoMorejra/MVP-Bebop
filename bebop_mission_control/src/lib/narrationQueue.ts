@@ -163,8 +163,17 @@ export class NarrationQueue {
     this.interrupt();
   }
 
-  /** Drop every line not yet started. The one being spoken, if any, finishes. */
+  /**
+   * Drop every line not yet started. The one being spoken, if any, finishes.
+   *
+   * Dropped lines are logged: a reset is what a new `mission.start` does, and
+   * a relaunch clicked while the previous lines were still queued silently
+   * loses them, which has cost more than one investigation to find.
+   */
   reset(): void {
+    if (this.items.length > 0) {
+      console.debug(`[narração] ${this.items.length} fala(s) descartada(s) por reset: ${this.labels().join(', ')}`);
+    }
     this.items.length = 0;
   }
 

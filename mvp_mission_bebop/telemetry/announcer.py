@@ -45,6 +45,13 @@ _FIRST_AUDIO_TIMEOUT_SEC: Final[float] = 6.0
 _CHUNK_GAP_TIMEOUT_SEC: Final[float] = 3.0
 #: Lines synthesized ahead of their turn, oldest evicted first.
 _PREFETCH_LIMIT: Final[int] = 4
+#: Age past which the idle warm Live session is recycled rather than used.
+_WARM_MAX_AGE_SEC: Final[float] = 40.0
+#: How often the idle warm session is checked. The station starts the daemon
+#: with the app, minutes before the first line, so a session opened once at
+#: start-up would be long stale by then; checking on this period keeps the
+#: one on hand at most _WARM_MAX_AGE_SEC + _WARM_REFRESH_SEC old.
+_WARM_REFRESH_SEC: Final[float] = 10.0
 
 # The Live model infers accent from the prompt as much as from the session
 # locale, and without an explicit ban it drifts to European Portuguese on
@@ -421,6 +428,9 @@ class MissionAudioAnnouncer:
         self._warm_ctx: Optional[Any] = None
         self._warm_session_time: float = 0.0
         self._is_warming: bool = False
+        #: Whether the last warm-up failed, so a failure is reported once per
+        #: streak rather than on every refresh.
+        self._warm_failed: bool = False
         self._lock = threading.Lock()
         self._seq: int = 0
         self._active: bool = True
@@ -452,16 +462,23 @@ class MissionAudioAnnouncer:
         asyncio.set_event_loop(self._loop)
         self._queue = asyncio.PriorityQueue()
         self._loop.create_task(self._consumer_worker())
+        self._loop.create_task(self._keep_warm())
         try:
             self._loop.run_forever()
         finally:
             self._loop.close()
 
+    async def _keep_warm(self) -> None:
+        """Keep a fresh Live session on hand while the copilot is idle."""
+        while self._active:
+            await asyncio.sleep(_WARM_REFRESH_SEC)
+            await self._ensure_warm_session()
+
     async def _ensure_warm_session(self) -> None:
         if not self._active or self.session_config is None:
             return
         if self._warm_session is not None:
-            if (time.time() - self._warm_session_time) > 40.0:
+            if (time.time() - self._warm_session_time) > _WARM_MAX_AGE_SEC:
                 try:
                     await self._warm_ctx.__aexit__(None, None, None)
                 except Exception:
@@ -485,8 +502,15 @@ class MissionAudioAnnouncer:
             self._warm_ctx = ctx
             self._warm_session = session
             self._warm_session_time = time.time()
-        except Exception as exc:
-            logger.debug("Warm session initialization check: %s", exc)
+            if self._warm_failed:
+                logger.warning("Speech session warm-up recovered.")
+            self._warm_failed = False
+        except Exception as exc:  # noqa: BLE001 - reported, then retried on the next refresh
+            if not self._warm_failed:
+                # A warning, not debug: this is the copilot going quiet, and the
+                # station forwards the daemon's stderr as "[copiloto]" lines.
+                logger.warning("Speech session warm-up failed, lines will open cold: %s", exc)
+            self._warm_failed = True
             self._warm_session = None
             self._warm_ctx = None
         finally:
@@ -495,11 +519,19 @@ class MissionAudioAnnouncer:
     async def _open_session(self) -> Tuple[Optional[Any], Optional[Any]]:
         """Take the warm session, or open one. Returns ``(session, ctx)`` or ``(None, None)``."""
         session, ctx = self._warm_session, self._warm_ctx
+        age = time.time() - self._warm_session_time
         self._warm_session = None
         self._warm_ctx = None
         asyncio.create_task(self._ensure_warm_session())
-        if session is not None:
+        if session is not None and age <= _WARM_MAX_AGE_SEC + _WARM_REFRESH_SEC:
             return session, ctx
+        if session is not None and ctx is not None:
+            # Past its refresh window: the server may already have closed it,
+            # and a dead session costs a failed turn and a retry.
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
 
         token = self.auth_token or _resolve_auth_token()
         if not token:

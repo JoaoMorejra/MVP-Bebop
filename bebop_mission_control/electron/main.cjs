@@ -2598,6 +2598,11 @@ app.whenReady().then(async () => {
     return;
   }
   startBackgroundServices();
+  // The copilot comes up with the station, not with the first mission. Its
+  // cold start (Python, google.genai, the Live handshake) took about 2.5 s,
+  // and the first line of a launch clicked seconds after opening the app
+  // ended 7.9 s later; started here, the session is warm before any launch.
+  ensureSpeechProcess();
   startBridgeWatchdog();
   startTelemetryWatchdog();
   startLocationRefresh();
