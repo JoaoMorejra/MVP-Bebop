@@ -62,10 +62,10 @@ const ParameterControl: React.FC<{
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className="text-sm text-frost">{spec.label}</span>
+            <span className="font-sans text-sm font-medium text-frost">{spec.label}</span>
             {changed ? <span className="h-1.5 w-1.5 rounded-full bg-mint" aria-label="alterado" /> : null}
           </div>
-          <p className="mt-0.5 text-2xs leading-relaxed text-haze-deep">{spec.hint}</p>
+          <p className="mt-0.5 font-sans text-2xs leading-relaxed text-haze">{spec.hint}</p>
         </div>
 
         <ExactValueField
@@ -164,20 +164,32 @@ const GroupCard: React.FC<{
   const changed = group.items.filter((item) => changedPaths.has(item.path)).length;
 
   return (
-    <section className="flex min-h-0 flex-col rounded-panel border border-strut-soft bg-hull/80">
+    <section
+      className={cn(
+        // The sheet behind is already frosted glass over the film; a second
+        // blur here would sample a flat field and cost GPU for nothing.
+        'glass flex min-h-0 flex-col rounded-panel backdrop-filter-none transition-[border-color,box-shadow] duration-300 ease-instrument',
+        changed > 0 && 'glass-live'
+      )}
+    >
       <header className="flex items-center gap-3 border-b border-strut-soft px-4 py-3">
-        <span className="grid h-8 w-8 place-items-center rounded-bezel border border-mint/35 bg-mint/10 text-mint">
+        <span
+          className={cn(
+            'grid h-8 w-8 shrink-0 place-items-center rounded-bezel border transition-colors duration-300',
+            changed > 0 ? 'border-mint/35 bg-mint/10 text-mint' : 'border-strut-soft bg-hull-raise/60 text-frost-dim'
+          )}
+        >
           <Icon size={15} strokeWidth={1.8} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-baseline gap-2">
-            <span className="font-mono text-3xs text-haze-deep">0{index + 1}</span>
-            <h3 className="font-cond text-sm font-semibold tracking-wide text-frost">{group.title}</h3>
+            <span className="tnum font-mono text-3xs text-haze-deep">0{index + 1}</span>
+            <h3 className="font-cond text-base font-semibold tracking-wide text-frost">{group.title}</h3>
           </div>
-          <p className="truncate text-3xs text-haze">{group.summary}</p>
+          <p className="line-clamp-2 font-sans text-2xs text-haze">{group.summary}</p>
         </div>
         {changed > 0 ? (
-          <span className="rounded-full bg-mint/15 px-2 py-0.5 font-mono text-3xs text-mint">
+          <span className="tnum rounded-full bg-mint/15 px-2 py-0.5 font-mono text-3xs text-mint">
             {changed}
           </span>
         ) : null}
@@ -238,7 +250,7 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-panel border border-strut-soft bg-abyss/85 backdrop-blur-md">
+    <div className="glass flex h-full min-h-0 flex-col overflow-hidden rounded-panel bg-abyss/75">
       <div className="flex shrink-0 items-center justify-between border-b border-strut-soft px-5 py-3.5">
         <div>
           <h2 className="font-cond text-lg font-semibold tracking-wide text-frost">Parâmetros de voo</h2>

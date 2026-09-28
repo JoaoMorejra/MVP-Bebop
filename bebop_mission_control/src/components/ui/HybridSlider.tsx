@@ -10,11 +10,13 @@ export type SliderAccent = 'mint' | 'amber';
 const ACCENT: Record<SliderAccent, { fill: string; thumb: string }> = {
   mint: {
     fill: 'bg-gradient-to-r from-kelp to-mint',
-    thumb: 'border-mint peer-hover:shadow-live peer-focus-visible:shadow-live',
+    thumb: 'border-mint peer-hover:shadow-live peer-focus-visible:shadow-live peer-active:shadow-live',
   },
+  // No amber glow exists in the token set, so the battery thumb answers focus
+  // and drag by filling instead.
   amber: {
     fill: 'bg-amber',
-    thumb: 'border-amber',
+    thumb: 'border-amber peer-focus-visible:bg-amber peer-active:bg-amber',
   },
 };
 
@@ -73,7 +75,7 @@ export const HybridSlider: React.FC<HybridSliderProps> = ({
         onChange={(e) => onChange(Number(Number(e.target.value).toFixed(precision)))}
         className="peer absolute inset-0 h-full w-full cursor-pointer opacity-0 disabled:cursor-not-allowed"
       />
-      <div className="pointer-events-none absolute left-0 right-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-strut" />
+      <div className="pointer-events-none absolute left-0 right-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-strut transition-colors duration-150 peer-hover:bg-strut-bright peer-disabled:bg-strut" />
       <div
         className={cn('pointer-events-none absolute left-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full', tone.fill)}
         style={{ width: `${ratio * 100}%` }}
@@ -88,8 +90,10 @@ export const HybridSlider: React.FC<HybridSliderProps> = ({
       <div
         className={cn(
           'pointer-events-none absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full',
-          'border-2 bg-hull-deep transition-shadow duration-150',
-          tone.thumb
+          'border-2 bg-hull-deep transition-[box-shadow,background-color,transform] duration-150 ease-instrument',
+          'peer-active:scale-110',
+          tone.thumb,
+          'peer-disabled:scale-100 peer-disabled:bg-hull-deep peer-disabled:shadow-none'
         )}
         style={{ left: `${ratio * 100}%` }}
       />
