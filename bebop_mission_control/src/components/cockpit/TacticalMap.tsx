@@ -115,14 +115,34 @@ const TILE_SOURCES: readonly TileSource[] = (() => {
 
 /** Failures within one source before the next is tried. */
 const SOURCE_FAILURE_BUDGET = 6;
-/** Never zoom the overlay closer than this, or a stationary aircraft fills it. */
-const MIN_EXTENT_M = 40;
 /**
- * Extent framed before a mission, in metres: wide enough to read the site on
- * the imagery. Once a mission starts the view fits the flight again, down to
- * {@link MIN_EXTENT_M}.
+ * Least extent the automatic fit frames, in metres: wide enough to read the
+ * site on the imagery. It holds through the mission too. A floor that fell
+ * to a few tens of metres at launch zoomed the map in abruptly the instant a
+ * mission started; the fit now only widens as the flight spreads, and a
+ * closer look is the manual zoom's job.
  */
 const OVERVIEW_EXTENT_M = 300;
+
+/** The automatic extent that frames `track` around the aircraft, never below `floor`. */
+export function fitExtent(
+  track: readonly { x: number; y: number }[],
+  droneEast: number,
+  droneNorth: number,
+  floor: number
+): number {
+  let extent = floor;
+  for (const p of track) {
+    extent = Math.max(
+      extent,
+      Math.abs(p.x - droneEast) * 2.4,
+      Math.abs(p.y - droneNorth) * 2.4,
+      Math.abs(p.x) * 2.4,
+      Math.abs(p.y) * 2.4
+    );
+  }
+  return extent;
+}
 /**
  * Drawn size of the aircraft marker relative to its geometry. The marker is
  * what the operator's eye goes to first, across the room from the station.
@@ -312,17 +332,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
    * it, so the overlay and the streets share one metres-per-pixel. Without
    * tiles the overlay fits the flight directly.
    */
+  // The extent on screen at the last moment of rest, carried into the
+  // mission as its floor: the launch resets the trail, and a view that had
+  // opened wider over the resting trail must not close at the click.
+  const restExtent = useRef(OVERVIEW_EXTENT_M);
   const view = useMemo(() => {
-    let extent = overview ? OVERVIEW_EXTENT_M : MIN_EXTENT_M;
-    for (const p of track) {
-      extent = Math.max(
-        extent,
-        Math.abs(p.x - droneEast) * 2.4,
-        Math.abs(p.y - droneNorth) * 2.4,
-        Math.abs(p.x) * 2.4,
-        Math.abs(p.y) * 2.4
-      );
-    }
+    const extent = fitExtent(track, droneEast, droneNorth, overview ? OVERVIEW_EXTENT_M : restExtent.current);
+    if (overview) restExtent.current = extent;
 
     let pxPerMetre: number;
     let tile = { z: 0, scale: 1 };
