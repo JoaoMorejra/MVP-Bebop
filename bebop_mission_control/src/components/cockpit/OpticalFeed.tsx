@@ -337,9 +337,6 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
       <div className="pointer-events-none absolute bottom-3 left-3 z-30 flex items-end gap-4">
         <Figure label="alt" value={telemetry.data_fresh ? telemetry.altitude.toFixed(2) : '—'} unit="m" />
         <Figure label="vel" value={telemetry.data_fresh ? telemetry.speed.toFixed(2) : '—'} unit="m/s" />
-        {gimbalTilt !== null ? (
-          <Figure label="gimbal" value={gimbalTilt.toFixed(0)} unit="°" />
-        ) : null}
       </div>
 
       {/* Camera tilt, on the picture it changes.
