@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import { Camera, Plane, RotateCcw, Save, Star, Timer, Undo2 } from 'lucide-react';
 import {
   PARAMETER_GROUPS,
@@ -9,6 +9,7 @@ import {
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { getPath } from '../../lib/paths';
 import { Button } from '../ui/Button';
+import { ExactValueField, HybridSlider } from '../ui/HybridSlider';
 import { cn } from '../../lib/format';
 
 interface ParameterSheetProps {
@@ -48,26 +49,8 @@ const ParameterControl: React.FC<{
   changed: boolean;
   onEdit: (path: string, value: unknown) => void;
 }> = ({ spec, value, changed, onEdit }) => {
-  const [draft, setDraft] = useState(() => value.toFixed(spec.precision));
-
-  useEffect(() => {
-    setDraft(value.toFixed(spec.precision));
-  }, [value, spec.precision]);
-
-  const commit = (raw: string) => {
-    const parsed = Number.parseFloat(raw.replace(',', '.'));
-    if (!Number.isFinite(parsed)) {
-      setDraft(value.toFixed(spec.precision));
-      return;
-    }
-    const clamped = Math.min(spec.max, Math.max(spec.min, parsed));
-    const rounded = Number(clamped.toFixed(spec.precision));
-    onEdit(spec.path, rounded);
-    setDraft(rounded.toFixed(spec.precision));
-  };
-
-  const ratio = Math.max(0, Math.min(1, (value - spec.min) / (spec.max - spec.min || 1)));
   const atDefault = Math.abs(value - spec.defaultValue) < 10 ** -(spec.precision + 1);
+  const edit = (next: number) => onEdit(spec.path, next);
 
   return (
     <div
@@ -85,57 +68,30 @@ const ParameterControl: React.FC<{
           <p className="mt-0.5 text-2xs leading-relaxed text-haze-deep">{spec.hint}</p>
         </div>
 
-        <label className="flex w-[92px] shrink-0 items-baseline justify-end gap-1 rounded-bezel border border-strut bg-abyss px-2 py-1 transition-colors focus-within:border-mint/70">
-          <input
-            value={draft}
-            inputMode="decimal"
-            aria-label={`${spec.label}, valor exato`}
-            onChange={(e) => setDraft(e.target.value)}
-            onBlur={(e) => commit(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-            }}
-            className="tnum w-full bg-transparent text-right font-mono text-base text-frost outline-none"
-          />
-          {spec.unit ? (
-            <span className="shrink-0 font-mono text-3xs text-haze-deep">{spec.unit}</span>
-          ) : null}
-        </label>
-      </div>
-
-      <div className="group relative mt-3 h-5">
-        <input
-          type="range"
-          aria-label={spec.label}
+        <ExactValueField
+          value={value}
           min={spec.min}
           max={spec.max}
-          step={spec.step}
-          value={value}
-          onChange={(e) => onEdit(spec.path, Number(Number(e.target.value).toFixed(spec.precision)))}
-          className="peer absolute inset-0 h-full w-full cursor-pointer opacity-0"
-        />
-        <div className="pointer-events-none absolute left-0 right-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-strut" />
-        <div
-          className="pointer-events-none absolute left-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-gradient-to-r from-kelp to-mint"
-          style={{ width: `${ratio * 100}%` }}
-        />
-        {/* Where the default sits, so a return to it is one drag and not a guess. */}
-        <div
-          aria-hidden
-          className="pointer-events-none absolute top-1/2 h-2.5 w-px -translate-y-1/2 bg-frost/40"
-          style={{
-            left: `${Math.max(0, Math.min(1, (spec.defaultValue - spec.min) / (spec.max - spec.min || 1))) * 100}%`,
-          }}
-        />
-        <div
-          className={cn(
-            'pointer-events-none absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full',
-            'border-2 border-mint bg-hull-deep transition-shadow duration-150',
-            'peer-hover:shadow-live peer-focus-visible:shadow-live'
-          )}
-          style={{ left: `${ratio * 100}%` }}
+          precision={spec.precision}
+          unit={spec.unit}
+          label={spec.label}
+          onCommit={edit}
+          className="w-[92px] shrink-0"
         />
       </div>
+
+      {/* The default tick makes a return to it one drag and not a guess. */}
+      <HybridSlider
+        value={value}
+        min={spec.min}
+        max={spec.max}
+        step={spec.step}
+        precision={spec.precision}
+        label={spec.label}
+        marker={spec.defaultValue}
+        onChange={edit}
+        className="mt-3"
+      />
 
       <div className="mt-1 flex items-center justify-between font-mono text-3xs text-haze-deep">
         <span className="tnum">
