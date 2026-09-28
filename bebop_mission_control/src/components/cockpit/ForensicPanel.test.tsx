@@ -70,3 +70,12 @@ describe('isAirborne', () => {
     expect(isAirborne(undefined)).toBe(false);
   });
 });
+
+describe('rotorsTurning', () => {
+  it('turns the rotors only in the ARSDK states where they spin', async () => {
+    const { rotorsTurning } = await import('../../lib/flightState');
+    expect([0, 1, 2, 3, 4, 5, 6, 7, 8].filter(rotorsTurning)).toEqual([1, 2, 3, 4, 7, 8]);
+    expect(rotorsTurning(null)).toBe(false);
+    expect(rotorsTurning(undefined)).toBe(false);
+  });
+});

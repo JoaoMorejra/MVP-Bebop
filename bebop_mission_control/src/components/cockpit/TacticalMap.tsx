@@ -19,6 +19,7 @@ import {
   zoomForPixelsPerMetre,
 } from '../../lib/mapView';
 import { cn } from '../../lib/format';
+import { rotorsTurning } from '../../lib/flightState';
 
 interface TacticalMapProps {
   track: TrackPoint[];
@@ -40,6 +41,8 @@ interface TacticalMapProps {
    * it), so this is keyed to the mission, not to the track.
    */
   overview?: boolean;
+  /** ARSDK flying state, null when unknown or stale; drives the rotor animation. */
+  flyingState?: number | null;
 }
 
 const TILE_SIZE = 256;
@@ -208,6 +211,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   arrivalRadius,
   stale,
   overview = false,
+  flyingState = null,
 }) => {
   const uid = useId().replace(/:/g, '');
   const [size, setSize] = useState({ width: 640, height: 320 });
@@ -664,7 +668,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           <g transform={`translate(${view.cx}, ${view.cy})`} opacity={stale ? 0.45 : 1}>
             <circle r="44" fill={`url(#${uid}-halo)`} />
             <g transform={`scale(${MARKER_SCALE})`}>
-              <Quadcopter heading={compass} spinning={!stale} />
+              <Quadcopter heading={compass} spinning={rotorsTurning(flyingState)} />
             </g>
           </g>
           <text
@@ -898,8 +902,9 @@ const LocalGrid: React.FC<{
  * street under it, the marker has to carry its own orientation.
  *
  * The whole drawing rotates with the compass, so the nose is the heading. The
- * discs turn only while telemetry is live: a stationary rotor is how a stale
- * link reads without a caption.
+ * rotors turn only while the aircraft reports them turning (its ARSDK flying
+ * state), not merely while telemetry is live: on the ground, armed or
+ * landed, they stand still. A stale link reads through the marker's fade.
  */
 const Quadcopter: React.FC<{ heading: number; spinning: boolean }> = ({ heading, spinning }) => {
   // Arm tips, clockwise from front-right, in the airframe's own frame.
