@@ -146,13 +146,10 @@ export const ExactValueField: React.FC<ExactValueFieldProps> = ({
     setDraft(rounded.toFixed(precision));
   };
 
+  // The input is the box itself, so the app-wide :focus-visible outline lands
+  // on the visible field. The unit sits inside its right padding.
   return (
-    <label
-      className={cn(
-        'flex items-baseline justify-end gap-1 rounded-bezel border border-strut bg-abyss px-2 py-1 transition-colors focus-within:border-mint/70',
-        className
-      )}
-    >
+    <label className={cn('relative block', className)}>
       <input
         value={draft}
         inputMode="decimal"
@@ -162,9 +159,14 @@ export const ExactValueField: React.FC<ExactValueFieldProps> = ({
         onKeyDown={(e) => {
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
         }}
-        className="tnum w-full bg-transparent text-right font-mono text-base text-frost outline-none"
+        style={unit ? { paddingRight: `${0.75 + unit.length * 0.4}rem` } : undefined}
+        className="tnum w-full rounded-bezel border border-strut bg-abyss py-1 pl-2 pr-2 text-right font-mono text-base text-frost"
       />
-      {unit ? <span className="shrink-0 font-mono text-3xs text-haze-deep">{unit}</span> : null}
+      {unit ? (
+        <span className="pointer-events-none absolute bottom-[0.45rem] right-2 font-mono text-3xs text-haze-deep">
+          {unit}
+        </span>
+      ) : null}
     </label>
   );
 };
