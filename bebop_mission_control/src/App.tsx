@@ -148,8 +148,6 @@ export const App: React.FC = () => {
 
   const committed = params.committed;
   const arrivalRadius = num(committed, 'rtl.arrival_radius_m', 0.2);
-  const nadirTilt = num(committed, 'gimbal.nadir_tilt_deg', -69);
-  const searchTilt = num(committed, 'gimbal.search_tilt_deg', -20);
 
   /**
    * The copilot narrates every run the same way: a real flight, a bench
@@ -560,8 +558,6 @@ export const App: React.FC = () => {
           captureCount={mission.captureCount}
           latestCapture={mission.latestCapture}
           arrivalRadius={arrivalRadius}
-          nadirTilt={nadirTilt}
-          searchTilt={searchTilt}
           // A flight that faulted produced no assessment. The capture still
           // rises and holds — it is evidence either way — but there is no
           // report under it to reveal.
@@ -638,8 +634,6 @@ export const App: React.FC = () => {
     track,
     mission,
     arrivalRadius,
-    nadirTilt,
-    searchTilt,
     abort,
     finishMission,
     report,

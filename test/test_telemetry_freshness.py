@@ -176,3 +176,30 @@ def test_a_cache_refreshed_after_expiring_is_read_again(bridge, monkeypatch, tmp
     bridge.clock["t"] += resolver.RELOAD_SEC + 1
 
     assert resolver.current().latitude == -23.0
+
+
+# ----------------------------------------------------------- gimbal echo
+
+
+def test_the_gimbal_echo_subscription_matches_volatile_publishers(bridge):
+    from rclpy.qos import DurabilityPolicy, QoSCompatibility, QoSProfile, qos_check_compatible
+
+    # The Nectar SDK and command_bridge both create the publisher with depth 1,
+    # which rclpy expands to reliable, volatile, keep-last.
+    from rclpy.qos import HistoryPolicy, ReliabilityPolicy
+
+    publisher = QoSProfile(depth=1)
+    compatible, reason = qos_check_compatible(publisher, bridge.MOVE_CAMERA_QOS)
+
+    # WARNING is rclpy flagging system_default liveliness, which still matches.
+    assert compatible != QoSCompatibility.ERROR, reason
+    assert bridge.MOVE_CAMERA_QOS.durability == DurabilityPolicy.VOLATILE
+
+    # The state topics' profile, which this subscription used to share.
+    transient = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+    assert qos_check_compatible(publisher, transient)[0] == QoSCompatibility.ERROR

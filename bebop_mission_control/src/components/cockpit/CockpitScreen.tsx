@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React from 'react';
 import type { MissionState, TelemetryView, TrackPoint } from '../../types/mission';
 import type { RawEvidence, VoiceLevel } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
@@ -27,8 +27,6 @@ interface CockpitScreenProps {
   captureCount: number;
   latestCapture: RawEvidence | null;
   arrivalRadius: number;
-  nadirTilt: number;
-  searchTilt: number;
   /**
    * The aircraft is down from a flight that completed. Distinct from the
    * mission merely being over: a faulted flight has no assessment behind it,
@@ -87,8 +85,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   captureCount,
   latestCapture,
   arrivalRadius,
-  nadirTilt,
-  searchTilt,
   landed,
   benchMode,
   benchStage,
@@ -113,12 +109,14 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   // without one: ending the cycle is also what lands it (`bmg:end-mission`).
   const canFinish = missionState !== 'idle' || isAirborne(telemetry.flying_state);
 
-  const gimbalTilt = useMemo(() => {
-    if (!running) return null;
-    if (stage >= 4) return nadirTilt;
-    if (stage >= 2) return searchTilt;
-    return null;
-  }, [running, stage, nadirTilt, searchTilt]);
+  // The last gimbal command on /bebop/move_camera, from the mission's ramp or
+  // the station's slider, as the telemetry bridge echoes it. A command, not a
+  // measurement: the Nectar SDK exposes no gimbal position, so this is the
+  // closest the station can come to where the camera points.
+  const gimbalTilt =
+    typeof telemetry.camera_tilt_deg === 'number' && Number.isFinite(telemetry.camera_tilt_deg)
+      ? telemetry.camera_tilt_deg
+      : null;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2.5 p-2.5">

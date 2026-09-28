@@ -109,6 +109,15 @@ TOPIC_STALE_SEC = 4.0
 BATTERY_STALE_SEC = 90.0
 
 EMIT_PERIOD_SEC = 0.5
+
+#: QoS for the /bebop/move_camera echo: reliable and volatile, which matches
+#: the volatile depth-1 publishers of the Nectar SDK and command_bridge.
+MOVE_CAMERA_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.VOLATILE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+)
 MONITOR_PERIOD_SEC = 2.0
 
 
@@ -562,8 +571,13 @@ class TelemetryNode(Node):
         # subscriber on it rather than the consumer. That is the point: whatever
         # commands the camera -- the mission's own stages, or the station's
         # slider -- passes through here and the interface can follow it.
+        #
+        # Volatile, not the state topics' transient-local: both publishers (the
+        # Nectar SDK's gimbal publisher and command_bridge) are volatile, and
+        # DDS never matches a transient-local subscriber to a volatile
+        # publisher. With state_qos this subscription received nothing at all.
         self.create_subscription(
-            Vector3, TOPIC_MOVE_CAMERA, self._on_move_camera, state_qos
+            Vector3, TOPIC_MOVE_CAMERA, self._on_move_camera, MOVE_CAMERA_QOS
         )
 
         self.base = BaseResolver()
