@@ -58,7 +58,6 @@ interface CockpitScreenProps {
   /** The report's closing line as the copilot said it. */
   reportClosing: string | null;
   onAbort: () => void;
-  onOpenEvidence: () => void;
   onFinish: () => void;
 }
 
@@ -106,7 +105,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   reportRevealed,
   reportClosing,
   onAbort,
-  onOpenEvidence,
   onFinish,
 }) => {
   const running = missionState === 'running' || missionState === 'arming';
@@ -193,7 +191,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
           report={report}
           reportRevealed={reportRevealed}
           reportClosing={reportClosing}
-          onOpenLibrary={onOpenEvidence}
           onFinish={onFinish}
           canFinish={canFinish}
         />

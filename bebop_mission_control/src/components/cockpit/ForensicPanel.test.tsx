@@ -35,7 +35,6 @@ function render(canFinish: boolean, onFinish = vi.fn()) {
         landed={false}
         report={null}
         reportRevealed={0}
-        onOpenLibrary={() => undefined}
         onFinish={onFinish}
         canFinish={canFinish}
       />

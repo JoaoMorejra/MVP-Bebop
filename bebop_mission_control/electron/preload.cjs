@@ -83,11 +83,6 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   terminalResize: (id, cols, rows) => ipcRenderer.invoke('bmg:terminal-resize', { id, cols, rows }),
   terminalKill: (id) => ipcRenderer.invoke('bmg:terminal-kill', id),
 
-  // Forensic evidence
-  listEvidence: () => ipcRenderer.invoke('bmg:list-evidence'),
-  exportDossier: (payload) => ipcRenderer.invoke('bmg:export-dossier', payload),
-  revealPath: (name) => ipcRenderer.invoke('bmg:reveal-path', name),
-
   // Events
   onTelemetryUpdate: subscribe('bmg:telemetry-update'),
   onStepChange: subscribe('bmg:step-change'),

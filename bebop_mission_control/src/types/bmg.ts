@@ -179,53 +179,6 @@ export interface RawEvidence {
   timestamp: number;
 }
 
-/** One capture as enumerated from the mission working directory. */
-export interface EvidenceItem {
-  id: string;
-  /** `YYYYMMDD_HHMMSS` as written by `MissionContext.record_photographic_evidence`. */
-  stamp: string;
-  capturedAtMs: number;
-  rawUrl: string | null;
-  annotatedUrl: string | null;
-  metadata: EvidenceMetadata | null;
-}
-
-/** Sidecar written by `MissionContext._write_metadata`. */
-export interface EvidenceMetadata {
-  captured_at_utc?: string;
-  timestamp?: string;
-  raw_image?: string | null;
-  annotated_image?: string | null;
-  frame?: { width: number; height: number };
-  gimbal_tilt_deg?: number;
-  detections?: EvidenceDetection[];
-  mission?: {
-    no_fly?: boolean;
-    elapsed_sec?: number;
-    target_classes?: string[];
-    confidence_threshold?: number;
-  };
-  odometry?: {
-    x_m?: number;
-    y_m?: number;
-    relative_altitude_m?: number;
-    raw_altitude_m?: number;
-    yaw_rad?: number;
-    speed_mps?: number;
-    launch_origin?: { x_m?: number; y_m?: number };
-    ground_reference_m?: number;
-  };
-}
-
-export interface EvidenceDetection {
-  class_name: string;
-  class_id: number;
-  confidence: number;
-  bbox_xyxy: [number, number, number, number] | number[];
-  center_px: [number, number] | number[];
-  area_px: number;
-}
-
 export interface MissionStepEvent {
   stepNumber: number;
   stepName: string;
@@ -398,12 +351,6 @@ export interface BatteryFailsafe {
   thresholdPct: number;
 }
 
-export interface ExportResult {
-  success: boolean;
-  path?: string;
-  error?: string;
-}
-
 export interface BmgAPI {
   isElectron: true;
   missionDir: string;
@@ -492,13 +439,6 @@ export interface BmgAPI {
   terminalWrite: (id: string, data: string) => Promise<{ success: boolean }>;
   terminalResize: (id: string, cols: number, rows: number) => Promise<{ success: boolean }>;
   terminalKill: (id: string) => Promise<{ success: boolean }>;
-
-  listEvidence: () => Promise<{ success: boolean; items: EvidenceItem[]; error?: string }>;
-  exportDossier: (payload: {
-    html: string;
-    stamp: string;
-  }) => Promise<ExportResult>;
-  revealPath: (p: string) => Promise<{ success: boolean }>;
 
   onTelemetryUpdate: (cb: (data: BmgTelemetry) => void) => () => void;
   onStepChange: (cb: (step: MissionStepEvent) => void) => () => void;

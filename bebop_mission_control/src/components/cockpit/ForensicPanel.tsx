@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Camera, Maximize2, ShieldCheck, Square } from 'lucide-react';
+import { Camera, ShieldCheck, Square } from 'lucide-react';
 import type { RawEvidence } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
 import { TOPIC_LABEL } from '../../lib/forensics';
@@ -20,7 +20,6 @@ interface ForensicPanelProps {
   reportRevealed: number;
   /** The closing line as the copilot said it, so screen and voice agree. */
   reportClosing?: string | null;
-  onOpenLibrary: () => void;
   onFinish: () => void;
   /** A mission is up or over, or an aircraft is airborne without one. */
   canFinish: boolean;
@@ -129,7 +128,6 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   report,
   reportRevealed,
   reportClosing,
-  onOpenLibrary,
   onFinish,
   canFinish,
 }) => {
@@ -171,13 +169,10 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
 
         <div className="flex min-h-0 flex-1 flex-col gap-2.5 p-3">
           {latest ? (
-            <button
-              type="button"
-              onClick={onOpenLibrary}
-              title="Abrir no dossiê"
+            <div
               className={cn(
-                'group relative block w-full shrink-0 overflow-hidden rounded-bezel border border-strut',
-                'transition-all duration-[900ms] ease-settle hover:border-mint/60',
+                'relative block w-full shrink-0 overflow-hidden rounded-bezel border border-strut',
+                'transition-all duration-[900ms] ease-settle',
                 // On touchdown the frame yields the column to the findings.
                 presenting ? 'h-[38%]' : 'h-full',
                 arrived && 'anim-land'
@@ -199,12 +194,8 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
                     {stampLabel(stampOf(latest))}
                   </div>
                 </div>
-                <span className="hud-legible flex shrink-0 items-center gap-1.5 text-2xs text-mint">
-                  <Maximize2 size={11} strokeWidth={2} />
-                  Abrir dossiê
-                </span>
               </div>
-            </button>
+            </div>
           ) : (
             <EvidenceStandby inspecting={inspecting} />
           )}

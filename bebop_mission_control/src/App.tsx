@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { X } from 'lucide-react';
 import type { Screen } from './types/mission';
 import type { Finding } from './lib/forensics';
 import type { BatteryFailsafe } from './types/bmg';
@@ -7,7 +6,6 @@ import { RTL_ACK_TIMEOUT_MS, RTL_STAGE, clampThreshold, failsafeAction } from '.
 import { PreflightScreen } from './components/preflight/PreflightScreen';
 import { CountdownOverlay } from './components/preflight/CountdownOverlay';
 import { CockpitScreen } from './components/cockpit/CockpitScreen';
-import { EvidenceScreen } from './components/evidence/EvidenceScreen';
 import { DiagnosticsScreen } from './components/diagnostics/DiagnosticsScreen';
 import { DiagnosticsOverlayHeader } from './components/diagnostics/DiagnosticsOverlayHeader';
 import { TabSwitch } from './components/shell/TabSwitch';
@@ -19,7 +17,6 @@ import { useMissionParameters } from './hooks/useMissionParameters';
 import { preflightLocked } from './lib/navigationLock';
 import { isAirborne } from './lib/flightState';
 import { useStreamHealth } from './hooks/useStreamHealth';
-import { useEvidence } from './hooks/useEvidence';
 import { useCameraTilt } from './hooks/useCameraTilt';
 import {
   useCopilot,
@@ -53,7 +50,7 @@ function launchCountdownSec(doc: unknown): number {
 }
 
 /** The station is two tabs; these open over whichever one is current. */
-type Overlay = 'none' | 'evidence' | 'diagnostics';
+type Overlay = 'none' | 'diagnostics';
 
 /** `?screen=cockpit` opens a tab directly, for screenshots and tests. */
 function initialScreen(): Screen {
@@ -117,8 +114,6 @@ export const App: React.FC = () => {
    * refusal message behind on the pre-flight screen.
    */
   const launching = useRef(false);
-  const [evidenceToken, setEvidenceToken] = useState(0);
-  const [selectedStamp, setSelectedStamp] = useState<string | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [benchStage, setBenchStage] = useState<number | null>(null);
   const [pendingStage, setPendingStage] = useState<number | null>(null);
@@ -137,7 +132,6 @@ export const App: React.FC = () => {
   const mission = useMissionRuntime();
   const params = useMissionParameters();
   const stream = useStreamHealth(true);
-  const evidence = useEvidence(evidenceToken);
   // Fed the angle the telemetry bridge observed on the gimbal topic, so the
   // control follows the mission's own stage changes and not only the operator.
   const camera = useCameraTilt(telemetry.camera_tilt_deg);
@@ -185,24 +179,6 @@ export const App: React.FC = () => {
     (landed || over) && !reportDismissed && Boolean(mission.latestCapture),
     report
   );
-
-  // A new capture means the library on disk changed.
-  useEffect(() => {
-    if (!mission.latestCapture) return;
-    setEvidenceToken((n) => n + 1);
-    setSelectedStamp(
-      mission.latestCapture.filename
-        .replace(/^accident_(raw|inspected)_/, '')
-        .replace(/\.(png|jpg)$/, '')
-    );
-  }, [mission.latestCapture]);
-
-  // The mission ending is also a moment the library may have changed.
-  useEffect(() => {
-    if (mission.state === 'finished' || mission.state === 'faulted') {
-      setEvidenceToken((n) => n + 1);
-    }
-  }, [mission.state]);
 
   /**
    * A bench routine finishing returns the bench to ready, and nothing else.
@@ -529,8 +505,6 @@ export const App: React.FC = () => {
     failsafeFiredRef.current = false;
     setFailsafeTriggered(false);
     setOverlay('none');
-    setSelectedStamp(null);
-    setEvidenceToken((n) => n + 1);
     setScreen('preflight');
   }, [bridge, camera, copilot, mission, resetTrack]);
 
@@ -587,7 +561,6 @@ export const App: React.FC = () => {
           reportRevealed={reportRevealed}
           reportClosing={reportClosing}
           onAbort={() => void abort()}
-          onOpenEvidence={() => setOverlay('evidence')}
           onFinish={() => void finishMission()}
         />
       );
@@ -692,38 +665,9 @@ export const App: React.FC = () => {
 
       {overlay !== 'none' ? (
         <div className="fixed inset-0 z-[60] flex flex-col bg-abyss/92 backdrop-blur-sm">
-          {overlay === 'evidence' ? (
-            <header className="flex h-12 shrink-0 items-center justify-between border-b border-strut-soft px-4">
-              <h2 className="font-cond text-base tracking-wide text-frost">Dossiê pericial</h2>
-              <button
-                type="button"
-                onClick={() => setOverlay('none')}
-                aria-label="Fechar"
-                className="rounded-bezel p-1.5 text-haze transition-colors hover:bg-hull-raise hover:text-frost"
-              >
-                <X size={16} />
-              </button>
-            </header>
-          ) : (
-            <DiagnosticsOverlayHeader title="Diagnóstico · Terminal" onClose={() => setOverlay('none')} />
-          )}
+          <DiagnosticsOverlayHeader title="Diagnóstico · Terminal" onClose={() => setOverlay('none')} />
           <div className="min-h-0 flex-1">
-            {overlay === 'evidence' ? (
-              <EvidenceScreen
-                items={evidence.items}
-                status={evidence.status}
-                error={evidence.error}
-                onReload={() => void evidence.reload()}
-                selectedStamp={selectedStamp}
-                onSelect={setSelectedStamp}
-              />
-            ) : (
-              <DiagnosticsScreen
-                missionRunning={running}
-                onLand={land}
-                onClose={() => setOverlay('none')}
-              />
-            )}
+            <DiagnosticsScreen missionRunning={running} onLand={land} onClose={() => setOverlay('none')} />
           </div>
         </div>
       ) : null}
