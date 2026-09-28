@@ -38,10 +38,10 @@ const FOCUS_CORNERS: readonly string[] = [
  *
  * One gesture instead of the four the panel used to layer (grid, vignette,
  * static reticle, turning arc): an autofocus frame that hunts, closing and
- * opening around the camera glyph, and a focus ring that pulses out from it.
- * While the aircraft is over the target (`inspecting`) the frame locks: it
- * sits tighter, brightens and beats faster, which is the moment the capture is
- * about to happen. Both stop under `prefers-reduced-motion`.
+ * opening around the camera glyph. While the aircraft is over the target
+ * (`inspecting`) the frame locks: it sits tighter, brightens and beats
+ * faster, which is the moment the capture is about to happen. It stops under
+ * `prefers-reduced-motion`.
  */
 const EvidenceStandby: React.FC<{ inspecting: boolean }> = ({ inspecting }) => (
   <div
@@ -51,15 +51,6 @@ const EvidenceStandby: React.FC<{ inspecting: boolean }> = ({ inspecting }) => (
     <div className="relative flex flex-col items-center gap-5">
       <div className="relative grid h-32 w-32 place-items-center">
         <svg viewBox="0 0 128 128" className="absolute inset-0 h-full w-full overflow-visible" aria-hidden>
-          <circle
-            cx="64"
-            cy="64"
-            r="34"
-            fill="none"
-            stroke={inspecting ? '#5CF2CE' : '#01D5A3'}
-            strokeWidth="1.5"
-            className={cn('anim-focus-pulse', inspecting && 'anim-focus-fast')}
-          />
           <g
             fill="none"
             stroke={inspecting ? '#5CF2CE' : 'rgba(1,213,163,0.75)'}

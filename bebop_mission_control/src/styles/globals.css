@@ -173,12 +173,10 @@
     animation: stage-glow 2.2s ease-in-out infinite;
   }
   /* The forensic panel's autofocus: the frame hunting for focus while the
-     flight is on its way, locking tighter and faster over the target, and a
-     ring pulsing out from the camera in the same rhythm. SVG children scale
-     about their own centre, not the viewport's corner. */
+     flight is on its way, locking tighter and faster over the target. SVG
+     children scale about their own centre, not the viewport's corner. */
   .anim-focus-hunt,
-  .anim-focus-lock,
-  .anim-focus-pulse {
+  .anim-focus-lock {
     transform-box: fill-box;
     transform-origin: center;
   }
@@ -188,12 +186,7 @@
   .anim-focus-lock {
     animation: focus-lock 1.4s ease-in-out infinite;
   }
-  .anim-focus-pulse {
-    animation: focus-pulse 2.8s ease-out infinite;
-  }
-  .anim-focus-fast {
-    animation-duration: 1.4s;
-  }
+
   /* The terminal's cursor. */
   .anim-cursor {
     animation: cursor-blink 1.05s steps(1, end) infinite;
@@ -256,16 +249,6 @@
   }
 }
 
-@keyframes focus-pulse {
-  0% {
-    transform: scale(0.8);
-    opacity: 0.7;
-  }
-  100% {
-    transform: scale(1.55);
-    opacity: 0;
-  }
-}
 
 @keyframes cursor-blink {
   0%,
@@ -367,7 +350,6 @@
   .anim-stage-glow,
   .anim-focus-hunt,
   .anim-focus-lock,
-  .anim-focus-pulse,
   .anim-cursor,
   .anim-finding-reveal {
     animation: none !important;
