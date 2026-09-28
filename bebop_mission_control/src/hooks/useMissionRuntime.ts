@@ -28,6 +28,13 @@ export function useMissionRuntime() {
   const [stageName, setStageName] = useState<string>('');
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [exitCode, setExitCode] = useState<number | null>(null);
+  /**
+   * A mission process existed in this cycle: spawned by a launch, or started
+   * as a bench routine. Cleared only by `reset`. It is what tells a flight
+   * that ended apart from a launch that never got off the ground, both of
+   * which read `faulted`.
+   */
+  const [ran, setRan] = useState(false);
   const [missionLog, setMissionLog] = useState<LogLine[]>([]);
   const [driverLog, setDriverLog] = useState<LogLine[]>([]);
   const [latestCapture, setLatestCapture] = useState<RawEvidence | null>(null);
@@ -102,6 +109,7 @@ export function useMissionRuntime() {
         return { success: false, message: 'Uma missão já está em andamento.' };
       }
       processUp.current = true;
+      setRan(false);
       setState('arming');
       setStage(0);
       stageRef.current = 0;
@@ -135,6 +143,7 @@ export function useMissionRuntime() {
         setState('faulted');
         cues.play('fault');
       } else {
+        setRan(true);
         setState('running');
       }
       return result;
@@ -173,6 +182,7 @@ export function useMissionRuntime() {
    */
   const reset = useCallback(() => {
     processUp.current = false;
+    setRan(false);
     setState('idle');
     setStage(0);
     stageRef.current = 0;
@@ -196,6 +206,7 @@ export function useMissionRuntime() {
    */
   const beginBenchStage = useCallback(() => {
     processUp.current = true;
+    setRan(true);
     setState('running');
     setStage(0);
     stageRef.current = 0;
@@ -216,6 +227,7 @@ export function useMissionRuntime() {
     stageName,
     startedAt,
     exitCode,
+    ran,
     missionLog,
     driverLog,
     latestCapture,

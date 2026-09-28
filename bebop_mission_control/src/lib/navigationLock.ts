@@ -3,17 +3,21 @@ import type { MissionState } from '../types/mission';
 /**
  * Whether the pre-flight tab is locked.
  *
- * Locked from the operator's launch click — the runtime is `arming` before the
- * mission process has even been spawned, so the whole countdown is covered —
- * through the flight and any abort, until the process reports its exit. The
- * pre-flight screen's one control commands a launch, and the cockpit holds the
- * only control that stops one, so neither may be one tab away from the other
- * while an aircraft is committed.
+ * Locked from the operator's launch click -- the runtime is `arming` before the
+ * mission process has even been spawned, so the whole countdown is covered --
+ * through the flight, any abort and the landing, until the operator ends the
+ * cycle with "Finalizar missão" (which resets the runtime to `idle`). The
+ * process exiting is not the end of the cycle: the aircraft has only just
+ * landed and the report is being read, and the pre-flight screen's one
+ * control commands the next launch.
  *
- * The bench is no exception, a whole mission or a single routine: it rehearses
- * the flight, so it holds the operator in the cockpit the same way. The tab
- * frees as soon as the process reports its exit.
+ * `ran` says a mission process existed. A launch whose process never started
+ * also reads `faulted`, and it leaves the tab free: nothing flew, and the
+ * operator has to get back to the control that failed.
+ *
+ * The bench is no exception, a whole mission or a single routine.
  */
-export function preflightLocked(state: MissionState): boolean {
-  return state === 'arming' || state === 'running' || state === 'aborting';
+export function preflightLocked(state: MissionState, ran: boolean): boolean {
+  if (state === 'arming' || state === 'running' || state === 'aborting') return true;
+  return ran && (state === 'finished' || state === 'faulted');
 }
