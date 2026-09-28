@@ -106,6 +106,12 @@ describe('phrase pools', () => {
       for (const line of PHRASE_POOLS[key]) expect(line, key).not.toMatch(/\{[a-z_]+\}/);
     }
   });
+
+  it('never count seconds in the countdown call, which lands after synthesis latency', () => {
+    for (const line of PHRASE_POOLS['mission.countdown_3']) {
+      expect(line).not.toMatch(/segundo|\b(um|dois|tr[eê]s|quatro|cinco)\b|\d/i);
+    }
+  });
 });
 
 describe('estimateSpeechSeconds', () => {

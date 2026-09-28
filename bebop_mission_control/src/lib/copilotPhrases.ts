@@ -109,12 +109,12 @@ export const PHRASE_POOLS: Readonly<Record<MilestoneKey, readonly string[]>> = {
     'Missão em preparação. Carregando perfil de voo.',
   ],
   'mission.countdown_3': [
-    'Parâmetros carregados. Decolagem em três segundos.',
-    'Configuração validada. Iniciando voo em três segundos.',
-    'Parâmetros de voo prontos. Três segundos para a decolagem.',
+    'Parâmetros carregados. Sistemas prontos para o voo.',
+    'Configuração validada. Pronto para a decolagem.',
+    'Checklist completo. Aeronave pronta para o voo.',
     'Perfil de voo carregado. Decolagem iminente.',
-    'Parâmetros confirmados. Início do voo em três segundos.',
-    'Parâmetros aplicados. Afastem-se, decolagem em três segundos.',
+    'Parâmetros confirmados. Sistemas validados para a decolagem.',
+    'Parâmetros aplicados. Afastem-se da aeronave.',
   ],
   'mission.takeoff': [
     'Decolagem autorizada. Subindo para {altitude}.',
