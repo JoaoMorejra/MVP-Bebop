@@ -36,6 +36,9 @@ class TakeoffStep(BaseStep):
     def execute(self, ctx: MissionContext) -> StepStatus:
         logger.info("--- [%s] ---", self.name)
 
+        if not self._check_prearm_battery(ctx):
+            return StepStatus.FAILURE
+
         ctx.current_tilt_deg = ctx.params.gimbal.search_tilt_deg
         ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
 
@@ -63,6 +66,47 @@ class TakeoffStep(BaseStep):
             return status
 
         return self._finalize(ctx)
+
+    # ---------------------------------------------------------------- pre-arm
+
+    def _check_prearm_battery(self, ctx: MissionContext) -> bool:
+        """Refuse to launch on a charge already at the in-flight land threshold.
+
+        The same ``battery.land_pct`` the failsafe lands on, not a second
+        limit: a takeoff at or below it would be answered by a landing on the
+        first health check after liftoff. Without a fresh reading the launch
+        proceeds, as the in-flight net does -- a charge the aircraft has not
+        reported is not a reading to act on.
+        """
+        battery = getattr(ctx.failsafe, "battery_supervisor", None)
+        if battery is None:
+            return True
+        percentage = battery.current_percentage()
+        if percentage is None or percentage > battery.land_pct:
+            return True
+
+        if ctx.drone.no_fly:
+            logger.warning(
+                "Battery at %.0f%% is at or below the %.0f%% land threshold, but --no-fly "
+                "is active, so the mission continues on the bench.",
+                percentage,
+                battery.land_pct,
+            )
+            return True
+
+        logger.critical(
+            "Battery at %.0f%% is at or below the %.0f%% land threshold. Refusing to launch: "
+            "the in-flight battery net would land the aircraft immediately after liftoff.",
+            percentage,
+            battery.land_pct,
+        )
+        self._announce(
+            "Falha na decolagem",
+            f"bateria em {percentage:.0f} por cento, no limiar de pouso de "
+            f"{battery.land_pct:.0f} por cento, decolagem cancelada",
+            priority="CRITICAL",
+        )
+        return False
 
     # ------------------------------------------------------------ calibration
 
