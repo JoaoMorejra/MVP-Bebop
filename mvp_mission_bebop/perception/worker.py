@@ -36,6 +36,16 @@ the Ultralytics predictor is not re-entrant. The worker therefore only runs whil
 *engaged*. :meth:`PerceptionPipeline.disengage` returns once the in-flight cycle
 has finished, after which the caller owns both the camera and the detector --
 which is what Stage 4's evidence capture and the Stage 5 marker search rely on.
+
+Engagement fencing
+------------------
+Which results reach the slot is decided by number, not by that wait. Every
+:meth:`PerceptionWorker.engage` increments an engagement generation; a cycle
+records the generation current when it starts and publishes only if it is still
+current when inference returns. A cycle that outlives its engagement -- a
+detector that overran the ``disengage`` bound and finished after the next stage
+had already engaged -- is therefore discarded rather than delivered to a stage
+that never asked for it, whatever the timing.
 """
 
 from __future__ import annotations
@@ -69,6 +79,8 @@ DEFAULT_FRAME_TIMEOUT_SEC: Final[float] = 0.2
 #: One worst-case CPU inference (250 ms) plus one frame acquisition timeout,
 #: with a factor of four for a descheduled process. Exceeding it means the
 #: detector itself is hung, and the caller is told rather than blocked forever.
+#: It bounds exclusive use of the camera and detector only: the result of an
+#: overrunning cycle is fenced off by engagement generation, not by this wait.
 DEFAULT_DISENGAGE_TIMEOUT_SEC: Final[float] = 2.0
 
 #: How long ``stop`` waits for the thread to exit before giving up on the join.
@@ -527,6 +539,10 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
         # what guarantees the camera and detector are free when it returns.
         self._cycle_lock = threading.Lock()
         self._cycles: int = 0
+        #: Incremented under ``_settings_lock`` by every :meth:`engage`. A cycle
+        #: publishes only while the generation it started under is current.
+        self._engagement_generation: int = 0
+        self._discarded: int = 0
         self._last_fault_log: float = -math.inf
 
     @property
@@ -538,17 +554,46 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
         """Completed inference cycles since start."""
         return self._cycles
 
+    @property
+    def engagement_generation(self) -> int:
+        """Number of :meth:`engage` calls so far; zero before the first."""
+        with self._settings_lock:
+            return self._engagement_generation
+
+    @property
+    def discarded(self) -> int:
+        """Inference results dropped because their engagement had ended."""
+        with self._settings_lock:
+            return self._discarded
+
     def engage(
         self, conf: Optional[float] = None, imgsz: Union[int, float, str, None] = None
     ) -> None:
         conf, size = self._validate_settings(conf, imgsz)
+        # Generation, settings and slot change together under the settings
+        # lock, which is also the lock a cycle publishes under, so no cycle can
+        # observe the new generation with the previous stage's slot contents.
         with self._settings_lock:
             self._conf = conf
             self._imgsz = size
-        self._slot.clear()
+            self._engagement_generation += 1
+            self._slot.clear()
         self._engaged_event.set()
 
     def disengage(self, timeout_sec: float = DEFAULT_DISENGAGE_TIMEOUT_SEC) -> bool:
+        """Stop the worker and wait, bounded, for the in-flight cycle.
+
+        The wait is for exclusive use of the camera and detector. It is not
+        what keeps a late result out of the next engagement: that is the
+        engagement generation, so a False return no longer lets a stale
+        observation through.
+
+        Returns
+        -------
+        bool
+            True once no cycle is in flight, False if the in-flight cycle did
+            not finish within ``timeout_sec``.
+        """
         self._engaged_event.clear()
         if threading.current_thread() is self:
             return True
@@ -557,7 +602,8 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
             self._cycle_lock.release()
         else:
             logger.error(
-                "Perception cycle still in flight %.1f s after disengage; the detector may be hung.",
+                "Perception cycle still in flight %.1f s after disengage; the detector may be "
+                "hung. Its result will be discarded by engagement generation.",
                 timeout_sec,
             )
         return acquired
@@ -602,24 +648,33 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
         logger.info("Perception worker stopped after %d cycles.", self._cycles)
 
     def _cycle(self) -> None:
+        with self._settings_lock:
+            generation = self._engagement_generation
+            conf, imgsz = self._conf, self._imgsz
+
         frame = self._ctx.grab_frame(timeout_sec=self._frame_timeout)
         if frame is None:
             return
         stamp = self._clock()
-        conf, imgsz, _ = self._snapshot_settings()
 
         started = time.perf_counter()
         result = self._infer(frame, conf, imgsz)
         inference_sec = time.perf_counter() - started
 
-        if not self._engaged_event.is_set():
-            # Disengaged mid-inference: the stage that asked for this result has
-            # ended, and the next one must not inherit it.
-            return
-
-        sample = self._slot.publish(frame, result, stamp, inference_sec)
+        with self._settings_lock:
+            # Disengaged mid-inference, or disengaged and re-engaged: the stage
+            # that asked for this result has ended, and the next one must not
+            # inherit it. Checked and published under the lock ``engage`` holds,
+            # so the decision cannot interleave with a new engagement.
+            if (
+                generation != self._engagement_generation
+                or not self._engaged_event.is_set()
+            ):
+                self._discarded += 1
+                return
+            sample = self._slot.publish(frame, result, stamp, inference_sec)
+            status = self._status
         self._cycles += 1
-        _, _, status = self._snapshot_settings()
         self._ctx.publish_detection_summary(sample, status)
 
     def _log_fault(self, exc: Exception) -> None:

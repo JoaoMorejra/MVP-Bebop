@@ -267,6 +267,92 @@ def test_engaging_clears_the_previous_stage_result(worker_factory):
     assert worker.slot.latest() is None
 
 
+class GatedCtx(PerceptionCtx):
+    """A detector whose first call blocks until released, as a hung one would.
+
+    Each result records the confidence it was produced under, so a sample in
+    the slot can be traced back to the engagement that asked for it.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.first_call = threading.Event()
+
+    def detect(self, _frame, **kwargs):
+        with self._lock:
+            self.detect_calls.append(kwargs)
+            first = len(self.detect_calls) == 1
+        if first:
+            self.first_call.set()
+            self.release.wait(timeout=5.0)
+        result = Result([Detection()])
+        result.conf = kwargs.get("conf")
+        return result
+
+
+def test_every_engage_advances_the_engagement_generation(worker_factory):
+    worker = worker_factory(PerceptionCtx())
+    assert worker.engagement_generation == 0
+
+    worker.engage(conf=0.5)
+    worker.disengage()
+    worker.engage(conf=0.6)
+
+    assert worker.engagement_generation == 2
+
+
+def test_a_cycle_that_overruns_disengage_is_fenced_off_the_next_engagement(worker_factory):
+    """The race: disengage times out, the next stage engages, the old cycle lands.
+
+    Before the fence the late cycle only checked the engaged flag, which the
+    new engagement had already set again, so the previous stage's observation
+    was delivered to the next stage as if it were its own.
+    """
+    ctx = GatedCtx()
+    worker = worker_factory(ctx)
+    worker.engage(conf=0.5)
+    assert ctx.first_call.wait(timeout=2.0)
+
+    assert worker.disengage(timeout_sec=0.05) is False
+    worker.engage(conf=0.6)
+    ctx.release.set()
+
+    assert wait_until(lambda: worker.get_latest(1.0) is not None)
+    assert worker.discarded == 1
+    assert worker.get_latest(1.0).result.conf == 0.6
+    assert all(sample.result.conf == 0.6 for sample in ctx.summaries)
+
+
+def test_a_fenced_result_never_reaches_the_overlay(worker_factory):
+    ctx = GatedCtx()
+    worker = worker_factory(ctx)
+    worker.engage(conf=0.5)
+    assert ctx.first_call.wait(timeout=2.0)
+
+    assert worker.disengage(timeout_sec=0.05) is False
+    ctx.release.set()
+    assert wait_until(lambda: worker.discarded == 1)
+
+    assert worker.slot.latest() is None
+    assert ctx.summaries == []
+    assert worker.cycles == 0
+
+
+def test_the_current_engagement_still_publishes_after_a_fence(worker_factory):
+    ctx = GatedCtx()
+    worker = worker_factory(ctx)
+    worker.engage(conf=0.5)
+    assert ctx.first_call.wait(timeout=2.0)
+    worker.disengage(timeout_sec=0.05)
+    worker.engage(conf=0.7)
+    ctx.release.set()
+
+    assert wait_until(lambda: len(ctx.summaries) >= 3)
+    generations = [sample.generation for sample in ctx.summaries]
+    assert generations == sorted(set(generations))
+
+
 def test_input_size_is_forwarded_only_when_configured(worker_factory):
     """Omitting it keeps the call valid against a detector without the keyword."""
     ctx = PerceptionCtx()
