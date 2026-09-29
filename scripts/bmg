@@ -27,12 +27,18 @@ fi
 
 MISSION_DIR="${PACKAGE_DIR}/mvp_mission_bebop"
 
-# Activate Nectar SDK and ROS 2 environment
+# Activate Nectar SDK and ROS 2 environment. A bare `source` hands this
+# script's arguments to the sourced file, and nectar-activate execs "$@" when
+# it has any, so the positional parameters are cleared around the source and
+# restored for Electron afterwards.
+BMG_ARGS=("$@")
+set --
 if [ -f "${WS_DIR}/bin/nectar-activate" ]; then
     source "${WS_DIR}/bin/nectar-activate"
 elif [ -f "${WS_DIR}/.venv/bin/activate" ]; then
     source "${WS_DIR}/.venv/bin/activate"
 fi
+set -- "${BMG_ARGS[@]}"
 
 # Ensure graphical display is available
 if [ -z "$DISPLAY" ]; then
