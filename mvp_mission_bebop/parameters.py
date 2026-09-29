@@ -50,6 +50,9 @@ class GimbalConstraintsConfig:
     #: subject. At -69 deg the optical axis meets the ground one altitude-over-
     #: tan(69) ahead -- 0.60 m at the 1.55 m operating height -- which frames the
     #: scene from a standoff the drone can hold without overflying it.
+    #:
+    #: Safe envelope: ``[-90, search_tilt_deg)``. Below -90 the axis looks
+    #: backward; at or above the search attitude the approach can never end.
     nadir_tilt_deg: float = -69.0
     #: How close to :attr:`nadir_tilt_deg` the commanded tilt must come before
     #: the inspection attitude counts as reached, in degrees.
@@ -395,6 +398,12 @@ class AltitudeGovernorConfig:
 class FlightKinematicsConfig:
     """Translational velocity caps and geometric safety envelopes."""
 
+    #: Operating altitude above the calibrated ground reference, in metres.
+    #:
+    #: Safe envelope: above ``VisionConfig.min_altitude_for_ibvs_m``, below
+    #: which the approach abandons the IBVS projection for the open-loop ramp,
+    #: and above :attr:`takeoff_settle_min_altitude_m`, below which no hover
+    #: sample counts as settled and the stabilization gate can only time out.
     target_altitude_m: float = 1.00
     altitude_ceiling_margin_m: float = 0.25
     forward_cruise_velocity: float = 0.20
@@ -518,6 +527,9 @@ class FlightKinematicsConfig:
     #: guidance law cannot command a full-throttle translation. Until now no
     #: bound of any kind stood between a guidance law and the wire: the failsafe
     #: saturated ``vz`` and ``vyaw`` and passed ``vx``/``vy`` through untouched.
+    #:
+    #: Safe envelope: at or above every legitimate demand (the cruise and
+    #: approach speeds, the lateral PID ceiling, the RTL cruise) and below 1.0.
     max_horizontal_speed: float = 0.30
     #: Target cadence for closed-loop mission control loops.
     control_loop_hz: float = 15.0
@@ -679,12 +691,17 @@ class ReturnToLaunchConfig:
     #: is rejected outright rather than treated as a weak observation: a
     #: mis-identified pad is a landing at the wrong place, and there is no
     #: subsequent stage to catch it.
+    #:
+    #: Safe envelope: a non-negative integer inside :attr:`marker_dict`.
     target_aruco_id: int = 8
     #: ArUco/AprilTag dictionary identifier, passed to
     #: ``nectar.vision.Aruco``.  Accepts legacy integer orders (4, 5, 6, 7 for
     #: ``DICT_NxN_1000``), OpenCV enum integers (e.g. ``20`` for
     #: ``DICT_APRILTAG_36h11``), or string names (e.g. ``"DICT_APRILTAG_36h11"``,
     #: ``"tag36h11"``).
+    #:
+    #: Safe envelope: a value the Stage 5 resolver accepts. Anything else
+    #: leaves the return on the degraded odometric path described above.
     marker_dict: Union[int, str] = "DICT_APRILTAG_36h11"
     #: Physical edge length of the printed marker, in metres.
     #:
@@ -693,6 +710,8 @@ class ReturnToLaunchConfig:
     #: 0.20 m and printed 0.15 m reports every distance 33% too large and the
     #: centering law converges onto a point 33% off. Measure the printed
     #: marker's black border, edge to edge.
+    #:
+    #: Safe envelope: a positive, finite length.
     tag_size: float = 0.20
     #: Gimbal depression for the return leg, in degrees (negative is down).
     #:
@@ -705,6 +724,8 @@ class ReturnToLaunchConfig:
     #: ``altitude / tan(80 deg)`` ahead -- 0.18 m at 1.0 m AGL -- and, more to the
     #: point, keeps the whole forward half of the frame looking at ground the
     #: drone has not yet flown over.
+    #:
+    #: Safe envelope: ``(-90, 0)``, down but never exactly nadir.
     camera_tilt_deg: float = -80.0
     #: Reverse cruise command for the marker search, normalized.
     #:
@@ -714,6 +735,8 @@ class ReturnToLaunchConfig:
     #: a sign error in configuration cannot turn the return into an outbound
     #: cruise. Slower than the Stage 2 cruise because the payoff is detection
     #: probability per metre travelled, not metres travelled.
+    #:
+    #: Safe envelope: strictly negative.
     reverse_cruise_velocity: float = -0.10
     #: Longitudinal (body-x) centering gains, m/s per metre of error and per
     #: metre-per-second of error rate.
@@ -744,6 +767,8 @@ class ReturnToLaunchConfig:
     #: retained unchanged as the internal deadband/rest-mode switch the PD
     #: converges the approach against; this is the separate, operational
     #: statement of when the approach is done.
+    #:
+    #: Safe envelope: at or above :attr:`centering_tolerance_m`.
     landing_radius_m: float = 0.13
     #: Consecutive cycles inside :attr:`landing_radius_m` *at residual speed*
     #: required before the landing is authorized. A single sample inside the

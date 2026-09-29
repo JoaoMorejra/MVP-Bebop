@@ -26,6 +26,7 @@ from nectar.vision import ImageHandler, QoSReliability, ROSConfig
 
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
+from mvp_mission_bebop.config_audit import log_envelope_divergences
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
@@ -351,6 +352,9 @@ def main() -> None:
         params.gimbal.nadir_tilt_tolerance_deg,
         params.rtl.timeout_sec,
     )
+    # Advisory only: a value outside its documented envelope is reported on the
+    # ground, where the operator can still act on it, and the mission proceeds.
+    log_envelope_divergences(params)
 
     try:
         from mvp_mission_bebop.telemetry.announcer import announce_sync
