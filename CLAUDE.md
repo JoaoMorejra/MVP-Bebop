@@ -21,7 +21,7 @@ O projeto consiste no sistema autonomo completo para o drone **Parrot Bebop 2**,
 
 O repositorio oficial da **Black Bee Drones** localiza-se no workspace em:
 ```text
-/home/jv/ros2_ws/src/nectar-sdk
+/home/joaomoreira/ros2_ws/src/nectar-sdk
 ```
 
 ### Regras de Ouro de Conhecimento e Implementacao
