@@ -918,6 +918,29 @@ class TimeoutsConfig:
 
 
 @dataclass
+class BatteryConfig:
+    """Onboard battery safety net, independent of the ground station.
+
+    The station owns the battery failsafe and its RTL-versus-land decision
+    (``bebop_mission_control/src/lib/batteryFailsafe.ts``). This section exists
+    for the runs it is not in command of -- a headless CLI bench routine, a
+    crashed GUI, a dropped IPC bridge -- where the mission process itself lands
+    the aircraft where it is. See :mod:`mvp_mission_bebop.telemetry.battery`.
+    """
+
+    #: Charge, in percent, at or below which the mission lands in place.
+    #:
+    #: Sent by the station at launch as ``battery.land_pct`` in the
+    #: ``--params-json`` payload, carrying the operator's battery-flyout
+    #: threshold (``failsafe.thresholdPct`` in ``App.tsx``). Absent -- a CLI run
+    #: without the station -- it falls back to this default, which is the same
+    #: number as ``FAILSAFE_DEFAULT.thresholdPct`` in ``App.tsx`` by convention
+    #: only: the two languages cannot share the constant, so a change on either
+    #: side must be replicated on the other.
+    land_pct: float = 20.0
+
+
+@dataclass
 class MissionParameters:
     """Root container consolidating all configurable mission subsystems."""
 
@@ -933,8 +956,28 @@ class MissionParameters:
     dead_reckoning: DeadReckoningConfig = field(default_factory=DeadReckoningConfig)
     inspection: InspectionConfig = field(default_factory=InspectionConfig)
     timeouts: TimeoutsConfig = field(default_factory=TimeoutsConfig)
+    battery: BatteryConfig = field(default_factory=BatteryConfig)
     no_fly: bool = False
     output_dir: str = "."
+
+    @property
+    def battery_land_pct(self) -> float:
+        """Charge, in percent, at which the mission lands in place.
+
+        Read-only view of ``battery.land_pct``, the nested path the station
+        writes. Not a dataclass field, so it never appears in :meth:`to_dict`
+        and the on-disk layout carries the value exactly once.
+
+        Raises
+        ------
+        TypeError
+            If the configured value is not numeric.
+        ValueError
+            If it is non-finite or outside ``[0, 100]``.
+        """
+        from mvp_mission_bebop.telemetry.battery import normalize_percentage
+
+        return normalize_percentage(self.battery.land_pct, "battery.land_pct")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert parameter dataclasses to a plain nested dictionary.

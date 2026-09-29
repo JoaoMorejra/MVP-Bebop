@@ -106,10 +106,15 @@ def test_to_dict_is_callable_the_way_the_gcs_calls_it():
         ("vision", "confirmation_frames"),
         ("vision", "target_classes"),
         ("rtl", "arrival_radius_m"),
+        ("battery", "land_pct"),
     ],
 )
 def test_configuration_keys_the_renderer_reads_still_exist(path):
-    """MissionLaunchScreen.tsx reads these nested keys by name."""
+    """The renderer reads and writes these nested keys by name.
+
+    ``battery.land_pct`` is written rather than read: ``App.tsx`` injects the
+    battery-flyout threshold under it into every launch payload.
+    """
     node = MissionParameters().to_dict()
     for segment in path:
         assert segment in node, f"{'.'.join(path)} is read by the GCS"
@@ -136,6 +141,7 @@ def test_params_json_payload_from_the_gcs_is_accepted():
             "target_classes": ["motorcycle"],
         },
         "rtl": {"arrival_radius_m": 0.18},
+        "battery": {"land_pct": 25},
         "no_fly": True,
     }
 
@@ -148,6 +154,7 @@ def test_params_json_payload_from_the_gcs_is_accepted():
     assert params.vision.confirmation_frames == 4
     assert params.vision.target_classes == ["motorcycle"]
     assert params.rtl.arrival_radius_m == 0.18
+    assert params.battery_land_pct == 25.0
     assert params.no_fly is True
 
 
@@ -349,7 +356,9 @@ MILESTONE_LINE = re.compile(r"\[MILESTONE ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$")
 STEP_LINE = re.compile(r"\[STEP ([1-5]):")
 
 #: Pool keys of the synchronisation table (spec section 4) that the mission
-#: process raises. ``mission.start`` and ``mission.countdown_3`` belong to the GCS.
+#: process raises, plus ``mission.battery_warning`` from the onboard battery net
+#: (``telemetry.battery``). ``mission.start`` and ``mission.countdown_3`` belong
+#: to the GCS.
 SPEC_MILESTONE_KEYS = (
     "mission.takeoff",
     "mission.scan_start",
@@ -358,6 +367,7 @@ SPEC_MILESTONE_KEYS = (
     "mission.capture_done",
     "mission.rtl_start",
     "mission.landing",
+    "mission.battery_warning",
 )
 
 
@@ -470,6 +480,7 @@ _SHORT_BENCH_RUN = {
     },
     "timeouts": {"search_timeout_sec": 10.0, "tracking_timeout_sec": 4.0},
     "rtl": {"timeout_sec": 4.0, "centering_timeout_sec": 3.0, "touchdown_timeout_sec": 4.0},
+    "battery": {"land_pct": 20.0},
 }
 
 

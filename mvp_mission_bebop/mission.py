@@ -15,8 +15,9 @@ from typing import List, Optional
 
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Int32
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 
 import nectar
 from nectar.ai.detection import Detector
@@ -32,7 +33,7 @@ from mvp_mission_bebop.controllers.visual_servoing import VisualServoingControll
 from mvp_mission_bebop.engine.runner import MissionRunner
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
-from mvp_mission_bebop.parameters import MissionParameters
+from mvp_mission_bebop.parameters import BatteryConfig, MissionParameters
 from mvp_mission_bebop.perception.worker import PerceptionWorker, detector_kwargs, normalize_imgsz
 from mvp_mission_bebop.steps import (
     ClosedLoopRTLStep,
@@ -40,6 +41,11 @@ from mvp_mission_bebop.steps import (
     NadirInspectionStep,
     TakeoffStep,
     VisualServoingStep,
+)
+from mvp_mission_bebop.telemetry.battery import (
+    BATTERY_WARNING_PCT,
+    BatterySupervisor,
+    normalize_percentage,
 )
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
@@ -376,6 +382,16 @@ def main() -> None:
     )
     calibration = SpeedCalibration.from_kinematics(params.kinematics)
 
+    # Normalized on the ground, like the detector input size below: a malformed
+    # threshold costs a log line here instead of disabling the net in flight.
+    try:
+        params.battery.land_pct = normalize_percentage(params.battery.land_pct, "battery.land_pct")
+    except (TypeError, ValueError) as exc:
+        fallback = BatteryConfig().land_pct
+        logger.error("Invalid battery.land_pct (%s); using %.0f%%.", exc, fallback)
+        params.battery.land_pct = fallback
+    battery_supervisor = BatterySupervisor(params.battery)
+
     # The aggregated motion sequence. Fed by the actuator proxy, so every
     # ``move_velocity`` the mission transmits is accounted for without any step
     # having to remember to report itself, and armed by Stage 1 at the same
@@ -498,6 +514,22 @@ def main() -> None:
         odom_supervisor.odometry_callback,
         qos_profile_sensor_data,
     )
+    # The driver publishes this topic reliable and transient-local at depth 1,
+    # so a matching subscription receives the last reported charge on creation
+    # instead of waiting up to one 500 ms state period for the next one.
+    battery_topic = f"/{params.network.namespace.strip('/')}/states/battery"
+    telemetry_node.create_subscription(
+        BatteryState,
+        battery_topic,
+        battery_supervisor.battery_callback,
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+    )
+    logger.info(
+        "Battery net on %s: land in place at <= %.0f%%, warning at <= %.0f%%.",
+        battery_topic,
+        params.battery_land_pct,
+        BATTERY_WARNING_PCT,
+    )
     nectar.add_node(telemetry_node)
 
     if simulator is not None:
@@ -535,6 +567,7 @@ def main() -> None:
         odom_supervisor=odom_supervisor,
         timeouts_cfg=params.timeouts,
         kinematics_cfg=params.kinematics,
+        battery_supervisor=battery_supervisor,
     )
     visual_controller = VisualServoingController(
         gimbal_config=params.gimbal,

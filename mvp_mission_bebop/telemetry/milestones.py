@@ -55,7 +55,9 @@ ALERT_KEYS: Final[Tuple[str, ...]] = (
     "mission.alert",
 )
 
-#: Milestones this process emits, in flight order.
+#: Milestones this process emits: the flight script in flight order, then
+#: ``mission.battery_warning``, which is raised at whatever point the charge
+#: crosses the fixed warning threshold (``telemetry.battery``).
 MILESTONE_KEYS: Final[Tuple[str, ...]] = (
     "mission.takeoff",
     "mission.scan_start",
@@ -64,6 +66,7 @@ MILESTONE_KEYS: Final[Tuple[str, ...]] = (
     "mission.capture_done",
     "mission.rtl_start",
     "mission.landing",
+    "mission.battery_warning",
 )
 
 

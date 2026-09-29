@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Final, Iterator, Optional, Tuple
 
 from mvp_mission_bebop.exceptions import KinematicConstraintViolation
 from mvp_mission_bebop.parameters import FlightKinematicsConfig, TimeoutsConfig
+from mvp_mission_bebop.telemetry.battery import BatterySupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor, TelemetryHealth
 
 if TYPE_CHECKING:  # pragma: no cover - avoids a circular import at runtime
@@ -34,11 +35,15 @@ class FailsafeSupervisor:
         odom_supervisor: OdometrySupervisor,
         timeouts_cfg: TimeoutsConfig,
         kinematics_cfg: Optional[FlightKinematicsConfig] = None,
+        battery_supervisor: Optional[BatterySupervisor] = None,
     ) -> None:
         self.actuator = drone_actuator
         self.odom_supervisor = odom_supervisor
         self.timeouts_cfg = timeouts_cfg
         self.kinematics_cfg = kinematics_cfg or FlightKinematicsConfig()
+        #: Onboard low-charge net. ``None`` disables the battery condition,
+        #: which is what every caller built before it existed gets.
+        self.battery_supervisor = battery_supervisor
         self.last_valid_frame_timestamp: float = time.monotonic()
         self.failsafe_active: bool = False
 
@@ -296,7 +301,7 @@ class FailsafeSupervisor:
             )
 
     def evaluate_system_health(self) -> Tuple[bool, str]:
-        """Verify telemetry health, altitude ceiling, and optical stream continuity."""
+        """Verify telemetry health, altitude ceiling, battery charge, and optical stream continuity."""
         if self.failsafe_active:
             return False, "Failsafe already active."
 
@@ -310,6 +315,11 @@ class FailsafeSupervisor:
             rel_alt = self.odom_supervisor.relative_altitude
             ceiling = self.odom_supervisor.altitude_ceiling
             return False, f"Altitude ceiling breached: {rel_alt:.2f} m > {ceiling:.2f} m."
+
+        if self.battery_supervisor is not None:
+            battery_reason = self.battery_supervisor.land_reason()
+            if battery_reason is not None:
+                return False, battery_reason
 
         frame_age = time.monotonic() - self.last_valid_frame_timestamp
         timeout = self.timeouts_cfg.video_stream_timeout_sec
