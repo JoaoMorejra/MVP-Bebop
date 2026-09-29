@@ -10,6 +10,8 @@
  * path and the runner continues at the requested stage.
  */
 
+import { setPath } from './paths';
+
 export const FAILSAFE_MIN_PCT = 0;
 export const FAILSAFE_MAX_PCT = 100;
 
@@ -52,4 +54,24 @@ export function failsafeAction(stage: number, missionRunning: boolean): Failsafe
   if (!missionRunning) return 'land';
   if (stage === RTL_STAGE) return 'none';
   return RETURNABLE_STAGES.has(stage) ? 'rtl' : 'land';
+}
+
+/**
+ * Where the mission reads its onboard land threshold:
+ * `BatteryConfig.land_pct` in `mvp_mission_bebop/parameters.py`.
+ */
+export const LAND_PCT_PATH = 'battery.land_pct';
+
+/**
+ * The `--params-json` payload for a launch or a bench routine.
+ *
+ * The parameter document goes out whole, with the battery-flyout threshold
+ * written under {@link LAND_PCT_PATH}. The mission lands in place at that
+ * charge only when this station is not the one in command (a CLI bench run, a
+ * dropped bridge); with the station up, the RTL-versus-land decision above is
+ * still taken here. The flyout keeps its own persistence, so the value is
+ * injected into a clone and never becomes a second stored copy.
+ */
+export function launchParamsJson(doc: unknown, thresholdPct: number): string {
+  return JSON.stringify(setPath(doc ?? {}, LAND_PCT_PATH, thresholdPct));
 }

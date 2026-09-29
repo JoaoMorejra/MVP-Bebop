@@ -2,7 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Screen } from './types/mission';
 import type { Finding } from './lib/forensics';
 import type { BatteryFailsafe } from './types/bmg';
-import { RTL_ACK_TIMEOUT_MS, RTL_STAGE, clampThreshold, failsafeAction } from './lib/batteryFailsafe';
+import {
+  RTL_ACK_TIMEOUT_MS,
+  RTL_STAGE,
+  clampThreshold,
+  failsafeAction,
+  launchParamsJson,
+} from './lib/batteryFailsafe';
 import { PreflightScreen } from './components/preflight/PreflightScreen';
 import { CountdownOverlay } from './components/preflight/CountdownOverlay';
 import { CockpitScreen } from './components/cockpit/CockpitScreen';
@@ -249,7 +255,7 @@ export const App: React.FC = () => {
         detectionTopic: String(
           getPath(doc, 'network.detection_stream_topic') ?? '/bebop/camera/detections'
         ),
-        paramsJson: JSON.stringify(doc ?? {}),
+        paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
       });
 
       if (!result.success) {
@@ -271,7 +277,7 @@ export const App: React.FC = () => {
     } finally {
       launching.current = false;
     }
-  }, [mission, params, primeLaunchPhrases, resetTrack]);
+  }, [failsafe.thresholdPct, mission, params, primeLaunchPhrases, resetTrack]);
 
   /**
    * One routine on the bench: same process, motors inert, and the same
@@ -308,7 +314,7 @@ export const App: React.FC = () => {
         detectionTopic: String(
           getPath(doc, 'network.detection_stream_topic') ?? '/bebop/camera/detections'
         ),
-        paramsJson: JSON.stringify(doc ?? {}),
+        paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
         countdown: seconds,
       });
 
@@ -325,7 +331,16 @@ export const App: React.FC = () => {
         setScreen('cockpit');
       }
     },
-    [bridge, copilot, mission, params.working, params.committed, primeLaunchPhrases, resetTrack]
+    [
+      bridge,
+      copilot,
+      failsafe.thresholdPct,
+      mission,
+      params.working,
+      params.committed,
+      primeLaunchPhrases,
+      resetTrack,
+    ]
   );
 
   /**
