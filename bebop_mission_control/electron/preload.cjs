@@ -1,3 +1,4 @@
+const path = require('path');
 const { contextBridge, ipcRenderer } = require('electron');
 
 /**
@@ -15,7 +16,7 @@ const subscribe = (channel) => (callback) => {
 
 contextBridge.exposeInMainWorld('bmgAPI', {
   isElectron: true,
-  missionDir: '/home/joaomoreira/ros2_ws/src/mvp_mission_bebop/mvp_mission_bebop',
+  missionDir: path.resolve(__dirname, '..', '..', 'mvp_mission_bebop'),
 
   // Wi-Fi link to the aircraft
   scanWifi: (options) => ipcRenderer.invoke('bmg:scan-wifi', options),

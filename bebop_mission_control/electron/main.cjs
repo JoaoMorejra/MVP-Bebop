@@ -10,19 +10,24 @@ const { deferBenchSpawn } = require('./benchCountdown.cjs');
 const { readSiteAnchorFile } = require('./siteAnchor.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
-const MISSION_DIR = '/home/joaomoreira/ros2_ws/src/mvp_mission_bebop/mvp_mission_bebop';
-const NECTAR_SDK_DIR = '/home/joaomoreira/ros2_ws/src/nectar-sdk';
+// The monorepo is checked out as <ws>/src/mvp_mission_bebop on every
+// workstation, under different home directories, so every host path is
+// resolved from this file's location rather than from a literal home.
+const MISSION_PACKAGE_DIR = path.resolve(__dirname, '..', '..');
+const WORKSPACE_DIR = path.resolve(MISSION_PACKAGE_DIR, '..', '..');
+const MISSION_DIR = path.join(MISSION_PACKAGE_DIR, 'mvp_mission_bebop');
+const NECTAR_SDK_DIR = path.join(WORKSPACE_DIR, 'src', 'nectar-sdk');
 const STREAMER_DIR = path.join(__dirname, '..', 'streamer');
-const PYTHON_VENV = '/home/joaomoreira/ros2_ws/.venv/bin/python3';
-const NECTAR_ACTIVATOR = '/home/joaomoreira/ros2_ws/bin/nectar-activate';
+const VENV_DIR = path.join(WORKSPACE_DIR, '.venv');
+const PYTHON_VENV = path.join(VENV_DIR, 'bin', 'python3');
+const NECTAR_ACTIVATOR = path.join(WORKSPACE_DIR, 'bin', 'nectar-activate');
 const CONFIG_PATH = path.join(MISSION_DIR, 'mission_config.json');
-const MISSION_PACKAGE_DIR = '/home/joaomoreira/ros2_ws/src/mvp_mission_bebop';
 const COMMAND_SCRIPT = path.join(STREAMER_DIR, 'command_bridge.py');
 const MJPEG_PORT = 9090;
 const DRONE_IP = '192.168.42.1';
 const BEBOP_SSID_RE = /^Bebop2?[-_]/i;
 /** Where the diagnostics terminal's shell starts. */
-const TERMINAL_HOME = '/home/joaomoreira/ros2_ws';
+const TERMINAL_HOME = WORKSPACE_DIR;
 
 // Bring-up budget: how long the aircraft gets to answer each stage of
 // `bmg:ensure-link` before the GCS calls it a failure and says which stage.
@@ -53,28 +58,28 @@ function getNectarEnv() {
     console.warn('[BMG] Dynamic environment resolution failed, using canonical fallback:', err.message);
     cachedNectarEnv = {
       ...process.env,
-      VIRTUAL_ENV: '/home/joaomoreira/ros2_ws/.venv',
+      VIRTUAL_ENV: VENV_DIR,
       ROS_DISTRO: 'jazzy',
       ROS_DOMAIN_ID: '14',
       ROS_AUTOMATIC_DISCOVERY_RANGE: 'LOCALHOST',
       ROS_STATIC_PEERS: '127.0.0.1',
       PYTHONUNBUFFERED: '1',
-      LD_LIBRARY_PATH: `/home/joaomoreira/.local/lib:/home/joaomoreira/ros2_ws/.venv/lib:${process.env.LD_LIBRARY_PATH || ''}`,
-      PATH: `/home/joaomoreira/ros2_ws/.venv/bin:/opt/ros/jazzy/bin:${process.env.PATH || ''}`,
+      LD_LIBRARY_PATH: `${path.join(os.homedir(), '.local', 'lib')}:${path.join(VENV_DIR, 'lib')}:${process.env.LD_LIBRARY_PATH || ''}`,
+      PATH: `${path.join(VENV_DIR, 'bin')}:/opt/ros/jazzy/bin:${process.env.PATH || ''}`,
       PYTHONPATH: [
-        '/home/joaomoreira/ros2_ws/install/mvp_mission_bebop/lib/python3.12/site-packages',
-        '/home/joaomoreira/ros2_ws/install/nectar/lib/python3.12/site-packages',
-        '/home/joaomoreira/ros2_ws/install/nectar_interfaces/lib/python3.12/site-packages',
-        '/home/joaomoreira/ros2_ws/install/ros2_bebop_driver/lib/python3.12/site-packages',
+        path.join(WORKSPACE_DIR, 'install', 'mvp_mission_bebop', 'lib', 'python3.12', 'site-packages'),
+        path.join(WORKSPACE_DIR, 'install', 'nectar', 'lib', 'python3.12', 'site-packages'),
+        path.join(WORKSPACE_DIR, 'install', 'nectar_interfaces', 'lib', 'python3.12', 'site-packages'),
+        path.join(WORKSPACE_DIR, 'install', 'ros2_bebop_driver', 'lib', 'python3.12', 'site-packages'),
         '/opt/ros/jazzy/lib/python3.12/site-packages',
         process.env.PYTHONPATH || '',
       ].filter(Boolean).join(':'),
       AMENT_PREFIX_PATH: [
-        '/home/joaomoreira/ros2_ws/install/mvp_mission_bebop',
-        '/home/joaomoreira/ros2_ws/install/nectar',
-        '/home/joaomoreira/ros2_ws/install/nectar_interfaces',
-        '/home/joaomoreira/ros2_ws/install/ros2_bebop_driver',
-        '/home/joaomoreira/ros2_ws/install/ros2_parrot_arsdk',
+        path.join(WORKSPACE_DIR, 'install', 'mvp_mission_bebop'),
+        path.join(WORKSPACE_DIR, 'install', 'nectar'),
+        path.join(WORKSPACE_DIR, 'install', 'nectar_interfaces'),
+        path.join(WORKSPACE_DIR, 'install', 'ros2_bebop_driver'),
+        path.join(WORKSPACE_DIR, 'install', 'ros2_parrot_arsdk'),
         '/opt/ros/jazzy',
         process.env.AMENT_PREFIX_PATH || '',
       ].filter(Boolean).join(':'),
@@ -1147,7 +1152,7 @@ async function startDriverProcess() {
  * Command lines that mean the Bebop driver is up.
  *
  * Kept specific on purpose: this application runs out of
- * /home/joaomoreira/ros2_ws/bebop_mission_control, so a loose "ros2.*bebop" matches
+ * <ws>/src/mvp_mission_bebop/bebop_mission_control, so a loose "ros2.*bebop" matches
  * Electron's own command line.
  */
 const DRIVER_PATTERN = 'bebop_driver_node|ros2_bebop_driver|bebop_node_launch';
@@ -1490,10 +1495,10 @@ ipcMain.handle('bmg:get-env-info', async () => {
   const env = getNectarEnv();
   return {
     activated: Boolean(env.VIRTUAL_ENV),
-    venvPath: env.VIRTUAL_ENV || '/home/joaomoreira/ros2_ws/.venv',
+    venvPath: env.VIRTUAL_ENV || VENV_DIR,
     rosDistro: env.ROS_DISTRO || 'jazzy',
     rosDomainId: env.ROS_DOMAIN_ID || '14',
-    pythonPath: path.join(env.VIRTUAL_ENV || '/home/joaomoreira/ros2_ws/.venv', 'bin', 'python3'),
+    pythonPath: path.join(env.VIRTUAL_ENV || VENV_DIR, 'bin', 'python3'),
   };
 });
 
@@ -1548,10 +1553,10 @@ ipcMain.handle('bmg:get-diagnostics', async () => {
     at: Date.now(),
     env: {
       activated: Boolean(env.VIRTUAL_ENV),
-      venvPath: env.VIRTUAL_ENV || '/home/joaomoreira/ros2_ws/.venv',
+      venvPath: env.VIRTUAL_ENV || VENV_DIR,
       rosDistro: env.ROS_DISTRO || 'jazzy',
       rosDomainId: env.ROS_DOMAIN_ID || '14',
-      pythonPath: path.join(env.VIRTUAL_ENV || '/home/joaomoreira/ros2_ws/.venv', 'bin', 'python3'),
+      pythonPath: path.join(env.VIRTUAL_ENV || VENV_DIR, 'bin', 'python3'),
     },
     missionRunning: Boolean(missionProcess),
     driverRunning: driverProbe || Boolean(driverProcess),
@@ -2213,7 +2218,7 @@ async function startMissionProcess(options = {}) {
     recordLog('mission', {
       type: 'stdout',
       text:
-        `[BMG] Ambiente: nectar-activate (${env.VIRTUAL_ENV || '/home/joaomoreira/ros2_ws/.venv'})\n` +
+        `[BMG] Ambiente: nectar-activate (${env.VIRTUAL_ENV || VENV_DIR})\n` +
         `[BMG] ROS 2 ${env.ROS_DISTRO || 'jazzy'} · domínio ${env.ROS_DOMAIN_ID || '14'}\n` +
         `[BMG] Armamento: ${options.noFly ? 'BANCADA (--no-fly, motores inertes)' : 'VOO REAL (--fly)'}\n` +
         `[BMG] Comando: python3 ${args.map((a) => (a.length > 120 ? `${a.slice(0, 117)}...` : a)).join(' ')}\n`,
