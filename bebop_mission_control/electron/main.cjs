@@ -752,8 +752,13 @@ function createWindow(port) {
  * `MissionContext._write_atomic` renames a dot-prefixed temporary into place, so
  * a file matching these prefixes is already complete. The short delay covers the
  * window where the raw PNG lands a moment before its annotated companion.
+ *
+ * One capture writes two files and fs.watch reports each of them, so the delay
+ * is a debounce keyed by the capture stamp: the renderer counts every event as
+ * a capture, and a timer per file would announce a single photograph twice.
  */
 function watchMissionDirectory() {
+  const pendingCaptures = new Map();
   try {
     if (!fs.existsSync(MISSION_DIR)) return;
     fs.watch(MISSION_DIR, (_eventType, filename) => {
@@ -766,7 +771,9 @@ function watchMissionDirectory() {
       const rawPath = path.join(MISSION_DIR, rawFilename);
       const inspectedPath = path.join(MISSION_DIR, inspectedFilename);
 
-      setTimeout(() => {
+      clearTimeout(pendingCaptures.get(stamp));
+      pendingCaptures.set(stamp, setTimeout(() => {
+        pendingCaptures.delete(stamp);
         const rawReady = fs.existsSync(rawPath) && fs.statSync(rawPath).size > 1000;
         const inspectedReady = fs.existsSync(inspectedPath) && fs.statSync(inspectedPath).size > 1000;
         if (!rawReady && !inspectedReady) return;
@@ -782,7 +789,7 @@ function watchMissionDirectory() {
           annotatedUrl: inspectedReady ? `/evidence/${inspectedFilename}` : `/evidence/${rawFilename}`,
           timestamp: Date.now(),
         });
-      }, 400);
+      }, 400));
     });
   } catch (err) {
     console.warn('[BMG] Could not watch the mission directory:', err.message);
