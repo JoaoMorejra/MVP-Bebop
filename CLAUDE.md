@@ -21,7 +21,7 @@ O projeto consiste no sistema autonomo completo para o drone **Parrot Bebop 2**,
 
 O repositorio oficial da **Black Bee Drones** localiza-se no workspace em:
 ```text
-/home/joaomoreira/ros2_ws/src/nectar-sdk
+~/ros2_ws/src/nectar-sdk
 ```
 
 ### Regras de Ouro de Conhecimento e Implementacao
@@ -70,7 +70,7 @@ MVP-Bebop/
 ### Ambiente Python e ROS 2
 - O ambiente canonico e ativado atraves de:
   ```bash
-  source /home/jv/ros2_ws/bin/nectar-activate
+  source ~/ros2_ws/bin/nectar-activate
   ```
 - A compilacao do pacote ROS 2 DEVE utilizar `--symlink-install` para evitar discrepancias entre o codigo fonte e a pasta `install/`:
   ```bash
