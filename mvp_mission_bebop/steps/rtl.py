@@ -86,6 +86,7 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
 )
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
+from mvp_mission_bebop.perception.intrinsics import DRIVER_PACKAGE, apply_driver_calibration
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, TelemetryHealth
@@ -708,6 +709,23 @@ class ClosedLoopRTLStep(BaseStep):
             )
             return None
 
+        calibration = apply_driver_calibration(detector)
+        if calibration is not None:
+            logger.info(
+                "Marker pose intrinsics: %s (%dx%d, principal point %.1f, %.1f).",
+                calibration.source,
+                calibration.width,
+                calibration.height,
+                float(calibration.camera_matrix[0, 2]),
+                float(calibration.camera_matrix[1, 2]),
+            )
+        else:
+            logger.warning(
+                "Bebop 2 calibration not found in the %s package; marker pose uses the "
+                "Nectar calibration package intrinsics.",
+                DRIVER_PACKAGE,
+            )
+
         logger.info(
             "ArUco/AprilTag detector ready: dict %s (resolved enum %d), "
             "tag %.3f m, accepting only ID %d.",
@@ -767,9 +785,9 @@ class ClosedLoopRTLStep(BaseStep):
             "(%.1f, %.1f) but the %dx%d stream is centred on (%.1f, %.1f). The pose "
             "estimate therefore carries a fixed bias of about (%+.3f, %+.3f) m per metre "
             "of range -- %.3f m lateral at 1 m -- which is larger than the %.3f m centering "
-            "tolerance. The calibration in camera_matrix.txt was captured from a camera or "
-            "a capture resolution other than this one; re-run the calibration node against "
-            "the live stream before relying on the landing precision.",
+            "tolerance. The calibration in use was captured from a camera or a capture "
+            "resolution other than this one; re-run the calibration node against the live "
+            "stream before relying on the landing precision.",
             principal_x,
             principal_y,
             int(width),
