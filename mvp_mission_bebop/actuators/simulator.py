@@ -22,7 +22,8 @@ import logging
 import math
 import threading
 import time
-from typing import Callable, Final
+from dataclasses import dataclass
+from typing import Callable, Final, Optional
 
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
@@ -56,6 +57,85 @@ DESCENT_RATE_MPS: Final[float] = 0.35
 #: above this height has to be earned with a commanded ``vz``.
 FIRMWARE_HOVER_ALTITUDE_M: Final[float] = 1.00
 
+#: ARSDK ``ARDrone3.PilotingState.FlyingStateChanged`` values the simulated
+#: airframe passes through, as the driver publishes them on
+#: ``/bebop/states/flying_state``.
+FLYING_STATE_LANDED: Final[int] = 0
+FLYING_STATE_TAKINGOFF: Final[int] = 1
+FLYING_STATE_HOVERING: Final[int] = 2
+FLYING_STATE_FLYING: Final[int] = 3
+FLYING_STATE_LANDING: Final[int] = 4
+
+#: World speed, in m/s, above which an airborne Bebop reports ``flying`` rather
+#: than ``hovering``. Below it the station-keeping residuals of the altitude
+#: governor would otherwise flicker the state.
+MOVING_SPEED_MPS: Final[float] = 0.05
+
+
+@dataclass(frozen=True)
+class SimulatedState:
+    """One synthetic sample, in the frame of the driver's ``/bebop/odom``.
+
+    Parameters
+    ----------
+    x, y, z : float
+        Position in metres: x forward and y left of the launch heading, z up.
+    yaw : float
+        Heading in radians, counter-clockwise from the launch heading.
+    vx, vy, vz : float
+        World-frame velocity in m/s.
+    flying_state : int
+        ARSDK flying state the airframe would report, see ``FLYING_STATE_*``.
+    """
+
+    x: float
+    y: float
+    z: float
+    yaw: float
+    vx: float
+    vy: float
+    vz: float
+    flying_state: int
+
+
+StateListener = Callable[[SimulatedState], None]
+
+
+def bebop_flying_state(
+    airborne: bool,
+    launching: bool,
+    target_altitude: float,
+    z: float,
+    speed_mps: float,
+) -> int:
+    """Map the simulated flight phase onto the ARSDK flying state.
+
+    Parameters
+    ----------
+    airborne : bool
+        Between a takeoff and the completion of its landing.
+    launching : bool
+        Inside the firmware launch transient.
+    target_altitude : float
+        Transient setpoint; zero once a landing has been commanded.
+    z : float
+        Current altitude in metres.
+    speed_mps : float
+        Magnitude of the world-frame velocity.
+
+    Returns
+    -------
+    int
+        One of the ``FLYING_STATE_*`` values.
+    """
+    if not airborne:
+        return FLYING_STATE_LANDED
+    if launching:
+        return FLYING_STATE_TAKINGOFF
+    if target_altitude <= 0.0 and z > 0.0:
+        return FLYING_STATE_LANDING
+    return FLYING_STATE_FLYING if speed_mps > MOVING_SPEED_MPS else FLYING_STATE_HOVERING
+
 
 class KinematicSimulator:
     """Integrates latched velocity commands into synthetic odometry.
@@ -88,6 +168,7 @@ class KinematicSimulator:
         "_airborne",
         "_launching",
         "_target_altitude",
+        "_state_listener",
         "_lock",
     )
 
@@ -97,6 +178,7 @@ class KinematicSimulator:
         calibration: SpeedCalibration,
         *,
         clock: Clock = time.monotonic,
+        state_listener: Optional[StateListener] = None,
     ) -> None:
         self._supervisor = supervisor
         self._calibration = calibration
@@ -114,6 +196,7 @@ class KinematicSimulator:
         self._airborne: bool = False
         self._launching: bool = False
         self._target_altitude: float = 0.0
+        self._state_listener: Optional[StateListener] = state_listener
         # Commands arrive on the mission thread; integration is driven from an
         # executor timer. Both mutate this state.
         self._lock = threading.RLock()
@@ -130,6 +213,15 @@ class KinematicSimulator:
         """Current simulated world position ``(x, y, z)`` in metres."""
         with self._lock:
             return self._x, self._y, self._z
+
+    def set_state_listener(self, listener: Optional[StateListener]) -> None:
+        """Receive every synthetic sample, e.g. to publish it for the station.
+
+        The listener runs on whichever thread emitted the sample and must not
+        block. An exception it raises is logged and swallowed: the station
+        losing its view of the simulation is no reason to stop simulating.
+        """
+        self._state_listener = listener
 
     # ----------------------------------------------------------------- events
 
@@ -232,9 +324,9 @@ class KinematicSimulator:
         """Publish the current simulated state through the public ingress."""
         with self._lock:
             state = (self._x, self._y, self._z, self._yaw, self._vx, self._vy,
-                     self._vz, self._airborne)
+                     self._vz, self._airborne, self._launching, self._target_altitude)
 
-        x, y, z, yaw, vx, vy, vz, airborne = state
+        x, y, z, yaw, vx, vy, vz, airborne, launching, target_altitude = state
         if airborne:
             speed_x = self._calibration.to_mps(vx)
             speed_y = self._calibration.to_mps(vy)
@@ -249,3 +341,16 @@ class KinematicSimulator:
         self._supervisor.inject_synthetic_sample(
             x=x, y=y, z=z, vx=world_vx, vy=world_vy, vz=world_vz, yaw=yaw
         )
+
+        listener = self._state_listener
+        if listener is None:
+            return
+        speed = math.sqrt(world_vx * world_vx + world_vy * world_vy + world_vz * world_vz)
+        sample = SimulatedState(
+            x=x, y=y, z=z, yaw=yaw, vx=world_vx, vy=world_vy, vz=world_vz,
+            flying_state=bebop_flying_state(airborne, launching, target_altitude, z, speed),
+        )
+        try:
+            listener(sample)
+        except Exception as exc:  # noqa: BLE001 - observers never stop the airframe
+            logger.debug("Simulated state listener failed: %s", exc)

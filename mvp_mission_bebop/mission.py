@@ -48,6 +48,7 @@ from mvp_mission_bebop.telemetry.battery import (
     BatterySupervisor,
     normalize_percentage,
 )
+from mvp_mission_bebop.telemetry.bench import BenchTelemetryPublisher
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
 
@@ -512,12 +513,29 @@ def main() -> None:
     # spin loop -- it just stops an odometry subscription from sharing a
     # lifecycle with the video pipeline.
     telemetry_node = Node("bebop_mission_telemetry", start_parameter_services=False)
-    telemetry_node.create_subscription(
-        Odometry,
-        params.network.odometry_topic,
-        odom_supervisor.odometry_callback,
-        qos_profile_sensor_data,
-    )
+    if simulator is None:
+        telemetry_node.create_subscription(
+            Odometry,
+            params.network.odometry_topic,
+            odom_supervisor.odometry_callback,
+            qos_profile_sensor_data,
+        )
+    else:
+        # The simulator is the only writer of the supervisor on the bench. With
+        # the aircraft powered on the table the driver keeps publishing a
+        # stationary /bebop/odom, and feeding both into the supervisor
+        # interleaves two airframes: the altitude governor would see the
+        # simulated 1.8 m and the real 0 m on alternate samples.
+        bench_publisher = BenchTelemetryPublisher(
+            telemetry_node, params.network.namespace, clock=telemetry_node.get_clock()
+        )
+        simulator.set_state_listener(bench_publisher.publish)
+        logger.info(
+            "[NO-FLY BENCHTOP] Simulated airframe published on %s and %s; %s is not read.",
+            bench_publisher.odometry_topic,
+            bench_publisher.flying_state_topic,
+            params.network.odometry_topic,
+        )
     # The driver publishes this topic reliable and transient-local at depth 1,
     # so a matching subscription receives the last reported charge on creation
     # instead of waiting up to one 500 ms state period for the next one.
