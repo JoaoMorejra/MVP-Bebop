@@ -66,9 +66,10 @@ export function useTelemetry() {
     );
     setLastFrameAt(Date.now());
 
-    // `driver_running` is the bridge's own odometry watchdog. Without it there
-    // is no fresh position of any kind to draw.
-    if (!data.driver_running) return;
+    // `driver_running` is the bridge's own odometry watchdog, and `simulated`
+    // its benchtop counterpart. Without either there is no fresh position of
+    // any kind to draw.
+    if (!data.driver_running && !data.simulated) return;
 
     // The trail is drawn from `/bebop/odom` itself, relative to where it was
     // when this flight's track began. Latitude and longitude are only the
@@ -155,9 +156,14 @@ export function useTelemetry() {
   const bridgeSilent = ageSec === null || ageSec > BRIDGE_SILENT_AFTER_SEC;
   const connected = Boolean(raw.connected && !bridgeSilent);
   const batteryKnown = connected && Boolean(raw.battery_known);
-  const stale = !connected || !raw.driver_running;
+  // A benchtop run is current without any aircraft: the simulated airframe
+  // needs no link and no driver, only a bridge that is still talking.
+  const simulated = !bridgeSilent && Boolean(raw.simulated);
+  const stale = !simulated && (!connected || !raw.driver_running);
   // A bridge older than `data_fresh` is read through its own odometry watchdog.
   const dataFresh = connected && Boolean(raw.data_fresh ?? raw.driver_running);
+  const navFresh = dataFresh || simulated;
+  const navReachable = connected || simulated;
 
   const view: TelemetryView = {
     ...raw,
@@ -169,14 +175,16 @@ export function useTelemetry() {
     driver_running: connected && Boolean(raw.driver_running),
     gps_fix: dataFresh && Boolean(raw.gps_fix),
     data_fresh: dataFresh,
+    nav_fresh: navFresh,
+    simulated,
     // Second line of defence behind the bridge's own gating: nothing measured
     // on the airframe is shown once the bridge or the aircraft goes quiet.
-    altitude: dataFresh ? raw.altitude : 0,
-    speed: dataFresh ? raw.speed : 0,
-    heading: dataFresh ? raw.heading : 0,
-    flight_time_sec: connected ? raw.flight_time_sec : 0,
-    latitude: connected ? raw.latitude : 0,
-    longitude: connected ? raw.longitude : 0,
+    altitude: navFresh ? raw.altitude : 0,
+    speed: navFresh ? raw.speed : 0,
+    heading: navFresh ? raw.heading : 0,
+    flight_time_sec: navReachable ? raw.flight_time_sec : 0,
+    latitude: navReachable ? raw.latitude : 0,
+    longitude: navReachable ? raw.longitude : 0,
     source: bridge ? 'hardware' : 'synthetic',
     ageSec,
   };

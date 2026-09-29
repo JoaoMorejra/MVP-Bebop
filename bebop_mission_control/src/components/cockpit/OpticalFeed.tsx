@@ -218,6 +218,8 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
   // is: neither figure expires on its own, so a powered-down drone would go on
   // reporting its last charge over a feed showing nothing.
   const connected = Boolean(telemetry.connected);
+  // Altitude and speed also follow a benchtop simulation, which has no link.
+  const navFresh = Boolean(telemetry.nav_fresh ?? telemetry.data_fresh);
   const known = connected && Boolean(telemetry.battery_known);
   const charge = known ? telemetry.battery_pct : 0;
   const bars = connected ? rfBars(telemetry.wifi_signal_dbm) : 0;
@@ -260,7 +262,7 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
       {/* Top-left: how long, and in what format. */}
       <div className="pointer-events-none absolute left-3 top-3 z-30 flex items-center gap-2">
         <HudChip icon={<Timer size={11} strokeWidth={2} />} tone={running ? 'mint' : 'default'}>
-          {connected ? duration(telemetry.flight_time_sec) : '—'}
+          {connected || telemetry.simulated ? duration(telemetry.flight_time_sec) : '—'}
         </HudChip>
         <HudChip icon={<Video size={11} strokeWidth={2} />} tone={live && fps < 8 ? 'amber' : 'default'}>
           {live ? `${formatName(width, height)} · ${fps} FPS` : 'sem vídeo'}
@@ -335,8 +337,8 @@ export const OpticalFeed: React.FC<OpticalFeedProps> = ({
       {/* Bottom-left: the airframe's own state. Quieter than the corners above,
           because these change every frame and must not pull the eye. */}
       <div className="pointer-events-none absolute bottom-3 left-3 z-30 flex items-end gap-4">
-        <Figure label="alt" value={telemetry.data_fresh ? telemetry.altitude.toFixed(2) : '—'} unit="m" />
-        <Figure label="vel" value={telemetry.data_fresh ? telemetry.speed.toFixed(2) : '—'} unit="m/s" />
+        <Figure label="alt" value={navFresh ? telemetry.altitude.toFixed(2) : '—'} unit="m" />
+        <Figure label="vel" value={navFresh ? telemetry.speed.toFixed(2) : '—'} unit="m/s" />
       </div>
 
       {/* Camera tilt, on the picture it changes.

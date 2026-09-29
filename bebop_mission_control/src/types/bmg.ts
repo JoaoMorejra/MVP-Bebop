@@ -58,6 +58,19 @@ export interface BmgTelemetry {
    * satisfies while the driver is dead: flight readouts follow this one.
    */
   data_fresh?: boolean;
+  /**
+   * Speed, altitude, heading, position, flying state and flight time are
+   * current. True for a live aircraft (`data_fresh`) and for a benchtop run.
+   */
+  nav_fresh?: boolean;
+  /** Where the navigation fields came from. */
+  nav_source?: 'aircraft' | 'simulator' | 'none';
+  /**
+   * The navigation fields describe the kinematic simulator of a
+   * `mission.py --no-fly` run, not the aircraft. `connected`, `data_fresh` and
+   * `driver_running` still describe the aircraft alone.
+   */
+  simulated?: boolean;
   drone_ip?: string;
   /**
    * Whether `battery_pct` is a measurement at all. The bridge reports 0 for
@@ -68,7 +81,7 @@ export interface BmgTelemetry {
   battery_age_sec?: number | null;
   /** `aircraft` is the drone's own RSSI; `host` is the laptop's radio. */
   signal_source?: 'aircraft' | 'host' | 'none';
-  position_source?: 'gps' | 'odometry';
+  position_source?: 'gps' | 'odometry' | 'simulator';
   gps_fix?: boolean;
   /**
    * Raw `/bebop/odom` position, metres, in the driver's frame: x north, y west.

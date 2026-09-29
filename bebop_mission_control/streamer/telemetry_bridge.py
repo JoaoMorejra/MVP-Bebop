@@ -62,6 +62,11 @@ TOPIC_WIFI_RSSI = f"{NAMESPACE}/states/wifi_rssi"
 TOPIC_FLYING_STATE = f"{NAMESPACE}/states/flying_state"
 TOPIC_ALTITUDE = f"{NAMESPACE}/states/altitude"
 TOPIC_GPS = f"{NAMESPACE}/states/gps"
+#: Simulated airframe of a `mission.py --no-fly` run. Published by the mission
+#: on topics of its own rather than on /bebop/odom, which belongs to the driver
+#: (`mvp_mission_bebop/telemetry/bench.py`, pinned by `test_bench_telemetry`).
+TOPIC_BENCH_ODOM = f"{NAMESPACE}/mission/bench_odom"
+TOPIC_BENCH_FLYING_STATE = f"{NAMESPACE}/mission/bench_flying_state"
 
 #: Topics the aircraft must be exchanging before the GCS clears the flight.
 #: `direction` is from the driver's point of view: `out` means the driver
@@ -118,6 +123,13 @@ MOVE_CAMERA_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=10,
 )
+#: Bench topics are published reliable and volatile at depth 1 by the mission.
+BENCH_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.VOLATILE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+)
 MONITOR_PERIOD_SEC = 2.0
 
 
@@ -149,6 +161,28 @@ def odom_yaw_to_compass(yaw_deg: float) -> float:
     """Driver odometry yaw to a compass heading: 0 north, clockwise, [0, 360)."""
     heading = (-yaw_deg) % 360.0
     return 0.0 if heading >= 360.0 else heading
+
+
+def decode_odometry(msg: Odometry) -> Tuple[float, float, float, Tuple[float, float]]:
+    """Speed, altitude, yaw in degrees and (x, y) of an odometry message.
+
+    Shared by the driver's /bebop/odom and the benchtop simulation, which is
+    published in the same frame so it decodes identically.
+    """
+    linear = msg.twist.twist.linear
+    speed = math.sqrt(linear.x**2 + linear.y**2 + linear.z**2)
+
+    position = msg.pose.pose.position
+    altitude = abs(float(position.z))
+
+    orientation = msg.pose.pose.orientation
+    siny_cosp = 2.0 * (
+        orientation.w * orientation.z + orientation.x * orientation.y
+    )
+    cosy_cosp = 1.0 - 2.0 * (orientation.y**2 + orientation.z**2)
+    heading = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+
+    return float(speed), altitude, float(heading), (float(position.x), float(position.y))
 
 
 # -----------------------------------------------------------------------------
@@ -203,6 +237,17 @@ class TelemetryState:
         self.flight_started_at: Optional[float] = None
         self.flight_time_sec = 0
 
+        # Simulated airframe of a benchtop run. Kept apart from the aircraft's
+        # fields so a rehearsal never overwrites, or is overwritten by, a real
+        # driver publishing on the same bench.
+        self.bench_speed = 0.0
+        self.bench_altitude = 0.0
+        self.bench_heading = 0.0
+        self.bench_position_xy = (0.0, 0.0)
+        self.bench_at: Optional[float] = None
+        self.bench_flying_state: Optional[int] = None
+        self.bench_flight_started_at: Optional[float] = None
+
         # ROS 2 graph
         self.node_present = False
         self.topics: Dict[str, Dict[str, Any]] = {}
@@ -232,6 +277,32 @@ class TelemetryState:
             self.heading = heading
             self.position_xy = position_xy
             self.odom_at = _now()
+
+    def set_bench(
+        self,
+        speed: float,
+        altitude: float,
+        heading: float,
+        position_xy: Tuple[float, float],
+    ) -> None:
+        with self._lock:
+            self.bench_speed = speed
+            self.bench_altitude = altitude
+            self.bench_heading = heading
+            self.bench_position_xy = position_xy
+            self.bench_at = _now()
+
+    def set_bench_flying_state(self, state: Optional[int]) -> None:
+        with self._lock:
+            previous = self.bench_flying_state
+            self.bench_flying_state = state
+            if state is None:
+                return
+            airborne = state in AIRBORNE_STATES
+            if airborne and self.bench_flight_started_at is None:
+                self.bench_flight_started_at = _now()
+            elif not airborne and previous in AIRBORNE_STATES:
+                self.bench_flight_started_at = None
 
     def set_battery(self, percent: Optional[int], source: str) -> None:
         with self._lock:
@@ -361,6 +432,53 @@ class TelemetryState:
             if self.flight_started_at is not None:
                 self.flight_time_sec = int(now - self.flight_started_at)
 
+            # Nothing measured on the airframe survives the airframe being out
+            # of reach. Every value below is the last one the drone reported,
+            # and none of them expires on its own -- so an unreachable aircraft
+            # kept publishing its final charge, altitude and speed as though it
+            # were still flying. `wifi_ssid` is worse than stale: it holds the
+            # network the *host* joined, which is some other network entirely
+            # once the operator has left the drone's.
+            reachable = bool(self.connected)
+            # `reachable` is a ping to the aircraft's access point, which keeps
+            # answering while the driver is dead or wedged; it says the host is
+            # on the drone's network, not that anything is coming out of it.
+            # Flight data is gated on the stricter fact that the driver is
+            # actually publishing, as the position fields always were. The
+            # console battery probe is exempt: it is read over Wi-Fi, not
+            # through the driver, and ages out on its own window.
+            data_fresh = odom_fresh and reachable
+
+            # Navigation source. A fresh benchtop simulation wins over the
+            # aircraft: during a rehearsal the station follows the airframe the
+            # mission is actually flying, which is the simulated one, even with
+            # the real drone powered on the bench and reporting 0 m. It never
+            # stands in for the link or the driver: `connected`, `data_fresh`
+            # and `driver_running` keep describing the aircraft alone.
+            bench_age = None if self.bench_at is None else now - self.bench_at
+            simulated = bench_age is not None and bench_age < ODOM_STALE_SEC
+            if simulated:
+                nav_source = "simulator"
+                nav_speed = self.bench_speed
+                nav_altitude = self.bench_altitude
+                nav_heading = self.bench_heading
+                dx, dy = self.bench_position_xy
+                nav_flying_state = self.bench_flying_state
+                nav_flight_time = (
+                    int(now - self.bench_flight_started_at)
+                    if self.bench_flight_started_at is not None
+                    else 0
+                )
+            else:
+                nav_source = "aircraft" if data_fresh else "none"
+                nav_speed = self.speed
+                nav_altitude = self.altitude
+                nav_heading = self.heading
+                dx, dy = self.position_xy
+                nav_flying_state = self.flying_state
+                nav_flight_time = int(self.flight_time_sec) if reachable else 0
+            nav_fresh = simulated or data_fresh
+
             # The drone's own RSSI describes the link that actually matters;
             # the host counter is the fallback when the driver is not up yet.
             if self.drone_rssi_dbm is not None and self.drone_rssi_dbm != 0:
@@ -374,10 +492,10 @@ class TelemetryState:
                 signal_source = "none"
 
             # Position: a real GPS fix wins; otherwise project the odometry
-            # offset onto the real base reference, when there is one.
-            dx, dy = self.position_xy
+            # offset onto the real base reference, when there is one. A
+            # simulated position is never a GPS position.
             east, north = odom_to_enu(dx, dy)
-            if self.gps_fix and self.gps_latitude is not None:
+            if not simulated and self.gps_fix and self.gps_latitude is not None:
                 latitude = round(self.gps_latitude, 7)
                 longitude = round(self.gps_longitude or 0.0, 7)
                 position_source = "gps"
@@ -386,11 +504,11 @@ class TelemetryState:
                 d_lon = east / (111139.0 * max(1e-6, math.cos(math.radians(base.latitude))))
                 latitude = round(base.latitude + d_lat, 7)
                 longitude = round(base.longitude + d_lon, 7)
-                position_source = "odometry"
+                position_source = "simulator" if simulated else "odometry"
             else:
                 latitude = 0.0
                 longitude = 0.0
-                position_source = "odometry"
+                position_source = "simulator" if simulated else "odometry"
 
             if self.gps_home is not None:
                 base_payload = {
@@ -433,22 +551,6 @@ class TelemetryState:
                 for name in required_in
             )
 
-            # Nothing measured on the airframe survives the airframe being out
-            # of reach. Every value below is the last one the drone reported,
-            # and none of them expires on its own -- so an unreachable aircraft
-            # kept publishing its final charge, altitude and speed as though it
-            # were still flying. `wifi_ssid` is worse than stale: it holds the
-            # network the *host* joined, which is some other network entirely
-            # once the operator has left the drone's.
-            reachable = bool(self.connected)
-            # `reachable` is a ping to the aircraft's access point, which keeps
-            # answering while the driver is dead or wedged; it says the host is
-            # on the drone's network, not that anything is coming out of it.
-            # Flight data is gated on the stricter fact that the driver is
-            # actually publishing, as the position fields always were. The
-            # console battery probe is exempt: it is read over Wi-Fi, not
-            # through the driver, and ages out on its own window.
-            data_fresh = odom_fresh and reachable
             battery_known = (
                 battery_known
                 and reachable
@@ -462,10 +564,10 @@ class TelemetryState:
                 "battery_pct": int(self.battery_pct) if battery_known else 0,
                 "wifi_ssid": self.wifi_ssid if data_fresh else "",
                 "wifi_signal_dbm": int(signal_dbm) if data_fresh else -100,
-                "speed": round(self.speed, 2) if data_fresh else 0.0,
-                "altitude": round(self.altitude, 2) if data_fresh else 0.0,
-                "flight_time_sec": int(self.flight_time_sec) if reachable else 0,
-                "heading": round(odom_yaw_to_compass(self.heading), 1) if data_fresh else 0.0,
+                "speed": round(nav_speed, 2) if nav_fresh else 0.0,
+                "altitude": round(nav_altitude, 2) if nav_fresh else 0.0,
+                "flight_time_sec": nav_flight_time,
+                "heading": round(odom_yaw_to_compass(nav_heading), 1) if nav_fresh else 0.0,
                 "latitude": latitude,
                 "longitude": longitude,
                 # -- additions ----------------------------------------------
@@ -478,16 +580,16 @@ class TelemetryState:
                 ),
                 "signal_source": signal_source,
                 "position_source": position_source,
-                "gps_fix": bool(self.gps_fix) and data_fresh,
+                "gps_fix": bool(self.gps_fix) and data_fresh and not simulated,
                 # Raw /bebop/odom position, metres in the odometry frame. The
                 # station draws the trail from these, never from a latitude
                 # that may have switched between GPS and projection mid-flight.
-                "odom_x_m": round(dx, 3) if data_fresh else None,
-                "odom_y_m": round(dy, 3) if data_fresh else None,
+                "odom_x_m": round(dx, 3) if nav_fresh else None,
+                "odom_y_m": round(dy, 3) if nav_fresh else None,
                 # The same position in the frame the map draws in: metres east
                 # and north of the odometry origin. See `odom_to_enu`.
-                "east_m": round(east, 3) if data_fresh else None,
-                "north_m": round(north, 3) if data_fresh else None,
+                "east_m": round(east, 3) if nav_fresh else None,
+                "north_m": round(north, 3) if nav_fresh else None,
                 **base_payload,
                 # Where the camera is actually pointing, and how long ago that
                 # was commanded. Null until something has commanded it at all:
@@ -502,16 +604,21 @@ class TelemetryState:
                     and not math.isnan(self.sonar_altitude)
                     else None
                 ),
-                "flying_state": self.flying_state if data_fresh else None,
+                "flying_state": nav_flying_state if nav_fresh else None,
                 "flying_state_label": (
                     FLYING_STATE_LABELS.get(
-                        self.flying_state if self.flying_state is not None else -1,
+                        nav_flying_state if nav_flying_state is not None else -1,
                         "unknown",
                     )
-                    if data_fresh
+                    if nav_fresh
                     else "disconnected"
                 ),
                 "data_fresh": bool(data_fresh),
+                # Navigation fields above come from `nav_source`; `simulated`
+                # marks a benchtop run so the station can say so.
+                "nav_fresh": bool(nav_fresh),
+                "nav_source": nav_source,
+                "simulated": bool(simulated),
                 "odom_age_sec": (
                     round(odom_age, 2) if odom_age is not None else None
                 ),
@@ -567,6 +674,12 @@ class TelemetryNode(Node):
             Float32, TOPIC_ALTITUDE, self._on_altitude, state_qos
         )
         self.create_subscription(NavSatFix, TOPIC_GPS, self._on_gps, state_qos)
+        self.create_subscription(
+            Odometry, TOPIC_BENCH_ODOM, self._on_bench_odom, BENCH_QOS
+        )
+        self.create_subscription(
+            UInt8, TOPIC_BENCH_FLYING_STATE, self._on_bench_flying_state, BENCH_QOS
+        )
         # The gimbal topic is an input to the driver, so this bridge is a second
         # subscriber on it rather than the consumer. That is the point: whatever
         # commands the camera -- the mission's own stages, or the station's
@@ -589,26 +702,15 @@ class TelemetryNode(Node):
 
     def _on_odom(self, msg: Odometry) -> None:
         STATE.note_sample(TOPIC_ODOM)
+        speed, altitude, heading, position_xy = decode_odometry(msg)
+        STATE.set_odom(speed=speed, altitude=altitude, heading=heading, position_xy=position_xy)
 
-        linear = msg.twist.twist.linear
-        speed = math.sqrt(linear.x**2 + linear.y**2 + linear.z**2)
+    def _on_bench_odom(self, msg: Odometry) -> None:
+        speed, altitude, heading, position_xy = decode_odometry(msg)
+        STATE.set_bench(speed=speed, altitude=altitude, heading=heading, position_xy=position_xy)
 
-        position = msg.pose.pose.position
-        altitude = abs(float(position.z))
-
-        orientation = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (
-            orientation.w * orientation.z + orientation.x * orientation.y
-        )
-        cosy_cosp = 1.0 - 2.0 * (orientation.y**2 + orientation.z**2)
-        heading = math.degrees(math.atan2(siny_cosp, cosy_cosp))
-
-        STATE.set_odom(
-            speed=float(speed),
-            altitude=altitude,
-            heading=float(heading),
-            position_xy=(float(position.x), float(position.y)),
-        )
+    def _on_bench_flying_state(self, msg: UInt8) -> None:
+        STATE.set_bench_flying_state(int(msg.data) if msg.data != 255 else None)
 
     def _on_battery(self, msg: BatteryState) -> None:
         STATE.note_sample(TOPIC_BATTERY)

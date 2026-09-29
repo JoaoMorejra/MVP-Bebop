@@ -14,9 +14,11 @@ let push: (data: BmgTelemetry) => void = () => undefined;
 let container: HTMLDivElement;
 let root: Root;
 let latest: TelemetryView | null = null;
+let latestHook: ReturnType<typeof useTelemetry> | null = null;
 
 const Probe: React.FC = () => {
-  latest = useTelemetry().telemetry;
+  latestHook = useTelemetry();
+  latest = latestHook.telemetry;
   return null;
 };
 
@@ -83,5 +85,52 @@ describe('useTelemetry flight readouts', () => {
     act(() => push(frame({ data_fresh: undefined, driver_running: false })));
     expect(latest?.data_fresh).toBe(false);
     expect(latest?.altitude).toBe(0);
+  });
+});
+
+describe('useTelemetry benchtop simulation', () => {
+  const bench = (extra: Partial<BmgTelemetry>): BmgTelemetry =>
+    frame({
+      connected: false,
+      driver_running: false,
+      data_fresh: false,
+      battery_known: false,
+      simulated: true,
+      nav_fresh: true,
+      nav_source: 'simulator',
+      altitude: 1.8,
+      speed: 0.2,
+      flight_time_sec: 12,
+      east_m: 0,
+      north_m: 0,
+      ...extra,
+    });
+
+  it('shows the simulated airframe without claiming a link or a driver', () => {
+    act(() => push(bench({})));
+    expect(latest?.simulated).toBe(true);
+    expect(latest?.nav_fresh).toBe(true);
+    expect([latest?.altitude, latest?.speed, latest?.flight_time_sec]).toEqual([1.8, 0.2, 12]);
+    expect(latest?.connected).toBe(false);
+    expect(latest?.driver_running).toBe(false);
+    expect(latest?.data_fresh).toBe(false);
+    expect(latest?.battery_known).toBe(false);
+    expect(latestHook?.stale).toBe(false);
+  });
+
+  it('draws the simulated trail on the map', () => {
+    act(() => push(bench({ east_m: 0, north_m: 0 })));
+    act(() => push(bench({ east_m: 0.5, north_m: 1.5 })));
+    const track = latestHook?.track ?? [];
+    expect(track.length).toBe(2);
+    expect([track[1].x, track[1].y]).toEqual([0.5, 1.5]);
+  });
+
+  it('blanks navigation again once the simulation stops', () => {
+    act(() => push(bench({})));
+    act(() => push(frame({ connected: false, driver_running: false, data_fresh: false, simulated: false, nav_fresh: false })));
+    expect(latest?.nav_fresh).toBe(false);
+    expect([latest?.altitude, latest?.speed, latest?.flight_time_sec]).toEqual([0, 0, 0]);
+    expect(latestHook?.stale).toBe(true);
   });
 });
