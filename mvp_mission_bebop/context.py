@@ -188,7 +188,7 @@ class MissionContext:
 
         *The video-loss failsafe becomes unreachable.* ``take_photo`` never
         returns ``None`` once a single frame has ever arrived, so the frame
-        heartbeat is refreshed forever and the eight-second stream timeout in
+        heartbeat is refreshed forever and the stream timeout in
         ``FailsafeSupervisor.evaluate_system_health`` cannot fire. Losing the
         Bebop's video link produced no abort at all.
 

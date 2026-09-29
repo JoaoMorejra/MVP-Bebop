@@ -914,7 +914,21 @@ class TimeoutsConfig:
     tracking_timeout_sec: float = 110.0
     target_recovery_timeout_sec: float = 4.0
     odometry_heartbeat_timeout_sec: float = 3.0
-    video_stream_timeout_sec: float = 8.0
+    #: Frame-heartbeat age at which the camera stream counts as lost and
+    #: ``FailsafeSupervisor.evaluate_system_health`` lands the aircraft, in
+    #: seconds. Safe envelope: 1.5-2.0 s.
+    #:
+    #: Was 8.0, sixteen times the 0.5 s ``perception_max_age_sec`` the control
+    #: laws already treat as the oldest usable observation: for the last 7.5 s
+    #: of that window Stages 2 and 3 were translating with no fresh evidence at
+    #: all -- 1.6 m at the 0.20 search cruise -- before anything reacted. The
+    #: heartbeat is refreshed once per new inference result, 150-250 ms apart on
+    #: the ground station's CPU, so 2.0 s is eight worst-case inference periods:
+    #: a single slow inference cannot trip it, a dead link or a hung detector
+    #: does. The lower edge of the envelope, 1.5 s, still leaves six. No
+    #: separate, longer diagnostic threshold is kept, because nothing in the
+    #: mission or the station would consume one.
+    video_stream_timeout_sec: float = 2.0
 
 
 @dataclass

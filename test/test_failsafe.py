@@ -207,3 +207,47 @@ def test_ceiling_breach_is_reported_as_unhealthy_during_a_climb():
 
     assert healthy is False
     assert "ceiling breached" in reason
+
+
+# ------------------------------------------------------ camera stream timeout
+
+
+def test_the_video_timeout_sits_in_its_documented_envelope():
+    """1.5-2.0 s: the same order as perception_max_age_sec, not sixteen times it."""
+    from mvp_mission_bebop.parameters import VisionConfig
+
+    timeout = TimeoutsConfig().video_stream_timeout_sec
+    assert 1.5 <= timeout <= 2.0
+    assert timeout >= 3.0 * VisionConfig().perception_max_age_sec
+
+
+def _failsafe_with_fresh_odometry():
+    kinematics_cfg = FlightKinematicsConfig(target_altitude_m=1.0)
+    timeouts_cfg = TimeoutsConfig()
+    odom_sup = OdometrySupervisor(kinematics_cfg, timeouts_cfg)
+    odom_sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.0)
+    return FailsafeSupervisor(DummyActuator(), odom_sup, timeouts_cfg), timeouts_cfg
+
+
+def test_a_frame_gap_inside_the_timeout_is_nominal():
+    import time
+
+    failsafe, timeouts_cfg = _failsafe_with_fresh_odometry()
+    failsafe.last_valid_frame_timestamp = (
+        time.monotonic() - 0.8 * timeouts_cfg.video_stream_timeout_sec
+    )
+
+    assert failsafe.evaluate_system_health() == (True, "Nominal")
+
+
+def test_a_frame_gap_past_two_seconds_is_a_camera_stream_loss():
+    """Under the previous 8.0 s timeout this gap passed every health gate."""
+    import time
+
+    failsafe, _ = _failsafe_with_fresh_odometry()
+    failsafe.last_valid_frame_timestamp = time.monotonic() - 2.5
+
+    healthy, reason = failsafe.evaluate_system_health()
+
+    assert healthy is False
+    assert "Camera stream loss" in reason
