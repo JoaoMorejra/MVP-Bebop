@@ -1598,15 +1598,18 @@ def test_the_real_detector_closes_the_loop_onto_the_pad():
     )
     assert pad.residual_m < start
 
-    # The gate itself, on the quantity the aircraft actually acts on.
-    assert command.radial_error_m <= controller.tolerance_m
+    # The gate itself, on the quantity the aircraft actually acts on. Settling
+    # is judged against landing_radius_m, deliberately looser than the internal
+    # centering_tolerance_m the PD converges against (f672f89): a touchdown
+    # anywhere inside it is still on the pad.
+    assert command.radial_error_m <= controller.landing_radius_m
 
     # And the ground truth. The two are not identical and cannot be: the render
     # places the pad centre on a whole pixel and rounds its side to an even
     # number of pixels, so the recovered pose disagrees with the offset that
     # produced it by a few millimetres -- one pixel is 1.7 mm at this focal
     # length and range. The margin is that resolution floor, not slack.
-    assert pad.residual_m <= controller.tolerance_m + 0.01
+    assert pad.residual_m <= controller.landing_radius_m + 0.01
 
 
 def test_the_real_detector_drives_the_aircraft_toward_the_pad_not_away_from_it():
