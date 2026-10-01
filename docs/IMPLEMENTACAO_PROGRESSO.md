@@ -13,20 +13,22 @@ Estados: `pendente`, `em andamento`, `feito`, `bloqueado`, `aguardando drone`, `
 - Se o 580 falhar: `sudo bash scripts/setup_station.sh rollback-nvidia`, registrar o motivo e seguir so com iGPU e CPU.
 - Depois: 0B.7 (torch cu126 com sm_50), 0B.8 (builds), 0B.9 (versoes), Fase 1.
 - Atualizacao: Fases 1, 2 e 3 concluidas. Fase 4: 4.2 a 4.6 feitos em codigo; proximo 4.1 e 4.7 (driver C++) e 4.5g; depois pedir o drone para 4.1, 4.2, 4.6, 4.7 e 4.8.
-- **Atualizacao (atual): AGUARDANDO DRONE.** Fase 4 completa em codigo (4.1, 4.5g e 4.7 incluidos); suite
-  completa verde (pytest 1092, vitest 42 arquivos / 372, tsc 0 erros). Ao receber a confirmacao do usuario:
+- **Atualizacao (atual): AGUARDANDO DRONE.** Fases 0-7 completas em codigo e Fase 8 completa na parte de
+  bancada; suites verdes (pytest 1177, vitest 53/443, tsc 0). Fases 0-4 commitadas e enviadas; 5-8 sem commit.
+  Ao receber a confirmacao do usuario:
   1. validar o link: `ping -c 3 192.168.42.1`, SSID `Bebop2-*` (`nmcli -t -f active,ssid dev wifi`), tethering
      USB ainda com rota para a internet, `ros2 daemon stop && ros2 daemon start`;
-  2. rebuild do driver (`colcon build --symlink-install --packages-select ros2_bebop_driver`) e subir o driver;
-     conferir `/bebop/camera/image_raw` e `/bebop/camera/image_raw/compressed` publicando;
-  3. retomar em **4.1 (validacao ao vivo)**: logs `Video resolution/framerate/stream mode applied` do
-     `commandReceivedCallback`, taxa de `image_raw` (`ros2 topic hz`);
-  4. depois 4.2 (comprimido no bridge), 4.3 (perfil DDS com o driver), 4.6 (`camera_info` x quadro),
-     4.7 (`/bebop/photo` pelo relay NAO: foto so com `mission.py --no-fly` no dominio isolado nao chega ao
-     driver; validar `states/picture_event` com `ros2 topic pub --once /bebop/photo` SOMENTE no dominio do
-     driver, que nao arma motores, e o FTP com `bebop_mission_control/streamer/media_fetch.py`),
-     4.8 (FPS por estagio com `--no-fly` + relay; CPU no Stage 2 decide o 4.5f);
-  5. em seguida, Fase 5.
+  2. subir o driver ja compilado (`colcon build --symlink-install --packages-select ros2_bebop_driver` feito);
+     conferir `/bebop/camera/image_raw`, `/bebop/camera/image_raw/compressed`, `states/link` true;
+  3. retomar em **4.1 (validacao ao vivo)**: logs `Video ... applied`, `ros2 topic hz` do `image_raw`;
+  4. 4.2/4.3 (comprimido no bridge, perfil DDS); 4.6 (`camera_info` x quadro); 4.7 (`ros2 topic pub --once
+     /bebop/photo std_msgs/msg/Bool "{data: true}"` SOMENTE no dominio do driver, autorizado pelo usuario;
+     `states/picture_event`; FTP com `bebop_mission_control/streamer/media_fetch.py`); 4.8 e 4.5f (FPS e CPU por
+     estagio com `--no-fly` + relay, `bench_fps`/`/status`);
+  5. 6.1 (stamps, derrubar o link e ver a invalidacao), 6.3 (ACK de flat trim: publicar `/bebop/flattrim` no
+     dominio do driver nao arma motores), 6.4 (calibracao magnetica pelo painel, girando a aeronave a mao);
+  6. 7.2 (daemon obsoleto com o driver vivo), 7.4 (`bench_startup` com driver e camera);
+  7. 8.4: completar `docs/RELATORIO_IMPLEMENTACAO_E2E_2026-09-30.md` e pedir os commits restantes.
 
 ## Contexto da estacao (medido em 2026-09-30)
 
@@ -140,45 +142,45 @@ Estados: `pendente`, `em andamento`, `feito`, `bloqueado`, `aguardando drone`, `
 
 | Item | Estado | Notas |
 |---|---|---|
-| 5.1 Sem fallbacks; `--params-json` unica fonte | pendente | |
-| 5.2 Fonte unica de defaults (`--dump-defaults`) | pendente | |
-| 5.3 JSON invalido retorna `success:false` | pendente | |
-| 5.4 Preflight bloqueia com `status !== 'ready'` | pendente | |
-| 5.5 Falha de `params.save()` aborta | pendente | |
-| 5.6 Escrita atomica com fsync | pendente | |
-| 5.7 `countdown_sec` 0 respeitado | pendente | |
-| 5.8 `applyPreset` preserva PID, calibracao, `no_fly` | pendente | |
-| 5.9 Bancada salva `dirty` antes do spawn | pendente | |
-| 5.10 Testes de duas missoes e merge | pendente | |
+| 5.1 Sem fallbacks; `--params-json` unica fonte | feito | `App.tsx`: `num()`/fallbacks removidos; launch e bancada passam por `commitLaunchDocument` e enviam so `{countdown, noFly, paramsJson}` (`MissionLaunchOptions.paramsJson` obrigatorio). `lib/launchDocument.ts`: `REQUIRED_LAUNCH_NUMBERS` (campos da ficha + os que eram flags), `launchBlockers` bloqueia com os nomes dos campos nao finitos. `main.cjs:startMissionProcess`: so `--params-json`, `--stages` e `--fly`/`--no-fly` (armamento explicito, ruling 1.x); documento ausente/invalido recusa o spawn; bancada reescreve `kinematics.countdown_sec=0` no documento (a estacao conta). Raio do mapa sem fallback (nulo nao desenha). Testes: `launchDocument.test.ts` (8), `launchArguments.test.ts` (13), `App.launchParams.test.tsx` (+6). |
+| 5.2 Fonte unica de defaults (`--dump-defaults`) | feito | `MissionParameters.factory()`; `mission.py --dump-defaults` imprime o JSON e sai sem ler/gravar o store; `main.cjs` `bmg:get-parameter-defaults` (spawn do activator, timeout 30 s) substitui o `python -c`; `parameterSchema.ts` sem `defaultValue`; `ParameterSheet` recebe `defaults` (marcador, "padrao" e Restaurar Padroes a partir deles; indisponivel sem eles); `readNumber` devolve `null` e o campo aparece como "valor ausente". Testes: `test_parameter_persistence.py`, `ParameterSheet.test.tsx` (5). |
+| 5.3 JSON invalido retorna `success:false` | feito | `electron/parameterStore.cjs:readParameterFile` (corrompido/nao-objeto -> erro; ausente -> `missing`); `bmg:get-parameters` so cai nos defaults com arquivo ausente (`source: 'defaults'`). Testes: `parameterStore.test.ts`, `launchArguments.test.ts`, `useMissionParameters.test.tsx`. |
+| 5.4 Preflight bloqueia com `status !== 'ready'` | feito | `lib/preflightGate.ts:preflightBlockedReason` (carregando/gravando/indisponivel, inclusive na bancada), usado pelo `PreflightScreen`; `commitLaunchDocument` repete a checagem. Testes: `preflightGate.test.ts` (6). |
+| 5.5 Falha de `params.save()` aborta | feito | `commitLaunchDocument`: save falho -> "Nao foi possivel salvar os parametros; lancamento abortado." Teste em `App.launchParams.test.tsx`. |
+| 5.6 Escrita atomica com fsync | feito | `parameterStore.cjs:writeJsonAtomic`: temporario unico (pid + 6 bytes aleatorios, `wx`), `fsyncSync`, `renameSync`, fsync do diretorio; falha remove o temporario e preserva o arquivo. `CONFIG_PATH` aceita `BMG_MISSION_CONFIG` (testes). |
+| 5.7 `countdown_sec` 0 respeitado | feito | Default Python 0 -> 10 s e `COUNTDOWN_MIN_SEC = 0` documentado; `resolve_parameters` recusa negativo/nao finito/nao numerico com SystemExit antes de persistir; `launchCountdownSec` literal (sem `STATION_COUNTDOWN_SEC`); campo "Contagem Regressiva" (0-30 s) na ficha. Testes: `test_parameter_persistence.py` (8), `launchDocument.test.ts`. |
+| 5.8 `applyPreset` preserva PID, calibracao, `no_fly` | feito | `applySchemaFields` no `applyPreset` e no `applyFactory`. Testes: `useMissionParameters.test.tsx` (5). |
+| 5.9 Bancada salva `dirty` antes do spawn | feito | `runBenchStage` usa `commitLaunchDocument`. Teste em `App.launchParams.test.tsx`. |
+| 5.10 Testes de duas missoes e merge | feito | vitest: segunda missao da sessao voa o valor editado; pytest: `resolve_parameters` (extraido do `main`) com arquivo + `--params-json` sem flags. Suites: pytest 1101, vitest 48/422, tsc 0. |
 
 ### Fase 6 — Telemetria e calibracoes com ACK
 
 | Item | Estado | Notas |
 |---|---|---|
-| 6.1 Driver: stamps ARSDK, invalidacao, pose | pendente | Validacao exige drone. |
-| 6.2 `telemetry_bridge.py` frescor e derivados | pendente | |
-| 6.3 Flat trim com ACK | pendente | Validacao exige drone. |
-| 6.4 Calibracao magnetica | pendente | Validacao exige drone. |
+| 6.1 Driver: stamps ARSDK, invalidacao, pose | feito (codigo); validacao ao vivo aguardando drone | `telemetry_state.{hpp,cpp}`: `LinkMonitor` (RUNNING/STOPPED do device controller + 2 s sem evento ARSDK = link caido), `OdometryIntegrator` (integra so entre amostras de speed novas, gap limitado a 0,5 s), `toNanoseconds`, `magnetoCalibrationJson`; `clock_type` explicitado como `system_clock`. `publishState`: `states/link` (Bool), stamp ARSDK no `header.stamp` de bateria e GPS, com o link caido bateria NaN/`present=false`, `flying_state` 255, GPS `NO_FIX`, altitude NaN, RSSI 0. `publishOdometry`: nada sem link ou sem amostra nova, stamp da amostra. Pragma de fallthrough do uthash em `ardrone3_state_callbacks.cpp` (o warning so aparecia em rebuild completo). gtest `test_telemetry_state` 9/9; build 0 warnings. |
+| 6.2 `telemetry_bridge.py` frescor e derivados | feito | Frescor da odometria pelo `header.stamp` (`STAMP_STALE_SEC` 1,5 s; `odom_age_sec` pelo stamp); `states/link` falso derruba os campos de voo na hora; lat/lon de GPS so com `data_fresh`; `/bebop/mission/ground_reference` (Float32, publicado pelo `takeoff._calibrate` via `ctx.publish_ground_reference`) zera `gps_home` e da o z0 -> `altitude` relativa (`altitude_reference` mission/odometry/simulator); `roll_deg`/`pitch_deg` do quaternion (`decode_attitude`); `sonar_altitude` mantido; `battery_age_sec` pelo stamp do relato. Tipos em `types/bmg.ts`. Relay de bancada encaminha `states/link`, `states/flat_trim`, `states/magneto_calibration`. Testes: `test_telemetry_truth.py` (14), `test_ground_reference.py` (2). |
+| 6.3 Flat trim com ACK | feito (codigo); validacao ao vivo aguardando drone | Driver: `FLATTRIMCHANGED` conta em `states/flat_trim` (UInt32, reliable, transient-local). Missao: `telemetry/flat_trim_ack.py` (`FlatTrimAckTracker`), assinatura no `mission.py`; `TakeoffStep._flat_trim` le a contagem, pede o trim e espera `timeouts.flat_trim_ack_timeout_sec` (3,0 s); voo real sem ACK -> FAILURE com alerta CRITICAL "Nivelamento sem confirmacao" (acao em `_GROUND_FAULT_ACTIONS`, sem frase de pouso); bancada segue com WARNING. Testes: `test_flat_trim_ack.py` (13); dublê de `test_prearm_battery_gate.py` passa a confirmar o trim. |
+| 6.4 Calibracao magnetica | feito (codigo); validacao ao vivo aguardando drone | Driver: assina `calibrate_magneto` (Bool) -> `sendCalibrationMagnetoCalibration`; `MagnetoCalibrationStateChanged`/`RequiredState`/`AxisToCalibrateChanged`/`StartedChanged` (U8 lidos com `argumentU8`) em `states/magneto_calibration` (JSON). Bridge de telemetria repassa `magneto_calibration`; `command_bridge` op `magneto` (so booleano JSON, `magneto_request`); `main.cjs` `bmg:magneto-calibration` (recusa iniciar com missao em execucao); `preload.calibrateMagneto`. GCS: `lib/magnetoCalibration.ts` (`magnetoView`: fases e eixos so do relato da aeronave) e `MagnetoCalibrationPanel` ao lado do terminal no Diagnostico; nunca automatico. Testes: `magnetoCalibration.test.ts` (6), `magnetoCommand.test.ts` (3), `MagnetoCalibrationPanel.test.tsx` (3), `test_command_bridge_magneto.py` (7). Suites: pytest 1135, vitest 51/434, tsc 0. |
 
 ### Fase 7 — Latencia de arranque
 
 | Item | Estado | Notas |
 |---|---|---|
-| 7.1 Import lazy do announcer | pendente | |
-| 7.2 Daemon ros2 obsoleto | pendente | |
-| 7.3 Limpeza de SHM orfao | pendente | |
-| 7.4 Warmup YOLO em paralelo | pendente | |
-| 7.5 `[TIMING] phase=` e `test_profiling.py` | pendente | |
+| 7.1 Import lazy do announcer | feito | `telemetry/__init__.py` com exports lazy (PEP 562); `announcer._load_genai()` importa `google.genai` so na primeira sintese (cliente, `session_config`, `Content`, status do daemon). Sob `BMG_GCS_SESSION=1` a missao nao importa o genai (medido: 1,8 s do boot). `context.py` passa o `Detector` do SDK para `TYPE_CHECKING` (torch, ~2 s, sai do boot e vai para a thread de inferencia). Testes: `test_lazy_announcer.py` (3). |
+| 7.2 Daemon ros2 obsoleto | feito (codigo); reproducao ao vivo aguardando drone | `actuators/driver_discovery.py` (`driver_in_graph` pelo `get_node_names_and_namespaces` do no de telemetria, espera ativa ate 2 s; `restart_ros2_daemon`). `BenchtopDroneProxy.connect(graph_probe, restart_daemon)`: grafo ve o driver e o SDK nao -> WARNING "ros2 daemon stale", stop/start uma vez e novo `connect()`; bancada sem driver no grafo pula o `ros2 node list` do SDK (`driver_reachable=False`). A sonda roda numa thread desde o `nectar.init`. `electron/rosHousekeeping.cjs:restartRos2Daemon` (single-flight `refreshRos2Daemon`) antes do `make driver-bebop` e em troca de SSID (`createSsidChangeDetector`, no `connect-wifi` e na telemetria). Testes: `test_driver_discovery.py` (11), `rosHousekeeping.test.ts`. |
+| 7.3 Limpeza de SHM orfao | feito | `cleanOrphanShm` no `startBackgroundServices` (antes dos bridges): sem processo ROS da estacao vivo (`/proc/*/cmdline`; o daemon ros2 nao conta, o comando so remove segmentos de dono morto) roda `fastdds shm clean` e loga removidos/antes/depois. Validado nesta estacao: 0 zumbis (os 6 segmentos em uso eram de 3 daemons ros2 que os testes de bancada deixaram nos dominios 86/87/89; parados). Testes: `rosHousekeeping.test.ts` (6). |
+| 7.4 Warmup YOLO em paralelo | feito | `perception/inference_device.py`: `preload_plan` (dispositivos que a selecao vai construir), `DetectorPreloader` (thread: build, load, warmup num quadro 856x480 sintetico; `build()` entrega cada preloaded uma vez, sem recarregar; erro do preload repassado a selecao). `mission.py`: `_prepare_inference` em thread logo apos `resolve_parameters` (import do torch, probe de devices, preload) enquanto o principal sobe SDK, sonda do driver e camera; join no `select_detector`, que continua escolhendo no primeiro quadro real (4.5d), antes do Stage 1; saidas de erro aguardam o setup (`_settle_inference_setup`). `CUDA_WARMUP_SAMPLES` 10 -> 2 (medido: 1a chamada 1,7 s, 2a 47 ms, demais 44-46 ms). Testes: `test_detector_preload.py` (7). |
+| 7.5 `[TIMING] phase=` e `test_profiling.py` | feito | `engine/startup_timing.py` (`StartupTimer.phase/lap/record`, `process_age_ms` por `/proc`): `boot`, `parameters`, `nectar_init`, `device_probe`, `camera_open`, `driver_connect`, `first_frame`, `detector_warmup`, `mission_wiring`. `scripts/bench_startup.py` (dominio 89, cache de device quente, `BMG_GCS_SESSION=1`). spawn -> `[STEP 1`, bancada sem driver, mediana: **11,8 s -> 6,2 s** (5 rodadas: 6,1-7,2 s). Fases depois: boot 0,79, device_probe 2,25 (thread), driver_connect 1,60 (sonda, sobreposta), detector_warmup 2,39 (espera do preload), camera_open 0,42, nectar_init 0,67, first_frame 0,24. Testes: `test_startup_timing.py` (9), `test_bench_startup.py` (3). Suites: pytest 1167, vitest 52/440, tsc 0. |
 
 ### Fase 8 — Validacao final
 
 | Item | Estado | Notas |
 |---|---|---|
-| 8.1 Suites completas e build npm | pendente | |
-| 8.2 colcon build missao e driver | pendente | |
-| 8.3 Ensaio completo em bancada | pendente | |
-| 8.4 Relatorio final | pendente | |
-| 8.5 git status e pedido de commits | pendente | |
+| 8.1 Suites completas e build npm | feito (bancada) | pytest 1177 (base 869), vitest 53 arquivos / 443 (base 27 / 219), tsc 0, `npm run build` OK (aviso preexistente de chunk > 500 kB do Vite). |
+| 8.2 colcon build missao e driver | feito | `colcon build --symlink-install` de `mvp_mission_bebop` e `ros2_bebop_driver` OK; driver com 0 warnings e gtests 9/9 + 5/5. |
+| 8.3 Ensaio completo em bancada | feito (bancada) | `scripts/bench_rehearsal.py` (dominio 91): completo exit 0, STEP 1..5 e milestones em ordem, 8 falas reais e 0 sobreposicoes (`[SPEECH]` + novo `[SPEECH_DONE] audio_ms=`); abort no Stage 2 exit 3; touchdown com janela de 0,05 s exit 4 (`method: unconfirmed`). Traco em `test/fixtures/bench_rehearsal_trace.json`, reproduzido em `finishLock.rehearsal.test.ts` (Finalizar travado em todos os estagios, liberado apos o exit em solo). `bench_fps.py`: 30,0 FPS no `/status` e no cliente nas tres janelas. Achado e corrigido: ultimo estado de bancada ficava LANDING (4) e travava o Finalizar apos missao bem-sucedida -> `KinematicSimulator.complete_landing()` no encerramento. Testes: `test_bench_rehearsal.py` (6), `test_simulator.py` (+3), `test_announcer_calls.py` (+1). |
+| 8.4 Relatorio final | em andamento (aguardando drone) | Rascunho em `docs/RELATORIO_IMPLEMENTACAO_E2E_2026-09-30.md` com a tabela antes/depois medida na bancada; colunas de aeronave marcadas "pendente drone". |
+| 8.5 git status e pedido de commits | aguardando usuario | Fases 0-4 commitadas e enviadas (`00e2292..7c4479d`, autorizado). Fases 5-8 prontas no working tree do monorepo; driver com alteracoes sem commit (nao autorizado). |
 
 ## Decisoes e desvios
 
@@ -222,4 +224,14 @@ Estados: `pendente`, `em andamento`, `feito`, `bloqueado`, `aguardando drone`, `
 - 4.7: Observacao: na bancada (`--no-fly` + relay), `/bebop/photo` nao cruza o relay; o sidecar registra `acknowledged: false`, que e o correto.
 - 4.5g: Ruling: CUDA passa de FP32 para FP16 — medido 7% mais rapido e sem mudanca de deteccao no conjunto de evidencias; invalida a afirmacao anterior de "FP16 sem ganho" (erro de medicao) — custo se errado: `CUDA_QUANTIZE = 32`.
 - Correcao: dubles de `detect` em `test_stage_altitude_wiring.py` e `test_stage3_integration.py` nao aceitavam `imgsz` desde o 4.5e (8 testes quebrados); assinatura corrigida.
+- 5.2: Ruling: os defaults da ficha passam a ser os do Python (altitude 1,00 m, estabilizacao 4 s, ...) e nao mais os do TypeScript (1,8 m, 2 s) — o plano exige fonte unica em `MissionParameters.factory()`; o valor salvo do operador nao muda, so o que "Restaurar Padroes" devolve — custo se errado: ajustar os defaults no `parameters.py`.
+- 5.7: Ruling: piso de `countdown_sec` = 0 s (0 = sem contagem) e default 10 s no Python; o campo entrou na ficha para o 0 ser visivel e intencional — o plano pede "piso minimo documentado" sem valor; um piso > 0 contradiria "0 respeitado como 0" — custo se errado: subir `COUNTDOWN_MIN_SEC`.
+- 5.1: Ruling: as flags individuais continuam aceitas pelo `mission.py` (uso por CLI); so a estacao deixou de envia-las. O `--fly`/`--no-fly` continua explicito.
+- 6.1: Ruling: so bateria e GPS ganham o stamp ARSDK em `header.stamp` (os outros estados sao `std_msgs` sem header); o frescor dos demais vem do `states/link` e da invalidacao no disconnect — o plano aceita "header.stamp ou campo age" — custo se errado: trocar os tipos por mensagens com header (quebra consumidores).
+- 6.1: Ruling: link caido = device STOPPED ou 2 s sem nenhum evento ARSDK — o Bebop envia atitude e velocidade a 5 Hz conectado — custo se errado: com a aeronave muda por >2 s sem desconectar, a estacao mostra "sem dados" ate o proximo evento.
+- 6.1: Ruling: `/bebop/odom` passa a sair so com amostra nova (~5 Hz, a taxa do ARSDK) em vez de 15 Hz republicando a mesma — custo se errado: um consumidor que exige 15 Hz (nenhum encontrado; o watchdog da missao usa janelas de segundos).
+- 6.4: Observacao: o componente `MagnetoCalibrationPanel` foi escrito junto com o teste (sem RED isolado do componente); a logica dele (`magnetoView`) teve RED.
+- 7.4: Desvio da meta: spawn -> `[STEP 1` ficou em 6,2 s na bancada (meta < 6 s). O caminho critico restante e o setup de inferencia, preso ao GIL: import do torch 1,8 s, build do detector 0,8 s, primeira inferencia CUDA 1,7 s (o torch importa o `_dynamo` sob demanda; `CUDA_MODULE_LOADING=EAGER` medido pior: 9,3 s) e a validacao do cache 0,36 s. Com o driver no ar a sonda responde em decimos e o SDK custa ~0,95 s, ambos sobrepostos ao setup; medir com o drone na Fase 8.
+- 7.5: Ruling: os testes de arranque ficaram em `test/test_startup_timing.py` e `test/test_bench_startup.py`, nao em `test/test_profiling.py`, que testa os perfis de velocidade jerk-limited (`controllers/profiling.py`) — custo se errado: mover os testes.
+- 7.2: Ruling: na bancada sem driver no grafo o `connect()` do SDK nao e chamado (a sonda ja respondeu) — o plano manda sondar antes; chamar o SDK so repetiria 0,95 s de `ros2 node list` para a mesma resposta — custo se errado: nenhum em voo (voo real sempre chama o SDK).
 
