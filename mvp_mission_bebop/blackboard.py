@@ -54,3 +54,13 @@ class MissionBlackboard:
     #: Set once the return leg has landed, so the runner's cleanup does not
     #: issue a second, redundant landing command.
     rtl_completed: bool = False
+    #: Set by the takeoff stage when its countdown ends and takeoff is about to
+    #: be commanded. From then on Stage 1 can never be re-entered.
+    takeoff_committed: bool = False
+    #: Set once the takeoff stage has climbed and stabilised. Stages 2-4
+    #: presuppose it when the run includes Stage 1.
+    takeoff_complete: bool = False
+    #: Outcome of the return leg's touchdown: ``True`` confirmed from odometry,
+    #: ``False`` commanded but unconfirmed, ``None`` when no touchdown ran. Drives
+    #: the exit status (``engine.exit_codes``).
+    touchdown_confirmed: Optional[bool] = None

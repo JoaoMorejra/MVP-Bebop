@@ -418,7 +418,7 @@ def test_a_normal_landing_is_commanded_and_confirmed():
     drone = LandingDrone(obeys_land=True)
     ctx = landing_ctx(drone)
 
-    status = ClosedLoopRTLStep()._touchdown(ctx, None)
+    status = ClosedLoopRTLStep()._touchdown(ctx, None, at_base=True)
 
     assert status.name == "SUCCESS"
     assert ctx.blackboard.rtl_completed, "a completed landing must be recorded as completed"
@@ -437,7 +437,7 @@ def test_a_firmware_that_ignores_land_still_gets_the_drone_down():
     drone = LandingDrone(obeys_land=False)
     ctx = landing_ctx(drone)
 
-    ClosedLoopRTLStep()._touchdown(ctx, None)
+    ClosedLoopRTLStep()._touchdown(ctx, None, at_base=True)
 
     descents = [vz for _vx, _vy, vz, _vyaw in drone.commands if vz < 0.0]
     assert descents, "assisted descent was never commanded"
@@ -459,7 +459,7 @@ def test_the_land_request_is_the_last_thing_on_the_wire():
     drone.land = lambda: (order.append("land"), original_land())[1]
     drone.move_velocity = lambda **kw: (order.append("move"), original_move(**kw))[1]
 
-    ClosedLoopRTLStep()._touchdown(ctx, None)
+    ClosedLoopRTLStep()._touchdown(ctx, None, at_base=True)
 
     assert order[-1] == "land", "the landing request must be the final command sent"
 
@@ -469,7 +469,7 @@ def test_touchdown_never_commands_climb_or_yaw():
 
     drone = LandingDrone(obeys_land=False)
     ctx = landing_ctx(drone)
-    ClosedLoopRTLStep()._touchdown(ctx, None)
+    ClosedLoopRTLStep()._touchdown(ctx, None, at_base=True)
 
     assert all(vz <= 0.0 for _vx, _vy, vz, _vyaw in drone.commands)
     assert all(vyaw == 0.0 for _vx, _vy, _vz, vyaw in drone.commands)
@@ -491,9 +491,54 @@ def test_a_slow_steady_descent_is_not_mistaken_for_touchdown():
     ctx = landing_ctx(drone)
     ctx.params.rtl.touchdown_timeout_sec = 1.0  # far too short to actually land
 
-    ClosedLoopRTLStep()._touchdown(ctx, None)
+    ClosedLoopRTLStep()._touchdown(ctx, None, at_base=True)
 
     assert ctx.odom_supervisor.relative_altitude > ctx.params.rtl.touchdown_altitude_m
     assert not ctx.blackboard.rtl_completed, (
         "a drone still airborne must not be recorded as landed"
     )
+
+
+@pytest.fixture
+def milestones(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(
+        "mvp_mission_bebop.steps.rtl.emit_milestone",
+        lambda key, payload=None: emitted.append((key, dict(payload or {}))),
+    )
+    return emitted
+
+
+@pytest.mark.parametrize("at_base", [True, False])
+def test_a_confirmed_touchdown_reports_its_outcome(milestones, at_base):
+    """``mission.touchdown`` is what the station's landing narration keys on."""
+    from mvp_mission_bebop.steps.rtl import ClosedLoopRTLStep
+
+    drone = LandingDrone(obeys_land=True)
+    ctx = landing_ctx(drone)
+
+    ClosedLoopRTLStep()._touchdown(ctx, None, at_base=at_base)
+
+    keys = [key for key, _ in milestones]
+    assert keys == ["mission.landing", "mission.touchdown"]
+    payload = milestones[-1][1]
+    assert payload["confirmed"] is True
+    assert payload["at_base"] is at_base
+    assert payload["method"] in ("settled", "stagnation")
+    assert ctx.blackboard.touchdown_confirmed is True
+
+
+def test_an_unconfirmed_touchdown_is_reported_as_such(milestones):
+    """Regression: an unconfirmed landing announced itself and exited as a success."""
+    from mvp_mission_bebop.steps.rtl import ClosedLoopRTLStep
+
+    drone = LandingDrone(obeys_land=True, descent_rate=0.10)
+    ctx = landing_ctx(drone)
+    ctx.params.rtl.touchdown_timeout_sec = 1.0
+
+    ClosedLoopRTLStep()._touchdown(ctx, None, at_base=True)
+
+    payload = milestones[-1][1]
+    assert milestones[-1][0] == "mission.touchdown"
+    assert payload == {"confirmed": False, "at_base": True, "method": "unconfirmed"}
+    assert ctx.blackboard.touchdown_confirmed is False

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Callable, Final, List, Optional
+from typing import Callable, Dict, Final, List, Optional
 
 import nectar
 
 from mvp_mission_bebop.context import MissionContext
+from mvp_mission_bebop.engine.exit_codes import EXIT_ABORTED_LANDED, mission_exit_code
 from mvp_mission_bebop.engine.signals import EmergencyHandler
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 
@@ -22,6 +23,15 @@ _EMERGENCY_BURST_COUNT: int = 5
 
 #: Spacing between commands in that burst.
 _EMERGENCY_BURST_INTERVAL_SEC: float = 0.04
+
+#: Stage names as the station speaks them in a failure alert.
+_SPOKEN_STAGE_NAMES: Final[Dict[int, str]] = {
+    1: "Decolagem",
+    2: "Varredura",
+    3: "Aproximação",
+    4: "Inspeção",
+    5: "Retorno à base",
+}
 
 #: First stage that presupposes a confirmed target. A run entering it without
 #: having confirmed one -- a partial bench run (``--stages 3,4,5``) or a stage
@@ -57,6 +67,7 @@ class MissionRunner:
             emergency_event=context.emergency_event,
             land_sequence=self._transmit_emergency_landing,
             finalizer=self._finalize,
+            exit_code=EXIT_ABORTED_LANDED,
         )
 
     @property
@@ -72,6 +83,17 @@ class MissionRunner:
         """Release resources if that has not already happened."""
         self._emergency.finalize_once()
 
+    def exit_code(self, succeeded: bool) -> int:
+        """Exit status for a run that returned ``succeeded`` from :meth:`run`.
+
+        See :func:`~mvp_mission_bebop.engine.exit_codes.mission_exit_code`.
+        """
+        return mission_exit_code(
+            succeeded,
+            aborted=self._emergency.triggered,
+            touchdown_confirmed=getattr(self.ctx.blackboard, "touchdown_confirmed", None),
+        )
+
     # -------------------------------------------------------------- execution
 
     def run(self) -> bool:
@@ -85,6 +107,7 @@ class MissionRunner:
         logger.info("Commencing autonomous mission execution (%d steps).", len(self.steps))
         all_succeeded = True
         index = 0
+        entered_by_jump = False
 
         try:
             while index < len(self.steps):
@@ -94,6 +117,13 @@ class MissionRunner:
                     break
 
                 step = self.steps[index]
+                alerts_before = self._alerts_raised()
+                # Read by the stage gate (engine.stage_gate) from the executor
+                # thread that receives the station's goto requests.
+                self.ctx.current_stage = self.stage_numbers[index]
+                # Read by the steps whose narration presupposes the stage before
+                # (``mission.rtl_start``: "inspeção concluída").
+                self.ctx.entered_by_jump = entered_by_jump
                 self._open_reveal_past_the_search(self.stage_numbers[index])
                 status = step.execute(self.ctx)
 
@@ -104,7 +134,9 @@ class MissionRunner:
                 target = self._take_stage_jump()
                 if target is not None:
                     index = target
+                    entered_by_jump = True
                     continue
+                entered_by_jump = False
 
                 if status is StepStatus.ABORTED:
                     logger.warning("Step '%s' signalled ABORT.", step.name)
@@ -114,9 +146,22 @@ class MissionRunner:
 
                 if status is StepStatus.FAILURE:
                     logger.error("Step '%s' failed. Halting mission pipeline.", step.name)
-                    self._announce_failure(
-                        "Falha na etapa", f"falha na etapa {step.name}", priority="CRITICAL"
+                    # A step or the failsafe that already alerted about this
+                    # failure has said the specific thing; a generic "step
+                    # failed" after it only delays the next line.
+                    already_alerted = self._alerts_raised() > alerts_before or bool(
+                        getattr(getattr(self.ctx, "failsafe", None), "failsafe_active", False)
                     )
+                    if already_alerted:
+                        logger.info("Step failure already alerted; no generic step_failed.")
+                    else:
+                        stage = self.stage_numbers[index]
+                        self._announce_failure(
+                            "Falha na etapa",
+                            _SPOKEN_STAGE_NAMES.get(stage, f"etapa {stage}"),
+                            priority="CRITICAL",
+                            airborne=bool(getattr(getattr(self.ctx, "blackboard", None), "takeoff_committed", False)),
+                        )
                     all_succeeded = False
                     break
 
@@ -226,10 +271,24 @@ class MissionRunner:
         logger.info("Mission resource cleanup finalized.")
 
     @staticmethod
-    def _announce_failure(action: str, detail: str, *, priority: str = "URGENT") -> None:
+    def _alerts_raised() -> int:
+        try:
+            from mvp_mission_bebop.telemetry.announcer import alerts_raised
+
+            return alerts_raised()
+        except Exception:  # noqa: BLE001 - audio is never flight-critical
+            return 0
+
+    @staticmethod
+    def _announce_failure(
+        action: str, detail: str, *, priority: str = "URGENT", airborne: Optional[bool] = None
+    ) -> None:
         try:
             from mvp_mission_bebop.telemetry.announcer import announce_sync
 
-            announce_sync(action, details={"etapa": detail}, priority=priority, wait=False)
+            details = {"etapa": detail}
+            if airborne is not None:
+                details["em_voo"] = airborne
+            announce_sync(action, details=details, priority=priority, wait=False)
         except Exception as exc:  # noqa: BLE001 - audio is never flight-critical
             logger.debug("Announcement dispatch failed: %s", exc)

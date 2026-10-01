@@ -26,6 +26,49 @@ logger = logging.getLogger("FailsafeSupervisor")
 KINEMATIC_TOLERANCE: Final[float] = 1e-4
 
 
+
+#: Relative altitude above which the airframe is taken to be flying, metres.
+AIRBORNE_ALTITUDE_M: Final[float] = 0.25
+
+#: Failsafe reasons as the station speaks them, by the English prefix the
+#: supervisors log. The log keeps the English detail; the voice gets pt-BR, and
+#: anything not listed -- an exception message above all -- is never read out
+#: raw.
+_SPOKEN_REASONS: Final[Tuple[Tuple[str, str], ...]] = (
+    ("no odometry has ever been received", "odometria nunca recebida"),
+    ("no odometry received", "odometria nunca recebida"),
+    ("odometry telemetry", "perda da telemetria de odometria"),
+    ("altitude ceiling breached", "teto de altitude excedido"),
+    ("battery at", "bateria no limiar de pouso"),
+    ("camera stream loss", "perda do vídeo da câmera"),
+    ("ground reference lost", "referência de solo perdida na subida"),
+    ("failsafe already active", "failsafe já ativo"),
+)
+
+#: Spoken for any reason not in :data:`_SPOKEN_REASONS`.
+_UNKNOWN_REASON: Final[str] = "falha interna da missão"
+
+
+def spoken_reason(reason: str) -> str:
+    """The pt-BR clause the station speaks for a failsafe ``reason``.
+
+    Parameters
+    ----------
+    reason : str
+        The English reason a supervisor logged, or an exception message.
+
+    Returns
+    -------
+    str
+        A short pt-BR clause without a trailing period; ``_UNKNOWN_REASON`` for
+        anything unrecognised.
+    """
+    text = str(reason or "").strip().lower()
+    for prefix, spoken in _SPOKEN_REASONS:
+        if text.startswith(prefix):
+            return spoken
+    return _UNKNOWN_REASON
+
 class FailsafeSupervisor:
     """Supervisory observer validating multi-sensor integrity and flight envelope invariants."""
 
@@ -328,6 +371,11 @@ class FailsafeSupervisor:
 
         return True, "Nominal"
 
+    def _airborne(self) -> bool:
+        """Whether odometry places the airframe above the ground. Unknown is not."""
+        altitude = getattr(self.odom_supervisor, "relative_altitude", None)
+        return isinstance(altitude, (int, float)) and math.isfinite(altitude) and altitude > AIRBORNE_ALTITUDE_M
+
     def trigger_emergency_land(self, reason: str) -> None:
         """Execute immediate controlled safe landing. Never cuts motors abruptly."""
         self.failsafe_active = True
@@ -337,7 +385,7 @@ class FailsafeSupervisor:
             from mvp_mission_bebop.telemetry.announcer import announce_sync
             announce_sync(
                 "Falha de segurança",
-                details={"erro": reason},
+                details={"erro": spoken_reason(reason), "em_voo": self._airborne()},
                 priority="CRITICAL",
                 wait=False,
             )

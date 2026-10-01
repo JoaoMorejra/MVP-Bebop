@@ -99,7 +99,10 @@ class VisualServoingStep(BaseStep):
             timeouts.tracking_timeout_sec,
         )
 
-        emit_milestone("mission.approaching", {"window_sec": timeouts.tracking_timeout_sec})
+        emit_milestone(
+            "mission.approaching",
+            {"window_sec": timeouts.tracking_timeout_sec, "ibvs": bool(vision_cfg.ibvs_enabled)},
+        )
         deadline = Deadline(timeouts.tracking_timeout_sec)
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
         approach_finished = False

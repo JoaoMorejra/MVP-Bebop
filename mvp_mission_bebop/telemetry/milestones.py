@@ -13,9 +13,11 @@ The key is one of :data:`MILESTONE_KEYS`, taken verbatim from the "pool key"
 column of the spec's synchronisation table; the GCS resolves it to a phrase
 pool. The payload is always present, always a single-line JSON object (``{}``
 when empty), with non-finite floats replaced by ``null`` so ``JSON.parse`` in
-the renderer never rejects it. ``mission.start`` and ``mission.countdown_3``
-are raised by the Electron process before this one exists and are
-deliberately absent here.
+the renderer never rejects it. ``mission.start`` is raised by the Electron
+process when it spawns this one and is deliberately absent here. The countdown
+(``mission.countdown`` every whole second, ``mission.countdown_3`` at the
+clearance call) is raised here, by ``TakeoffStep._countdown``, because only this
+process knows when its countdown actually runs.
 
 Alerts travel the same way on their own tag::
 
@@ -59,6 +61,8 @@ ALERT_KEYS: Final[Tuple[str, ...]] = (
 #: ``mission.battery_warning``, which is raised at whatever point the charge
 #: crosses the fixed warning threshold (``telemetry.battery``).
 MILESTONE_KEYS: Final[Tuple[str, ...]] = (
+    "mission.countdown",
+    "mission.countdown_3",
     "mission.takeoff",
     "mission.scan_start",
     "mission.target_found",
@@ -67,6 +71,8 @@ MILESTONE_KEYS: Final[Tuple[str, ...]] = (
     "mission.rtl_start",
     "mission.landing",
     "mission.battery_warning",
+    "mission.touchdown",
+    "mission.parameters",
 )
 
 
