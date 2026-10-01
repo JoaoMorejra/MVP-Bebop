@@ -402,6 +402,24 @@ def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
     return params
 
 
+#: Wait for the first camera frame, seconds; and the short wait when there is no camera.
+FIRST_FRAME_TIMEOUT_SEC = 2.5
+NO_CAMERA_TIMEOUT_SEC = 0.2
+
+
+def first_frame_timeout(driver_reachable: Optional[bool], camera_publishers: int) -> float:
+    """How long to wait for the first frame.
+
+    Short only when nothing can deliver one: no driver in the graph and no
+    publisher on the camera topic (the bench without a relay, which then uses
+    its static frame). A rehearsal fed by ``scripts/bench_relay.py`` has the
+    camera without the driver and waits the full window.
+    """
+    if driver_reachable is False and camera_publishers <= 0:
+        return NO_CAMERA_TIMEOUT_SEC
+    return FIRST_FRAME_TIMEOUT_SEC
+
+
 def main() -> None:
     """CLI initialization and mission lifecycle execution."""
     timer = StartupTimer()
@@ -635,8 +653,11 @@ def main() -> None:
         nectar.shutdown()
         sys.exit(1)
 
-    # Without a driver (bench) there is no camera to wait for.
-    sample_frame = handler.take_photo(timeout_sec=2.5 if actuator.driver_reachable is not False else 0.2)
+    sample_frame = handler.take_photo(
+        timeout_sec=first_frame_timeout(
+            actuator.driver_reachable, telemetry_node.count_publishers(params.network.camera_raw_topic)
+        )
+    )
     if sample_frame is None:
         if params.no_fly:
             logger.info("[NO-FLY BENCHTOP] Physical camera not available. Utilizing benchtop test frame.")
