@@ -4,6 +4,7 @@ import math
 
 import pytest
 
+from mvp_mission_bebop.actuators import simulator as simulator_module
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.actuators.simulator import (
     FIRMWARE_HOVER_ALTITUDE_M,
@@ -356,3 +357,51 @@ def test_a_lower_requested_altitude_still_caps_the_transient():
         simulator.integrate()
 
     assert supervisor.snapshot().raw_altitude == pytest.approx(0.60)
+
+
+# ------------------------------------------------------------ end of run (8.3)
+
+
+def _airborne_then(simulator, clock, *, land):
+    simulator.takeoff(1.0)
+    for _ in range(40):
+        clock.advance(0.1)
+        simulator.integrate()
+    if land:
+        simulator.land()
+        clock.advance(0.5)
+        simulator.integrate()
+
+
+def test_a_commanded_landing_is_completed_when_the_run_ends():
+    """Rehearsal: touchdown confirmed at 0.15 m, the mission exited before the
+    simulator reached the ground, and its last report stayed LANDING (4), so
+    the bench Finalizar lock read the airframe as still airborne."""
+    clock = FakeClock()
+    supervisor, simulator = build(clock)
+    reported = []
+    simulator.set_state_listener(reported.append)
+    _airborne_then(simulator, clock, land=True)
+    assert reported[-1].flying_state == simulator_module.FLYING_STATE_LANDING
+
+    assert simulator.complete_landing() is True
+    assert reported[-1].flying_state == simulator_module.FLYING_STATE_LANDED
+    assert supervisor.snapshot().raw_altitude == pytest.approx(0.0)
+    assert not simulator.airborne
+
+
+def test_no_landing_is_invented_for_a_hovering_airframe():
+    clock = FakeClock()
+    _supervisor, simulator = build(clock)
+    reported = []
+    simulator.set_state_listener(reported.append)
+    _airborne_then(simulator, clock, land=False)
+    count = len(reported)
+    assert simulator.complete_landing() is False
+    assert simulator.airborne
+    assert len(reported) == count
+
+
+def test_completing_on_the_ground_changes_nothing():
+    _supervisor, simulator = build()
+    assert simulator.complete_landing() is False

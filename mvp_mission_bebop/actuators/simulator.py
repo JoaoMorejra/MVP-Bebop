@@ -264,6 +264,33 @@ class KinematicSimulator:
             self._target_altitude = 0.0
         logger.debug("Simulated landing from %.2f m.", self._z)
 
+    def complete_landing(self) -> bool:
+        """Finish a commanded landing at once, as the firmware would, and report it.
+
+        Called when the run ends. The mission confirms touchdown from odometry
+        at ``rtl.touchdown_altitude_m`` and exits shortly after; the simulator
+        stopped with it mid-descent, so its last report was LANDING (4) and the
+        station's bench lock read the airframe as airborne after a completed
+        run. A real Bebop finishes the landing on its own and reports LANDED.
+
+        Returns
+        -------
+        bool
+            True when a landing was in progress and has been completed; a
+            hovering or grounded airframe is left as it is.
+        """
+        self.integrate()
+        with self._lock:
+            landing = self._airborne and self._target_altitude <= 0.0
+            if landing:
+                self._z = 0.0
+                self._vx = self._vy = self._vz = self._vyaw = 0.0
+                self._airborne = False
+                self._launching = False
+        if landing:
+            self._emit()
+        return landing
+
     def command(self, vx: float, vy: float, vz: float, vyaw: float) -> None:
         """Integrate the previously held command, then latch a new one."""
         self.integrate()
