@@ -67,7 +67,7 @@ from __future__ import annotations
 import logging
 import math
 from enum import Enum
-from typing import Any, Final, FrozenSet, Optional
+from typing import Any, Dict, Final, FrozenSet, List, Optional
 
 import cv2
 import numpy as np
@@ -86,7 +86,11 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
 )
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
-from mvp_mission_bebop.perception.intrinsics import DRIVER_PACKAGE, apply_driver_calibration
+from mvp_mission_bebop.perception.intrinsics import (
+    DRIVER_PACKAGE,
+    CalibrationMismatch,
+    apply_driver_calibration,
+)
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, TelemetryHealth
@@ -159,38 +163,6 @@ _TILT_REASSERT_SEC: Final[float] = 1.0
 #: term and the sigma-delta accumulator both have to absorb, over a marker, at
 #: low altitude. Better to treat the frame as missing and hold station.
 _CENTERING_FRAME_TIMEOUT_SEC: Final[float] = 0.4
-
-
-class _EmptyDetectionResult:
-    """A detection result carrying no detections, for the marker HUD.
-
-    ``MissionContext.publish_annotated_stream`` routes its frame through
-    ``Detector.draw_detections``, whose first act is ``if not result.detections``
-    (``nectar/ai/detection/core/base.py:539``). Passing ``None`` -- which reads
-    like the natural way to say "no boxes to draw" and is what this step did --
-    raises ``AttributeError`` there, on every single call.
-
-    The consequence was not a crash, which is what made it worth finding: the
-    exception was caught and logged at DEBUG, so Stage 5 published *no* annotated
-    frame at all for the whole return leg. The operator watching the detection
-    topic saw the last Stage 4 image, frozen, with no marker outline, no pose
-    axes and no HUD, while the aircraft flew home -- and the log said nothing at
-    a level anyone runs at.
-
-    One object with an empty ``detections`` satisfies the guard, ``draw_detections``
-    returns the frame unchanged, and the crosshair, the status band and the ROS
-    publish downstream of it all run as intended.
-    """
-
-    __slots__ = ()
-
-    #: Empty, and a tuple rather than a list so it cannot be appended to by
-    #: anything that mistakes this for a real result.
-    detections: Final[tuple] = ()
-
-
-#: Shared instance. It is immutable and stateless, so one is enough.
-_NO_DETECTIONS: Final[_EmptyDetectionResult] = _EmptyDetectionResult()
 
 
 class _PhaseOutcome(Enum):
@@ -361,6 +333,39 @@ class ArucoMarkerSensor:
             marker_id, translation, yaw, expected_id=self._target_id
         )
 
+    def overlay_geometry(self, frame: Optional[np.ndarray]) -> List[Dict[str, Any]]:
+        """Marker corners and projected pose axes, in pixels, for the GCS overlay.
+
+        One extra ``detect`` without drawing, a ``solvePnP`` and a projection of
+        the marker axes: the few milliseconds the station needs to draw the
+        HUD over the raw stream instead of receiving an annotated 1.2 MB frame.
+        Any failure reads as no marker; the overlay never ends a flight.
+        """
+        if frame is None:
+            return []
+        try:
+            bbox, marker_id = self._detector.detect(frame, False)
+            if marker_id is None or bbox is None or len(bbox) == 0:
+                return []
+            identifier = int(np.ravel(np.asarray(marker_id))[0])
+            corners = np.asarray(bbox[0], dtype=np.float32).reshape(4, 2)
+            entry: Dict[str, Any] = {"id": identifier, "corners_px": corners.tolist()}
+            matrix = np.asarray(self._detector.camera_matrix, dtype=np.float64)
+            distortion = np.asarray(self._detector.camera_distortion, dtype=np.float64)
+            solved, rotation, translation = cv2.solvePnP(
+                self._object_points, corners, matrix, distortion, flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+            if solved:
+                length = float(self._detector.tag_size)
+                axes = np.float32([[0, 0, 0], [length, 0, 0], [0, length, 0], [0, 0, length]])
+                projected, _ = cv2.projectPoints(axes, rotation, translation, matrix, distortion)
+                points = projected.reshape(4, 2).tolist()
+                entry["axes_px"] = dict(zip(("origin", "x", "y", "z"), points))
+            return [entry]
+        except Exception as exc:  # noqa: BLE001 - the overlay is never flight-critical
+            logger.debug("Marker overlay geometry unavailable: %s", exc)
+            return []
+
     # ---------------------------------------------------------------- helpers
 
     def _pose_via_solvepnp(self, frame: np.ndarray):
@@ -490,14 +495,29 @@ class ClosedLoopRTLStep(BaseStep):
         centering = self._build_centering(ctx)
 
         # ---- phase 1: attitude transition -------------------------------
-        emit_milestone("mission.rtl_start", {"marker_id": rtl_cfg.target_aruco_id})
+        # The sensor is built before the call so the call can say whether the
+        # return is marker-guided; building it depends on configuration and
+        # calibration only, not on the gimbal attitude.
+        sensor = None if centering is None else (self._sensor or self._build_sensor(ctx))
+        self._active_sensor = sensor
+        evidence = getattr(ctx.blackboard, "evidence", None)
+        emit_milestone(
+            "mission.rtl_start",
+            {
+                "marker_id": rtl_cfg.target_aruco_id,
+                "via_jump": bool(getattr(ctx, "entered_by_jump", False)),
+                "inspected": bool(
+                    ctx.blackboard.target_confirmed and evidence is not None and evidence.captured
+                ),
+                "marker_guided": sensor is not None,
+            },
+        )
         self._announce(
             "Iniciando Retorno à Base via ArUco",
             "iniciando retorno à base de lançamento por marcador ArUco",
         )
         self._engage_return_attitude(ctx)
 
-        sensor = None if centering is None else (self._sensor or self._build_sensor(ctx))
         if sensor is None:
             # Not a flight fault. See the module docstring: the legacy odometric
             # return is retained precisely so that a missing calibration file
@@ -547,7 +567,7 @@ class ClosedLoopRTLStep(BaseStep):
                 "Marcador não localizado",
                 "marcador da base não localizado, executando pouso seguro no local",
             )
-            return self._touchdown(ctx, guidance)
+            return self._touchdown(ctx, guidance, at_base=False)
 
         # ---- phase 3: closed-loop centering -----------------------------
         with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
@@ -573,7 +593,7 @@ class ClosedLoopRTLStep(BaseStep):
             )
 
         # ---- phase 4: precision touchdown -------------------------------
-        return self._touchdown(ctx, guidance)
+        return self._touchdown(ctx, guidance, at_base=True)
 
     # -------------------------------------------------------- phase 1: setup
 
@@ -709,7 +729,17 @@ class ClosedLoopRTLStep(BaseStep):
             )
             return None
 
-        calibration = apply_driver_calibration(detector)
+        try:
+            calibration = apply_driver_calibration(
+                detector, image_size=(int(ctx.frame_width), int(ctx.frame_height))
+            )
+        except CalibrationMismatch as exc:
+            logger.error(
+                "Marker-guided return refused: %s. A pose from these intrinsics would be "
+                "metrically wrong; the odometric return is flown instead.",
+                exc,
+            )
+            return None
         if calibration is not None:
             logger.info(
                 "Marker pose intrinsics: %s (%dx%d, principal point %.1f, %.1f).",
@@ -1193,7 +1223,7 @@ class ClosedLoopRTLStep(BaseStep):
                 "No launch origin was ever frozen and no motion sequence was aggregated; "
                 "there is nothing to return to. Descending in place."
             )
-            return self._touchdown(ctx, guidance)
+            return self._touchdown(ctx, guidance, at_base=False)
 
         logger.info(
             "Odometric RTL engaged. Cruise %.3f m/s (%.3f normalized), braking accel "
@@ -1221,7 +1251,7 @@ class ClosedLoopRTLStep(BaseStep):
         if status is not StepStatus.SUCCESS:
             return status
 
-        return self._touchdown(ctx, guidance)
+        return self._touchdown(ctx, guidance, at_base=True)
 
     # ------------------------------------------------------------- estimation
 
@@ -1416,8 +1446,22 @@ class ClosedLoopRTLStep(BaseStep):
 
     # --------------------------------------------------------------- terminal
 
-    def _touchdown(self, ctx: MissionContext, guidance: RTLGuidanceController) -> StepStatus:
+    def _touchdown(
+        self, ctx: MissionContext, guidance: RTLGuidanceController, *, at_base: bool
+    ) -> StepStatus:
         """Land, and confirm touchdown from odometry.
+
+        Parameters
+        ----------
+        ctx : MissionContext
+        guidance : RTLGuidanceController
+        at_base : bool
+            Whether the airframe is over the launch origin: after the marker
+            centering or the odometric station-keeping, not after a search that
+            ran out or a return with no origin to fly to. Keyword-only and
+            without a default, so no caller claims the base by omission. It
+            travels on ``mission.touchdown`` and decides whether the station
+            says "na base".
 
         Motor disarm cannot be confirmed on this airframe. ``BebopDrone.land``
         publishes an ``Empty`` message and returns immediately with no
@@ -1439,7 +1483,10 @@ class ClosedLoopRTLStep(BaseStep):
         # narration is an advance warning to the people around the pad.
         emit_milestone(
             "mission.landing",
-            {"altitude_m": round(ctx.odom_supervisor.snapshot().relative_altitude, 2)},
+            {
+                "altitude_m": round(ctx.odom_supervisor.snapshot().relative_altitude, 2),
+                "at_base": at_base,
+            },
         )
         self._assert_land(ctx, rtl_cfg.land_burst_count)
 
@@ -1447,6 +1494,7 @@ class ClosedLoopRTLStep(BaseStep):
         stagnant_elapsed = 0.0
         required_cycles = max(2, rtl_cfg.settle_min_samples // 2)
         confirmed = False
+        method = "unconfirmed"
         assisted = False
 
         start_altitude = ctx.odom_supervisor.snapshot().relative_altitude
@@ -1473,6 +1521,7 @@ class ClosedLoopRTLStep(BaseStep):
             settled_cycles = settled_cycles + 1 if (grounded and still) else 0
             if settled_cycles >= required_cycles:
                 confirmed = True
+                method = "settled"
                 break
 
             # --- fallback: the descent has stopped moving ---------------
@@ -1506,6 +1555,7 @@ class ClosedLoopRTLStep(BaseStep):
                     altitude,
                 )
                 confirmed = True
+                method = "stagnation"
                 break
 
             # --- escalation: the landing request is not being honoured ---
@@ -1555,7 +1605,11 @@ class ClosedLoopRTLStep(BaseStep):
         # unconditionally, so a drone still airborne at the timeout reported a
         # completed flight to everything downstream that reads the blackboard.
         ctx.blackboard.rtl_completed = confirmed
+        ctx.blackboard.touchdown_confirmed = confirmed
         final = ctx.odom_supervisor.snapshot()
+        emit_milestone(
+            "mission.touchdown", {"confirmed": confirmed, "at_base": at_base, "method": method}
+        )
 
         if confirmed:
             logger.info(
@@ -1564,7 +1618,10 @@ class ClosedLoopRTLStep(BaseStep):
                 final.speed,
                 " (assisted descent was required)" if assisted else "",
             )
-            self._announce("Pouso seguro concluído", "pouso seguro concluído na base de lançamento")
+            self._announce(
+                "Pouso seguro concluído",
+                "pouso seguro concluído na base de lançamento" if at_base else "pouso seguro concluído no local",
+            )
             return StepStatus.SUCCESS
 
         logger.warning(
@@ -1628,7 +1685,7 @@ class ClosedLoopRTLStep(BaseStep):
     def _publish_telemetry(
         self, ctx: MissionContext, command: GuidanceCommand, elapsed_sec: float
     ) -> None:
-        """Overlay guidance state onto the annotated camera stream."""
+        """Overlay guidance state onto the raw camera stream (``bmg.detections`` JSON)."""
         if ctx.handler is None:
             return
         try:
@@ -1637,9 +1694,9 @@ class ClosedLoopRTLStep(BaseStep):
                 return
             ctx.failsafe.notify_frame_received()
             prefix = "[NO-FLY] " if ctx.drone.no_fly else ""
-            ctx.publish_annotated_stream(
-                frame,
-                _NO_DETECTIONS,
+            ctx.publish_overlay(
+                getattr(ctx, "frame_width", 856),
+                getattr(ctx, "frame_height", 480),
                 f"{prefix}STEP 5: RTL ({elapsed_sec:.1f}s) | DIST: {command.distance_m:.2f}m "
                 f"| VX: {command.vx:.3f} | ALT: {ctx.odom_supervisor.relative_altitude:.2f}m",
             )
@@ -1649,23 +1706,26 @@ class ClosedLoopRTLStep(BaseStep):
     def _publish_marker_stream(
         self, ctx: MissionContext, frame: Optional[np.ndarray], status_text: str
     ) -> None:
-        """Publish an already-annotated frame with a HUD line.
+        """Publish the HUD line and the marker geometry as a JSON overlay.
 
-        The frame handed in is the one the detector drew on: ``Aruco.detect``
-        and ``Aruco.pose_estimate`` render the marker outline and the pose axes
-        into the caller's buffer in place, so by the time this runs the marker
-        is already marked up and only the status band is left to add. That is
-        why this exists alongside :meth:`_publish_telemetry` rather than
-        replacing it -- the legacy leg has no frame in hand and must grab one.
-
-        An empty detection result is passed rather than ``None``: see
-        :class:`_EmptyDetectionResult` for why ``None`` silently disabled this
-        entire HUD.
+        The station draws the marker outline, its pose axes and the status band
+        over the raw camera stream (``bmg.detections.v2``). This used to publish
+        the frame the detector had drawn on, a 1.2 MB image at the loop rate,
+        and the bridge preferred that stream: the cockpit ran at ~4 FPS for the
+        whole return leg. The frame is still what the geometry is measured on.
         """
         if ctx.handler is None or frame is None:
             return
         try:
-            ctx.publish_annotated_stream(frame, _NO_DETECTIONS, status_text)
+            sensor = getattr(self, "_active_sensor", None)
+            geometry = getattr(sensor, "overlay_geometry", None)
+            markers = geometry(frame) if callable(geometry) else []
+            ctx.publish_overlay(
+                getattr(ctx, "frame_width", 856),
+                getattr(ctx, "frame_height", 480),
+                status_text,
+                markers,
+            )
         except Exception as exc:  # noqa: BLE001 - telemetry must never break flight
             self._note_stream_failure(exc)
 

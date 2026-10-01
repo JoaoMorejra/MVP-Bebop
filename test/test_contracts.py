@@ -352,14 +352,24 @@ def test_bench_flags_default_to_the_gcs_behaviour(monkeypatch):
 #: The pattern the GCS matches milestone lines with (spec 2026-09-24, section 3.2).
 MILESTONE_LINE = re.compile(r"\[MILESTONE ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$")
 
-#: The GCS stage matcher, verbatim from ``electron/main.cjs``.
+#: The GCS stage matcher, verbatim from ``electron/milestones.cjs::STEP_LINE``.
 STEP_LINE = re.compile(r"\[STEP ([1-5]):")
+
+
+def test_the_step_matcher_is_the_one_the_gcs_ships():
+    path = os.path.join(_REPO, "bebop_mission_control", "electron", "milestones.cjs")
+    with open(path, encoding="utf-8") as handle:
+        match = re.search(r"const STEP_LINE = /(.+)/;", handle.read())
+    assert match, "STEP_LINE missing from milestones.cjs"
+    assert match.group(1) == STEP_LINE.pattern
 
 #: Pool keys of the synchronisation table (spec section 4) that the mission
 #: process raises, plus ``mission.battery_warning`` from the onboard battery net
-#: (``telemetry.battery``). ``mission.start`` and ``mission.countdown_3`` belong
-#: to the GCS.
+#: (``telemetry.battery``). ``mission.start`` belongs to the GCS; the countdown
+#: is the mission's (``TakeoffStep._countdown``).
 SPEC_MILESTONE_KEYS = (
+    "mission.countdown",
+    "mission.countdown_3",
     "mission.takeoff",
     "mission.scan_start",
     "mission.target_found",
@@ -368,6 +378,8 @@ SPEC_MILESTONE_KEYS = (
     "mission.rtl_start",
     "mission.landing",
     "mission.battery_warning",
+    "mission.touchdown",
+    "mission.parameters",
 )
 
 
@@ -524,6 +536,9 @@ def test_a_full_bench_run_crosses_every_milestone_in_flight_order(tmp_path):
             json.dumps(_SHORT_BENCH_RUN),
         ],
         cwd=tmp_path,
+        # A private domain: on the driver's (14) this bench run would move the
+        # gimbal, flat-trim and fire the camera of an aircraft left powered on.
+        env={**os.environ, "ROS_DOMAIN_ID": "86", "BMG_INFERENCE_CACHE": str(tmp_path / "inference_device.json")},
         capture_output=True,
         text=True,
         timeout=240,
@@ -543,7 +558,10 @@ def test_a_full_bench_run_crosses_every_milestone_in_flight_order(tmp_path):
             sequence.append(milestone.group(1))
 
     assert sequence == [
+        "mission.parameters",
         "STEP 1",
+        "mission.countdown_3",
+        "mission.countdown",
         "mission.takeoff",
         "STEP 2",
         "mission.scan_start",
@@ -555,9 +573,126 @@ def test_a_full_bench_run_crosses_every_milestone_in_flight_order(tmp_path):
         "STEP 5",
         "mission.rtl_start",
         "mission.landing",
+        "mission.touchdown",
     ]
+    assert payloads["mission.parameters"]["countdown_sec"] == pytest.approx(0.0)
+    assert payloads["mission.parameters"]["search_timeout_sec"] == pytest.approx(10.0)
+    assert payloads["mission.capture_done"]["target_confirmed"] is True
+    assert isinstance(payloads["mission.capture_done"]["settled"], bool)
+    assert payloads["mission.approaching"]["ibvs"] is MissionParameters().vision.ibvs_enabled
+    assert payloads["mission.rtl_start"]["via_jump"] is False
+    assert payloads["mission.rtl_start"]["inspected"] is True
+    assert isinstance(payloads["mission.rtl_start"]["marker_guided"], bool)
+    assert payloads["mission.landing"]["at_base"] is payloads["mission.touchdown"]["at_base"]
+    assert payloads["mission.touchdown"]["confirmed"] is True
+    assert isinstance(payloads["mission.touchdown"]["at_base"], bool)
+    assert payloads["mission.touchdown"]["method"] in ("settled", "stagnation")
     assert payloads["mission.takeoff"]["altitude_m"] == pytest.approx(
         MissionParameters().kinematics.target_altitude_m
     )
     assert payloads["mission.target_found"]["class_name"] in MissionParameters().vision.target_classes
     assert _config_digest(operator_config) == before, "the bench run rewrote the operator config"
+
+
+# ------------------------------------------------------------ mission outcome
+
+_OUTCOME_TS = os.path.join(_REPO, "bebop_mission_control", "src", "lib", "missionOutcome.ts")
+
+
+def test_exit_codes_are_distinct_and_keep_their_wire_values():
+    """The GCS maps these integers to the mission's final state."""
+    from mvp_mission_bebop.engine import exit_codes
+
+    assert exit_codes.EXIT_COMPLETE == 0
+    assert exit_codes.EXIT_FAILURE == 1
+    assert exit_codes.EXIT_ABORTED_LANDED == 3
+    assert exit_codes.EXIT_TOUCHDOWN_UNCONFIRMED == 4
+    assert exit_codes.FORCED_EXIT_CODE == 130
+    values = [
+        exit_codes.EXIT_COMPLETE,
+        exit_codes.EXIT_FAILURE,
+        exit_codes.EXIT_ABORTED_LANDED,
+        exit_codes.EXIT_TOUCHDOWN_UNCONFIRMED,
+        exit_codes.FORCED_EXIT_CODE,
+    ]
+    assert len(set(values)) == len(values)
+
+
+def test_signals_still_exports_the_forced_exit_code():
+    from mvp_mission_bebop.engine import exit_codes, signals
+
+    assert signals.FORCED_EXIT_CODE == exit_codes.FORCED_EXIT_CODE
+
+
+@pytest.mark.parametrize(
+    "succeeded, aborted, touchdown, expected",
+    [
+        (True, False, None, 0),
+        (True, False, True, 0),
+        (True, False, False, 4),
+        (False, False, None, 1),
+        (False, False, False, 1),
+        (False, True, None, 3),
+        (True, True, True, 3),
+        (False, True, False, 3),
+    ],
+)
+def test_mission_exit_code_is_determined_by_the_outcome(succeeded, aborted, touchdown, expected):
+    from mvp_mission_bebop.engine.exit_codes import mission_exit_code
+
+    assert mission_exit_code(succeeded, aborted=aborted, touchdown_confirmed=touchdown) == expected
+
+
+def test_gcs_outcome_map_uses_the_same_exit_codes():
+    from mvp_mission_bebop.engine import exit_codes
+
+    with open(_OUTCOME_TS, encoding="utf-8") as handle:
+        source = handle.read()
+    for name in ("EXIT_COMPLETE", "EXIT_ABORTED_LANDED", "EXIT_TOUCHDOWN_UNCONFIRMED"):
+        match = re.search(rf"export const {name} = (\d+);", source)
+        assert match, f"{name} missing from missionOutcome.ts"
+        assert int(match.group(1)) == getattr(exit_codes, name), name
+
+
+# ------------------------------------------------------------ airborne states
+
+#: ARSDK flying states with the rotors turning: takingoff, hovering, flying,
+#: landing, motor_ramping, emergency_landing. Not usertakeoff (6).
+CANONICAL_AIRBORNE_STATES = {1, 2, 3, 4, 7, 8}
+
+
+def _int_set(text):
+    return {int(value) for value in re.findall(r"\d+", text)}
+
+
+def test_the_three_airborne_sets_are_the_canonical_one():
+    """They disagreed: 6 was airborne in all three, 4 and 8 in two, 7 in none."""
+    gcs = os.path.join(_REPO, "bebop_mission_control")
+    with open(os.path.join(gcs, "src", "lib", "flightState.ts"), encoding="utf-8") as handle:
+        ts = re.search(r"export const AIRBORNE_STATES: readonly number\[\] = \[([^\]]*)\];", handle.read())
+    with open(os.path.join(gcs, "electron", "main.cjs"), encoding="utf-8") as handle:
+        cjs = re.search(r"const AIRBORNE_FLYING_STATES = new Set\(\[([^\]]*)\]\);", handle.read())
+    with open(os.path.join(gcs, "streamer", "telemetry_bridge.py"), encoding="utf-8") as handle:
+        py = re.search(r"^AIRBORNE_STATES = \{([^}]*)\}", handle.read(), re.MULTILINE)
+    assert ts and cjs and py, "an airborne set moved or was renamed"
+    assert _int_set(ts.group(1)) == CANONICAL_AIRBORNE_STATES
+    assert _int_set(cjs.group(1)) == CANONICAL_AIRBORNE_STATES
+    assert _int_set(py.group(1)) == CANONICAL_AIRBORNE_STATES
+
+
+# ------------------------------------------------------------ speech ceilings (3.9)
+
+
+def test_the_speech_ceiling_is_one_value_across_renderer_main_and_daemon():
+    """A renderer giving up at 14 s while the daemon holds the line for 30 s
+    left the next sentence queued behind one the station had already written off."""
+    gcs = os.path.join(_REPO, "bebop_mission_control")
+    with open(os.path.join(gcs, "src", "hooks", "useCopilot.ts"), encoding="utf-8") as handle:
+        renderer = re.search(r"export const SPEECH_CEILING_MS = (\d+);", handle.read())
+    with open(os.path.join(gcs, "electron", "main.cjs"), encoding="utf-8") as handle:
+        main_text = handle.read()
+    main = re.search(r"const SPEECH_CEILING_SEC = (\d+);", main_text)
+    assert renderer and main, "a speech ceiling moved or was renamed"
+    assert int(renderer.group(1)) == int(main.group(1)) * 1000
+    assert "?? SPEECH_CEILING_SEC" in main_text
+    assert "?? 30" not in main_text.split("const SPEECH_CEILING_SEC")[1].split("bmg:prepare-speech")[0]

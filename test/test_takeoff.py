@@ -345,6 +345,7 @@ class ScriptedOdometry:
     def __init__(self, sample):
         self._sample = sample
         self._calls = 0
+        self.altitude_ceiling = 3.0
 
     def snapshot(self):
         self._calls += 1
@@ -445,3 +446,147 @@ def test_the_flat_trim_settle_is_untouched():
     from mvp_mission_bebop.steps import takeoff as takeoff_module
 
     assert takeoff_module._FLAT_TRIM_SETTLE_SEC == 2.0
+
+
+# ------------------------------------------------ takeoff call on confirmation
+
+
+@pytest.fixture
+def milestones(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(
+        "mvp_mission_bebop.steps.takeoff.emit_milestone",
+        lambda key, payload=None: emitted.append((key, dict(payload or {}))),
+    )
+    return emitted
+
+
+@pytest.mark.parametrize(
+    "flying_state, altitude, expected",
+    [
+        (None, 0.0, False),
+        (0, 0.0, False),
+        (6, 0.0, False),
+        (1, 0.0, True),
+        (2, 0.0, True),
+        (None, 0.29, False),
+        (None, 0.31, True),
+        (0, 0.31, True),
+    ],
+)
+def test_takeoff_is_confirmed_by_flying_state_or_odometry(flying_state, altitude, expected):
+    from mvp_mission_bebop.steps.takeoff import takeoff_confirmed
+
+    assert takeoff_confirmed(flying_state, altitude, 0.30) is expected
+
+
+def test_the_takeoff_command_alone_says_nothing(milestones):
+    """Regression: ``BebopDrone.takeoff`` returns True after sleep(3) always."""
+    params = stabilize_params()
+    ctx = scripted_context(params, lambda n: (0.0, 0.0, True))
+    ctx.drone.takeoff = lambda altitude: True
+    assert TakeoffStep()._launch(ctx) is StepStatus.SUCCESS
+    assert milestones == []
+
+
+def test_takeoff_is_called_when_odometry_leaves_the_ground_with_the_configured_altitude(milestones):
+    params = stabilize_params(ceiling=0.6)
+    params.kinematics.target_altitude_m = 2.3
+    ctx = scripted_context(params, lambda n: (0.0 if n < 5 else 0.6, 0.0, True))
+    step = TakeoffStep()
+    step._stabilize(ctx)
+    assert milestones == [("mission.takeoff", {"altitude_m": 2.3})]
+
+
+def test_takeoff_is_never_called_for_an_airframe_that_stayed_down(milestones):
+    params = stabilize_params(ceiling=0.3)
+    ctx = scripted_context(params, lambda n: (0.0, 0.0, True))
+    TakeoffStep()._stabilize(ctx)
+    assert milestones == []
+
+
+def test_a_reported_flying_state_confirms_before_the_odometry_does(milestones):
+    params = stabilize_params(ceiling=0.3)
+    ctx = scripted_context(params, lambda n: (0.0, 0.0, True))
+    ctx.flying_state = 1
+    TakeoffStep()._stabilize(ctx)
+    assert [key for key, _ in milestones] == ["mission.takeoff"]
+
+
+# ------------------------------------------------ countdown driven by the mission
+
+
+def countdown_ctx(duration):
+    params = stabilize_params()
+    params.kinematics.countdown_sec = duration
+    ctx = scripted_context(params, lambda n: (0.0, 0.0, True))
+    ctx.failsafe = types.SimpleNamespace(notify_frame_received=lambda: None)
+    ctx.perception = RecordingPerception()
+    return ctx
+
+
+def test_the_countdown_is_reported_every_whole_second_down_to_zero(milestones):
+    """Regression: the station timed it from the spawn, ~14 s ahead of the real one."""
+    TakeoffStep()._countdown(countdown_ctx(4.0))
+    ticks = [payload["remaining_sec"] for key, payload in milestones if key == "mission.countdown"]
+    assert ticks == [4, 3, 2, 1, 0]
+
+
+def test_the_countdown_clearance_call_lands_at_three_point_two_seconds(milestones):
+    TakeoffStep()._countdown(countdown_ctx(4.0))
+    sequence = [
+        key if key != "mission.countdown" else f"t{payload['remaining_sec']}" for key, payload in milestones
+    ]
+    assert sequence == ["t4", "mission.countdown_3", "t3", "t2", "t1", "t0"]
+
+
+def test_a_zero_countdown_still_clears_and_reports_zero(milestones):
+    TakeoffStep()._countdown(countdown_ctx(0.0))
+    assert [key for key, _ in milestones] == ["mission.countdown_3", "mission.countdown"]
+    assert milestones[-1][1] == {"remaining_sec": 0}
+
+
+# ------------------------------------------------ countdown through the worker (4.5e / 4.4)
+
+
+class RecordingPerception:
+    """Stand-in pipeline: records engagement and status, serves one sample."""
+
+    def __init__(self):
+        self.engaged_with = []
+        self.statuses = []
+        self.disengaged = 0
+
+    def session(self, conf=None, imgsz=None):
+        import contextlib
+
+        @contextlib.contextmanager
+        def scope():
+            self.engaged_with.append(imgsz)
+            try:
+                yield self
+            finally:
+                self.disengaged += 1
+
+        return scope()
+
+    def set_status(self, text):
+        self.statuses.append(text)
+
+    def get_latest(self, max_age_sec):
+        return types.SimpleNamespace(frame=object(), result=None)
+
+
+def test_the_countdown_warms_yolo_on_the_worker_not_on_the_control_thread(milestones):
+    ctx = countdown_ctx(2.0)
+    ctx.perception = RecordingPerception()
+    ctx.params.vision.inference_imgsz = 480
+    calls = []
+    ctx.detector = types.SimpleNamespace(detect=lambda *a, **k: calls.append(1))
+    ctx.publish_annotated_stream = lambda *a, **k: calls.append("annotated")
+
+    assert TakeoffStep()._countdown(ctx) is StepStatus.SUCCESS
+    assert calls == []
+    assert ctx.perception.engaged_with == [480]
+    assert ctx.perception.disengaged == 1
+    assert any("CONTAGEM REGRESSIVA" in text for text in ctx.perception.statuses)

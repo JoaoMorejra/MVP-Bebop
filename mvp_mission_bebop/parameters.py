@@ -94,14 +94,23 @@ class VisionConfig:
     confidence_threshold: float = 0.50
     #: Detector input size in pixels, or ``None`` for the model's native 640.
     #:
-    #: Inference cost on the ground station's CPU falls roughly with the square
-    #: of this number (bench, one 856x480 frame, YOLOv8n .pt on CPU: 640 ~81 ms,
-    #: 480 ~47 ms, 320 ~30 ms). It also shrinks the smallest object the
-    #: detector resolves, and a target at the far end of the search track spans
-    #: few pixels already, so a reduced size is not the default until it has
-    #: been validated in the field. Must be a multiple of 32, the YOLOv8
-    #: feature stride. Bench recommendation for the first field trial: 480.
-    inference_imgsz: Optional[int] = None
+    #: Inference cost falls roughly with the square of this number (bench, one
+    #: 856x480 frame, YOLOv8n .pt on CPU: 640 ~81 ms, 480 ~47 ms, 320 ~30 ms).
+    #: 480 was validated against 640 on the 35 recorded evidence frames
+    #: (2026-09-30): same classes on 33, the other two corrected to the true
+    #: target (640 read a bicycle as a motorcycle and as a clock), and 24
+    #: target hits against 22 with the .pt weights, 33/35 identical with the
+    #: OpenVINO IR. Must be a multiple of 32, the YOLOv8 feature stride.
+    inference_imgsz: Optional[int] = 480
+    #: Where the detector runs: ``AUTO`` (benchmark on the first real frame),
+    #: ``CUDA`` (GeForce MX110), ``IGPU`` (Intel HD 620 through OpenVINO) or
+    #: ``CPU`` (OpenVINO). Always with a runtime fallback down CUDA, IGPU, CPU.
+    #: Validated by ``perception.inference_device.normalize_inference_device``.
+    inference_device: str = "AUTO"
+    #: Least time between two inferences of the perception worker, seconds.
+    #: Unbounded, YOLO on the CPU took 187 % and dragged the driver's own
+    #: camera delivery from 27 to 11 Hz; 0.1 s caps it at 10 Hz.
+    inference_min_period_sec: float = 0.10
     #: Oldest detection a control loop may still act on, in seconds.
     #:
     #: Inference runs on its own thread and a loop reads the newest result, so
@@ -917,6 +926,14 @@ class InspectionConfig:
     #: silently discarded any operator setting above 0.30 and made that slider
     #: a no-op for the only inference the forensic record depends on.
     nadir_confidence_threshold: float = 0.30
+    #: Longest wait for the aircraft to report the native 14 MP photo
+    #: (``PictureEventChanged``), counted from the request.
+    #:
+    #: The request goes out before the local inference, so the detector and
+    #: the image writes run inside this window rather than after it; only the
+    #: remainder, if any, is spent waiting. A missing acknowledgement is
+    #: recorded in the sidecar and never fails the capture.
+    native_photo_ack_timeout_sec: float = 2.0
 
 
 @dataclass

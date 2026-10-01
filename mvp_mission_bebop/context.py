@@ -35,6 +35,7 @@ from mvp_mission_bebop.perception.worker import (
 )
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, OdometrySupervisor
+from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
 
 logger = logging.getLogger("MissionContext")
 
@@ -104,6 +105,15 @@ class MissionContext:
         self.stage_jump_event = threading.Event()
         #: Stage number requested with ``stage_jump_event``, 1-5.
         self.requested_stage: Optional[int] = None
+        #: Stage number the runner is executing; ``None`` before the first.
+        self.current_stage: Optional[int] = None
+        #: Last ``/bebop/states/flying_state`` from the aircraft, or ``None``.
+        self.flying_state: Optional[int] = None
+        #: Native photo acknowledgements from ``states/picture_event``; ``None``
+        #: when no driver topic is wired (unit doubles).
+        self.picture_ack: Optional[PictureAckTracker] = None
+        #: The runner entered the current stage through a station jump.
+        self.entered_by_jump: bool = False
         self.start_time: float = time.time()
         self.blackboard = MissionBlackboard()
 
@@ -329,12 +339,38 @@ class MissionContext:
         except Exception as exc:  # noqa: BLE001 - the overlay is never flight-critical
             logger.warning("Detection overlay publishing exception: %s", exc)
 
+    def publish_overlay(
+        self, width: int, height: int, status_text: str, markers: Sequence[Any] = ()
+    ) -> None:
+        """Publish a caption and optional landing-marker geometry as the GCS overlay.
+
+        For stages that draw no detector boxes (the return leg): the station
+        composites the caption and the markers onto the raw stream at the
+        camera rate. ``bmg.detections.v1`` without markers, ``v2`` with them.
+        Failures are logged and swallowed.
+        """
+        try:
+            message = String()
+            message.data = encode_detection_summary(
+                detections=[],
+                frame_width=int(width),
+                frame_height=int(height),
+                status=status_text,
+                stamp_sec=time.monotonic() + self._monotonic_to_ros_sec,
+                inference_ms=0.0,
+                markers=markers,
+            )
+            self.boxes_pub.publish(message)
+        except Exception as exc:  # noqa: BLE001 - the overlay is never flight-critical
+            logger.warning("Overlay publishing exception: %s", exc)
+
     def record_photographic_evidence(
         self,
         raw_frame: Optional[np.ndarray],
         annotated_frame: Optional[np.ndarray],
         detections: Optional[Sequence[Any]] = None,
         snapshot: Optional[OdometrySnapshot] = None,
+        native_photo: Optional[Dict[str, Any]] = None,
     ) -> EvidenceRecord:
         """Persist dual-fidelity evidence plus a forensic metadata sidecar.
 
@@ -380,6 +416,7 @@ class MissionContext:
                 os.path.join(output_dir, f"accident_metadata_{timestamp}.json"),
                 record,
                 snapshot,
+                native_photo,
             )
 
         return record
@@ -414,11 +451,15 @@ class MissionContext:
         path: str,
         record: EvidenceRecord,
         snapshot: Optional[OdometrySnapshot],
+        native_photo: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Write the forensic sidecar describing the capture.
 
         Purely additive: the GCS assembles its report client-side and reads no
-        such file, so the schema here is free to evolve.
+        such file, so the schema here is free to evolve. ``native_photo`` is
+        the aircraft's acknowledgement of the 14 MP photo; its
+        ``remote_path``/``local_path`` are filled after touchdown by
+        ``bebop_mission_control/streamer/media_fetch.py``.
         """
         payload: Dict[str, Any] = {
             "captured_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -437,6 +478,9 @@ class MissionContext:
                 "confidence_threshold": self.params.vision.confidence_threshold,
             },
         }
+
+        if native_photo is not None:
+            payload["native_photo"] = dict(native_photo)
 
         if snapshot is not None:
             payload["odometry"] = {

@@ -9,18 +9,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
+import time
 from typing import List, Optional
 
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String, UInt8
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 
 import nectar
-from nectar.ai.detection import Detector
 from nectar.control import BebopConfig, DroneFactory
 from nectar.vision import ImageHandler, QoSReliability, ROSConfig
 
@@ -32,9 +33,18 @@ from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
 from mvp_mission_bebop.engine.runner import MissionRunner
+from mvp_mission_bebop.engine.stage_gate import StageRequestHandler
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
-from mvp_mission_bebop.parameters import BatteryConfig, MissionParameters
+from mvp_mission_bebop.parameters import BatteryConfig, MissionParameters, VisionConfig
+from mvp_mission_bebop.perception.inference_device import (
+    CUDA_WARMUP_SAMPLES,
+    available_devices,
+    build_device_detector,
+    model_cache_key,
+    normalize_inference_device,
+    select_detector,
+)
 from mvp_mission_bebop.perception.worker import PerceptionWorker, detector_kwargs, normalize_imgsz
 from mvp_mission_bebop.steps import (
     ClosedLoopRTLStep,
@@ -50,7 +60,10 @@ from mvp_mission_bebop.telemetry.battery import (
 )
 from mvp_mission_bebop.telemetry.bench import BenchTelemetryPublisher
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
+from mvp_mission_bebop.telemetry.milestones import emit_milestone
+from mvp_mission_bebop.telemetry.mission_parameters import spoken_parameters
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
+from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
 
 # Mission logs go to stdout deliberately. The Electron GCS registers its step
 # matcher on the child's stdout pipe and looks for the literal "[STEP N:"
@@ -397,6 +410,11 @@ def main() -> None:
         params.battery.land_pct = fallback
     battery_supervisor = BatterySupervisor(params.battery)
 
+    # D2: the station speaks the numbers of this document and of no other.
+    # Emitted after every normalization above, so it is exactly what the steps
+    # will fly.
+    emit_milestone("mission.parameters", spoken_parameters(params, calibration))
+
     # The aggregated motion sequence. Fed by the actuator proxy, so every
     # ``move_velocity`` the mission transmits is accounted for without any step
     # having to remember to report itself, and armed by Stage 1 at the same
@@ -452,13 +470,24 @@ def main() -> None:
     except (TypeError, ValueError) as exc:
         logger.error("Invalid vision.inference_imgsz (%s); using the model's native size.", exc)
         params.vision.inference_imgsz = None
+    try:
+        params.vision.inference_device = normalize_inference_device(params.vision.inference_device)
+    except (TypeError, ValueError) as exc:
+        logger.error("Invalid vision.inference_device (%s); using AUTO.", exc)
+        params.vision.inference_device = "AUTO"
+    inference_backends = available_devices()
     logger.info(
-        "Loading YOLO detector: %s (input size %s)...",
+        "YOLO detector %s (input size %s), device %s; station devices %s.",
         params.vision.model_path,
         params.vision.inference_imgsz or "native",
+        params.vision.inference_device,
+        ", ".join(f"{name}={backend}" for name, backend in inference_backends.items()),
     )
-    detector = Detector(params.vision.model_path, confidence_threshold=params.vision.confidence_threshold)
-    detector.load()
+
+    def _build_detector(device: str):
+        return build_device_detector(
+            device, params.vision.model_path, params.vision.confidence_threshold, inference_backends
+        )
 
     cam_config = ROSConfig(
         topic=params.network.camera_raw_topic,
@@ -497,16 +526,36 @@ def main() -> None:
 
     frame_height, frame_width = sample_frame.shape[:2]
 
-    # Pre-flight detector warmup: the first inference allocates torch
-    # runtime layers/kernels and takes several seconds on CPU. Paying
-    # that cost here on the ground prevents search loop timeouts.
-    logger.info("Executing pre-flight detector warmup...")
-    try:
-        kwargs = detector_kwargs(None, params.vision.inference_imgsz)
-        detector.detect(sample_frame, **kwargs)
-        logger.info("Pre-flight detector warmup completed.")
-    except Exception as exc:  # noqa: BLE001 - warmup is best-effort
-        logger.debug("Pre-flight detector warmup notice: %s", exc)
+    # Device selection doubles as the pre-flight warmup: every candidate runs
+    # its first, expensive inferences here on the ground, on the first real
+    # frame, under the mission's own load (D3, perception.inference_device).
+    selection_started = time.monotonic()
+    warm_kwargs = detector_kwargs(None, params.vision.inference_imgsz)
+    detector, inference_report = select_detector(
+        params.vision.inference_device,
+        list(inference_backends),
+        _build_detector,
+        frame=sample_frame,
+        cache_path=os.environ.get("BMG_INFERENCE_CACHE")
+        or os.path.join(os.path.expanduser("~"), ".cache", "bmg", "inference_device.json"),
+        cache_key=model_cache_key(params.vision.model_path, params.vision.inference_imgsz),
+        detect_kwargs=warm_kwargs,
+    )
+    if detector.device == "CUDA":
+        # Resident on the GPU with its kernels already selected, so the first
+        # search cycle runs at full cadence.
+        for _ in range(CUDA_WARMUP_SAMPLES):
+            detector.detect(sample_frame, **warm_kwargs)
+    chosen = inference_report["candidates"].get(detector.device, {})
+    logger.info(
+        "[TIMING] inference_device=%s p50_ms=%s p95_ms=%s selection_ms=%d cached=%s candidates=%s",
+        detector.device,
+        chosen.get("p50_ms"),
+        chosen.get("p95_ms"),
+        int((time.monotonic() - selection_started) * 1000.0),
+        inference_report["cached"],
+        json.dumps(inference_report["candidates"]),
+    )
 
     # Telemetry gets its own node rather than riding on the camera handler's.
     # Both are registered with the same shared Nectar executor, so this adds no
@@ -617,9 +666,39 @@ def main() -> None:
     # it, so the countdown warmup and the Stage 4 capture keep exclusive use of
     # the camera and detector, and the Stage 5 marker search is not competing
     # with it for frames.
-    perception = PerceptionWorker(ctx)
+    period = params.vision.inference_min_period_sec
+    if isinstance(period, bool) or not isinstance(period, (int, float)) or not math.isfinite(period) or period < 0:
+        fallback_period = VisionConfig().inference_min_period_sec
+        logger.error("Invalid vision.inference_min_period_sec (%r); using %.2f s.", period, fallback_period)
+        params.vision.inference_min_period_sec = fallback_period
+    perception = PerceptionWorker(ctx, min_period_sec=params.vision.inference_min_period_sec)
     ctx.perception = perception
     perception.start()
+
+    # The aircraft's own FlyingStateChanged. Confirms the takeoff before
+    # `mission.takeoff` is raised (steps.takeoff.takeoff_confirmed); the driver
+    # publishes it reliable and transient-local at depth 1.
+    flying_state_topic = f"/{params.network.namespace.strip('/')}/states/flying_state"
+
+    def _on_flying_state(message: UInt8) -> None:
+        ctx.flying_state = int(message.data)
+
+    telemetry_node.create_subscription(
+        UInt8,
+        flying_state_topic,
+        _on_flying_state,
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+    )
+
+    # Native photo acknowledgements (RecordPictureV2), JSON from the driver;
+    # reliable, volatile, depth 10 on the driver side.
+    ctx.picture_ack = PictureAckTracker()
+    telemetry_node.create_subscription(
+        String,
+        f"/{params.network.namespace.strip('/')}/states/picture_event",
+        lambda message: ctx.picture_ack.update(message.data),
+        10,
+    )
 
     def _release_mission_resources() -> None:
         perception.stop()
@@ -656,32 +735,17 @@ def main() -> None:
     # The ground station's stage control.
     #
     # One Int32 naming the stage the operator wants next. It lands on the same
-    # executor as the odometry subscription, sets the context's jump event, and
-    # the running step unwinds through its own abort path; the runner then reads
-    # which of the two happened and continues at the requested stage.
-    #
-    # Stage 1 is refused while the aircraft is off the ground. TakeoffStep opens
-    # by arming and climbing from a standstill, and commanding that at something
-    # already flying is the one jump in the set that is not merely unusual.
+    # executor as the odometry subscription; an accepted request sets the
+    # context's jump event, the running step unwinds through its own abort
+    # path, and the runner continues at the requested stage. Which requests are
+    # accepted is decided by the mission's progress (engine.stage_gate), with
+    # altitude as an additional condition for Stage 1.
+    stage_gate = StageRequestHandler(
+        ctx, stage_numbers, lambda: odom_supervisor.snapshot().relative_altitude
+    )
+
     def _on_stage_request(message: Int32) -> None:
-        requested = int(message.data)
-        if requested not in stage_numbers:
-            logger.warning("Stage request %d ignored: not in this run.", requested)
-            return
-        if requested == 1:
-            # TakeoffStep opens by arming and climbing from a standstill.
-            # Commanding that at an airframe already in the air is the one jump
-            # in the set that is not merely unusual, so it is refused rather
-            # than flown.
-            try:
-                airborne = odom_supervisor.snapshot().relative_altitude > 0.25
-            except Exception:  # noqa: BLE001 - no reading is not a reason to allow it
-                airborne = True
-            if airborne:
-                logger.warning("Stage request 1 refused: the aircraft is already airborne.")
-                return
-        logger.info("Stage %d requested by the ground station.", requested)
-        ctx.request_stage(requested)
+        stage_gate(int(message.data))
 
     stage_topic = f"/{params.network.namespace.strip('/')}/mission/goto_stage"
     telemetry_node.create_subscription(Int32, stage_topic, _on_stage_request, 10)
@@ -701,7 +765,7 @@ def main() -> None:
         # arrangement ran cleanup three times on every Ctrl-C.
         runner.finalize()
 
-    sys.exit(0 if succeeded else 1)
+    sys.exit(runner.exit_code(succeeded))
 
 
 if __name__ == "__main__":

@@ -1002,6 +1002,9 @@ class Blackboard:
     def __init__(self):
         self.rtl_completed = False
         self.rtl_marker_sighted = False
+        self.target_confirmed = False
+        self.evidence = None
+        self.touchdown_confirmed = None
 
 
 class Ctx:
@@ -1045,6 +1048,9 @@ class Ctx:
         return object()
 
     def publish_annotated_stream(self, _frame, _result, _text):
+        return None
+
+    def publish_overlay(self, width, height, status, markers=()):
         return None
 
     # -- assertions ------------------------------------------------------
@@ -1740,12 +1746,19 @@ class HudCtx(Ctx):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.published = []
+        self.annotated = []
+        self.overlays = []
 
     def publish_annotated_stream(self, frame, result, text):
         if not result.detections:  # the exact guard, including its failure mode
             pass
         self.published.append(text)
+        self.annotated.append(text)
         return None
+
+    def publish_overlay(self, width, height, status, markers=()):
+        self.published.append(status)
+        self.overlays.append((width, height, status, list(markers)))
 
 
 def test_the_marker_hud_actually_reaches_the_annotated_stream():
@@ -1922,3 +1935,70 @@ def test_cruise_backward_feeds_the_commanded_vx_to_the_governor():
     assert all(fed <= 0.0 for fed in ctx.governor.calls), "the reverse cruise must feed a non-positive vx"
     assert any(fed < 0.0 for fed in ctx.governor.calls), "the governor never saw the cruise"
     assert ctx.governor.calls == pytest.approx(sent)
+
+
+
+class GeometrySensor(ScriptedSensor):
+    """A scripted sensor that also reports marker geometry for the overlay."""
+
+    def overlay_geometry(self, frame):
+        return [{"id": 7, "corners_px": [[1, 1], [9, 1], [9, 9], [1, 9]]}]
+
+
+def test_the_return_leg_hud_travels_as_json_over_the_raw_stream():
+    """4.4: the RTL published annotated frames and held the cockpit at ~4 FPS."""
+    ctx = HudCtx(altitude=0.20)
+    ctx.params.rtl.timeout_sec = 1.0
+    ctx.frame_width, ctx.frame_height = 856, 480
+    ctx.sensor = GeometrySensor(ctx.drone, acquire_after=3, ex=0.1, ey=0.05)
+
+    ClosedLoopRTLStep(sensor=ctx.sensor).execute(ctx)
+
+    assert ctx.annotated == []
+    assert ctx.overlays, "the return leg published no overlay"
+    assert all(width == 856 and height == 480 for width, height, _s, _m in ctx.overlays)
+    assert any(markers and markers[0]["id"] == 7 for _w, _h, _s, markers in ctx.overlays)
+
+
+def test_the_sensor_reports_marker_corners_and_projected_axes():
+    import numpy as _np
+
+    from mvp_mission_bebop.steps.rtl import ArucoMarkerSensor
+
+    class Detector:
+        tag_size = 0.15
+        camera_matrix = [[537.3, 0.0, 427.3], [0.0, 527.0, 240.2], [0.0, 0.0, 1.0]]
+        camera_distortion = [0.0, 0.0, 0.0, 0.0, 0.0]
+
+        def detect(self, frame, draw):
+            assert draw is False
+            return [_np.array([[[400.0, 200.0], [460.0, 200.0], [460.0, 260.0], [400.0, 260.0]]])], _np.array([[7]])
+
+        def pose_estimate(self, frame, draw=True):
+            return None, None, None
+
+        def calculateYawFromCorners(self, bbox):
+            return 0.0
+
+    sensor = ArucoMarkerSensor(Detector(), target_id=7, backend="solvepnp")
+    [marker] = sensor.overlay_geometry(_np.zeros((480, 856, 3), dtype=_np.uint8))
+    assert marker["id"] == 7
+    assert marker["corners_px"][0] == [400.0, 200.0]
+    origin = marker["axes_px"]["origin"]
+    assert 425 < origin[0] < 435 and 225 < origin[1] < 235
+
+
+def test_no_marker_means_no_geometry():
+    import numpy as _np
+
+    from mvp_mission_bebop.steps.rtl import ArucoMarkerSensor
+
+    class Blind:
+        tag_size = 0.15
+        camera_matrix = _np.eye(3)
+        camera_distortion = _np.zeros(5)
+
+        def detect(self, frame, draw):
+            return None, None
+
+    assert ArucoMarkerSensor(Blind(), target_id=7, backend="solvepnp").overlay_geometry(_np.zeros((4, 4, 3))) == []

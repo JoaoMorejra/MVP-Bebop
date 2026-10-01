@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import math
+from typing import Final, FrozenSet, Optional
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.profiling import (
@@ -13,7 +14,6 @@ from mvp_mission_bebop.controllers.profiling import (
 )
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
-from mvp_mission_bebop.perception.worker import detector_kwargs
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
@@ -27,14 +27,61 @@ _CLEARANCE_ANNOUNCE_SEC: float = 3.2
 _FLAT_TRIM_SETTLE_SEC: float = 2.0
 
 
+#: ARSDK flying states that confirm the airframe has left the ground: takingoff
+#: (1) and hovering (2). ``usertakeoff`` (6) waits on the ground.
+_TAKEOFF_CONFIRMING_STATES: Final[FrozenSet[int]] = frozenset({1, 2})
+
+
+def takeoff_confirmed(flying_state: Optional[int], relative_altitude: float, min_altitude: float) -> bool:
+    """Whether the takeoff actually happened.
+
+    ``BebopDrone.takeoff`` publishes an ``Empty`` and returns True after a fixed
+    three-second sleep whatever the firmware did (``nectar/control/bebop/drone.py``),
+    so its return value cannot be the evidence. Either the aircraft reports a
+    flying state in :data:`_TAKEOFF_CONFIRMING_STATES`, or odometry places it
+    above ``min_altitude`` (``takeoff_settle_min_altitude_m``); on the bench the
+    simulator supplies that odometry.
+
+    Parameters
+    ----------
+    flying_state : int or None
+        Last ``/bebop/states/flying_state``, or None when none has arrived.
+    relative_altitude : float
+        Altitude above the calibrated ground reference, metres.
+    min_altitude : float
+        Threshold above which the airframe is off the ground, metres.
+    """
+    if flying_state in _TAKEOFF_CONFIRMING_STATES:
+        return True
+    return relative_altitude > min_altitude
+
+
 class TakeoffStep(BaseStep):
     """Calibrates, launches, and establishes a drift-free airborne origin."""
 
     def __init__(self) -> None:
         super().__init__("STEP 1: Calibration, Takeoff & Stabilization")
+        self._takeoff_called = False
+
+    def _call_takeoff_once_confirmed(self, ctx: MissionContext, relative_altitude: float) -> None:
+        """Raise ``mission.takeoff`` the first time the takeoff is confirmed.
+
+        The altitude in the payload is the configured target (D2), not the
+        measured height: only the moment of the call depends on the flight.
+        """
+        if self._takeoff_called:
+            return
+        kinematics = ctx.params.kinematics
+        if not takeoff_confirmed(
+            getattr(ctx, "flying_state", None), relative_altitude, kinematics.takeoff_settle_min_altitude_m
+        ):
+            return
+        self._takeoff_called = True
+        emit_milestone("mission.takeoff", {"altitude_m": round(kinematics.target_altitude_m, 2)})
 
     def execute(self, ctx: MissionContext) -> StepStatus:
         logger.info("--- [%s] ---", self.name)
+        self._takeoff_called = False
 
         if not self._check_prearm_battery(ctx):
             return StepStatus.FAILURE
@@ -53,6 +100,7 @@ class TakeoffStep(BaseStep):
         if status is not StepStatus.SUCCESS:
             return status
 
+        ctx.blackboard.takeoff_committed = True
         status = self._launch(ctx)
         if status is not StepStatus.SUCCESS:
             return status
@@ -65,7 +113,10 @@ class TakeoffStep(BaseStep):
         if status is not StepStatus.SUCCESS:
             return status
 
-        return self._finalize(ctx)
+        status = self._finalize(ctx)
+        if status is StepStatus.SUCCESS:
+            ctx.blackboard.takeoff_complete = True
+        return status
 
     # ---------------------------------------------------------------- pre-arm
 
@@ -144,6 +195,8 @@ class TakeoffStep(BaseStep):
         """
         duration = ctx.params.kinematics.countdown_sec
         if duration <= 0.0:
+            emit_milestone("mission.countdown_3", {"remaining_sec": 0})
+            emit_milestone("mission.countdown", {"remaining_sec": 0})
             return StepStatus.SUCCESS
 
         logger.info("Pre-flight countdown and sensor warmup (%.1f s)...", duration)
@@ -151,35 +204,46 @@ class TakeoffStep(BaseStep):
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
         announced = False
         warmup_frames = 0
+        seen = None
+        # The station's countdown overlay and its clearance call follow these
+        # milestones rather than a timer of their own: timed from the spawn,
+        # they ran some 14 s ahead of this loop (imports, YOLO load, flat trim
+        # and ground calibration all come first).
+        last_whole: Optional[int] = None
 
-        while deadline.active:
-            if ctx.interrupted():
-                return StepStatus.ABORTED
+        # Warmup runs on the perception worker, at the flight input size, and
+        # publishes a detection summary rather than an annotated frame: drawn
+        # on this thread it held the countdown loop to the inference rate and
+        # gated the cockpit video on the annotated frame (5 FPS in Stage 1).
+        with ctx.perception.session(imgsz=ctx.params.vision.inference_imgsz):
+            while deadline.active:
+                if ctx.interrupted():
+                    return StepStatus.ABORTED
 
-            remaining = deadline.remaining_sec
-            frame = ctx.grab_frame(timeout_sec=0.2)
-            if frame is not None:
-                ctx.failsafe.notify_frame_received()
-                try:
-                    # Same input size as flight: the first call at a new
-                    # shape is the expensive one, and it is what this pays for.
-                    result = ctx.detector.detect(
-                        frame, **detector_kwargs(None, ctx.params.vision.inference_imgsz)
-                    )
+                remaining = deadline.remaining_sec
+                whole = int(math.ceil(max(0.0, remaining)))
+                if whole != last_whole and whole > 0:
+                    last_whole = whole
+                    emit_milestone("mission.countdown", {"remaining_sec": whole})
+                ctx.perception.set_status(f"CONTAGEM REGRESSIVA: {remaining:.1f}s | YOLO PRONTO")
+
+                sample = ctx.perception.get_latest(max_age_sec=1.0)
+                if sample is not None and sample is not seen:
+                    seen = sample
                     warmup_frames += 1
-                    ctx.publish_annotated_stream(
-                        frame, result, f"CONTAGEM REGRESSIVA: {remaining:.1f}s | YOLO PRONTO"
-                    )
-                except Exception as exc:  # noqa: BLE001 - warmup is best-effort
-                    logger.debug("Warmup inference notice: %s", exc)
+                    ctx.failsafe.notify_frame_received()
 
-            if remaining <= _CLEARANCE_ANNOUNCE_SEC and not announced:
-                announced = True
-                logger.info("Takeoff synchronization window reached. Announcing clearance.")
-                self._announce("Decolagem autorizada", "decolagem autorizada, iniciando voo")
+                if remaining <= _CLEARANCE_ANNOUNCE_SEC and not announced:
+                    announced = True
+                    logger.info("Takeoff synchronization window reached. Announcing clearance.")
+                    emit_milestone("mission.countdown_3", {"remaining_sec": round(remaining, 1)})
+                    self._announce("Decolagem autorizada", "decolagem autorizada, iniciando voo")
 
-            rate.tick()
+                rate.tick()
 
+        if not announced:
+            emit_milestone("mission.countdown_3", {"remaining_sec": 0})
+        emit_milestone("mission.countdown", {"remaining_sec": 0})
         logger.info("Perception pipeline warmed up over %d frames.", warmup_frames)
         return StepStatus.SUCCESS
 
@@ -210,7 +274,6 @@ class TakeoffStep(BaseStep):
             )
             return StepStatus.FAILURE
 
-        emit_milestone("mission.takeoff", {"altitude_m": round(target_altitude, 2)})
         return StepStatus.SUCCESS
 
     def _stabilize(self, ctx: MissionContext) -> StepStatus:
@@ -273,6 +336,7 @@ class TakeoffStep(BaseStep):
             rate.tick()
 
             snapshot = ctx.odom_supervisor.snapshot()
+            self._call_takeoff_once_confirmed(ctx, snapshot.relative_altitude)
             if snapshot.sample_count == last_sample:
                 continue
             last_sample = snapshot.sample_count
@@ -405,6 +469,7 @@ class TakeoffStep(BaseStep):
 
                 snapshot = ctx.odom_supervisor.snapshot()
                 altitude = snapshot.relative_altitude
+                self._call_takeoff_once_confirmed(ctx, altitude)
 
                 # Checked on every cycle and in every mode, benchtop included.
                 # This is the only phase of the mission that commands ascent, so
@@ -522,6 +587,7 @@ class TakeoffStep(BaseStep):
         # the RTL that consumes it would then fly home to the wrong place. The
         # ground reference is a usable fallback; a stale airborne sample is not.
         snapshot = ctx.odom_supervisor.snapshot()
+        self._call_takeoff_once_confirmed(ctx, snapshot.relative_altitude)
         if not ctx.drone.no_fly:
             healthy, reason = ctx.failsafe.evaluate_system_health()
             if not healthy:
