@@ -101,3 +101,63 @@ def test_no_fly_mode_also_clamps_yaw_before_the_simulator():
 
     assert drone.calls == [], "no-fly must not reach the real drone at all"
     assert simulator.calls == [(0.1, 0.0, 0.0, 0.0)], "the simulator integrated a yaw rate"
+
+
+# ------------------------------------------------------------ no-fly interlock
+
+
+class ArmingDrone:
+    """Records every call; stands in for the raw ``BebopDrone``."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        def record(*args, **kwargs):
+            self.calls.append(name)
+            return True
+
+        return record
+
+
+def test_no_fly_never_reaches_the_raw_takeoff_or_velocity():
+    import pytest
+
+    raw = ArmingDrone()
+    proxy = BenchtopDroneProxy(raw, no_fly=True)
+
+    assert proxy.takeoff(1.8) is True
+    proxy.move_velocity(vx=0.3)
+    proxy.land()
+    for name in ("takeoff", "move_velocity", "move_to", "rtl", "flip", "arm"):
+        with pytest.raises(RuntimeError, match="no-fly"):
+            getattr(proxy.drone, name)()
+    assert not {"takeoff", "move_velocity", "move_to", "rtl", "flip", "arm"} & set(raw.calls)
+
+
+def test_no_fly_keeps_gimbal_flat_trim_and_photo_physical():
+    """The bench exercises these on the real aircraft on purpose."""
+    raw = ArmingDrone()
+    proxy = BenchtopDroneProxy(raw, no_fly=True)
+    proxy.camera_control(tilt=-90.0)
+    proxy.flat_trim()
+    proxy.snapshot()
+    proxy.cleanup()
+    assert raw.calls == ["camera_control", "flat_trim", "snapshot", "cleanup"]
+
+
+def test_no_fly_cannot_be_switched_off_after_construction():
+    import pytest
+
+    proxy = BenchtopDroneProxy(ArmingDrone(), no_fly=True)
+    with pytest.raises(AttributeError):
+        proxy.no_fly = False
+    assert proxy.no_fly is True
+
+
+def test_armed_flight_reaches_the_raw_drone_unchanged():
+    raw = ArmingDrone()
+    proxy = BenchtopDroneProxy(raw, no_fly=False)
+    proxy.takeoff(1.8)
+    proxy.move_velocity(vx=0.1)
+    assert raw.calls == ["takeoff", "move_velocity"]

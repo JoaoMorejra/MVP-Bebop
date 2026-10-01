@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Protocol
+from typing import Any, Callable, Final, FrozenSet, Optional, Protocol
 
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
@@ -36,12 +36,55 @@ class DroneActuator(Protocol):
     def cleanup(self) -> None: ...
 
 
+#: Raw drone methods that can spin the rotors. Under ``--no-fly`` none of them
+#: may be reached, by any path.
+ARMING_METHODS: Final[FrozenSet[str]] = frozenset(
+    {"takeoff", "move_velocity", "move_to", "rtl", "flip", "arm"}
+)
+
+
+class _NoFlyInterlock:
+    """The raw drone as a no-fly proxy holds it: arming methods refuse to run.
+
+    The proxy's own no-fly branches return before the raw drone is called, but
+    that is behaviour, and behaviour regresses. This makes the guarantee
+    structural: whatever reaches ``proxy.drone.takeoff`` or
+    ``proxy.drone.move_velocity`` -- a new branch, a step holding the raw
+    handle, a refactor -- raises instead of publishing on ``/bebop/takeoff`` or
+    ``/bebop/cmd_vel``. Everything else is delegated unchanged.
+    """
+
+    __slots__ = ("_drone",)
+
+    def __init__(self, drone: "DroneActuator") -> None:
+        object.__setattr__(self, "_drone", drone)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ARMING_METHODS:
+            return self._refuse(name)
+        return getattr(self._drone, name)
+
+    @staticmethod
+    def _refuse(name: str) -> Callable[..., Any]:
+        def refused(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError(f"no-fly interlock: raw drone {name}() refused, motors must stay unpowered")
+
+        return refused
+
+
 class BenchtopDroneProxy:
     """Wraps the drone so a mission can run with motors unpowered.
 
     In ``--no-fly`` mode motor commands are diverted into a kinematic
-    simulation, while the gimbal and snapshot paths still drive real hardware --
-    those are the parts a benchtop run is meant to exercise.
+    simulation, and the raw drone is held behind :class:`_NoFlyInterlock`, so
+    no path can reach its takeoff or velocity publishers: any attempt raises
+    ``RuntimeError``. ``no_fly`` is fixed at construction.
+
+    What stays physical on the bench, deliberately: the gimbal
+    (``camera_control`` on ``/bebop/move_camera``), the IMU flat trim
+    (``/bebop/flattrim``, a ground calibration) and the photo trigger
+    (``/bebop/photo``). None of them spins a rotor; they are the parts a
+    benchtop run is meant to exercise on the real aircraft.
     """
 
     def __init__(
@@ -51,8 +94,8 @@ class BenchtopDroneProxy:
         simulator: Optional[KinematicSimulator] = None,
         motion_tracker: Optional[DeadReckoningTracker] = None,
     ) -> None:
-        self.drone = drone
-        self.no_fly = no_fly
+        self._no_fly: bool = bool(no_fly)
+        self.drone = _NoFlyInterlock(drone) if self._no_fly else drone
         self.simulator = simulator
         # Dead reckoning is fed here rather than by the steps, and that is the
         # point: every velocity command in the mission passes through this
@@ -60,6 +103,11 @@ class BenchtopDroneProxy:
         # forgot to report its own motion. A tracker that is only as complete as
         # the discipline of five separate control loops is not a tracker.
         self.motion_tracker = motion_tracker
+
+    @property
+    def no_fly(self) -> bool:
+        """Whether motors are unpowered for this run. Read-only by design."""
+        return self._no_fly
 
     def flat_trim(self) -> None:
         """Calibrate IMU flat trim. The drone must be on a level surface."""
