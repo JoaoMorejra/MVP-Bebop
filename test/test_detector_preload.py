@@ -103,10 +103,11 @@ def test_the_plan_follows_the_selection(tmp_path):
     present = ["CUDA", "IGPU", "CPU"]
     assert idev.preload_plan("IGPU", present, str(cache), "k") == ["IGPU"]
     assert idev.preload_plan("CUDA", ["IGPU", "CPU"], str(cache), "k") == ["IGPU"]
-    assert idev.preload_plan("AUTO", present, str(cache), "k") == ["CUDA", "IGPU", "CPU"]
+    assert idev.preload_plan("AUTO", present, str(cache), "k") == ["CUDA"]
     cache.write_text(json.dumps({"k": {"device": "IGPU", "p95_ms": 30.0}}))
-    assert idev.preload_plan("AUTO", present, str(cache), "k") == ["IGPU"]
-    assert idev.preload_plan("AUTO", present, str(cache), "other") == ["CUDA", "IGPU", "CPU"]
+    assert idev.preload_plan("AUTO", present, str(cache), "k") == ["CUDA"], "the MX110 comes first even over a cached choice"
+    assert idev.preload_plan("AUTO", ["IGPU", "CPU"], str(cache), "k") == ["IGPU"]
+    assert idev.preload_plan("AUTO", ["IGPU", "CPU"], str(cache), "other") == ["IGPU", "CPU"]
 
 
 def test_a_device_can_be_warmed_more_than_once():

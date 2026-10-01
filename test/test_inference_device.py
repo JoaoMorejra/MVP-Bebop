@@ -170,9 +170,47 @@ class FakeClock:
         self.now += seconds
 
 
+def test_auto_prefers_the_mx110_whenever_it_runs(tmp_path):
+    """Operator decision (2026-10-01): MX110 first. Idle, the HD 620 measured a
+    lower p95, but loading it took 5.4 s at start-up against ~2.5 s for CUDA."""
+    clock = FakeClock()
+    latencies = {"CUDA": 48.0, "IGPU": 30.0, "CPU": 70.0}
+    built = []
+
+    def build(device):
+        detector = TimedDetector(device, latencies[device], clock)
+        built.append(detector)
+        return detector
+
+    chain, report = idev.select_detector(
+        "AUTO", ["CUDA", "IGPU", "CPU"], build, frame="frame", cache_path=tmp_path / "c.json", cache_key="k", clock=clock
+    )
+    assert chain.device == "CUDA"
+    assert [d.name for d in built] == ["CUDA"]
+    assert set(report["candidates"]) == {"CUDA"}
+    assert report["preferred"] is True
+    assert chain.chain == ["CUDA", "IGPU", "CPU"]
+
+
+def test_an_mx110_that_cannot_load_falls_back_to_the_benchmark(tmp_path):
+    clock = FakeClock()
+    latencies = {"IGPU": 41.0, "CPU": 70.0}
+
+    def build(device):
+        if device == "CUDA":
+            raise RuntimeError("CUDA error: no kernel image is available")
+        return TimedDetector(device, latencies[device], clock)
+
+    chain, report = idev.select_detector(
+        "AUTO", ["CUDA", "IGPU", "CPU"], build, frame="frame", cache_path=tmp_path / "c.json", cache_key="k", clock=clock
+    )
+    assert chain.device == "IGPU"
+    assert set(report["candidates"]) == {"IGPU", "CPU"}
+
+
 def test_auto_benchmarks_every_available_device_and_caches_the_choice(tmp_path):
     clock = FakeClock()
-    latencies = {"CUDA": 48.0, "IGPU": 41.0, "CPU": 70.0}
+    latencies = {"IGPU": 41.0, "CPU": 70.0}
     built = []
 
     def build(device):
@@ -182,17 +220,17 @@ def test_auto_benchmarks_every_available_device_and_caches_the_choice(tmp_path):
 
     cache = tmp_path / "inference_device.json"
     chain, report = idev.select_detector(
-        "AUTO", ["CUDA", "IGPU", "CPU"], build, frame="frame", cache_path=cache, cache_key="k", clock=clock
+        "AUTO", ["IGPU", "CPU"], build, frame="frame", cache_path=cache, cache_key="k", clock=clock
     )
     assert chain.device == "IGPU"
     assert report["device"] == "IGPU"
-    assert set(report["candidates"]) == {"CUDA", "IGPU", "CPU"}
+    assert set(report["candidates"]) == {"IGPU", "CPU"}
     stored = json.loads(cache.read_text())
     assert stored["k"]["device"] == "IGPU"
 
     built.clear()
     chain, report = idev.select_detector(
-        "AUTO", ["CUDA", "IGPU", "CPU"], build, frame="frame", cache_path=cache, cache_key="k", clock=clock
+        "AUTO", ["IGPU", "CPU"], build, frame="frame", cache_path=cache, cache_key="k", clock=clock
     )
     assert chain.device == "IGPU"
     assert report["cached"] is True
@@ -207,9 +245,9 @@ def test_the_benchmark_stays_within_its_budget(tmp_path):
         return TimedDetector(device, 900.0, clock)
 
     _chain, report = idev.select_detector(
-        "AUTO", ["CUDA", "IGPU", "CPU"], build, frame="frame", cache_path=tmp_path / "c.json", cache_key="k", clock=clock
+        "AUTO", ["IGPU", "CPU"], build, frame="frame", cache_path=tmp_path / "c.json", cache_key="k", clock=clock
     )
-    warmups = 3 * idev.WARMUP_SAMPLES * 0.9
+    warmups = 2 * idev.WARMUP_SAMPLES * 0.9
     assert clock() - warmups <= idev.BENCH_BUDGET_SEC + 1.0
 
 
@@ -223,17 +261,17 @@ def test_slow_first_inferences_do_not_starve_the_later_devices(tmp_path):
                 self.clock.advance(2.0)
             return super().detect(frame, **kwargs)
 
-    latencies = {"CUDA": 48.0, "IGPU": 41.0, "CPU": 70.0}
+    latencies = {"IGPU": 41.0, "CPU": 70.0}
     chain, report = idev.select_detector(
         "AUTO",
-        ["CUDA", "IGPU", "CPU"],
+        ["IGPU", "CPU"],
         lambda d: ColdStart(d, latencies[d], clock),
         frame="frame",
         cache_path=tmp_path / "c.json",
         cache_key="k",
         clock=clock,
     )
-    assert set(report["candidates"]) == {"CUDA", "IGPU", "CPU"}
+    assert set(report["candidates"]) == {"IGPU", "CPU"}
     assert chain.device == "IGPU"
 
 

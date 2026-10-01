@@ -31,9 +31,10 @@ evidence frames (same classes, confidence within 0.004, IoU >= 0.997), so CUDA
 runs FP16 (:data:`CUDA_QUANTIZE`). An earlier reading of "no gain" reused one
 Ultralytics predictor for both precisions, which keeps the first one's dtype.
 Idle, the HD 620 wins; it shares the package's 15 W with the CPU, and under the
-mission's own load it measured 45/72 ms against CUDA's 49/51. The choice is
-therefore made by :func:`select_detector` on the first real frame, under that
-load, and cached per model and input size.
+mission's own load it measured 45/72 ms against CUDA's 49/51. Loading it costs
+5.4 s at start-up against ~2.5 s for CUDA (measured live). Operator decision
+(2026-10-01): ``AUTO`` takes the MX110 whenever it works; the benchmark of
+:func:`select_detector` decides between the others only without it.
 """
 
 from __future__ import annotations
@@ -323,9 +324,13 @@ def select_detector(
 ) -> Tuple[FallbackDetector, Dict[str, Any]]:
     """Build the mission detector on the requested or the benchmarked device.
 
-    ``AUTO`` reuses a cached choice for ``cache_key`` after a
-    :data:`VALIDATION_SAMPLES` check, or benchmarks every available device on
-    ``frame`` within :data:`BENCH_BUDGET_SEC` and applies :func:`choose_device`.
+    ``AUTO`` takes the MX110 whenever it loads and passes a
+    :data:`VALIDATION_SAMPLES` check (operator decision, 2026-10-01: idle, the
+    HD 620 measured a lower p95, but loading it cost 5.4 s at start-up against
+    ~2.5 s for CUDA). Without CUDA, or with a CUDA that fails, it reuses a
+    cached choice for ``cache_key`` after the same check, or benchmarks the
+    remaining devices on ``frame`` within :data:`BENCH_BUDGET_SEC` and applies
+    :func:`choose_device`.
     An explicit device is used as asked, or the next available one if absent.
     Either way the result falls back down :data:`PREFERENCE` at run time.
 
@@ -350,6 +355,26 @@ def select_detector(
         chain.load()
         report["device"] = chain.device
         return chain, report
+
+    if "CUDA" in present:
+        try:
+            detector = build("CUDA")
+            detector.load()
+            _warm(detector, frame, kwargs)
+            measured = _measure(detector, frame, VALIDATION_SAMPLES, clock() + BENCH_BUDGET_SEC, clock, kwargs)
+        except Exception as exc:  # noqa: BLE001 - the remaining devices are benchmarked instead
+            logger.warning("Preferred inference device CUDA unusable (%s); benchmarking the others.", exc)
+            measured = None
+        if measured is not None:
+            report.update(
+                device="CUDA",
+                preferred=True,
+                candidates={"CUDA": {"p50_ms": round(measured[0], 1), "p95_ms": round(measured[1], 1)}},
+            )
+            return FallbackDetector(_chain_from("CUDA", present), build, primary=detector), report
+        present = [device for device in present if device != "CUDA"]
+        if not present:
+            raise RuntimeError("the preferred CUDA device failed and no other device is available")
 
     cached = _load_cache(cache_path).get(cache_key)
     if isinstance(cached, dict) and cached.get("device") in present:
@@ -419,8 +444,8 @@ def preload_plan(requested: str, available: Sequence[str], cache_path: Optional[
     """Devices :func:`select_detector` will build first, in order.
 
     An explicit device (or the next present one) alone; under ``AUTO`` the
-    cached choice alone, or every present device when the selection will
-    benchmark.
+    MX110 when present, else the cached choice alone, or every present device
+    when the selection will benchmark.
     """
     name = normalize_inference_device(requested)
     present = [device for device in PREFERENCE if device in available]
@@ -431,6 +456,8 @@ def preload_plan(requested: str, available: Sequence[str], cache_path: Optional[
             (device for device in PREFERENCE[PREFERENCE.index(name):] if device in present), present[0]
         )
         return [start]
+    if "CUDA" in present:
+        return ["CUDA"]
     cached = _load_cache(cache_path).get(cache_key)
     if isinstance(cached, dict) and cached.get("device") in present:
         return [cached["device"]]
