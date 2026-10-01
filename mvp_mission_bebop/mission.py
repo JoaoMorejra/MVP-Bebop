@@ -7,6 +7,7 @@ Entry point executing the deterministic 5-step mission pipeline via Nectar SDK.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import math
@@ -15,16 +16,22 @@ import sys
 import time
 from typing import List, Optional
 
+import numpy as np
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import Int32, String, UInt8
+from std_msgs.msg import Float32, Int32, String, UInt8, UInt32
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 
 import nectar
 from nectar.control import BebopConfig, DroneFactory
 from nectar.vision import ImageHandler, QoSReliability, ROSConfig
 
+from mvp_mission_bebop.actuators.driver_discovery import (
+    DRIVER_PROBE_SEC,
+    driver_in_graph,
+    restart_ros2_daemon,
+)
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
 from mvp_mission_bebop.config_audit import log_envelope_divergences
@@ -33,12 +40,20 @@ from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
 from mvp_mission_bebop.engine.runner import MissionRunner
+from mvp_mission_bebop.engine.startup_timing import StartupTimer, process_age_ms
 from mvp_mission_bebop.engine.stage_gate import StageRequestHandler
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
-from mvp_mission_bebop.parameters import BatteryConfig, MissionParameters, VisionConfig
+from mvp_mission_bebop.parameters import (
+    COUNTDOWN_MIN_SEC,
+    BatteryConfig,
+    MissionParameters,
+    VisionConfig,
+)
 from mvp_mission_bebop.perception.inference_device import (
     CUDA_WARMUP_SAMPLES,
+    DetectorPreloader,
+    preload_plan,
     available_devices,
     build_device_detector,
     model_cache_key,
@@ -63,6 +78,7 @@ from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.mission_parameters import spoken_parameters
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
+from mvp_mission_bebop.telemetry.flat_trim_ack import FlatTrimAckTracker
 from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
 
 # Mission logs go to stdout deliberately. The Electron GCS registers its step
@@ -215,6 +231,15 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--dump-defaults",
+        action="store_true",
+        default=False,
+        help=(
+            "Print MissionParameters.factory() as JSON and exit, without reading "
+            "or writing the parameter store. The ground station's source of defaults."
+        ),
+    )
+    parser.add_argument(
         "--bench-frame",
         default=None,
         help=(
@@ -256,9 +281,31 @@ def parse_stage_selection(raw: Optional[str]) -> Optional[List[int]]:
     return selection
 
 
-def main() -> None:
-    """CLI initialization and mission lifecycle execution."""
-    args = parse_arguments(MissionParameters())
+def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
+    """Merge the parameter store, ``--params-json`` and the CLI flags, then persist.
+
+    Order: ``mission_config.json`` (or ``--config``), then the ``--params-json``
+    document, then any explicit flag. The ground station sends the document
+    alone (``electron/main.cjs:startMissionProcess``); the flags remain for CLI
+    use. The arming mode is never persisted.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        From :func:`parse_arguments`.
+
+    Returns
+    -------
+    MissionParameters
+        The parameters this run flies.
+
+    Raises
+    ------
+    SystemExit
+        On a malformed ``--params-json``, ``--fly`` together with ``--no-fly``,
+        or a countdown that is not a finite number of at least
+        :data:`~mvp_mission_bebop.parameters.COUNTDOWN_MIN_SEC`.
+    """
     config_file = args.config or os.path.join(os.path.dirname(__file__), "mission_config.json")
     params = MissionParameters.load_from_file(config_file)
 
@@ -325,6 +372,18 @@ def main() -> None:
         params.no_fly = False
     if args.countdown is not None:
         params.kinematics.countdown_sec = args.countdown
+    countdown = params.kinematics.countdown_sec
+    if (
+        isinstance(countdown, bool)
+        or not isinstance(countdown, (int, float))
+        or not math.isfinite(countdown)
+        or countdown < COUNTDOWN_MIN_SEC
+    ):
+        raise SystemExit(
+            f"kinematics.countdown_sec must be a finite number >= {COUNTDOWN_MIN_SEC:g} s, "
+            f"got {countdown!r}; refusing to fly."
+        )
+    params.kinematics.countdown_sec = float(countdown)
 
     try:
         # Persist the tuning, never the arming state: see the note above on the
@@ -340,6 +399,91 @@ def main() -> None:
         params.no_fly = armed_for_this_run
     except Exception as save_err:
         logger.warning("Could not persist active mission config: %s", save_err)
+    return params
+
+
+def main() -> None:
+    """CLI initialization and mission lifecycle execution."""
+    timer = StartupTimer()
+    args = parse_arguments(MissionParameters())
+    if args.dump_defaults:
+        print(json.dumps(MissionParameters.factory().to_dict()))
+        return
+    # Interpreter start-up and every import, the package's included: the
+    # process is older than any clock this module could start.
+    boot_ms = process_age_ms()
+    if boot_ms is not None:
+        timer.record("boot", boot_ms)
+    params = resolve_parameters(args)
+
+    # Initialize perception. The input size is normalized here, before takeoff,
+    # so a malformed value from the parameter sheet costs a log line on the
+    # ground instead of an exception inside a flight stage. Falling back to the
+    # native size is the conservative choice: it is the validated detector
+    # configuration, only slower.
+    try:
+        params.vision.inference_imgsz = normalize_imgsz(params.vision.inference_imgsz)
+    except (TypeError, ValueError) as exc:
+        logger.error("Invalid vision.inference_imgsz (%s); using the model's native size.", exc)
+        params.vision.inference_imgsz = None
+    try:
+        params.vision.inference_device = normalize_inference_device(params.vision.inference_device)
+    except (TypeError, ValueError) as exc:
+        logger.error("Invalid vision.inference_device (%s); using AUTO.", exc)
+        params.vision.inference_device = "AUTO"
+    inference_cache = os.environ.get("BMG_INFERENCE_CACHE") or os.path.join(
+        os.path.expanduser("~"), ".cache", "bmg", "inference_device.json"
+    )
+    inference_key = model_cache_key(params.vision.model_path, params.vision.inference_imgsz)
+    warm_kwargs = detector_kwargs(None, params.vision.inference_imgsz)
+
+    def _prepare_inference():
+        """Device probe and detector preload, off the main thread (7.4).
+
+        Imports torch and the SDK detector, probes the devices, then loads and
+        warms the ones the selection will need on the stream's geometry
+        (REC1080_STREAM480: 856x480), while the main thread brings up the SDK,
+        the driver link and the camera. The device choice itself still runs on
+        the first real frame.
+        """
+        probe_started = time.monotonic()
+        backends = available_devices()
+        timer.record("device_probe", (time.monotonic() - probe_started) * 1000.0)
+        logger.info(
+            "YOLO detector %s (input size %s), device %s; station devices %s.",
+            params.vision.model_path,
+            params.vision.inference_imgsz or "native",
+            params.vision.inference_device,
+            ", ".join(f"{name}={backend}" for name, backend in backends.items()),
+        )
+
+        def build(device: str):
+            return build_device_detector(
+                device, params.vision.model_path, params.vision.confidence_threshold, backends
+            )
+
+        loader = DetectorPreloader(
+            preload_plan(params.vision.inference_device, list(backends), inference_cache, inference_key),
+            build,
+            warm_frame=np.zeros((480, 856, 3), dtype=np.uint8),
+            detect_kwargs=warm_kwargs,
+            warm_counts={"CUDA": CUDA_WARMUP_SAMPLES},
+        )
+        loader.start()
+        return backends, loader
+
+    inference_setup = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="InferenceSetup"
+    ).submit(_prepare_inference)
+
+    def _settle_inference_setup() -> None:
+        """Wait for the background setup before exiting: torch or a GPU runtime
+        initialising under interpreter shutdown turns an exit code into a crash."""
+        try:
+            _backends, loader = inference_setup.result(timeout=60.0)
+            loader.join(30.0)
+        except Exception:  # noqa: BLE001 - exiting anyway
+            pass
 
     logger.info(
         "Active parameters: altitude=%.2fm, velocity=%.3fm/s, hover=%.1fs, "
@@ -380,8 +524,16 @@ def main() -> None:
     except Exception as vocal_err:
         logger.debug("Announce dispatch failure: %s", vocal_err)
 
+    timer.lap("parameters")
     logger.info("Initializing Nectar SDK runtime...")
     nectar.init()
+    telemetry_node = Node("bebop_mission_telemetry", start_parameter_services=False)
+    # Up to DRIVER_PROBE_SEC of DDS discovery, run while the rest of the
+    # ground preparation proceeds.
+    driver_probe = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="DriverProbe").submit(
+        driver_in_graph, telemetry_node, namespace=params.network.namespace
+    )
+    timer.lap("nectar_init")
 
     config = BebopConfig(
         name="bebop_mission",
@@ -440,7 +592,26 @@ def main() -> None:
         motion_tracker=motion_tracker,
     )
 
-    if not actuator.connect():
+
+    cam_config = ROSConfig(
+        topic=params.network.camera_raw_topic,
+        compressed=False,
+        reliability=QoSReliability.BEST_EFFORT,
+    )
+    handler = ImageHandler(image_source=params.network.camera_raw_topic, config=cam_config)
+    handler.open()
+    timer.lap("camera_open")
+
+    # 7.2: the live graph (probed since `nectar.init`) is asked before the
+    # SDK's `ros2 node list`, which a stale daemon answers wrongly. Checked
+    # after the camera and the detector preload have started, so the SDK's
+    # check overlaps the model load.
+    connected = actuator.connect(
+        graph_probe=lambda: driver_probe.result(timeout=DRIVER_PROBE_SEC + 1.0),
+        restart_daemon=restart_ros2_daemon,
+    )
+    timer.lap("driver_connect")
+    if not connected:
         erro_msg = f"Falha de conexão com driver do drone no IP {params.network.drone_ip}"
         logger.error(
             "Driver connection failure. Ensure ros2_bebop_driver is running:\n"
@@ -457,52 +628,19 @@ def main() -> None:
             )
         except Exception:
             pass
+        # The preload may be inside a CUDA or OpenVINO initialisation; exiting
+        # under it turns the exit code into a crash.
+        _settle_inference_setup()
+        handler.cleanup()
         nectar.shutdown()
         sys.exit(1)
 
-    # Initialize perception. The input size is normalized here, before takeoff,
-    # so a malformed value from the parameter sheet costs a log line on the
-    # ground instead of an exception inside a flight stage. Falling back to the
-    # native size is the conservative choice: it is the validated detector
-    # configuration, only slower.
-    try:
-        params.vision.inference_imgsz = normalize_imgsz(params.vision.inference_imgsz)
-    except (TypeError, ValueError) as exc:
-        logger.error("Invalid vision.inference_imgsz (%s); using the model's native size.", exc)
-        params.vision.inference_imgsz = None
-    try:
-        params.vision.inference_device = normalize_inference_device(params.vision.inference_device)
-    except (TypeError, ValueError) as exc:
-        logger.error("Invalid vision.inference_device (%s); using AUTO.", exc)
-        params.vision.inference_device = "AUTO"
-    inference_backends = available_devices()
-    logger.info(
-        "YOLO detector %s (input size %s), device %s; station devices %s.",
-        params.vision.model_path,
-        params.vision.inference_imgsz or "native",
-        params.vision.inference_device,
-        ", ".join(f"{name}={backend}" for name, backend in inference_backends.items()),
-    )
-
-    def _build_detector(device: str):
-        return build_device_detector(
-            device, params.vision.model_path, params.vision.confidence_threshold, inference_backends
-        )
-
-    cam_config = ROSConfig(
-        topic=params.network.camera_raw_topic,
-        compressed=False,
-        reliability=QoSReliability.BEST_EFFORT,
-    )
-    handler = ImageHandler(image_source=params.network.camera_raw_topic, config=cam_config)
-    handler.open()
-
-    sample_frame = handler.take_photo(timeout_sec=2.5)
+    # Without a driver (bench) there is no camera to wait for.
+    sample_frame = handler.take_photo(timeout_sec=2.5 if actuator.driver_reachable is not False else 0.2)
     if sample_frame is None:
         if params.no_fly:
             logger.info("[NO-FLY BENCHTOP] Physical camera not available. Utilizing benchtop test frame.")
             import cv2
-            import numpy as np
             test_img_path = args.bench_frame or os.path.join(
                 os.path.dirname(__file__), "accident_raw_20260903_033713.png"
             )
@@ -519,33 +657,30 @@ def main() -> None:
             handler.take_photo = lambda timeout_sec=1.0: sample_frame.copy()
         else:
             logger.critical("Fatal: Unable to receive initial video frame. Aborting.")
+            _settle_inference_setup()
             handler.cleanup()
             raw_drone.cleanup()
             nectar.shutdown()
             sys.exit(1)
 
     frame_height, frame_width = sample_frame.shape[:2]
+    timer.lap("first_frame")
 
     # Device selection doubles as the pre-flight warmup: every candidate runs
     # its first, expensive inferences here on the ground, on the first real
     # frame, under the mission's own load (D3, perception.inference_device).
     selection_started = time.monotonic()
-    warm_kwargs = detector_kwargs(None, params.vision.inference_imgsz)
+    inference_backends, preloader = inference_setup.result()
     detector, inference_report = select_detector(
         params.vision.inference_device,
         list(inference_backends),
-        _build_detector,
+        preloader.build,
         frame=sample_frame,
-        cache_path=os.environ.get("BMG_INFERENCE_CACHE")
-        or os.path.join(os.path.expanduser("~"), ".cache", "bmg", "inference_device.json"),
-        cache_key=model_cache_key(params.vision.model_path, params.vision.inference_imgsz),
+        cache_path=inference_cache,
+        cache_key=inference_key,
         detect_kwargs=warm_kwargs,
     )
-    if detector.device == "CUDA":
-        # Resident on the GPU with its kernels already selected, so the first
-        # search cycle runs at full cadence.
-        for _ in range(CUDA_WARMUP_SAMPLES):
-            detector.detect(sample_frame, **warm_kwargs)
+    timer.lap("detector_warmup")
     chosen = inference_report["candidates"].get(detector.device, {})
     logger.info(
         "[TIMING] inference_device=%s p50_ms=%s p95_ms=%s selection_ms=%d cached=%s candidates=%s",
@@ -561,7 +696,6 @@ def main() -> None:
     # Both are registered with the same shared Nectar executor, so this adds no
     # spin loop -- it just stops an odometry subscription from sharing a
     # lifecycle with the video pipeline.
-    telemetry_node = Node("bebop_mission_telemetry", start_parameter_services=False)
     if simulator is None:
         telemetry_node.create_subscription(
             Odometry,
@@ -700,8 +834,31 @@ def main() -> None:
         10,
     )
 
+    # FlatTrimChanged count (6.3): Stage 1 waits for it to advance after the
+    # flat-trim request. Reliable and transient-local at depth 1, as published.
+    ctx.flat_trim_ack = FlatTrimAckTracker()
+    telemetry_node.create_subscription(
+        UInt32,
+        f"/{params.network.namespace.strip('/')}/states/flat_trim",
+        lambda message: ctx.flat_trim_ack.update(int(message.data)),
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+    )
+
+    # z0 of this mission (6.2), for the station's relative altitude and its
+    # per-mission home. Transient-local so a bridge started later still gets it.
+    ground_reference_publisher = telemetry_node.create_publisher(
+        Float32,
+        f"/{params.network.namespace.strip('/')}/mission/ground_reference",
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+    )
+    ctx.publish_ground_reference = lambda z0: ground_reference_publisher.publish(Float32(data=float(z0)))
+
     def _release_mission_resources() -> None:
         perception.stop()
+        if simulator is not None and simulator.complete_landing():
+            # Published on the bench topic before the node goes away, so the
+            # station's last simulated state is LANDED (simulator.complete_landing).
+            logger.info("[NO-FLY] Simulated landing completed at the end of the run.")
         telemetry_node.destroy_node()
 
     all_steps = {
@@ -754,6 +911,7 @@ def main() -> None:
     # Registration is explicit rather than a constructor side effect, so the
     # runner can be constructed in a test off the main thread.
     runner.install_signal_handlers()
+    timer.lap("mission_wiring")
 
     try:
         succeeded = runner.run()

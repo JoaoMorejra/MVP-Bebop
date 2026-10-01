@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -17,8 +17,12 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-from nectar.ai.detection import Detector
 from nectar.vision import ImageHandler
+
+if TYPE_CHECKING:
+    # Annotation only: importing it loads torch (~2 s), which mission.py now
+    # does on a background thread (_prepare_inference).
+    from nectar.ai.detection import Detector
 
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.blackboard import EvidenceRecord, MissionBlackboard
@@ -35,6 +39,7 @@ from mvp_mission_bebop.perception.worker import (
 )
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, OdometrySupervisor
+from mvp_mission_bebop.telemetry.flat_trim_ack import FlatTrimAckTracker
 from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
 
 logger = logging.getLogger("MissionContext")
@@ -109,6 +114,10 @@ class MissionContext:
         self.current_stage: Optional[int] = None
         #: Last ``/bebop/states/flying_state`` from the aircraft, or ``None``.
         self.flying_state: Optional[int] = None
+        #: FlatTrimChanged count from ``states/flat_trim``; ``None`` in unit doubles.
+        self.flat_trim_ack: Optional[FlatTrimAckTracker] = None
+        #: Publishes this mission's z0 on ``mission/ground_reference``; no-op until wired.
+        self.publish_ground_reference: Callable[[float], None] = lambda _z0: None
         #: Native photo acknowledgements from ``states/picture_event``; ``None``
         #: when no driver topic is wired (unit doubles).
         self.picture_ack: Optional[PictureAckTracker] = None

@@ -78,8 +78,13 @@ VALIDATION_SAMPLES: Final[int] = 5
 #: default. They are reported separately as ``load_ms``.
 BENCH_BUDGET_SEC: Final[float] = 6.0
 
-#: Warmup inferences a CUDA detector receives once chosen, keeping it resident.
-CUDA_WARMUP_SAMPLES: Final[int] = 10
+#: Warm-up inferences a CUDA detector receives in the preload (7.4).
+#:
+#: Measured on the MX110 at 480 px: the first call 1.7 s (torch imports its
+#: dynamo machinery and selects kernels), the second 47 ms, every later one
+#: 44-46 ms. Two leave it resident at full cadence; the selection's own
+#: validation then runs eight more on the real frame. Was 10.
+CUDA_WARMUP_SAMPLES: Final[int] = 2
 
 #: Share of the MX110's 2 GB this process may allocate.
 CUDA_MEMORY_FRACTION: Final[float] = 0.8
@@ -405,6 +410,129 @@ def select_detector(
     chain = FallbackDetector(_chain_from(chosen, present), build, primary=primary)
     chain.load()
     return chain, report
+
+
+# -------------------------------------------------------------- preloading
+
+
+def preload_plan(requested: str, available: Sequence[str], cache_path: Optional[str], cache_key: str) -> List[str]:
+    """Devices :func:`select_detector` will build first, in order.
+
+    An explicit device (or the next present one) alone; under ``AUTO`` the
+    cached choice alone, or every present device when the selection will
+    benchmark.
+    """
+    name = normalize_inference_device(requested)
+    present = [device for device in PREFERENCE if device in available]
+    if not present:
+        return []
+    if name != "AUTO":
+        start = name if name in present else next(
+            (device for device in PREFERENCE[PREFERENCE.index(name):] if device in present), present[0]
+        )
+        return [start]
+    cached = _load_cache(cache_path).get(cache_key)
+    if isinstance(cached, dict) and cached.get("device") in present:
+        return [cached["device"]]
+    return present
+
+
+class _Loaded:
+    """A detector already loaded by the preloader; ``load`` does not reload it."""
+
+    def __init__(self, detector: Any) -> None:
+        self._detector = detector
+
+    def load(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__dict__["_detector"], name)
+
+
+class DetectorPreloader:
+    """Loads and warms detectors on a thread while the mission waits for a frame (7.4).
+
+    The first inference is the expensive one (cuDNN initialisation on the
+    MX110, graph compilation on the HD 620), and it does not depend on the
+    image, so it runs on ``warm_frame`` concurrently with the camera start-up.
+    :meth:`build` is the builder handed to :func:`select_detector`: it waits for
+    the preload and returns each preloaded detector once, then builds normally.
+
+    Parameters
+    ----------
+    devices : sequence of str
+        From :func:`preload_plan`.
+    build : callable
+        Builds an unloaded detector for a device name.
+    warm_frame : object
+        Image for the warm-up inference; the stream geometry is enough.
+    detect_kwargs : dict, optional
+        Passed to ``detect`` (``imgsz`` decides the compiled shape).
+    join_timeout_sec : float
+        Longest :meth:`build` waits for the preload before building directly.
+    warm_counts : dict, optional
+        Warm-up inferences per device (default 1). The MX110 takes
+        :data:`CUDA_WARMUP_SAMPLES`, so it is resident with its kernels selected
+        before the first search cycle.
+    """
+
+    def __init__(
+        self,
+        devices: Sequence[str],
+        build: Builder,
+        *,
+        warm_frame: Any,
+        detect_kwargs: Optional[Dict[str, Any]] = None,
+        join_timeout_sec: float = 60.0,
+        warm_counts: Optional[Dict[str, int]] = None,
+    ) -> None:
+        self._devices = list(devices)
+        self._build = build
+        self._frame = warm_frame
+        self._kwargs = dict(detect_kwargs or {})
+        self._join_timeout = join_timeout_sec
+        self._warm_counts = dict(warm_counts or {})
+        self._ready: Dict[str, Any] = {}
+        self._failed: Dict[str, BaseException] = {}
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="DetectorPreload", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        if self._thread.is_alive():
+            self._thread.join(timeout)
+
+    def _run(self) -> None:
+        for device in self._devices:
+            started = time.monotonic()
+            try:
+                detector = self._build(device)
+                detector.load()
+                for _ in range(max(1, int(self._warm_counts.get(device, 1)))):
+                    detector.detect(self._frame, **self._kwargs)
+            except Exception as exc:  # noqa: BLE001 - handed to the selection, which skips the device
+                with self._lock:
+                    self._failed[device] = exc
+                continue
+            with self._lock:
+                self._ready[device] = detector
+            logger.info("Preloaded inference device %s in %.0f ms.", device, (time.monotonic() - started) * 1000.0)
+
+    def build(self, device: str) -> Any:
+        """The preloaded detector for ``device`` (once), else a newly built one."""
+        if device in self._devices:
+            self.join(self._join_timeout)
+        with self._lock:
+            ready = self._ready.pop(device, None)
+            failed = self._failed.pop(device, None)
+        if ready is not None:
+            return _Loaded(ready)
+        if failed is not None:
+            raise failed
+        return self._build(device)
 
 
 # -------------------------------------------------------------- real devices

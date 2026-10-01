@@ -873,6 +873,29 @@ def test_every_played_line_logs_its_latency(cached_announcer):
     assert "source=synth" in lines[0] and "source=cache" in lines[1]
 
 
+def test_every_played_line_logs_the_length_of_its_audio(cached_announcer):
+    """8.3: the rehearsal checks for overlapping speech from these lines."""
+    import logging
+
+    instance, _calls, _device, _dir = cached_announcer
+    records = []
+    handler = logging.Handler(level=logging.INFO)
+    handler.emit = records.append
+    target = logging.getLogger("TelemetryAnnouncer")
+    previous = target.level
+    target.addHandler(handler)
+    target.setLevel(logging.INFO)
+    try:
+        instance.announce("Linha medida.", wait=True, timeout=5.0, verbatim=True)
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous)
+    done = [r.getMessage() for r in records if r.getMessage().startswith("[SPEECH_DONE]")]
+    assert len(done) == 1
+    assert "audio_ms=" in done[0] and "priority=NORMAL" in done[0]
+    assert int(done[0].split("audio_ms=")[1].split()[0]) > 0
+
+
 # ------------------------------------------------------------ block playback (3.9)
 
 

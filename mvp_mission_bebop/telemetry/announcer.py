@@ -22,12 +22,29 @@ import threading
 import time
 from typing import Any, Awaitable, Callable, Dict, Final, List, Optional, Tuple
 
-try:
-    from google import genai
-    from google.genai import types
-except ImportError:
-    genai = None  # type: ignore
-    types = None  # type: ignore
+#: ``google.genai`` and its ``types``, loaded by :func:`_load_genai` on the
+#: first synthesis. Importing them costs ~1.8 s, and a mission under a ground
+#: station session never synthesizes (``station_narrates``), so the import is
+#: no longer paid at module load (7.1).
+genai: Any = None
+types: Any = None
+_genai_loaded = False
+_genai_lock = threading.Lock()
+
+
+def _load_genai() -> Tuple[Any, Any]:
+    """``(google.genai, google.genai.types)``, imported once; ``(None, None)`` if absent."""
+    global genai, types, _genai_loaded
+    with _genai_lock:
+        if not _genai_loaded:
+            try:
+                from google import genai as genai_module
+                from google.genai import types as types_module
+            except ImportError:
+                genai_module = types_module = None
+            genai, types = genai_module, types_module
+            _genai_loaded = True
+        return genai, types
 
 logger = logging.getLogger("TelemetryAnnouncer")
 
@@ -126,9 +143,10 @@ def _get_synthesis_client(api_key: str) -> Any:
     global _cached_client
     with _client_lock:
         if _cached_client is None:
-            if genai is None:
+            genai_module, _ = _load_genai()
+            if genai_module is None:
                 raise RuntimeError("Speech synthesis client dependencies not installed.")
-            _cached_client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
+            _cached_client = genai_module.Client(api_key=api_key, http_options={"api_version": "v1beta"})
         return _cached_client
 
 
@@ -456,6 +474,7 @@ _GROUND_FAULT_ACTIONS: Final[Tuple[str, ...]] = (
     "falha na calibração",
     "falha na decolagem",
     "falha na etapa",
+    "nivelamento sem confirmação",
 )
 
 #: Appended to a fault sentence only when the aircraft is airborne.
@@ -606,12 +625,13 @@ class MissionAudioAnnouncer:
         self._playing_urgent_until: float = 0.0
         self._cache = PhraseCache()
 
-        if types is not None:
-            self.session_config = types.LiveConnectConfig(
-                response_modalities=[types.Modality.AUDIO],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=SYNTHESIZER_VOICE)
+        _, types_module = _load_genai()
+        if types_module is not None:
+            self.session_config = types_module.LiveConnectConfig(
+                response_modalities=[types_module.Modality.AUDIO],
+                speech_config=types_module.SpeechConfig(
+                    voice_config=types_module.VoiceConfig(
+                        prebuilt_voice_config=types_module.PrebuiltVoiceConfig(voice_name=SYNTHESIZER_VOICE)
                     ),
                     language_code=SYNTHESIZER_LANGUAGE,
                 ),
@@ -731,10 +751,11 @@ class MissionAudioAnnouncer:
         audio = bytearray()
         reason = "error"
         try:
+            _, types_module = _load_genai()
             await session.send_client_content(
-                turns=types.Content(
+                turns=types_module.Content(
                     role="user",
-                    parts=[types.Part(text=synthesis_instruction(statement, verbatim))],
+                    parts=[types_module.Part(text=synthesis_instruction(statement, verbatim))],
                 ),
                 turn_complete=True,
             )
@@ -991,9 +1012,18 @@ class MissionAudioAnnouncer:
                 self.device.play_audio(bytes(audio_buffer))
                 log_start(source)
             if spoke:
+                rate = float(getattr(self.device, "sample_rate", 24000) or 24000)
+                audio_sec = len(audio_buffer) / (2.0 * rate)
                 if pri_int == 0:
-                    rate = float(getattr(self.device, "sample_rate", 24000) or 24000)
-                    self._playing_urgent_until = time.monotonic() + len(audio_buffer) / (2.0 * rate)
+                    self._playing_urgent_until = time.monotonic() + audio_sec
+                # Paired with the `[SPEECH]` start line: start plus audio_ms is
+                # when the line stops sounding (scripts/bench_rehearsal.py).
+                logger.info(
+                    "[SPEECH_DONE] '%s' audio_ms=%d priority=%s",
+                    statement[:48],
+                    int(audio_sec * 1000.0),
+                    "URGENT" if pri_int == 0 else "NORMAL",
+                )
 
             self._queue.task_done()
             if done_fut and not done_fut.done():
@@ -1488,12 +1518,12 @@ def serve_stdin() -> int:
             "event": "ready",
             "voice": SYNTHESIZER_VOICE,
             "model": SYNTHESIZER_MODEL,
-            "synthesis": genai is not None and bool(announcer.auth_token),
+            "synthesis": _load_genai()[0] is not None and bool(announcer.auth_token),
             "playback": announcer.device._active,
             **announcer.device.get_level(),
             "detail": (
                 "google-genai não instalado"
-                if genai is None
+                if _load_genai()[0] is None
                 else "sem chave de API (SPEECH_API_KEY / GEMINI_API_KEY)"
                 if not announcer.auth_token
                 else "sem dispositivo de áudio (PortAudio)"
