@@ -74,11 +74,11 @@ def summarize(runs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def run_once(scratch: str) -> Dict[str, Any]:
+def run_once(scratch: str, domain: int = DOMAIN) -> Dict[str, Any]:
     """One mission start, stopped at Stage 1."""
     env = {
         **os.environ,
-        "ROS_DOMAIN_ID": str(DOMAIN),
+        "ROS_DOMAIN_ID": str(domain),
         "BMG_INFERENCE_CACHE": os.path.join(scratch, "inference_device.json"),
         "BMG_SPEECH_CACHE_DIR": os.path.join(scratch, "speech"),
         "PYTHONUNBUFFERED": "1",
@@ -97,6 +97,8 @@ def run_once(scratch: str) -> Dict[str, Any]:
         os.path.join(scratch, "mission_config.json"),
         "--bench-frame",
         os.path.join(_REPO, "test", "fixtures", "bench_target.jpg"),
+        "--model-path",
+        os.path.join(_REPO, "mvp_mission_bebop", "yolov8n.pt"),
         "--params-json",
         json.dumps(PARAMS),
     ]
@@ -127,13 +129,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Print every run and the median as JSON. Returns 1 if no run reached Stage 1."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument(
+        "--domain",
+        type=int,
+        default=DOMAIN,
+        help="ROS_DOMAIN_ID; a rehearsal domain fed by scripts/bench_relay.py measures with the live camera",
+    )
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs must be at least 1")
 
     scratch = tempfile.mkdtemp(prefix="bmg-startup-")
-    run_once(scratch)
-    runs = [run_once(scratch) for _ in range(args.runs)]
+    run_once(scratch, args.domain)
+    runs = [run_once(scratch, args.domain) for _ in range(args.runs)]
     try:
         summary = summarize(runs)
     except ValueError as exc:
