@@ -409,6 +409,8 @@ export interface BmgAPI {
   cancelSpeech: () => Promise<{ success: boolean; cancelled?: boolean; error?: string }>;
   /** Synthesize `text` ahead of its `announce`, which then plays without waiting on synthesis. */
   prepareSpeech: (text: string) => Promise<{ success: boolean; error?: string }>;
+  /** Have the copilot synthesize these sentences into its on-disk cache, in the background. */
+  cacheSpeech: (texts: string[]) => Promise<{ success: boolean; error?: string }>;
   setVoiceLevel: (level: Partial<VoiceLevel>) => Promise<{ success: boolean } & VoiceLevel>;
   getVoiceLevel: () => Promise<VoiceLevel>;
 

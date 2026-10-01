@@ -3,11 +3,23 @@ const path = require('path');
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
-const { spawn, exec, execSync } = require('child_process');
-const { createMilestoneParser, scheduleScriptMilestones } = require('./milestones.cjs');
+const { spawn, exec, execFileSync, execSync } = require('child_process');
+const {
+  createMilestoneParser,
+  createStepMarkerParser,
+  emitLaunchMilestone,
+} = require('./milestones.cjs');
 const { createTerminalHost } = require('./terminal.cjs');
 const { deferBenchSpawn } = require('./benchCountdown.cjs');
 const { readSiteAnchorFile } = require('./siteAnchor.cjs');
+const {
+  createBridgeGate,
+  createShutdownSequence,
+  publishStopThenLand,
+  signalOnce,
+  singleFlight,
+} = require('./missionLifecycle.cjs');
+const { MEDIA_FETCH_ARGS, createNativePhotoFetch } = require('./nativePhotos.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 // The monorepo is checked out as <ws>/src/mvp_mission_bebop on every
@@ -18,11 +30,17 @@ const WORKSPACE_DIR = path.resolve(MISSION_PACKAGE_DIR, '..', '..');
 const MISSION_DIR = path.join(MISSION_PACKAGE_DIR, 'mvp_mission_bebop');
 const NECTAR_SDK_DIR = path.join(WORKSPACE_DIR, 'src', 'nectar-sdk');
 const STREAMER_DIR = path.join(__dirname, '..', 'streamer');
+/**
+ * Fast DDS profile for 2.76 MB camera samples (16 MB SHM segment, 8 MB UDP
+ * buffers). Every process this station starts loads it.
+ */
+const FASTDDS_PROFILE = path.join(__dirname, '..', 'config', 'fastdds_video.xml');
 const VENV_DIR = path.join(WORKSPACE_DIR, '.venv');
 const PYTHON_VENV = path.join(VENV_DIR, 'bin', 'python3');
 const NECTAR_ACTIVATOR = path.join(WORKSPACE_DIR, 'bin', 'nectar-activate');
 const CONFIG_PATH = path.join(MISSION_DIR, 'mission_config.json');
 const COMMAND_SCRIPT = path.join(STREAMER_DIR, 'command_bridge.py');
+const MEDIA_FETCH_SCRIPT = path.join(STREAMER_DIR, 'media_fetch.py');
 const MJPEG_PORT = 9090;
 const DRONE_IP = '192.168.42.1';
 const BEBOP_SSID_RE = /^Bebop2?[-_]/i;
@@ -52,7 +70,7 @@ function getNectarEnv() {
       `source "${NECTAR_ACTIVATOR}" && node -e "console.log(JSON.stringify(process.env))"`,
       { shell: '/bin/bash', encoding: 'utf-8', timeout: 8000 }
     );
-    cachedNectarEnv = JSON.parse(rawEnv.trim());
+    cachedNectarEnv = { ...JSON.parse(rawEnv.trim()), FASTRTPS_DEFAULT_PROFILES_FILE: FASTDDS_PROFILE };
     return cachedNectarEnv;
   } catch (err) {
     console.warn('[BMG] Dynamic environment resolution failed, using canonical fallback:', err.message);
@@ -63,6 +81,7 @@ function getNectarEnv() {
       ROS_DOMAIN_ID: '14',
       ROS_AUTOMATIC_DISCOVERY_RANGE: 'LOCALHOST',
       ROS_STATIC_PEERS: '127.0.0.1',
+      FASTRTPS_DEFAULT_PROFILES_FILE: FASTDDS_PROFILE,
       PYTHONUNBUFFERED: '1',
       LD_LIBRARY_PATH: `${path.join(os.homedir(), '.local', 'lib')}:${path.join(VENV_DIR, 'lib')}:${process.env.LD_LIBRARY_PATH || ''}`,
       PATH: `${path.join(VENV_DIR, 'bin')}:/opt/ros/jazzy/bin:${process.env.PATH || ''}`,
@@ -94,6 +113,8 @@ let mainWindow = null;
 let server = null;
 let driverProcess = null;
 let missionProcess = null;
+/** Longest FTP fetch of the native photos before it is killed, ms. */
+const MEDIA_FETCH_TIMEOUT_MS = 120000;
 let missionStartedAt = null;
 /** Cancels a bench routine still counting down to its spawn (`deferBenchSpawn`). */
 let pendingBenchStage = null;
@@ -508,9 +529,53 @@ function reapOrphanedServices() {
   }
 }
 
+/**
+ * Mission processes this app did not spawn, or no longer holds a handle to.
+ *
+ * A GCS that crashed mid-flight leaves its `mission.py` running and possibly
+ * still commanding the aircraft. A second one spawned beside it would publish
+ * on the same `/bebop/cmd_vel`.
+ */
+function findOrphanMissions() {
+  const script = path.join(MISSION_DIR, 'mission.py');
+  const own = missionProcess ? missionProcess.pid : null;
+  let found = '';
+  try {
+    // execFile, not a shell: `sh -c "pgrep -f <pattern>"` carries the pattern
+    // in its own command line and is matched as a live mission every time.
+    found = execFileSync('pgrep', ['-f', `python3 ${script}`], { encoding: 'utf-8', timeout: 3000 });
+  } catch (err) {
+    // Status 1 is pgrep's "nothing matched".
+    if (err && err.status === 1) return [];
+    console.warn('[BMG] Could not scan for orphaned missions:', err.message);
+    return [];
+  }
+  return found
+    .split('\n')
+    .map((line) => Number(line.trim()))
+    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid && pid !== own);
+}
+
+/**
+ * Interrupt orphaned missions so they land.
+ *
+ * SIGINT, never SIGKILL: the orphan may be flying, and its own handler
+ * transmits the landing burst; a SIGKILL would leave the aircraft holding its
+ * last setpoint with nothing on the ground commanding it.
+ */
+function interruptOrphanMissions() {
+  for (const pid of findOrphanMissions()) {
+    try {
+      process.kill(pid, 'SIGINT');
+      recordLog('mission', { type: 'stderr', text: `[BMG] Missão órfã (pid ${pid}) interrompida: pouso comandado.\n` });
+    } catch (e) { /* already gone */ }
+  }
+}
+
 function startBackgroundServices() {
   servicesStopping = false;
   reapOrphanedServices();
+  interruptOrphanMissions();
   mjpegProcess = superviseService('mjpeg', [
     path.join(STREAMER_DIR, 'mjpeg_server.py'),
     String(MJPEG_PORT),
@@ -716,6 +781,15 @@ function createWindow(port) {
    */
   mainWindow.webContents.session.setPermissionRequestHandler((_wc, permission, callback) => {
     callback(permission === 'geolocation' || permission === 'media');
+  });
+
+  // Closing the window is quitting the station. With a mission running or the
+  // aircraft in the air that is a decision, not a click: the quit path asks,
+  // and the window only goes once the landing has been handled.
+  mainWindow.on('close', (event) => {
+    if (shutdownDone || quitApproved || !missionActiveOrAirborne()) return;
+    event.preventDefault();
+    void requestQuit();
   });
 
   const query = process.env.BMG_INITIAL_QUERY ? `?${process.env.BMG_INITIAL_QUERY}` : '';
@@ -1685,6 +1759,13 @@ function stopSpeechProcess() {
   child.once('close', () => clearTimeout(escalate));
 }
 
+/**
+ * Longest one spoken line may hold the copilot, seconds. The same ceiling as
+ * the renderer's `SPEECH_CEILING_MS` (useCopilot.ts) and the daemon's
+ * `announce(wait)`: pinned by `test/test_contracts.py`.
+ */
+const SPEECH_CEILING_SEC = 14;
+
 ipcMain.handle('bmg:announce', async (_event, payload = {}) => {
   const text = typeof payload === 'string' ? payload : String(payload.text ?? '').trim();
   if (!text) return { success: false, error: 'texto vazio' };
@@ -1699,7 +1780,7 @@ ipcMain.handle('bmg:announce', async (_event, payload = {}) => {
     text,
     priority: typeof payload === 'string' ? 'NORMAL' : payload.priority ?? 'NORMAL',
     verbatim: typeof payload === 'string' ? true : payload.verbatim !== false,
-    timeout: typeof payload === 'string' ? 30 : payload.timeout ?? 30,
+    timeout: typeof payload === 'string' ? SPEECH_CEILING_SEC : payload.timeout ?? SPEECH_CEILING_SEC,
   };
 
   try {
@@ -1718,6 +1799,26 @@ ipcMain.handle('bmg:announce', async (_event, payload = {}) => {
  * Fire-and-forget: the line is still requested, and heard, through
  * `bmg:announce`; this only lets that request find the audio ready.
  */
+/**
+ * Fill the copilot's phrase cache with every sentence the mission can say.
+ * Sent once the mission has reported its parameters; the daemon synthesizes
+ * what it does not have yet, one line at a time, while it is otherwise idle.
+ */
+ipcMain.handle('bmg:cache-speech', async (_event, texts) => {
+  const lines = Array.isArray(texts)
+    ? texts.filter((line) => typeof line === 'string' && line.trim()).map((line) => line.trim())
+    : [];
+  if (!lines.length) return { success: false, error: 'nada para armazenar' };
+  const child = ensureSpeechProcess();
+  if (!child) return { success: false, error: 'copiloto indisponível' };
+  try {
+    child.stdin.write(JSON.stringify({ op: 'cache', texts: lines }) + '\n');
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
 ipcMain.handle('bmg:prepare-speech', async (_event, text) => {
   const line = String(text ?? '').trim();
   if (!line || !speechProcess) return { success: false };
@@ -1748,6 +1849,8 @@ ipcMain.handle('bmg:cancel-speech', async () => {
 // -----------------------------------------------------------------------------
 
 const COMMAND_EVENT_PREFIX = 'BMG_CMD:';
+/** Which command-bridge processes have announced `ready`; see missionLifecycle.cjs. */
+const commandBridgeGate = createBridgeGate();
 /** The last tilt actually published, so the interface reports the camera rather than the handle. */
 let lastCameraTilt = null;
 
@@ -1756,7 +1859,9 @@ function ingestCommandLine(line) {
   if (!trimmed.startsWith(COMMAND_EVENT_PREFIX)) return;
   try {
     const event = JSON.parse(trimmed.slice(COMMAND_EVENT_PREFIX.length));
-    if (event.event === 'tilt') {
+    if (event.event === 'ready') {
+      commandBridgeGate.markReady(commandProcess);
+    } else if (event.event === 'tilt') {
       lastCameraTilt = event.tilt;
       send('bmg:camera-tilt-changed', { tilt: event.tilt, pan: event.pan ?? 0 });
     } else if (event.event === 'land') {
@@ -1771,13 +1876,19 @@ function ingestCommandLine(line) {
 /**
  * Write one request to the resident bridge.
  *
- * Returns false when the bridge is not up, which the caller reports rather than
- * papers over: an abort that could not be published is something the operator
- * has to know about, not something to retry silently.
+ * Returns false when the bridge is not up, or is up but has not announced
+ * `ready`, which the caller reports rather than papers over: an abort that
+ * could not be published is something the operator has to know about, not
+ * something to retry silently. Stdin written before `ready` waited in the pipe
+ * until the node finished starting and reached the aircraft 1.3 s late.
  */
 function sendCommand(request) {
   const child = commandProcess;
   if (!child) return false;
+  if (!commandBridgeGate.isReady(child)) {
+    recordLog('driver', { type: 'stderr', text: '[comando] ponte ainda não anunciou ready; comando não enviado\n' });
+    return false;
+  }
   try {
     child.stdin.write(JSON.stringify(request) + '\n');
     return true;
@@ -2150,6 +2261,13 @@ ipcMain.handle('bmg:get-voice-level', async () => ({ volume: voiceVolume, muted:
  */
 async function startMissionProcess(options = {}) {
   if (missionProcess) return { success: false, message: 'Uma missão já está em andamento.' };
+  const orphans = findOrphanMissions();
+  if (orphans.length) {
+    return {
+      success: false,
+      message: `Missão órfã ainda em execução (pid ${orphans.join(', ')}). Aguarde o pouso ou encerre-a antes de lançar.`,
+    };
+  }
   if (pendingBenchStage) return { success: false, message: 'Uma rotina de bancada está em contagem regressiva.' };
 
   // Single voice: the station's copilot is the only speaker in the system. The
@@ -2214,13 +2332,20 @@ async function startMissionProcess(options = {}) {
     // Flight-script milestones travel on their own channel rather than on
     // `bmg:step-change`, which stays the five-stage contract it has always
     // been. A bench routine is one stage out of its script, so only a full
-    // launch raises the two milestones this process owns.
-    const forwardMilestone = (message) => send('bmg:milestone', message);
+    // launch raises `mission.start`, the one milestone this process owns; the
+    // countdown is raised by the mission itself (`TakeoffStep._countdown`).
+    const forwardMilestone = (message) => {
+      nativePhotoFetch.observe(message);
+      send('bmg:milestone', message);
+    };
     const milestones = createMilestoneParser(forwardMilestone);
+    // The stage machine. `mission.py` logs `--- [STEP N: ...] ---` from each
+    // step's `execute`, on stdout, which is what makes this reliable.
+    const stepMarkers = createStepMarkerParser((stepNumber) => {
+      send('bmg:step-change', { stepNumber, stepName: STEP_NAMES[stepNumber] });
+    });
     const fullScript = !args.includes('--stages');
-    const cancelScriptMilestones = fullScript
-      ? scheduleScriptMilestones(Number(options.countdown ?? 0), forwardMilestone)
-      : () => {};
+    if (fullScript) emitLaunchMilestone(Number(options.countdown ?? 0), forwardMilestone);
 
     recordLog('mission', {
       type: 'stdout',
@@ -2235,14 +2360,7 @@ async function startMissionProcess(options = {}) {
       const text = data.toString();
       recordLog('mission', { type: 'stdout', text });
       milestones.push(text);
-
-      // The stage machine. `mission.py` logs `--- [STEP N: ...] ---` from each
-      // step's `execute`, on stdout, which is what makes this reliable.
-      const match = /\[STEP ([1-5]):/.exec(text);
-      if (match) {
-        const stepNumber = Number(match[1]);
-        send('bmg:step-change', { stepNumber, stepName: STEP_NAMES[stepNumber] });
-      }
+      stepMarkers.push(text);
     });
 
     missionProcess.stderr.on('data', (data) => {
@@ -2251,11 +2369,12 @@ async function startMissionProcess(options = {}) {
 
     missionProcess.on('close', (code, signal) => {
       milestones.flush();
-      cancelScriptMilestones();
+      stepMarkers.flush();
       missionProcess = null;
       missionStartedAt = null;
       recordLog('mission', { type: 'exit', text: `[BMG] Missão finalizada com código ${code}\n` });
       send('bmg:mission-exit', { code, signal });
+      nativePhotoFetch.missionExited();
     });
 
     return { success: true, pid: missionProcess.pid, argv: args };
@@ -2265,6 +2384,48 @@ async function startMissionProcess(options = {}) {
     return { success: false, error: error.message };
   }
 }
+
+/**
+ * Run `streamer/media_fetch.py` once and collect its JSON report.
+ *
+ * The mission writes its sidecars to its working directory, `MISSION_DIR`, so
+ * that is the directory the fetch reads and writes.
+ */
+function runMediaFetch() {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(NECTAR_ACTIVATOR, MEDIA_FETCH_ARGS(MEDIA_FETCH_SCRIPT, MISSION_DIR), {
+        cwd: STREAMER_DIR,
+        env: getNectarEnv(),
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    let stdout = '';
+    const timer = setTimeout(() => child.kill('SIGKILL'), MEDIA_FETCH_TIMEOUT_MS);
+    child.stdout.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    drainInto(child.stderr, 'mission', 'stderr', '[fotos nativas] ');
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout });
+    });
+  });
+}
+
+const nativePhotoFetch = createNativePhotoFetch({
+  run: runMediaFetch,
+  onResult: (report) => send('bmg:native-photos', report),
+  log: (text) => recordLog('mission', { type: 'stdout', text }),
+});
 
 ipcMain.handle('bmg:start-mission', async (_event, options = {}) => startMissionProcess(options));
 
@@ -2337,17 +2498,14 @@ ipcMain.handle('bmg:get-mission-status', async () => ({
  *
  * The fast path is the SIGINT below. The mission process already holds an
  * initialised ROS 2 node, so its own landing burst reaches the aircraft in
- * milliseconds. The two publishes here are the backup for when there is no
- * mission process to signal, or when it is wedged.
+ * milliseconds. The resident command bridge is the second path, and the CLI
+ * stop-then-land (`publishStopThenLand`, missionLifecycle.cjs) the backstop for
+ * when there is neither a mission process to signal nor a ready bridge.
  *
- * `-w 0` is load-bearing. Without it `--once` waits for a matching
- * subscription and blocks indefinitely when the driver is down. The timeout is
- * generous because a cold `ros2 topic pub` spends about seven seconds starting
- * Python and completing discovery before it publishes at all -- a shorter one
- * killed the command just before it sent anything.
+ * The timeout is generous because a cold `ros2 topic pub` spends seconds
+ * starting Python and completing discovery before it publishes at all -- a
+ * shorter one killed the command just before it sent anything.
  */
-const LAND_PUB = 'ros2 topic pub --once -w 0 /bebop/land std_msgs/msg/Empty "{}"';
-const STOP_PUB = 'ros2 topic pub --once -w 0 /bebop/cmd_vel geometry_msgs/msg/Twist "{}"';
 const PUB_TIMEOUT_MS = 20000;
 
 /**
@@ -2371,44 +2529,28 @@ function stopMissionProcess(grace = 1200) {
   const child = missionProcess;
   if (!child) return Promise.resolve(false);
 
-  return new Promise((resolve) => {
-    let escalation = null;
-
-    const settle = () => {
-      if (escalation !== null) clearTimeout(escalation);
-      // Only this handle is cleared. A restart that already replaced it must
-      // not be dropped by the exit of the process it replaced.
+  // One SIGINT per process, whoever asks: `signals.py` reads a second one as
+  // the operator insisting. Only this handle is cleared on exit; a restart that
+  // already replaced it must not be dropped by the exit of the process it
+  // replaced.
+  return signalOnce(child, {
+    grace,
+    log: (text) => recordLog('mission', { type: 'stderr', text }),
+    onSettle: () => {
       if (missionProcess === child) {
         missionProcess = null;
         missionStartedAt = null;
       }
-      resolve(true);
-    };
-
-    child.once('close', settle);
-
-    try {
-      child.kill('SIGINT');
-    } catch (e) {
-      // Already gone; the close event has fired or is about to.
-      return settle();
-    }
-
-    escalation = setTimeout(() => {
-      recordLog('mission', {
-        type: 'stderr',
-        text: `[BMG] Missão não respondeu ao SIGINT em ${grace} ms: enviando SIGKILL.\n`,
-      });
-      try { child.kill('SIGKILL'); } catch (e) { /* already gone */ }
-      // The close event still arrives and settles this; this is only the
-      // backstop for a child whose handle never reports at all.
-      setTimeout(settle, 1500).unref?.();
-    }, grace);
+    },
   });
 }
 
-/** ARSDK flying states in which the airframe is off the ground. */
-const AIRBORNE_FLYING_STATES = new Set([1, 2, 3, 4, 6, 8]);
+/**
+ * ARSDK flying states in which the airframe is off the ground with the rotors
+ * turning. Canonical set, mirrored from `src/lib/flightState.ts:AIRBORNE_STATES`
+ * and pinned by `test/test_contracts.py`.
+ */
+const AIRBORNE_FLYING_STATES = new Set([1, 2, 3, 4, 7, 8]);
 
 /**
  * End a mission that is finishing on its own.
@@ -2418,7 +2560,20 @@ const AIRBORNE_FLYING_STATES = new Set([1, 2, 3, 4, 6, 8]);
  * completed mission, as the renderer used to, commanded a landing at an
  * airframe that had already cut its motors.
  */
-ipcMain.handle('bmg:end-mission', async () => {
+/** Run the CLI stop-then-land backstop and log a land that did not go out. */
+function publishLandBackstop(env) {
+  return publishStopThenLand(exec, env, PUB_TIMEOUT_MS).then((result) => {
+    if (result.land) {
+      recordLog('mission', {
+        type: 'stderr',
+        text: `[BMG] Backup de pouso via ros2 topic pub falhou: ${result.land.message}\n`,
+      });
+    }
+    return result;
+  });
+}
+
+ipcMain.handle('bmg:end-mission', singleFlight(async () => {
   const env = getNectarEnv();
   const missionKilled = await stopMissionProcess(1200);
 
@@ -2426,8 +2581,7 @@ ipcMain.handle('bmg:end-mission', async () => {
   if (airborne) {
     recordLog('mission', { type: 'stderr', text: '[BMG] Aeronave ainda no ar: enviando pouso.\n' });
     sendCommand({ op: 'land' });
-    exec(STOP_PUB, { env, timeout: PUB_TIMEOUT_MS }, () => {});
-    exec(LAND_PUB, { env, timeout: PUB_TIMEOUT_MS }, () => {});
+    publishLandBackstop(env);
   } else {
     recordLog('mission', { type: 'stdout', text: '[BMG] Missão encerrada. Aeronave em solo.\n' });
   }
@@ -2453,9 +2607,9 @@ ipcMain.handle('bmg:end-mission', async () => {
   send('bmg:mission-reset', { at: Date.now(), missionKilled, landCommanded: airborne });
 
   return { success: true, missionKilled, landCommanded: airborne, reset: true };
-});
+}));
 
-ipcMain.handle('bmg:abort-mission', async () => {
+ipcMain.handle('bmg:abort-mission', singleFlight(async () => {
   const env = getNectarEnv();
 
   // The landing goes out first and through the resident bridge, which holds a
@@ -2473,66 +2627,69 @@ ipcMain.handle('bmg:abort-mission', async () => {
       : '[BMG] Aborto: ponte de comando indisponível, usando ros2 topic pub.\n',
   });
 
-  exec(STOP_PUB, { env, timeout: PUB_TIMEOUT_MS }, () => {});
-  exec(LAND_PUB, { env, timeout: PUB_TIMEOUT_MS }, (err) => {
-    if (err) console.warn('[BMG] Direct land publish failed:', err.message);
-  });
+  // Stop then land, in sequence, land last. Started before the mission is
+  // signalled so a bridge that is down does not also cost the CLI's start-up.
+  publishLandBackstop(env);
 
   const hadMission = Boolean(missionProcess);
   const missionKilled = await stopMissionProcess(900);
 
   if (!hadMission) {
     // No mission process to have said it on the way down, so the station says
-    // it. Routed through the resident copilot rather than a throwaway
-    // interpreter: a second announcer would contend with it for the one audio
-    // device, and pay the cold-start cost to do it.
-    const copilot = ensureSpeechProcess();
-    if (copilot) {
-      try {
-        speechSeq += 1;
-        copilot.stdin.write(
-          JSON.stringify({
-            id: speechSeq,
-            text: 'Missão abortada. Pouso imediato comandado.',
-            priority: 'URGENT',
-            verbatim: true,
-          }) + '\n'
-        );
-      } catch (voiceErr) {
-        console.warn('[BMG] Voice announcer unavailable:', voiceErr.message);
-      }
-    }
+    // it -- as an alert on the milestone channel, so it goes through the
+    // renderer's one narration queue (`NarrationQueue.preempt`) like every
+    // other line, rather than being written to the copilot around it.
+    send('bmg:milestone', {
+      kind: 'alert',
+      key: 'mission.abort',
+      payload: { text: 'Missão abortada. Pouso imediato comandado.', priority: 'URGENT' },
+      at: Date.now(),
+      source: 'station',
+    });
   }
-
-  exec(LAND_PUB, { env, timeout: PUB_TIMEOUT_MS }, () => {});
 
   recordLog('mission', { type: 'stderr', text: '[BMG] Aborto comandado. Pouso enviado em /bebop/land.\n' });
   return { success: true, missionKilled };
-});
+}));
 
 // -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
-let cleanedUp = false;
+let quitApproved = false;
+let shutdownDone = false;
 
-/**
- * Tear every child down before the app exits.
- *
- * `make driver-stop` has to run synchronously here. Fired asynchronously on
- * `before-quit`, Electron regularly exited first and left `ros2 launch` and the
- * `bebop_driver` node holding the aircraft's ARSDK session, so the next launch
- * of the GCS could not connect at all.
- */
-function cleanupAllProcesses() {
-  if (cleanedUp) return;
-  cleanedUp = true;
+function isAirborneNow() {
+  return AIRBORNE_FLYING_STATES.has(latestTelemetry.flying_state);
+}
 
-  if (missionProcess) {
-    try { missionProcess.kill('SIGINT'); } catch (e) { /* already exited */ }
-    missionProcess = null;
-    missionStartedAt = null;
-  }
+function missionActiveOrAirborne() {
+  return Boolean(missionProcess) || isAirborneNow();
+}
 
+/** Ask before quitting over a running mission or an airborne aircraft. */
+async function confirmQuit() {
+  if (quitApproved || !missionActiveOrAirborne()) return true;
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+  const airborne = isAirborneNow();
+  const { response } = await dialog.showMessageBox(parent, {
+    type: 'warning',
+    buttons: ['Cancelar', airborne ? 'Pousar e sair' : 'Encerrar missão e sair'],
+    defaultId: 0,
+    cancelId: 0,
+    title: 'Missão em andamento',
+    message: airborne
+      ? 'A aeronave está no ar.'
+      : 'Há uma missão em execução.',
+    detail: airborne
+      ? 'Sair comanda o pouso e aguarda a confirmação de solo (até 10 s) antes de desligar o driver.'
+      : 'Sair interrompe a missão, que transmite o pouso controlado antes de encerrar.',
+  });
+  quitApproved = response === 1;
+  return quitApproved;
+}
+
+/** Everything that is not the mission: bridges, watchdogs, terminals, driver. */
+function stopServicesAndDriver() {
   stopBridgeWatchdog();
   stopTelemetryWatchdog();
   stopSpeechProcess();
@@ -2555,6 +2712,10 @@ function cleanupAllProcesses() {
     driverProcess = null;
   }
 
+  // `make driver-stop` has to complete before the app exits. Left to finish on
+  // its own, Electron regularly exited first and left `ros2 launch` and the
+  // `bebop_driver` node holding the aircraft's ARSDK session, so the next
+  // launch of the GCS could not connect at all.
   try {
     execSync('make driver-stop', {
       cwd: NECTAR_SDK_DIR,
@@ -2588,6 +2749,42 @@ function cleanupAllProcesses() {
     server = null;
   }
 }
+
+/**
+ * Tear every child down before the app exits, in the order that keeps the
+ * aircraft landing: the mission is drained first (grace 1500 ms, then
+ * SIGKILL), an aircraft still airborne is landed through the resident bridge
+ * and given up to 10 s to report ground, and only then do the bridges and the
+ * driver go. See `createShutdownSequence` in missionLifecycle.cjs.
+ */
+const runShutdown = createShutdownSequence({
+  stopMission: () => stopMissionProcess(1500),
+  isAirborne: isAirborneNow,
+  commandLand: () => {
+    const bridged = sendCommand({ op: 'land' });
+    recordLog('mission', {
+      type: 'stderr',
+      text: bridged
+        ? '[BMG] Encerramento com aeronave no ar: pouso publicado pela ponte de comando.\n'
+        : '[BMG] Encerramento com aeronave no ar: ponte indisponível, usando ros2 topic pub.\n',
+    });
+    if (!bridged) publishLandBackstop(getNectarEnv());
+  },
+  stopServices: stopServicesAndDriver,
+  groundWaitMs: 10000,
+});
+
+/** Confirm, drain, then quit for real. Concurrent quit requests share one. */
+const requestQuit = singleFlight(async () => {
+  if (shutdownDone) return;
+  if (!(await confirmQuit())) return;
+  const outcome = await runShutdown();
+  if (outcome.landCommanded && !outcome.grounded) {
+    console.warn('[BMG] Aeronave não reportou solo em 10 s; driver encerrado assim mesmo.');
+  }
+  shutdownDone = true;
+  app.quit();
+});
 
 app.whenReady().then(async () => {
   let port;
@@ -2626,8 +2823,11 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  cleanupAllProcesses();
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', cleanupAllProcesses);
+app.on('before-quit', (event) => {
+  if (shutdownDone) return;
+  event.preventDefault();
+  void requestQuit();
+});

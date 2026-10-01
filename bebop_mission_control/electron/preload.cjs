@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('bmgAPI', {
     ),
   cancelSpeech: () => ipcRenderer.invoke('bmg:cancel-speech'),
   prepareSpeech: (text) => ipcRenderer.invoke('bmg:prepare-speech', text),
+  cacheSpeech: (texts) => ipcRenderer.invoke('bmg:cache-speech', texts),
   setVoiceLevel: (level = {}) => ipcRenderer.invoke('bmg:set-voice-level', level),
   getVoiceLevel: () => ipcRenderer.invoke('bmg:get-voice-level'),
 

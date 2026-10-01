@@ -87,6 +87,9 @@ function createTerminalHost({
           TERM: 'xterm-256color',
           COLORTERM: 'truecolor',
           BMG_NECTAR_ACTIVATE: activator,
+          // A mission started from this terminal must not open a second voice
+          // beside the station's copilot (`announcer.station_narrates`).
+          BMG_GCS_SESSION: '1',
         },
       });
     } catch (error) {

@@ -91,6 +91,9 @@ describe('single-voice architecture', () => {
     const mission = main.spawned.find((child) => child.args.some((arg) => arg.endsWith('mission.py')));
     const daemon = main.spawned.find((child) => child.args.some((arg) => arg.includes('--serve')));
     expect(mission?.env.BMG_GCS_SESSION).toBe('1');
+    // 4.3: every station process loads the large-sample Fast DDS profile.
+    expect(mission?.env.FASTRTPS_DEFAULT_PROFILES_FILE).toMatch(/config\/fastdds_video\.xml$/);
+    expect(daemon?.env.FASTRTPS_DEFAULT_PROFILES_FILE).toMatch(/config\/fastdds_video\.xml$/);
     expect(daemon, 'the copilot daemon is started alongside the mission').toBeDefined();
     expect(daemon?.env.BMG_GCS_SESSION).toBeUndefined();
   });
@@ -109,7 +112,7 @@ describe('alertSentence', () => {
 
   it('falls back to a generic call without one', () => {
     for (const payload of [{}, { text: '' }, { text: 12 }, null, undefined]) {
-      expect(alertSentence(payload as never)).toBe('Alerta de voo. Executando pouso seguro.');
+      expect(alertSentence(payload as never)).toBe('Alerta de voo recebido. Verifique a aeronave.');
     }
   });
 });

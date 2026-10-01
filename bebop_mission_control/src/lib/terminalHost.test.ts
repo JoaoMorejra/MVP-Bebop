@@ -66,6 +66,7 @@ describe('terminal host', () => {
       ROS_DOMAIN_ID: '14',
       TERM: 'xterm-256color',
       BMG_NECTAR_ACTIVATE: '/home/op/ros2_ws/bin/nectar-activate',
+      BMG_GCS_SESSION: '1',
     });
   });
 

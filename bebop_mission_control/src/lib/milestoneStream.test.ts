@@ -161,3 +161,47 @@ describe('station-owned script milestones', () => {
     expect(seen).toEqual(['mission.start', 'mission.countdown_3']);
   });
 });
+
+describe('countdown ownership (3.4)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a launch raises only mission.start: the countdown is the mission process', async () => {
+    const { emitLaunchMilestone } = await import('../../electron/milestones.cjs');
+    const seen: MilestoneMessage[] = [];
+    emitLaunchMilestone(10, (message) => seen.push(message), () => 7);
+    vi.advanceTimersByTime(30_000);
+    expect(seen).toEqual([
+      { kind: 'milestone', key: 'mission.start', payload: { countdown_sec: 10 }, at: 7, source: 'station' },
+    ]);
+  });
+
+  it('a station-counted bench routine ticks every whole second down to zero', async () => {
+    const { scheduleCountdownTicks } = await import('../../electron/milestones.cjs');
+    const ticks: number[] = [];
+    scheduleCountdownTicks(3, (message) => ticks.push(Number(message.payload.remaining_sec)));
+    expect(ticks).toEqual([3]);
+    vi.advanceTimersByTime(999);
+    expect(ticks).toEqual([3]);
+    vi.advanceTimersByTime(1);
+    expect(ticks).toEqual([3, 2]);
+    vi.advanceTimersByTime(2000);
+    expect(ticks).toEqual([3, 2, 1, 0]);
+    vi.advanceTimersByTime(5000);
+    expect(ticks).toEqual([3, 2, 1, 0]);
+  });
+
+  it('cancelled ticks stop', async () => {
+    const { scheduleCountdownTicks } = await import('../../electron/milestones.cjs');
+    const ticks: number[] = [];
+    const cancel = scheduleCountdownTicks(5, (message) => ticks.push(Number(message.payload.remaining_sec)));
+    vi.advanceTimersByTime(1000);
+    cancel();
+    vi.advanceTimersByTime(10_000);
+    expect(ticks).toEqual([5, 4]);
+  });
+});

@@ -10,7 +10,7 @@
  * what makes an abort during the countdown leave nothing behind.
  */
 
-const { scheduleScriptMilestones } = require('./milestones.cjs');
+const { scheduleCountdownTicks, scheduleScriptMilestones } = require('./milestones.cjs');
 
 /**
  * @param {number} countdownSec  Seconds to count; clamped to at least zero.
@@ -22,7 +22,12 @@ const { scheduleScriptMilestones } = require('./milestones.cjs');
 function deferBenchSpawn(countdownSec, { emit, spawn }) {
   const seconds = Number.isFinite(Number(countdownSec)) ? Math.max(0, Number(countdownSec)) : 0;
   let pending = true;
-  const cancelMilestones = scheduleScriptMilestones(seconds, emit);
+  const cancelScript = scheduleScriptMilestones(seconds, emit);
+  const cancelTicks = scheduleCountdownTicks(seconds, emit);
+  const cancelMilestones = () => {
+    cancelScript();
+    cancelTicks();
+  };
   const timer = setTimeout(() => {
     pending = false;
     spawn();

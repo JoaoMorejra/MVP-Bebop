@@ -11,9 +11,14 @@ afterEach(() => {
 
 function run(seconds: number) {
   const keys: string[] = [];
+  const ticks: number[] = [];
   const spawn = vi.fn();
-  const cancel = deferBenchSpawn(seconds, { emit: (m: MilestoneMessage) => keys.push(m.key), spawn });
-  return { keys, spawn, cancel };
+  const emit = (m: MilestoneMessage) => {
+    if (m.key === 'mission.countdown') ticks.push(Number(m.payload.remaining_sec));
+    else keys.push(m.key);
+  };
+  const cancel = deferBenchSpawn(seconds, { emit, spawn });
+  return { keys, ticks, spawn, cancel };
 }
 
 describe('deferBenchSpawn', () => {
@@ -28,12 +33,13 @@ describe('deferBenchSpawn', () => {
   });
 
   it('an abort during the countdown leaves no spawn and no countdown call behind', () => {
-    const { keys, spawn, cancel } = run(10);
+    const { keys, ticks, spawn, cancel } = run(10);
     vi.advanceTimersByTime(4000);
     expect(cancel()).toBe(true);
     vi.advanceTimersByTime(20000);
     expect(spawn).not.toHaveBeenCalled();
     expect(keys).toEqual(['mission.start']);
+    expect(ticks).toEqual([10, 9, 8, 7, 6]);
   });
 
   it('reports nothing to cancel once the routine has been spawned', () => {
