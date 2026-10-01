@@ -18,19 +18,24 @@ from mvp_mission_bebop.steps.base import StepStatus
 from mvp_mission_bebop.steps.takeoff import TakeoffStep
 from mvp_mission_bebop.telemetry.battery import BatterySupervisor
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
+from mvp_mission_bebop.telemetry.flat_trim_ack import FlatTrimAckTracker
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
 
 
 class RecordingDrone:
-    def __init__(self, no_fly: bool) -> None:
+    def __init__(self, no_fly: bool, flat_trim_ack=None) -> None:
         self.no_fly = no_fly
         self.calls: List[str] = []
+        self.flat_trim_ack = flat_trim_ack
 
     def camera_control(self, tilt, pan=0.0):
         self.calls.append("camera_control")
 
     def flat_trim(self):
         self.calls.append("flat_trim")
+        # The aircraft acknowledges (FlatTrimChanged); see test_flat_trim_ack.py.
+        if self.flat_trim_ack is not None:
+            self.flat_trim_ack.update((self.flat_trim_ack.sequence or 0) + 1)
 
     def delay(self, seconds):
         self.calls.append("delay")
@@ -83,7 +88,9 @@ def context(land_pct: float, reading=None, *, no_fly: bool = False):
     battery = BatterySupervisor(params.battery)
     if reading is not None:
         battery.inject_synthetic_reading(reading)
-    drone = RecordingDrone(no_fly)
+    flat_trim_ack = FlatTrimAckTracker()
+    flat_trim_ack.update(0)
+    drone = RecordingDrone(no_fly, flat_trim_ack)
     failsafe = FailsafeSupervisor(
         drone, odometry, params.timeouts, params.kinematics, battery_supervisor=battery
     )
@@ -93,6 +100,7 @@ def context(land_pct: float, reading=None, *, no_fly: bool = False):
         failsafe=failsafe,
         odom_supervisor=odometry,
         current_tilt_deg=0.0,
+        flat_trim_ack=flat_trim_ack,
     )
 
 

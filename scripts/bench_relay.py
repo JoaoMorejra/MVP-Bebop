@@ -75,6 +75,9 @@ SENSOR_TOPICS: Final[Tuple[RelayTopic, ...]] = (
     RelayTopic("/bebop/states/altitude", "std_msgs/msg/Float32", "latched"),
     RelayTopic("/bebop/states/gps", "sensor_msgs/msg/NavSatFix", "latched"),
     RelayTopic("/bebop/states/picture_event", "std_msgs/msg/String", "default"),
+    RelayTopic("/bebop/states/link", "std_msgs/msg/Bool", "latched"),
+    RelayTopic("/bebop/states/flat_trim", "std_msgs/msg/UInt32", "latched"),
+    RelayTopic("/bebop/states/magneto_calibration", "std_msgs/msg/String", "latched"),
 )
 
 #: Every topic the driver subscribes to. None of them may cross the relay.

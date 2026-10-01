@@ -42,7 +42,7 @@ from rclpy.qos import (
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import BatteryState, NavSatFix
-from std_msgs.msg import Float32, Int16, UInt8
+from std_msgs.msg import Bool, Float32, Int16, String, UInt8
 
 # -----------------------------------------------------------------------------
 # Contract
@@ -62,6 +62,13 @@ TOPIC_WIFI_RSSI = f"{NAMESPACE}/states/wifi_rssi"
 TOPIC_FLYING_STATE = f"{NAMESPACE}/states/flying_state"
 TOPIC_ALTITUDE = f"{NAMESPACE}/states/altitude"
 TOPIC_GPS = f"{NAMESPACE}/states/gps"
+#: ARSDK link as the driver sees it (``states/link``): false the moment the
+#: device controller stops or the aircraft goes silent.
+TOPIC_LINK = f"{NAMESPACE}/states/link"
+TOPIC_MAGNETO = f"{NAMESPACE}/states/magneto_calibration"
+#: z0 of the running mission (``mission.py``), for the relative altitude and
+#: the per-mission home.
+TOPIC_GROUND_REFERENCE = f"{NAMESPACE}/mission/ground_reference"
 #: Simulated airframe of a `mission.py --no-fly` run. Published by the mission
 #: on topics of its own rather than on /bebop/odom, which belongs to the driver
 #: (`mvp_mission_bebop/telemetry/bench.py`, pinned by `test_bench_telemetry`).
@@ -110,6 +117,11 @@ BEBOP_IP = os.environ.get("BMG_BEBOP_IP", "192.168.42.1")
 
 #: A sample older than this is no longer evidence that the link is alive.
 ODOM_STALE_SEC = 3.0
+#: Ceiling on the age of an odometry sample by its own header stamp, seconds.
+#: The driver stamps /bebop/odom with the time the aircraft reported the
+#: speed, so a republished old sample is recognised however recently it
+#: arrived. The Bebop reports speed at 5 Hz.
+STAMP_STALE_SEC = 1.5
 TOPIC_STALE_SEC = 4.0
 #: Battery is reported on change, not on a schedule; the Bebop can go a minute
 #: between percentage steps, so it needs a far more generous window.
@@ -137,6 +149,26 @@ MONITOR_PERIOD_SEC = 2.0
 
 def _now() -> float:
     return time.monotonic()
+
+
+def _wall() -> float:
+    """Wall clock, the time base of the driver's header stamps."""
+    return time.time()
+
+
+def stamp_seconds(header: Any) -> Optional[float]:
+    """``header.stamp`` in seconds since the epoch, or ``None`` for an unset stamp."""
+    stamp = header.stamp
+    seconds = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+    return seconds if seconds > 0.0 else None
+
+
+def decode_attitude(msg: Odometry) -> Tuple[float, float]:
+    """Roll and pitch of an odometry orientation, in degrees."""
+    q = msg.pose.pose.orientation
+    roll = math.atan2(2.0 * (q.w * q.x + q.y * q.z), 1.0 - 2.0 * (q.x**2 + q.y**2))
+    sin_pitch = max(-1.0, min(1.0, 2.0 * (q.w * q.y - q.z * q.x)))
+    return math.degrees(roll), math.degrees(math.asin(sin_pitch))
 
 
 # -----------------------------------------------------------------------------
@@ -213,6 +245,8 @@ class TelemetryState:
         self.battery_pct: Optional[int] = None
         self.battery_source = "none"
         self.battery_at: Optional[float] = None
+        #: When the aircraft reported the charge (header stamp, wall seconds).
+        self.battery_stamp: Optional[float] = None
 
         # Navigation
         self.speed = 0.0
@@ -221,6 +255,17 @@ class TelemetryState:
         self.heading = 0.0
         self.position_xy = (0.0, 0.0)
         self.odom_at: Optional[float] = None
+        #: Raw odometry z and the header stamp of the last sample (wall seconds).
+        self.raw_z: Optional[float] = None
+        self.odom_stamp: Optional[float] = None
+        self.roll_deg: Optional[float] = None
+        self.pitch_deg: Optional[float] = None
+        #: z0 of the running mission; ``None`` until a mission publishes one.
+        self.ground_reference: Optional[float] = None
+        #: The driver's ``states/link``; ``None`` from a driver that predates it.
+        self.driver_link: Optional[bool] = None
+        #: Latest ``states/magneto_calibration`` report, parsed.
+        self.magneto: Optional[Dict[str, Any]] = None
 
         self.flying_state: Optional[int] = None
         self.flying_state_at: Optional[float] = None
@@ -272,6 +317,10 @@ class TelemetryState:
         altitude: float,
         heading: float,
         position_xy: Tuple[float, float],
+        raw_z: Optional[float] = None,
+        stamp: Optional[float] = None,
+        roll_deg: Optional[float] = None,
+        pitch_deg: Optional[float] = None,
     ) -> None:
         with self._lock:
             self.speed = speed
@@ -279,6 +328,35 @@ class TelemetryState:
             self.heading = heading
             self.position_xy = position_xy
             self.odom_at = _now()
+            self.raw_z = raw_z
+            self.odom_stamp = stamp
+            self.roll_deg = roll_deg
+            self.pitch_deg = pitch_deg
+
+    def set_ground_reference(self, z0: float) -> None:
+        """A mission established its z0: new altitude reference, new home.
+
+        The home was the first GPS fix of the station's session, so a second
+        mission flown from elsewhere drew its base at the first one's.
+        """
+        with self._lock:
+            self.ground_reference = float(z0)
+            self.gps_home = None
+
+    def set_driver_link(self, up: bool) -> None:
+        with self._lock:
+            self.driver_link = bool(up)
+
+    def set_magneto_calibration(self, text: str) -> None:
+        """Accept one ``states/magneto_calibration`` JSON; malformed ones are ignored."""
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("sequence"), int):
+            return
+        with self._lock:
+            self.magneto = parsed
 
     def set_bench(
         self,
@@ -306,7 +384,7 @@ class TelemetryState:
             elif not airborne and previous in AIRBORNE_STATES:
                 self.bench_flight_started_at = None
 
-    def set_battery(self, percent: Optional[int], source: str) -> None:
+    def set_battery(self, percent: Optional[int], source: str, stamp: Optional[float] = None) -> None:
         with self._lock:
             if percent is None:
                 # Never overwrite a good reading with a failed probe; the
@@ -315,6 +393,7 @@ class TelemetryState:
             self.battery_pct = int(percent)
             self.battery_source = source
             self.battery_at = _now()
+            self.battery_stamp = stamp
 
     def set_drone_rssi(self, rssi: Optional[int]) -> None:
         with self._lock:
@@ -420,11 +499,20 @@ class TelemetryState:
         with self._lock:
             now = _now()
 
+            wall = _wall()
             odom_age = None if self.odom_at is None else now - self.odom_at
             odom_fresh = odom_age is not None and odom_age < ODOM_STALE_SEC
+            if self.odom_stamp is not None and odom_age is not None:
+                # The sample's own age, not its arrival's: the driver stamps it
+                # with the time the aircraft reported it.
+                odom_age = max(0.0, wall - self.odom_stamp)
+                odom_fresh = odom_fresh and odom_age < STAMP_STALE_SEC
 
             battery_age = (
                 None if self.battery_at is None else now - self.battery_at
+            )
+            reported_age = (
+                max(0.0, wall - self.battery_stamp) if self.battery_stamp is not None else battery_age
             )
             battery_fresh = (
                 battery_age is not None and battery_age < BATTERY_STALE_SEC
@@ -449,7 +537,7 @@ class TelemetryState:
             # actually publishing, as the position fields always were. The
             # console battery probe is exempt: it is read over Wi-Fi, not
             # through the driver, and ages out on its own window.
-            data_fresh = odom_fresh and reachable
+            data_fresh = odom_fresh and reachable and self.driver_link is not False
 
             # Navigation source. A fresh benchtop simulation wins over the
             # aircraft: during a rehearsal the station follows the airframe the
@@ -475,6 +563,8 @@ class TelemetryState:
                 nav_source = "aircraft" if data_fresh else "none"
                 nav_speed = self.speed
                 nav_altitude = self.altitude
+                if self.ground_reference is not None and self.raw_z is not None:
+                    nav_altitude = self.raw_z - self.ground_reference
                 nav_heading = self.heading
                 dx, dy = self.position_xy
                 nav_flying_state = self.flying_state
@@ -497,7 +587,7 @@ class TelemetryState:
             # offset onto the real base reference, when there is one. A
             # simulated position is never a GPS position.
             east, north = odom_to_enu(dx, dy)
-            if not simulated and self.gps_fix and self.gps_latitude is not None:
+            if not simulated and data_fresh and self.gps_fix and self.gps_latitude is not None:
                 latitude = round(self.gps_latitude, 7)
                 longitude = round(self.gps_longitude or 0.0, 7)
                 position_source = "gps"
@@ -578,7 +668,7 @@ class TelemetryState:
                 "battery_known": bool(battery_known),
                 "battery_source": self.battery_source if battery_known else "none",
                 "battery_age_sec": (
-                    round(battery_age, 1) if battery_age is not None else None
+                    round(reported_age, 1) if reported_age is not None else None
                 ),
                 "signal_source": signal_source,
                 "position_source": position_source,
@@ -616,6 +706,20 @@ class TelemetryState:
                     else "disconnected"
                 ),
                 "data_fresh": bool(data_fresh),
+                # Relative to the running mission's z0 when one was published;
+                # otherwise the raw odometry height.
+                "altitude_reference": (
+                    "simulator"
+                    if simulated
+                    else ("mission" if self.ground_reference is not None and self.raw_z is not None else "odometry")
+                ),
+                "roll_deg": (
+                    round(self.roll_deg, 1) if data_fresh and not simulated and self.roll_deg is not None else None
+                ),
+                "pitch_deg": (
+                    round(self.pitch_deg, 1) if data_fresh and not simulated and self.pitch_deg is not None else None
+                ),
+                "magneto_calibration": dict(self.magneto) if self.magneto is not None else None,
                 # Navigation fields above come from `nav_source`; `simulated`
                 # marks a benchtop run so the station can say so.
                 "nav_fresh": bool(nav_fresh),
@@ -676,6 +780,9 @@ class TelemetryNode(Node):
             Float32, TOPIC_ALTITUDE, self._on_altitude, state_qos
         )
         self.create_subscription(NavSatFix, TOPIC_GPS, self._on_gps, state_qos)
+        self.create_subscription(Bool, TOPIC_LINK, self._on_link, state_qos)
+        self.create_subscription(String, TOPIC_MAGNETO, self._on_magneto, state_qos)
+        self.create_subscription(Float32, TOPIC_GROUND_REFERENCE, self._on_ground_reference, state_qos)
         self.create_subscription(
             Odometry, TOPIC_BENCH_ODOM, self._on_bench_odom, BENCH_QOS
         )
@@ -705,7 +812,27 @@ class TelemetryNode(Node):
     def _on_odom(self, msg: Odometry) -> None:
         STATE.note_sample(TOPIC_ODOM)
         speed, altitude, heading, position_xy = decode_odometry(msg)
-        STATE.set_odom(speed=speed, altitude=altitude, heading=heading, position_xy=position_xy)
+        roll, pitch = decode_attitude(msg)
+        STATE.set_odom(
+            speed=speed,
+            altitude=altitude,
+            heading=heading,
+            position_xy=position_xy,
+            raw_z=float(msg.pose.pose.position.z),
+            stamp=stamp_seconds(msg.header),
+            roll_deg=roll,
+            pitch_deg=pitch,
+        )
+
+    def _on_link(self, msg: Bool) -> None:
+        STATE.set_driver_link(bool(msg.data))
+
+    def _on_magneto(self, msg: String) -> None:
+        STATE.set_magneto_calibration(msg.data)
+
+    def _on_ground_reference(self, msg: Float32) -> None:
+        if math.isfinite(float(msg.data)):
+            STATE.set_ground_reference(float(msg.data))
 
     def _on_bench_odom(self, msg: Odometry) -> None:
         speed, altitude, heading, position_xy = decode_odometry(msg)
@@ -718,7 +845,7 @@ class TelemetryNode(Node):
         STATE.note_sample(TOPIC_BATTERY)
         if not msg.present or math.isnan(msg.percentage):
             return
-        STATE.set_battery(int(round(msg.percentage * 100.0)), "aircraft")
+        STATE.set_battery(int(round(msg.percentage * 100.0)), "aircraft", stamp=stamp_seconds(msg.header))
 
     def _on_wifi_rssi(self, msg: Int16) -> None:
         STATE.note_sample(TOPIC_WIFI_RSSI)

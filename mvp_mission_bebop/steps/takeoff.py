@@ -89,9 +89,8 @@ class TakeoffStep(BaseStep):
         ctx.current_tilt_deg = ctx.params.gimbal.search_tilt_deg
         ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
 
-        logger.info("Executing IMU flat trim on a level surface...")
-        ctx.drone.flat_trim()
-        ctx.drone.delay(_FLAT_TRIM_SETTLE_SEC)
+        if not self._flat_trim(ctx):
+            return StepStatus.FAILURE
 
         if not self._calibrate(ctx):
             return StepStatus.FAILURE
@@ -117,6 +116,45 @@ class TakeoffStep(BaseStep):
         if status is StepStatus.SUCCESS:
             ctx.blackboard.takeoff_complete = True
         return status
+
+    # --------------------------------------------------------------- flat trim
+
+    def _flat_trim(self, ctx: MissionContext) -> bool:
+        """Request the IMU flat trim and require the aircraft to confirm it.
+
+        The count on ``states/flat_trim`` is read before the request and must
+        advance within ``timeouts.flat_trim_ack_timeout_sec``. Without that, a
+        real flight is refused: the trim is the attitude reference the whole
+        flight is levelled on, and the SDK's request is fire-and-forget. The
+        bench proceeds, since ``/bebop/flattrim`` does not cross the relay.
+
+        Returns
+        -------
+        bool
+            False only when a real flight must not take off.
+        """
+        tracker = getattr(ctx, "flat_trim_ack", None)
+        mark = tracker.sequence if tracker is not None else None
+        logger.info("Executing IMU flat trim on a level surface...")
+        ctx.drone.flat_trim()
+        timeout = ctx.params.timeouts.flat_trim_ack_timeout_sec
+        acknowledged = tracker is not None and tracker.wait_after(mark, timeout)
+        if acknowledged:
+            logger.info("Flat trim acknowledged by the aircraft.")
+        elif ctx.drone.no_fly:
+            logger.warning("[NO-FLY] Flat trim not acknowledged within %.1f s; bench continues.", timeout)
+        else:
+            logger.critical(
+                "Flat trim not acknowledged within %.1f s (FlatTrimChanged). Refusing to take off.", timeout
+            )
+            self._announce(
+                "Nivelamento sem confirmação",
+                "a aeronave não confirmou o nivelamento, decolagem cancelada",
+                priority="CRITICAL",
+            )
+            return False
+        ctx.drone.delay(_FLAT_TRIM_SETTLE_SEC)
+        return True
 
     # ---------------------------------------------------------------- pre-arm
 
@@ -164,6 +202,9 @@ class TakeoffStep(BaseStep):
     def _calibrate(self, ctx: MissionContext) -> bool:
         """Establish the ground altitude reference, refusing an untrustworthy one."""
         if ctx.odom_supervisor.calibrate_ground_reference():
+            z0 = ctx.odom_supervisor.snapshot().ground_reference
+            if z0 is not None:
+                getattr(ctx, "publish_ground_reference", lambda _z0: None)(z0)
             return True
 
         if ctx.drone.no_fly:
