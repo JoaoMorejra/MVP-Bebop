@@ -34,6 +34,12 @@ import { useVoiceLevel } from './hooks/useVoiceLevel';
 import { buildForensicReport } from './lib/forensics';
 import { LAUNCH_KEYS, reserveLaunchPhrase } from './lib/copilotPhrases';
 import { getPath } from './lib/paths';
+import { isMissionOver } from './lib/missionOutcome';
+import { useFinishLock } from './hooks/useFinishLock';
+import { reportMayStart } from './lib/finishLock';
+import { useGuardedAsync } from './hooks/useGuardedAsync';
+import { useMissionCountdown } from './hooks/useMissionCountdown';
+import { runCriticalBatteryReturn } from './lib/batteryReturn';
 
 const num = (doc: unknown, path: string, fallback: number): number => {
   const v = getPath(doc, path);
@@ -144,10 +150,11 @@ export const App: React.FC = () => {
   const camera = useCameraTilt(telemetry.camera_tilt_deg);
   const copilot = useCopilot();
   const narration = useNarrationQueue(copilot);
+  const missionCountdown = useMissionCountdown();
   const voice = useVoiceLevel();
 
   const running = mission.state === 'running' || mission.state === 'arming';
-  const over = mission.state === 'finished' || mission.state === 'faulted';
+  const over = isMissionOver(mission.state);
   const benchMode = Boolean(getPath(params.working ?? params.committed, 'no_fly'));
   /** The aircraft is committed: pre-flight is locked until it is back down. See `preflightLocked`. */
   const airborne = preflightLocked(mission.state, mission.ran);
@@ -163,13 +170,7 @@ export const App: React.FC = () => {
    */
   const landed = over && mission.exitCode === 0;
 
-  useFlightNarration(
-    narration,
-    landed,
-    true,
-    mission.startedAt,
-    num(committed, 'kinematics.target_altitude_m', Number.NaN)
-  );
+  useFlightNarration(narration, true, mission.startedAt);
 
   // The report is drawn when the capture lands, not when it is read out: the
   // wording and the order are settled before the aircraft is back on the ground.
@@ -179,11 +180,6 @@ export const App: React.FC = () => {
     setReportDismissed(false);
   }, [mission.latestCapture]);
 
-  const { revealed: reportRevealed, closing: reportClosing } = useForensicNarration(
-    narration,
-    (landed || over) && !reportDismissed && Boolean(mission.latestCapture),
-    report
-  );
 
   /**
    * A bench routine finishing returns the bench to ready, and nothing else.
@@ -194,7 +190,7 @@ export const App: React.FC = () => {
    * true.
    */
   useEffect(() => {
-    if (benchStage !== null && (mission.state === 'finished' || mission.state === 'faulted')) {
+    if (benchStage !== null && isMissionOver(mission.state)) {
       setBenchStage(null);
     }
   }, [benchStage, mission.state]);
@@ -294,7 +290,7 @@ export const App: React.FC = () => {
       // the one that is up. Safe by construction here: everything the bench
       // runs is `--no-fly`, so there is nothing in the air to interrupt.
       if (mission.state === 'running' || mission.state === 'arming') {
-        copilot.cancel();
+        narration.silence();
         await bridge.endMission().catch(() => undefined);
       }
 
@@ -333,7 +329,7 @@ export const App: React.FC = () => {
     },
     [
       bridge,
-      copilot,
+      narration,
       failsafe.thresholdPct,
       mission,
       params.working,
@@ -388,7 +384,7 @@ export const App: React.FC = () => {
   // ground calibration — is shown at once rather than after the remaining
   // seconds of a countdown for a process that is no longer there.
   useEffect(() => {
-    if (counting && (mission.state === 'finished' || mission.state === 'faulted')) finishCountdown();
+    if (counting && isMissionOver(mission.state)) finishCountdown();
   }, [counting, mission.state, finishCountdown]);
 
   const cancelCountdown = useCallback(async () => {
@@ -463,30 +459,20 @@ export const App: React.FC = () => {
    * the landing this failsafe always made before it could fly a return.
    */
   const returnOnCriticalBattery = useCallback(async () => {
-    const action = failsafeAction(stageRef.current, running);
-    copilot.cancel();
-    if (action === 'none') {
-      void copilot.say('Bateria crítica. Retorno à base já em curso.', 'URGENT');
-      return;
-    }
-    if (action === 'land' || !bridge) {
-      void copilot.say('Bateria crítica. Pouso de emergência iniciado.', 'URGENT');
-      await landRef.current();
-      return;
-    }
-
-    void copilot.say('Bateria crítica. Retornando à base para pouso.', 'URGENT');
-    const jump = await bridge.gotoStage(RTL_STAGE).catch(() => ({ success: false }));
-    if (!jump.success) {
-      await landRef.current();
-      return;
-    }
+    const planned = failsafeAction(stageRef.current, running);
+    const action = planned === 'rtl' && !bridge ? 'land' : planned;
+    const taken = await runCriticalBatteryReturn(action, {
+      say: (label, text) => narration.preempt(label, () => text, 'URGENT'),
+      gotoStage: () => (bridge ? bridge.gotoStage(RTL_STAGE) : Promise.resolve({ success: false })),
+      land: () => landRef.current(),
+    });
+    if (taken !== 'rtl') return;
     clearRtlWatchdog();
     rtlWatchdogRef.current = window.setTimeout(() => {
       rtlWatchdogRef.current = null;
       if (stageRef.current !== RTL_STAGE) void landRef.current();
     }, RTL_ACK_TIMEOUT_MS);
-  }, [bridge, clearRtlWatchdog, copilot, running]);
+  }, [bridge, clearRtlWatchdog, narration, running]);
 
   useEffect(() => {
     if (!failsafe.enabled || !inFlight || failsafeFiredRef.current) return;
@@ -517,8 +503,8 @@ export const App: React.FC = () => {
    *
    * Safe to call twice. Nothing here depends on what state it is starting from.
    */
-  const finishMission = useCallback(async () => {
-    copilot.cancel();
+  const endCycle = useCallback(async () => {
+    narration.silence();
 
     if (bridge) {
       // Unconditional, not only while a mission is up: the handler is
@@ -539,7 +525,29 @@ export const App: React.FC = () => {
     setFailsafeTriggered(false);
     setOverlay('none');
     setScreen('preflight');
-  }, [bridge, camera, copilot, mission, resetTrack]);
+  }, [bridge, camera, mission, narration, resetTrack]);
+
+  /**
+   * "Finalizar Missão", guarded: a double click ends the cycle once, and the
+   * lock reads `finishing` until `endMission` has resolved.
+   */
+  const { run: finishMission, busy: finishing } = useGuardedAsync(endCycle);
+
+  /** "Finalizar Missão": unlocked only on confirmed ground (lib/finishLock.ts). */
+  const finishLock = useFinishLock({
+    missionState: mission.state,
+    exitCode: mission.exitCode,
+    benchMode: benchMode || benchStage !== null,
+    telemetry,
+    finishing,
+  });
+
+  // The report opens with "Aeronave em solo": it waits for confirmed ground.
+  const { revealed: reportRevealed, closing: reportClosing } = useForensicNarration(
+    narration,
+    reportMayStart(finishLock) && !reportDismissed && Boolean(mission.latestCapture),
+    report
+  );
 
   // The host tearing a mission down out from under the interface clears the
   // state that belonged to the processes it stopped. The rest of the reset is
@@ -591,8 +599,9 @@ export const App: React.FC = () => {
           report={landed || over ? report : null}
           reportRevealed={reportRevealed}
           reportClosing={reportClosing}
-          onAbort={() => void abort()}
+          onAbort={() => void land()}
           onFinish={() => void finishMission()}
+          finishLock={finishLock}
         />
       );
     }
@@ -685,6 +694,9 @@ export const App: React.FC = () => {
       {counting ? (
         <CountdownOverlay
           seconds={countdownSeconds}
+          remaining={missionCountdown.remaining}
+          clearance={missionCountdown.clearance}
+          trimAcked={false}
           stageReached={mission.stage >= 1}
           linkReady={benchMode || benchStage !== null ? link.driverRunning : link.flightReady}
           onDone={finishCountdown}

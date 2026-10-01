@@ -6,9 +6,11 @@ import { StageBar } from './StageBar';
 import { OpticalFeed } from './OpticalFeed';
 import { TacticalMap } from './TacticalMap';
 import { ForensicPanel } from './ForensicPanel';
-import { isAirborne } from '../../lib/flightState';
+import { abortEnabled } from '../../lib/flightState';
 import { AbortControl } from './AbortControl';
 import { cn } from '../../lib/format';
+import { isMissionOver } from '../../lib/missionOutcome';
+import type { FinishLockResult } from '../../lib/finishLock';
 
 interface CockpitScreenProps {
   telemetry: TelemetryView;
@@ -57,6 +59,8 @@ interface CockpitScreenProps {
   reportClosing: string | null;
   onAbort: () => void;
   onFinish: () => void;
+  /** The finish lock, evaluated by `useFinishLock` in the App. */
+  finishLock: FinishLockResult;
 }
 
 /**
@@ -102,12 +106,10 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   reportClosing,
   onAbort,
   onFinish,
+  finishLock,
 }) => {
   const running = missionState === 'running' || missionState === 'arming';
-  const over = missionState === 'finished' || missionState === 'faulted';
-  // Nothing to finish before a mission starts, unless an aircraft is in the air
-  // without one: ending the cycle is also what lands it (`bmg:end-mission`).
-  const canFinish = missionState !== 'idle' || isAirborne(telemetry.flying_state);
+  const over = isMissionOver(missionState);
 
   // The last gimbal command on /bebop/move_camera, from the mission's ramp or
   // the station's slider, as the telemetry bridge echoes it. A command, not a
@@ -158,7 +160,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
             <div className="absolute inset-x-0 -bottom-5 z-30 flex justify-center">
               <AbortControl
                 onAbort={onAbort}
-                disabled={!running}
+                disabled={!abortEnabled(missionState, telemetry.flying_state)}
                 busy={missionState === 'aborting'}
               />
             </div>
@@ -191,7 +193,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
           reportRevealed={reportRevealed}
           reportClosing={reportClosing}
           onFinish={onFinish}
-          canFinish={canFinish}
+          lock={finishLock}
         />
       </div>
 

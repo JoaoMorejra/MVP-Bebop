@@ -21,6 +21,7 @@ import type { LinkPhase } from '../../hooks/useLink';
 import { cn, rfBars } from '../../lib/format';
 import { FAILSAFE_MAX_PCT, FAILSAFE_MIN_PCT } from '../../lib/batteryFailsafe';
 import { HybridSlider } from '../ui/HybridSlider';
+import { flyingStateLabel } from '../../lib/flightState';
 
 interface StatusBarProps {
   telemetry: TelemetryView;
@@ -308,11 +309,7 @@ const BatteryWidget: React.FC<{
       : '—';
   const age =
     typeof telemetry.battery_age_sec === 'number' ? `há ${telemetry.battery_age_sec.toFixed(0)} s` : '—';
-  const flying = telemetry.flying_state_label && telemetry.flying_state_label !== 'unknown'
-    ? telemetry.flying_state_label
-    : connected
-    ? 'em solo'
-    : '—';
+  const flying = flyingStateLabel(telemetry.flying_state_label, connected);
 
   return (
     <div ref={hostRef} className="relative">

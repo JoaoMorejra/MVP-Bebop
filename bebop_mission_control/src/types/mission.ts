@@ -23,7 +23,15 @@ export const MISSION_STAGES: MissionStage[] = [
   { step: 5, name: 'Retornando base', detail: 'Retorno à origem e pouso sobre o marcador ArUco' },
 ];
 
-export type MissionState = 'idle' | 'arming' | 'running' | 'aborting' | 'finished' | 'faulted';
+export type MissionState =
+  | 'idle'
+  | 'arming'
+  | 'running'
+  | 'aborting'
+  | 'finished'
+  | 'finished_unconfirmed'
+  | 'aborted'
+  | 'faulted';
 
 /** Link readiness, derived strictly from telemetry and driver probes. */
 export interface ReadinessCheck {

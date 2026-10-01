@@ -56,6 +56,8 @@ const STATE_LABEL: Partial<Record<MissionState, string>> = {
   running: 'Missão autônoma Bebop 2',
   aborting: 'Abortando',
   finished: 'Missão concluída',
+  finished_unconfirmed: 'Pouso sem confirmação',
+  aborted: 'Missão abortada',
   faulted: 'Missão interrompida',
 };
 
@@ -92,7 +94,7 @@ export const StageBar: React.FC<StageBarProps> = ({
   onVolume,
   onToggleMute,
 }) => {
-  const aborted = state === 'aborting' || state === 'faulted';
+  const aborted = state === 'aborting' || state === 'aborted' || state === 'faulted';
   const running = state === 'running' || state === 'arming';
   const label = STATE_LABEL[state];
   /**

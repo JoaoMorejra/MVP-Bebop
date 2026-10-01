@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { LogLine, MissionLaunchOptions, RawEvidence } from '../types/bmg';
 import type { MissionState } from '../types/mission';
 import { cues } from '../audio/cues';
+import { missionStateForExit } from '../lib/missionOutcome';
 import { useBridge } from './useBridge';
 
 const LOG_LIMIT = 4000;
@@ -96,8 +97,11 @@ export function useMissionRuntime() {
         exitSeen.current = true;
         processUp.current = false;
         setExitCode(event.code);
-        setState(event.code === 0 ? 'finished' : 'faulted');
-        cues.play(event.code === 0 ? 'complete' : 'fault');
+        const outcome = missionStateForExit(event.code);
+        setState(outcome);
+        // The abort cue already sounded on the click; an aborted exit adds none.
+        if (outcome === 'finished') cues.play('complete');
+        else if (outcome !== 'aborted') cues.play('fault');
       }),
     ];
     return () => off.forEach((fn) => fn());
@@ -167,7 +171,7 @@ export function useMissionRuntime() {
     // said otherwise. Only settle when nothing reported an exit at all.
     if (!exitSeen.current) {
       processUp.current = false;
-      setState('finished');
+      setState('aborted');
     }
   }, [bridge]);
 

@@ -1,10 +1,21 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import { Check, Loader2, X } from 'lucide-react';
 import { Wordmark } from '../brand/Wordmark';
 import { cn } from '../../lib/format';
 
 interface CountdownOverlayProps {
+  /** The configured countdown, which scales the ring. */
   seconds: number;
+  /**
+   * Whole seconds left as the mission last reported them (`mission.countdown`),
+   * or null before its countdown has begun. The overlay keeps no clock of its
+   * own: timed from the spawn it ran about 14 s ahead of the mission's.
+   */
+  remaining: number | null;
+  /** The mission made its clearance call (`mission.countdown_3`). */
+  clearance: boolean;
+  /** The aircraft acknowledged the IMU flat trim. */
+  trimAcked: boolean;
   /** The mission process has reported it reached stage 1. */
   stageReached: boolean;
   /** Every essential topic is exchanging data with the airframe. */
@@ -12,9 +23,6 @@ interface CountdownOverlayProps {
   onDone: () => void;
   onCancel: () => void;
 }
-
-/** The clearance call the mission makes near the end of its countdown. */
-const CLEARANCE_AT_SEC = 3.2;
 
 /**
  * The pre-arm sequence, in the order `TakeoffStep` actually runs it: gimbal to
@@ -41,34 +49,25 @@ const SEQUENCE = [
  */
 export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
   seconds,
+  remaining: reported,
+  clearance,
+  trimAcked,
   stageReached,
   linkReady,
   onDone,
   onCancel,
 }) => {
-  const total = Math.max(1, seconds);
-  const [remaining, setRemaining] = useState(total);
-  const startedAt = useRef(Date.now());
+  const total = Math.max(1, Math.ceil(seconds));
+  const started = reported !== null;
+  const remaining = started ? Math.max(0, Math.min(total, reported)) : total;
   const done = useRef(false);
 
   useEffect(() => {
-    startedAt.current = Date.now();
-    done.current = false;
-    setRemaining(total);
-
-    const id = window.setInterval(() => {
-      const elapsed = (Date.now() - startedAt.current) / 1000;
-      const left = Math.max(0, total - elapsed);
-      setRemaining(left);
-      if (left <= 0 && !done.current) {
-        done.current = true;
-        window.clearInterval(id);
-        onDone();
-      }
-    }, 50);
-
-    return () => window.clearInterval(id);
-  }, [total, onDone]);
+    if (reported === 0 && !done.current) {
+      done.current = true;
+      onDone();
+    }
+  }, [reported, onDone]);
 
   // Escape is the fastest possible path out of a launch already in motion.
   useEffect(() => {
@@ -81,34 +80,33 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
 
   const elapsed = total - remaining;
   const progress = Math.max(0, Math.min(1, elapsed / total));
-  const whole = Math.ceil(remaining - 0.001);
+  const whole = remaining;
 
   const RADIUS = 132;
   const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
 
   const status = useMemo(() => {
-    // The first three run before the countdown window opens, so reaching stage
-    // 1 is what confirms them. The warmup owns the window; clearance is called
-    // by the mission at T-3.2 s.
-    const preflightDone = stageReached || elapsed > 0.6;
+    // Every item follows an event, not a schedule. The gimbal, the trim and the
+    // ground reference run before the countdown opens, so its first tick is
+    // what confirms the gimbal and the ground reference; the trim waits for
+    // the aircraft's own acknowledgement. The warmup owns the window, and the
+    // clearance is the mission's call.
     return SEQUENCE.map((item) => {
-      // The link is the one item with a live answer rather than a schedule:
-      // it reports the topic contract the main process is already validating.
       if (item.id === 'link') {
         return { ...item, state: linkReady ? 'done' : 'active' } as const;
       }
+      if (item.id === 'imu') {
+        return { ...item, state: trimAcked ? 'done' : stageReached ? 'active' : 'pending' } as const;
+      }
       if (item.id === 'clearance') {
-        return { ...item, state: remaining <= CLEARANCE_AT_SEC ? 'done' : 'pending' } as const;
+        return { ...item, state: clearance ? 'done' : 'pending' } as const;
       }
       if (item.id === 'vision') {
-        return {
-          ...item,
-          state: remaining <= CLEARANCE_AT_SEC ? 'done' : preflightDone ? 'active' : 'pending',
-        } as const;
+        return { ...item, state: clearance ? 'done' : started ? 'active' : 'pending' } as const;
       }
-      return { ...item, state: preflightDone ? 'done' : 'active' } as const;
+      return { ...item, state: started ? 'done' : stageReached ? 'active' : 'pending' } as const;
     });
-  }, [stageReached, linkReady, elapsed, remaining]);
+  }, [stageReached, linkReady, trimAcked, clearance, started]);
 
   return (
     <div
@@ -140,7 +138,7 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
               cy="150"
               r={RADIUS}
               fill="none"
-              stroke={remaining <= CLEARANCE_AT_SEC ? '#5CF2CE' : '#01D5A3'}
+              stroke={clearance ? '#5CF2CE' : '#01D5A3'}
               strokeWidth="3"
               strokeLinecap="round"
               strokeDasharray={CIRCUMFERENCE}
@@ -169,12 +167,13 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
           <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
             <span
               key={whole}
+              data-countdown-numeral
               className="anim-tick tnum font-mono text-6xl font-medium leading-none text-frost"
             >
               {whole}
             </span>
             <span className="mt-3 font-cond text-sm tracking-wide text-haze">
-              {remaining <= CLEARANCE_AT_SEC ? 'decolagem autorizada' : 'segundos para decolar'}
+              {!started ? 'Aguardando a missão' : clearance ? 'decolagem autorizada' : 'segundos para decolar'}
             </span>
           </div>
         </div>
@@ -192,7 +191,7 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
 
           <ul className="flex flex-col gap-2.5">
             {status.map((item) => (
-              <li key={item.id} className="flex items-center gap-3">
+              <li key={item.id} data-step={item.id} data-state={item.state} className="flex items-center gap-3">
                 <span
                   className={cn(
                     'flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition-colors duration-300',

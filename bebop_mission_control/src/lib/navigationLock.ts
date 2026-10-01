@@ -1,4 +1,5 @@
 import type { MissionState } from '../types/mission';
+import { isMissionOver } from './missionOutcome';
 
 /**
  * Whether the pre-flight tab is locked.
@@ -19,5 +20,5 @@ import type { MissionState } from '../types/mission';
  */
 export function preflightLocked(state: MissionState, ran: boolean): boolean {
   if (state === 'arming' || state === 'running' || state === 'aborting') return true;
-  return ran && (state === 'finished' || state === 'faulted');
+  return ran && isMissionOver(state);
 }

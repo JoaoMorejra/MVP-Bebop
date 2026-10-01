@@ -1,10 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Camera, ShieldCheck, Square } from 'lucide-react';
 import type { RawEvidence } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
 import { TOPIC_LABEL } from '../../lib/forensics';
 import { PHRASE_POOLS } from '../../lib/copilotPhrases';
 import { cn, stampLabel } from '../../lib/format';
+import { FINISH_HOLD_MS, type FinishLockResult } from '../../lib/finishLock';
 
 interface ForensicPanelProps {
   latest: RawEvidence | null;
@@ -21,8 +22,8 @@ interface ForensicPanelProps {
   /** The closing line as the copilot said it, so screen and voice agree. */
   reportClosing?: string | null;
   onFinish: () => void;
-  /** A mission is up or over, or an aircraft is airborne without one. */
-  canFinish: boolean;
+  /** The finish lock (`lib/finishLock.ts`): whether, why not, and how. */
+  lock: FinishLockResult;
 }
 
 /** One corner of the autofocus frame, as an L drawn from its outer point. */
@@ -120,9 +121,41 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   reportRevealed,
   reportClosing,
   onFinish,
-  canFinish,
+  lock,
 }) => {
   const [arrived, setArrived] = useState(false);
+  const holdTimer = useRef<number | null>(null);
+  const [holding, setHolding] = useState(false);
+
+  const cancelHold = useCallback(() => {
+    if (holdTimer.current !== null) window.clearTimeout(holdTimer.current);
+    holdTimer.current = null;
+    setHolding(false);
+  }, []);
+
+  // A press on a lost link only counts once held for the full duration. Each
+  // pointer-down restarts the one timer rather than adding another, so a
+  // bouncing press cannot finish twice.
+  const startHold = useCallback(() => {
+    if (!lock.enabled || !lock.requiresConfirm) return;
+    cancelHold();
+    setHolding(true);
+    holdTimer.current = window.setTimeout(() => {
+      holdTimer.current = null;
+      setHolding(false);
+      onFinish();
+    }, FINISH_HOLD_MS);
+  }, [cancelHold, lock.enabled, lock.requiresConfirm, onFinish]);
+
+  useEffect(() => cancelHold, [cancelHold]);
+  useEffect(() => {
+    if (!lock.requiresConfirm) cancelHold();
+  }, [cancelHold, lock.requiresConfirm]);
+
+  const click = useCallback(() => {
+    if (!lock.enabled || lock.requiresConfirm) return;
+    onFinish();
+  }, [lock.enabled, lock.requiresConfirm, onFinish]);
 
   useEffect(() => {
     if (!latest) return;
@@ -245,20 +278,28 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
       <div className="flex shrink-0 items-center gap-2.5">
         <button
           type="button"
-          onClick={onFinish}
-          disabled={!canFinish}
-          title={canFinish ? undefined : 'Disponível após iniciar uma missão'}
+          onClick={click}
+          onPointerDown={startHold}
+          onPointerUp={cancelHold}
+          onPointerLeave={cancelHold}
+          onPointerCancel={cancelHold}
+          disabled={!lock.enabled}
+          aria-disabled={!lock.enabled}
+          data-finish-state={lock.state}
+          title={lock.reason || undefined}
           className={cn(
             'ml-auto flex items-center gap-2 rounded-bezel border px-4 py-2 text-sm font-semibold transition-colors',
-            !canFinish
+            !lock.enabled
               ? 'cursor-not-allowed border-strut bg-hull text-haze-deep'
+              : lock.requiresConfirm
+              ? cn('border-ember/70 bg-ember/15 text-ember', holding && 'bg-ember/40')
               : missionOver
               ? 'border-mint bg-mint text-abyss hover:bg-mint-bright'
               : 'border-ember/70 bg-ember/15 text-ember hover:bg-ember hover:text-abyss'
           )}
         >
           <Square size={12} strokeWidth={2.5} fill="currentColor" />
-          Finalizar missão
+          {lock.requiresConfirm ? 'Segure para finalizar' : 'Finalizar missão'}
         </button>
       </div>
     </section>
