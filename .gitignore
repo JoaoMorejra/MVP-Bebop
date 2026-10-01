@@ -62,3 +62,11 @@ active_config.json
 accident_raw_*.png
 accident_inspected_*.jpg
 accident_metadata_*.json
+
+# Native 14 MP photos downloaded from the aircraft after touchdown
+# (bebop_mission_control/streamer/media_fetch.py).
+native/
+
+# Intel graphics compiler diagnostics, written to the working directory when
+# OpenVINO compiles for the integrated GPU.
+kernel.errors.txt
