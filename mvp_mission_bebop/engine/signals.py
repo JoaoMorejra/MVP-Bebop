@@ -28,6 +28,8 @@ import time
 from types import FrameType
 from typing import Callable, Final, Optional
 
+from mvp_mission_bebop.engine.exit_codes import FORCED_EXIT_CODE
+
 logger = logging.getLogger("EmergencyHandler")
 
 #: Total wall-clock budget for the emergency sequence. Must stay below the
@@ -35,8 +37,6 @@ logger = logging.getLogger("EmergencyHandler")
 #: process killed mid-landing instead of landing cleanly.
 DEFAULT_BUDGET_SEC: Final[float] = 0.70
 
-#: Exit status used when the operator insists with a second interrupt.
-FORCED_EXIT_CODE: Final[int] = 130
 
 Clock = Callable[[], float]
 
@@ -66,7 +66,8 @@ class EmergencyHandler:
     budget_sec : float
         Wall-clock ceiling for the whole sequence.
     exit_code : int
-        Status passed to ``sys.exit`` on the normal path.
+        Status the process leaves with once the sequence has run; the runner
+        passes :data:`~mvp_mission_bebop.engine.exit_codes.EXIT_ABORTED_LANDED`.
 
     Notes
     -----
@@ -83,6 +84,7 @@ class EmergencyHandler:
         "_clock",
         "_lock",
         "_triggered",
+        "_landing_done",
         "_finalized",
         "_installed",
         "_previous",
@@ -110,6 +112,7 @@ class EmergencyHandler:
 
         self._lock: threading.Lock = threading.Lock()
         self._triggered: bool = False
+        self._landing_done: threading.Event = threading.Event()
         self._finalized: bool = False
         self._installed: bool = False
         self._previous: dict[int, object] = {}
@@ -120,6 +123,11 @@ class EmergencyHandler:
     def triggered(self) -> bool:
         """True once an operator interrupt has been observed."""
         return self._triggered
+
+    @property
+    def landing_transmitted(self) -> bool:
+        """True once the first interrupt's landing sequence has returned or raised."""
+        return self._landing_done.is_set()
 
     @property
     def finalized(self) -> bool:
@@ -194,8 +202,13 @@ class EmergencyHandler:
             self._triggered = True
 
         if not first:
-            # The operator insisted. Honour it immediately rather than replaying
-            # a landing burst that is already in flight.
+            # Python runs this nested inside the first handler, between two of
+            # its bytecodes. Before the burst has gone out, leaving here would
+            # truncate the redundancy that makes the land survive a lossy
+            # best-effort link, so the first handler is allowed to finish.
+            if not self._landing_done.is_set():
+                logger.critical("Second interrupt during the landing burst. Burst continues.")
+                return
             logger.critical("Second interrupt received. Terminating immediately.")
             os._exit(FORCED_EXIT_CODE)
 
@@ -211,6 +224,8 @@ class EmergencyHandler:
             self._land_sequence(remaining)
         except Exception as exc:  # noqa: BLE001 - never abort the exit path
             logger.error("Exception during emergency landing dispatch: %s", exc, exc_info=True)
+        finally:
+            self._landing_done.set()
 
         self.finalize_once()
 
