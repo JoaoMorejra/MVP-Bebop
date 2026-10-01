@@ -77,6 +77,27 @@ MVP-Bebop/
   colcon build --symlink-install --packages-select mvp_mission_bebop
   ```
 
+### Setup de uma Estacao Nova
+- Dependencias de sistema (root), idempotente, com log em `~/.cache/bmg/setup_station.log`:
+  ```bash
+  sudo bash scripts/setup_station.sh           # instala / confere
+  sudo bash scripts/setup_station.sh status    # so relata
+  ```
+  - `ros-jazzy-image-transport-plugins`: o driver passa a oferecer `/bebop/camera/image_raw/compressed`, que o
+    `streamer/mjpeg_server.py` prefere ao raw.
+  - `intel-opencl-icd`, `clinfo`, `vainfo`: iGPU Intel para o OpenVINO (`GPU.0`).
+  - Driver NVIDIA legado `nvidia-headless-580` com pin (`/etc/apt/preferences.d/bmg-nvidia-legacy`) e hold: a
+    MX110 (Maxwell) so e suportada pela serie 580. Exige reboot.
+  - Grupos `render`/`video` e `/etc/sysctl.d/60-bmg-dds.conf` (`net.core.rmem_max`/`wmem_max` = 16 MB).
+  - Exporta `FASTRTPS_DEFAULT_PROFILES_FILE` no `bin/nectar-activate`, apontando para
+    `bebop_mission_control/config/fastdds_video.xml` (SHM 16 MB, UDP 8 MB). O `getNectarEnv()` do Electron
+    exporta o mesmo perfil para todo processo da estacao.
+- Python no venv: `torch==2.9.1+cu126`, `torchvision==0.24.1+cu126`, `torchaudio==2.9.1+cu126` (indice
+  `https://download.pytorch.org/whl/cu126`; o sufixo `+cu126` e obrigatorio, sem ele o pip mantem a build CPU).
+- Inferencia: `vision.inference_device` (`AUTO`, `CUDA`, `IGPU`, `CPU`) em
+  `mvp_mission_bebop/perception/inference_device.py`; o IR OpenVINO precisa existir ao lado dos pesos
+  (`scripts/export_openvino_model.py`).
+
 ### Estacao de Solo (BMG Frontend)
 - Local: `bebop_mission_control/`
 - Build de producao:

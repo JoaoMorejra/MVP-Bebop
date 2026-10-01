@@ -1,0 +1,225 @@
+# Progresso da Implementacao — E2E, Video, Finalizar, Copiloto
+
+Plano: `docs/PROMPT_IMPLEMENTACAO_E2E_VIDEO_FINALIZAR_COPILOTO.md`.
+Diagnostico de referencia: `docs/RELATORIO_VERIFICACAO_E2E_2026-09-30.md`.
+Estados: `pendente`, `em andamento`, `feito`, `bloqueado`, `aguardando drone`, `aguardando usuario`.
+
+## Ponto de retomada
+
+- Estado: 0B.1 a 0B.4 feitos e validados. Reboot (0B.5) pedido ao usuario.
+- Retomar em **Fase 0B.6** (validacao pos-reboot): `nvidia-smi` lista a GeForce MX110;
+  `journalctl -k -b | grep NVRM` sem a mensagem de legado; `clinfo -l` lista a Intel; OpenVINO com `GPU`;
+  `id -nG` com `render` e `video`; `sysctl net.core.rmem_max` = 16777216.
+- Se o 580 falhar: `sudo bash scripts/setup_station.sh rollback-nvidia`, registrar o motivo e seguir so com iGPU e CPU.
+- Depois: 0B.7 (torch cu126 com sm_50), 0B.8 (builds), 0B.9 (versoes), Fase 1.
+- Atualizacao: Fases 1, 2 e 3 concluidas. Fase 4: 4.2 a 4.6 feitos em codigo; proximo 4.1 e 4.7 (driver C++) e 4.5g; depois pedir o drone para 4.1, 4.2, 4.6, 4.7 e 4.8.
+- **Atualizacao (atual): AGUARDANDO DRONE.** Fase 4 completa em codigo (4.1, 4.5g e 4.7 incluidos); suite
+  completa verde (pytest 1092, vitest 42 arquivos / 372, tsc 0 erros). Ao receber a confirmacao do usuario:
+  1. validar o link: `ping -c 3 192.168.42.1`, SSID `Bebop2-*` (`nmcli -t -f active,ssid dev wifi`), tethering
+     USB ainda com rota para a internet, `ros2 daemon stop && ros2 daemon start`;
+  2. rebuild do driver (`colcon build --symlink-install --packages-select ros2_bebop_driver`) e subir o driver;
+     conferir `/bebop/camera/image_raw` e `/bebop/camera/image_raw/compressed` publicando;
+  3. retomar em **4.1 (validacao ao vivo)**: logs `Video resolution/framerate/stream mode applied` do
+     `commandReceivedCallback`, taxa de `image_raw` (`ros2 topic hz`);
+  4. depois 4.2 (comprimido no bridge), 4.3 (perfil DDS com o driver), 4.6 (`camera_info` x quadro),
+     4.7 (`/bebop/photo` pelo relay NAO: foto so com `mission.py --no-fly` no dominio isolado nao chega ao
+     driver; validar `states/picture_event` com `ros2 topic pub --once /bebop/photo` SOMENTE no dominio do
+     driver, que nao arma motores, e o FTP com `bebop_mission_control/streamer/media_fetch.py`),
+     4.8 (FPS por estagio com `--no-fly` + relay; CPU no Stage 2 decide o 4.5f);
+  5. em seguida, Fase 5.
+
+## Contexto da estacao (medido em 2026-09-30)
+
+- Workspace: `/home/jv/ros2_ws`; monorepo em `src/mvp_mission_bebop` (HEAD `00e2292`, alinhado com origin).
+- `ros2_bebop_driver`: 10 arquivos modificados sem commit sobre `d783e92` (632+/44-). Base de trabalho.
+- `nectar-sdk`: tambem tem modificacoes locais sem commit (8 arquivos em `nectar/nectar`, `scripts/lib`).
+  Nao editado por esta implementacao.
+- `sudo -n true`: exige senha. Passos de root vao para `scripts/setup_station.sh`.
+- NVIDIA: stack 610.57.04 do repositorio CUDA (pin 600), `dkms` com `nvidia/610.57.04` para 6.8.0-111/138/139.
+  Candidato `nvidia-headless-580` 580.178.04-1ubuntu1 (repositorio CUDA) e 580.178.04-0ubuntu0.24.04.1
+  (Ubuntu restricted). Headers de 6.8.0-139 instalados. Secure Boot desligado. `prime-select` ausente.
+- `intel-opencl-icd` 23.43, `clinfo`, `vainfo`, `ros-jazzy-image-transport-plugins` 4.0.7: nao instalados.
+- `fastdds` CLI presente (`ros-jazzy-fastrtps`).
+- Grupos de `jv`: `video` sim, `render` nao. `net.core.rmem_max`/`wmem_max` = 212992.
+- Disco `/`: 11 GB livres (86%).
+
+## Linha de base de testes (Fase 0.1)
+
+| Suite | Resultado |
+|---|---|
+| `python3 -m pytest test/ -q` | 869 passed (123,7 s) |
+| `npx vitest run` | 27 arquivos, 219 passed |
+| `npx tsc --noEmit` | 0 erros |
+
+## Itens
+
+### Fase 0 — Check-in e diagnostico
+
+| Item | Estado | Notas |
+|---|---|---|
+| 0.1 Check-in (git status, pull, linha de base) | feito | Ja atualizado; 869/219/tsc limpo. |
+| 0.2 Diagnostico ao vivo somente leitura | aguardando drone | Drone fora da rede (Wi-Fi em outra rede). Linha de base "antes" usa o relatorio. |
+| 0.3 `scripts/bench_relay.py` rastreado | feito | `scripts/bench_relay.py`, `test/test_bench_relay.py` (21 passed, 3 rodadas). Relay por bytes serializados; sinks de descarte por tipo descoberto no grafo; watchdog de publishers em takeoff/cmd_vel/land no dominio do driver (exit 2 se >0). |
+
+### Fase 0B — Dependencias da estacao
+
+| Item | Estado | Notas |
+|---|---|---|
+| 0B.0 Snapshot de rollback `~/.cache/bmg/rollback/` | feito | `dpkg_before.txt`, `pip_before.txt` (torch 2.9.1+cpu, torchvision 0.24.1+cpu, torchaudio 2.11.0, ultralytics 8.4.137, openvino 2026.4.0), `holds_before.txt` (vazio), `nvidia_before.txt`, `dkms_before.txt`, `preferences.d_before/`. O script refaz snapshot com timestamp antes de mexer no NVIDIA. |
+| 0B.1 Pacotes ROS e ferramentas | feito | Via `setup_station.sh` (usuario, 13:08). ros-jazzy-image-transport-plugins 4.0.7 (+compressed-image-transport), clinfo 3.0.23, vainfo 2.12.0, intel-opencl-icd 23.43.27642.40. `fastdds` presente. Validado: `clinfo -l` lista HD 620; OpenVINO `['CPU', 'GPU']` ja antes do reboot. |
+| 0B.2 Grupos render/video | feito | `render:x:110:jv`. Efetivo na sessao apos reboot (hoje o acesso ao renderD128 vem da ACL do seat). |
+| 0B.3 sysctl DDS | feito | `/etc/sysctl.d/60-bmg-dds.conf`; rmem/wmem_max 16777216, defaults 4194304 validados. |
+| 0B.4 Driver NVIDIA 580 com pin e hold | feito | Concluido na execucao das 13:26. 13 pacotes 580.178.04-1ubuntu1 em hold (`hi`), nenhum 610 instalado (so residuais `rc` de libnvidia-compute 610 e 535), `dpkg --audit` limpo. dkms `nvidia/580.178.04` installed para 6.8.0-111/138/139; `modinfo nvidia` = 580.178.04; initramfs de 6.8.0-139 regenerado 13:37; nouveau em blacklist por `nvidia-graphics-drivers.conf` do pacote 580; pin ativo (`nvidia-driver`/`cuda-drivers` sem candidato). Historico: 13:08 falhou (`pkg_`), 13:14 falhou (sem `--allow-downgrades`), 13:18 falhou no unpack (colisao de `libnvidia-cfg.so.1` entre `libnvidia-cfg1` 610 e `libnvidia-cfg1-580`), usuario ajustou o script e 13:26 concluiu. |
+| 0B.5 Reboot (usuario) | feito | Usuario reiniciou; boot 2026-09-30 13:47:25, kernel 6.8.0-139. |
+| 0B.6 Validacao pos-reboot | feito | `nvidia-smi`: GeForce MX110, driver 580.178.04, CUDA 13.0, 2048 MiB. `NVRM: loading ... 580.178.04`, sem mensagem de legado NVIDIA (o unico "legacy" no log e do `printk` do console). `clinfo -l`: Intel HD 620 e NVIDIA CUDA MX110. OpenVINO: `['CPU', 'GPU.0', 'GPU.1']` = i5-7200U, HD 620 (iGPU), MX110 (dGPU). `id -nG` com render e video. rmem/wmem_max 16777216. Display: Intel (OpenGL vendor Intel, x11). |
+| 0B.7 torch CUDA no venv | feito | `pip cache purge` (1,8 GB), depois `torch==2.9.1+cu126`, `torchvision==0.24.1+cu126`, `torchaudio==2.9.1+cu126` do indice cu126 (a primeira tentativa sem o sufixo `+cu126` manteve as builds CPU). `torch.cuda.is_available()` True, CUDA 12.6, `GeForce MX110` capability (5, 0), `get_arch_list()` com `sm_50`; matmul e `torchvision.ops.nms` em `cuda` OK, sem aviso de capability. ultralytics 8.4.137 e nectar importam (`Detector(model_source, framework, device, ...)`). Suite: 893 passed; as 22 falhas eram os testes RED do item 1.4 e 1 flaky (`test_a_prefetched_line_is_synthesized_once_and_played_on_request`, passa 3/3 isolado). Disco: 6,9 GB livres depois da instalacao. |
+| 0B.8 Build colcon e npm | feito | `colcon build --symlink-install --packages-select ros2_bebop_driver mvp_mission_bebop`: 2 pacotes, exit 0, 0 warnings. `npm run build`: exit 0 (so o aviso de tamanho de chunk do Vite, preexistente). |
+| 0B.9 Registro de versoes finais | feito | NVIDIA 580.178.04-1ubuntu1 (headless, hold), intel-opencl-icd 23.43.27642.40, ros-jazzy-image-transport-plugins 4.0.7, clinfo 3.0.23, vainfo 2.12.0, torch 2.9.1+cu126, torchvision 0.24.1+cu126, torchaudio 2.9.1+cu126, ultralytics 8.4.137, openvino 2026.4.0. |
+
+### Fase 1 — Seguranca do abort e ciclo de vida (P0)
+
+| Item | Estado | Notas |
+|---|---|---|
+| 1.1 Segundo SIGINT nao corta o pouso | feito | `engine/signals.py`: `threading.Event` `_landing_done`, setado no `finally` do burst; um segundo sinal antes dele retorna e deixa o primeiro terminar; depois dele, `os._exit(130)`. `electron/missionLifecycle.cjs:signalOnce`: um SIGINT por processo (WeakMap), chamadas repetidas devolvem a mesma promise, SIGKILL unico apos o grace; `main.cjs:stopMissionProcess` usa `signalOnce`. Testes: `test/test_signals.py` (+3, RED->GREEN) e `src/lib/missionLifecycle.test.ts` (5 casos de signalOnce). |
+| 1.2 Handlers IPC single-flight | feito | `singleFlight` em `missionLifecycle.cjs`; `bmg:end-mission` e `bmg:abort-mission` embrulhados. Teste vitest (3 casos). |
+| 1.3 Backup de land confiavel | feito | `LAND_PUB`/`STOP_PUB` com `-w 1 --max-wait-time-secs 5 -t 10 -r 20` em `missionLifecycle.cjs`; `publishStopThenLand` sequencial (stop, depois land, land por ultimo), usado nos dois handlers (o `exec(LAND_PUB)` duplicado no fim do abort foi removido). `sendCommand` recusa e loga enquanto a ponte nao anunciou `ready` (`createBridgeGate`, marcado em `ingestCommandLine`). Runner ja publicava Twist zero antes de cada land e terminava em land: fixado por `test_runner_burst_zeroes_velocity_before_each_land_and_ends_on_land`. `scripts/bench_abort_latency.py` + `test/test_bench_abort_latency.py` (8 passed, RED visto). Bench em dominio isolado (probe no lugar do driver): CLI `LAND_PUB` 30/30, 0 perdas, p50 2064 ms, p95 2802 ms; CLI STOP->LAND 30/30, 0 perdas, p50 5075 ms, p95 6014 ms; ponte residente com espera zero apos `ready` 30/30, 0 perdas, p50 0,55 ms, primeiro comando 42 ms. Achado no bench: a ponte perdia o primeiro land enviado logo apos `ready` (antes do pareamento DDS); corrigido em `streamer/command_bridge.py` (`LAND_MATCH_WAIT_SEC=5.0`, espera o publisher parear antes do burst; evento `land` passa a trazer `matched`); teste `test_a_land_sent_the_moment_the_bridge_is_ready_is_delivered` (RED com 0 s de espera, GREEN 3/3). |
+| 1.4 Exit codes deterministicos e `mission.touchdown` | feito | `engine/exit_codes.py` (`EXIT_COMPLETE=0`, `EXIT_FAILURE=1`, `EXIT_ABORTED_LANDED=3`, `EXIT_TOUCHDOWN_UNCONFIRMED=4`, `FORCED_EXIT_CODE=130`, `mission_exit_code`); `signals.py` reexporta `FORCED_EXIT_CODE`; runner passa `exit_code=EXIT_ABORTED_LANDED` ao handler e expoe `exit_code(succeeded)`; `mission.py` sai com ele; `blackboard.touchdown_confirmed`; `rtl._touchdown(..., *, at_base)` emite `mission.touchdown {confirmed, at_base, method}` (`settled`/`stagnation`/`unconfirmed`) e o anuncio so diz "na base" com `at_base`. `MILESTONE_KEYS` += `mission.touchdown`. GCS: `src/lib/missionOutcome.ts` (0 finished, 3 aborted, 4 finished_unconfirmed, resto faulted, `isMissionOver`), `MissionState` estendido, consumidores atualizados (App, CockpitScreen, navigationLock, StageBar, useMissionRuntime; o abort sem exit agora assenta em `aborted`). Testes: contratos (+12), touchdown (+3), signals (+2), `missionOutcome.test.ts` (16). |
+| 1.5 Parser `[STEP N:` com buffer de linha | feito | `milestones.cjs`: `createLineBuffer` extraido e compartilhado com `createMilestoneParser`; `createStepMarkerParser` emite todos os marcadores do chunk em ordem; `STEP_LINE` exportado; `main.cjs` usa o parser e faz `flush` no close. Testes: `src/lib/stepMarkers.test.ts` (7, RED->GREEN), contrato `test_the_step_matcher_is_the_one_the_gcs_ships`. |
+| 1.6 `goto_stage` seguro | feito | `engine/stage_gate.py`: `refuse_stage_request` (puro) e `StageRequestHandler` (callback do `mission.py`). Regras: 1 recusado se a missao passou do Stage 1, se o countdown terminou (`blackboard.takeoff_committed`) ou se airborne (altitude > 0,25 m ou leitura indisponivel); 5 recusado com Stage 5 em curso; 2, 3 e 4 recusados enquanto o Stage 1 (quando presente no run) nao concluiu (`blackboard.takeoff_complete`). Runner grava `ctx.current_stage`. Testes em `test/test_safety_invariants.py` (+15, RED->GREEN). |
+| 1.7 Encerramento do app em voo | feito | `missionLifecycle.cjs:createShutdownSequence` (missao drenada com grace 1500 ms e SIGKILL; aeronave airborne recebe land pela ponte e ate 10 s para reportar solo; so entao pontes e `make driver-stop`), `waitFor`. `main.cjs`: `cleanupAllProcesses` substituido por `stopServicesAndDriver` + `runShutdown`; `before-quit` e `close` da janela passam por `requestQuit` (single-flight) com `dialog.showMessageBox` quando ha missao ativa ou aeronave no ar; `findOrphanMissions` (`execFileSync('pgrep')`) recusa lancamento com missao orfa viva e `interruptOrphanMissions` no boot. Testes: `missionLifecycle.test.ts` (+4); `singleVoice.test.ts` pegou o falso positivo do `pgrep` via shell (corrigido). |
+| 1.8 Intertravamento estrutural da bancada | feito | `actuators/proxy.py`: `_NoFlyInterlock` envolve o drone cru em no-fly e levanta `RuntimeError` em `takeoff`, `move_velocity`, `move_to`, `rtl`, `flip`, `arm`; `no_fly` virou propriedade somente leitura; docstring registra gimbal, flat trim e photo fisicos. Testes: `test_actuator_proxy.py` (+4, RED->GREEN) e `test/test_no_fly_interlock.py` (mission.py --no-fly --stages 1-5 em dominio 87 com probe em takeoff/cmd_vel/move_camera: 0 takeoff, 0 Twist nao nulo, gimbal observado). |
+| 1.9 Abortar sempre disponivel com aeronave no ar | feito | `lib/flightState.ts:abortEnabled(missionState, flyingState)`; `CockpitScreen` usa; o botao do cockpit chama `land()` do App (com processo morto publica pela ponte via `bmg:abort-mission`). Teste `abortAvailability.test.ts` (RED->GREEN). O conjunto airborne ainda e o antigo; unificado na Fase 2.3. |
+
+### Fase 2 — Trava do Finalizar
+
+| Item | Estado | Notas |
+|---|---|---|
+| 2.1 `finishLock.ts` puro | feito | `src/lib/finishLock.ts`: `FinishLockState`, `FinishLockInput` (campos do plano mais `benchFlyingState` e `exitedAt`), `finishLockState(input, now)`, constantes `GROUND_CONFIRM_MS=2000`, `TELEMETRY_FRESH_SEC=1.5`, `LINK_LOST_MS=10000`, `FINISH_HOLD_MS=1500`, `FINISH_REASONS`. |
+| 2.2 Regras da maquina de estados | feito | grounded so com processo encerrado, `flying_state===0` continuo >= 2 s, telemetria < 1,5 s, `nav_fresh` e fonte `aircraft`; bancada: exit + ultimo `bench_flying_state===0`; 5 -> grounded com aviso; silencio > 10 s depois do exit -> `link_lost` com hold de 1,5 s; qualquer {1,2,3,4,7,8} -> `await_ground`. `hooks/useFinishLock.ts` rastreia os instantes e reavalia a cada 250 ms. Testes: `finishLock.test.ts` (34), `useFinishLock.test.tsx` (5), RED->GREEN. |
+| 2.3 Conjunto airborne canonico | feito | `flightState.ts:AIRBORNE_STATES=[1,2,3,4,7,8]` (aliases antigos removidos; `rotorsTurning` delega), `main.cjs:AIRBORNE_FLYING_STATES` e `telemetry_bridge.py:AIRBORNE_STATES` iguais; contrato `test_the_three_airborne_sets_are_the_canonical_one` (RED->GREEN). Teste antigo que fixava [1,2,3,6] atualizado. |
+| 2.4 `ForensicPanel` e guard em `App.finishMission` | feito | Prop `lock` substitui `canFinish`: `disabled`, `aria-disabled`, tooltip = `lock.reason`, `data-finish-state`, rotulo "Segure para finalizar" com hold-to-confirm (um unico timer, reiniciado a cada pointer-down). `App`: `useGuardedAsync` (ref sincrona) em volta do fim de ciclo; `finishing` alimenta a trava. |
+| 2.5 `StatusBar` sem fallback "em solo" | feito | `flightState.ts:flyingStateLabel` ("estado desconhecido" com link e sem estado; "—" sem link); teste `flightStateLabel.test.ts` (RED->GREEN). |
+| 2.6 Testes vitest e integracao | feito | Tabela completa em `finishLock.test.ts`; integracao em `ForensicPanel.test.tsx` (tooltips por estado, hold, soltura antecipada, pointer-down repetido em 50 ms); clique duplo em `useGuardedAsync.test.tsx`. Suites no fim da fase: vitest 317/317, tsc limpo, `npm run build` ok; pytest 940 passed, 1 falha intermitente (ver observacao do SIGABRT). |
+
+### Fase 3 — Copiloto veridico
+
+| Item | Estado | Notas |
+|---|---|---|
+| 3.0 Milestone `mission.parameters` (D2) | feito | `telemetry/mission_parameters.py:spoken_parameters` (9 chaves do plano, velocidades via `SpeedCalibration`); `mission.py` emite depois de todas as normalizacoes; chave em `MILESTONE_KEYS`. Frontend: `phraseValues(payload, parameters)` (payload primeiro, depois `mission.parameters`; nada de default); variantes so elegiveis com todos os placeholders; `FALLBACK_VARIANTS` sem numero; `spokenSpeed` (2 casas, singular abaixo de 2); `useFlightNarration` guarda o documento e o descarta em `mission.start`; parametro de altitude configurada removido do App. Testes: `test_mission_parameters.py` (4), contrato do bench (sequencia comeca em `mission.parameters`), `copilotPhrases.test.ts` (+5), `useFlightNarration.parameters.test.tsx` (lancamento a 2,3 m e 0,35 m/s fala "2,3 metros"; RED contra o hook do HEAD). |
+| 3.1 Laudo pericial encadeado (D1) | feito | Laudo (pools e sorteio intactos) so comeca com `reportMayStart(finishLock)` = `grounded`; linhas no grupo `forensic` da fila (descartadas por Finalizar/alerta); `NarrationQueue` ganhou `fallbackMs` (espera so quando a fala nao foi ouvida) e o laudo usa `fallbackMs: findingGapMs()` no lugar de `minMs`. Testes: `narrationQueue.test.ts` (3), `finishLock.test.ts` (+1), `useForensicNarration.test.tsx` (piso so sem voz; sem espera extra apos fala ouvida). |
+| 3.2 Touchdown | feito | Chamada de pouso so no milestone `mission.touchdown`: pools `mission.touchdown` (confirmado na base), `mission.touchdown_in_place`, `mission.touchdown_unconfirmed` (frase ditada pelo plano); o disparo por `exitCode === 0` (`TOUCHDOWN_CALL`, parametro `landed`) foi removido. Sem Stage 5, nao ha milestone e nada e dito. Testes: `copilotPhrases.test.ts` (+3), hook (+2). |
+| 3.3 Decolagem confirmada | feito | `steps/takeoff.py:takeoff_confirmed(flying_state, altitude, min)` ({1,2} ou altitude > `takeoff_settle_min_altitude_m`); `mission.takeoff` sai uma vez, de dentro de `_stabilize`/`_ascend`/`_finalize`, com `altitude_m` configurado (D2); `_launch` nao emite mais. `mission.py` assina `/bebop/states/flying_state` (transient local) em `ctx.flying_state`. Variante "Teto operacional" removida; 2 variantes sem numero. Testes: `test_takeoff.py` (+12). |
+| 3.4 Countdown dirigido pela missao | feito (parcial: IMU) | `TakeoffStep._countdown` emite `mission.countdown {remaining_sec}` a cada segundo inteiro ate 0 e `mission.countdown_3` a T-3,2 s (countdown 0: os dois de imediato). Estacao: `emitLaunchMilestone` (so `mission.start`) no lancamento; bancada adiada usa `scheduleCountdownTicks`. `useMissionCountdown` + `CountdownOverlay` sem relogio proprio ("Aguardando a missao" ate o primeiro tick; fecha no 0). Variantes sem checklist/validacao/prontidao. Item "Nivelamento da IMU" so conclui com `trimAcked`, hoje `false` ate o ACK da Fase 6.3. Testes: pytest (+3), `milestoneStream.test.ts` (+3), `CountdownOverlay.test.tsx` (5), `useMissionCountdown.test.tsx` (3), frases (+1). |
+| 3.5 Frases condicionais | feito | Payloads: `capture_done.target_confirmed`, `approaching.ibvs`, `rtl_start.{via_jump, inspected, marker_guided}` (sensor construido antes do milestone), `landing.at_base`; runner grava `ctx.entered_by_jump`. Frontend: `poolForMilestone` escolhe `capture_reference`, `approaching_direct`, `rtl_start_jump`, `rtl_start_no_target`, `landing_in_place`; flag ausente = nao aconteceu; veto de "marcador" sem `marker_guided`; "alta fidelidade" removido. Testes: contrato do bench (+7 asserts), `test_signals.py` (+1), `copilotPhrases.test.ts` (+7). |
+| 3.6 Alertas no solo | feito | `announcer._format_telemetry_statement`: falhas de inicializacao/calibracao/decolagem/etapa dizem o motivo real e so acrescentam "Executando pouso seguro" com `details["em_voo"]`; ponto unico no fim. `failsafe.spoken_reason` (dicionario `Final` de prefixos -> pt-BR; qualquer outro texto, inclusive `str(exc)`, vira "falha interna da missao") e `em_voo` pela altitude (> 0,25 m). Runner: nome pt-BR do estagio, `em_voo` = `takeoff_committed`, e `step_failed` suprimido quando a etapa ou o failsafe ja alertou (`announcer.alerts_raised()`). Frontend: `ALERT_FALLBACK` sem afirmar pouso. Testes: `test_announcer_calls.py` (+20). |
+| 3.7 `mission.battery_warning` | feito | Pool com `{threshold}` (limiar configurado em `threshold_pct`, nunca a leitura `battery_pct`) e 2 variantes de fallback sem numero; `spokenPercent`. Disparo segue a leitura real (inalterado). Testes: `copilotPhrases.test.ts` (+2). |
+| 3.8 Fila unica e mutex real | feito | App: bateria critica por `runCriticalBatteryReturn` (`lib/batteryReturn.ts`, fala do RTL so depois do ACK do `gotoStage`, via `NarrationQueue.preempt`); fim de ciclo e troca de rotina por `NarrationQueue.silence()`. main.cjs: abort sem missao emite alerta `mission.abort` em `bmg:milestone`. announcer: geracao incrementada no cancel, task de sintese cancelavel, audio de geracao antiga descartado; alerta nao corta alerta (reproducao e fila). `terminal.cjs` exporta `BMG_GCS_SESSION=1`; lockfile `$XDG_RUNTIME_DIR/bmg-announcer.lock` do daemon faz `station_narrates()` verdadeiro em outro processo. Testes: `batteryReturn.test.ts` (5), `narrationQueue.test.ts` (+1), pytest (+9). |
+| 3.9 Latencia de fala | feito | Cache em disco `~/.cache/bmg/speech/<sha1(texto, modo, voz, modelo)>.pcm` (`PhraseCache`); `warm_cache`/op `cache` do daemon preenche em segundo plano, so com a fila ociosa; renderer envia no `mission.parameters` todas as frases da missao (`allMissionPhrases`), as 304 do laudo (`allFindingSentences`) e os alertas fixos. Playback em blocos de 50 ms num `RawOutputStream` persistente com geracao (stop < 100 ms); streaming a partir do primeiro chunk. Tetos alinhados em 14 s (`SPEECH_CEILING_MS` = `SPEECH_CEILING_SEC` = prazo unico do `announce(wait)`), com `cancelSpeech` ao estourar. Log `[SPEECH] ... latency_ms= source=`. `scripts/bench_speech_latency.py` (API real, dispositivo silencioso): fria 1243-1298 ms (meta < 1500), quente 709-856 ms (meta < 800; do cache 0,3 ms), URGENT apos cancel 143-147 ms (meta < 1000), linha cancelada 0 buffers apos o cancel. Testes: pytest (+15), vitest (+4), contrato do teto. |
+| 3.10 Standalone verbatim | feito | O consumidor sintetiza sempre em modo verbatim a frase ja composta pelo mapeador, que e a registrada no log. Teste `test_a_standalone_announcement_speaks_exactly_the_sentence_it_logs`. |
+
+### Fase 4 — Video 30 FPS e inferencia
+
+| Item | Estado | Notas |
+|---|---|---|
+| 4.1 Driver: configuracao de video, thread de publicacao, try/catch | feito (codigo); validacao ao vivo aguardando drone | `ros2_bebop_driver`: `video_settings.{hpp,cpp}` (parse e validacao de `video_resolution` REC1080_STREAM480/REC720_STREAM720, `video_framerate` 24/25/30_FPS, `video_stream_mode` LOW_LATENCY/HIGH_RELIABILITY/HIGH_RELIABILITY_LOW_FRAMERATE, `video_stabilization` vazio/NONE/ROLL_PITCH/PITCH/ROLL); `Bebop::configureVideo` envia `sendPictureSettingsVideoResolutions`, `VideoFramerate`, `sendMediaStreamingVideoStreamMode` e `VideoStabilizationMode`, e o `commandReceivedCallback` loga o valor aplicado pela aeronave; `cameraLoop` em thread propria com `getFrontCameraFrame(wait)`; `guarded()` (try/catch) em todos os callbacks; grupos `odometry_group`/`command_group`; destrutor faz join. Parametros no `bebop_node_launch.xml` e README. Build 0 warnings; gtest `test_video_settings` 5/5. |
+| 4.2 Transporte comprimido para o GCS | feito (codigo); validacao ao vivo aguardando drone | `mjpeg_server.py`: assina `<raw>/compressed` (`CompressedImage`, BE depth 1); sem overlay repassa o JPEG (tamanho lido do SOF por `jpeg_size`, sem decodificar); com overlay decodifica, desenha e recodifica em q75; nao-JPEG recodificado; raw ignorado enquanto o comprimido esta vivo e a assinatura raw destruida/recriada por timer (fallback); um `wfile.write` por quadro e `TCP_NODELAY`. Dependencia documentada no `CLAUDE.md`. Testes: `test_compressed_stream.py` (7). Pendente: ver `/bebop/camera/image_raw/compressed` com o driver no ar. |
+| 4.3 Perfil Fast DDS | feito | `bebop_mission_control/config/fastdds_video.xml` (SHM 16 MB, UDPv4 8 MB); `getNectarEnv()` exporta `FASTRTPS_DEFAULT_PROFILES_FILE` (teste em `singleVoice.test.ts`); `setup_station.sh:step_dds_profile` insere o export antes do passthrough do `nectar-activate` (idempotente, ensaiado numa copia); aplicado ao `nectar-activate` desta estacao (backup em `~/.cache/bmg/rollback/nectar-activate_before_dds_profile`). Verificado: imagens de 2,76 MB entregues com o perfil nos dois lados, so num e em nenhum (147-157 quadros em 8 s, dominio 99). `CLAUDE.md` com o setup de estacao. Pendente: confirmar com o driver C++ no ar. |
+| 4.4 Fim do bloqueio por quadro anotado | feito | Countdown: YOLO pelo worker (`ctx.perception.session`), resumo JSON em vez de quadro anotado. RTL: `publish_overlay` + `bmg.detections.v2` (`markers`: cantos e eixos projetados, `ArucoMarkerSensor.overlay_geometry`); `_EmptyDetectionResult` removido. Bridge: parse/desenho do v2; `DETECTION_PRIORITY_SEC` 1,5 -> 0,25 s. Testes: `test_detection_overlay.py` (+7), `test_aruco_rtl.py` (+3, dubles do HUD atualizados), `test_takeoff.py` (+1). |
+| 4.5a Selecao de device | feito | `vision.inference_device` (`AUTO`/`CUDA`/`IGPU`/`CPU`, default `AUTO`) e `vision.inference_min_period_sec` (0,10) em `parameters.py`; `perception/inference_device.py` (`normalize_inference_device`, `choose_device`, `FallbackDetector`, `select_detector`, `available_devices`, `build_device_detector`, `model_cache_key`). O `Detector` do SDK so resolve device por torch (cpu/cuda/mps): CUDA pelo SDK com `device="cuda:0"`; IGPU/CPU pelo SDK com o IR OpenVINO e o device fixado no preditor Ultralytics (`intel:gpu.0`/`intel:cpu`, `_PinnedOpenVino`), sem editar o SDK. Verificado ao vivo: bicicleta 0,93 nos tres devices; `EXECUTION_DEVICES` = `GPU.0` e `CPU`. Testes: `test_inference_device.py` (28). |
+| 4.5b MX110 CUDA | feito | FP32 (FP16 medido igual: 62/63 ms a 640, 47/48 a 480; sm_50 sem FP16 rapido); `set_per_process_memory_fraction(0.8)`; 10 inferencias de warmup quando escolhida; fallback CUDA -> IGPU -> CPU em tempo de execucao com WARNING. |
+| 4.5c iGPU OpenVINO | feito | IR FP16 existente; cache de compilacao em `~/.cache/bmg/ov` por subclasse de `openvino.Core` (o Core do Ultralytics nao herda `CACHE_DIR` de outro): CPU 1148 -> 241 ms, HD 620 2613 -> 2084 ms na segunda carga. |
+| 4.5d Regra AUTO no warmup | feito | No `mission.py`, no primeiro quadro real: 30 inferencias por device (orcamento de 6 s so para as cronometradas; carga e warmup fora, em `load_ms`), menor p95, empate < 10% -> CUDA > IGPU > CPU; cache em `~/.cache/bmg/inference_device.json` (override `BMG_INFERENCE_CACHE`) com validacao de 5 inferencias; log `[TIMING] inference_device= p50_ms= p95_ms= selection_ms= cached= candidates=`. Ensaio real a 480: CUDA 48,8/50,5, IGPU 45,1/72,1, CPU 88,9/97,3 -> CUDA. |
+| 4.5e Modelo, imgsz, periodo minimo, countdown no worker | feito | Validacao em 35 evidencias: OpenVINO@480 vs .pt@640 33/35 iguais, as 2 restantes corrigidas para bicicleta (o 640 dizia motocicleta/relogio); .pt@480: 24 acertos contra 22 a 640. Default `inference_imgsz` 480; `model_path` segue `yolov8n.pt` (a CUDA precisa dele; o IR OpenVINO e derivado ao lado). `PerceptionWorker(min_period_sec)` (validado no `mission.py`); countdown pelo worker. Testes: `test_perception_worker.py` (+5), `test_inference_config.py` (default). |
+| 4.5f Decode H.264 (VAAPI condicional) | aguardando drone | Decisao depende da CPU total no Stage 2 com video real (regra do plano: VAAPI so acima de 70%). Bench sem drone: inferencia continua a 480 px ocupa 31% (CUDA), 54% (iGPU) e 67% (CPU) da estacao, sem decode. |
+| 4.5g `scripts/bench_inference_devices.py` | feito (sem coluna mjpeg; aguardando drone para `--mjpeg-url`) | p50/p95, inferencias/s, CPU total (`/proc/stat`) e FPS do mjpeg em paralelo (`--mjpeg-url`), por device (CUDA FP32, CUDA FP16, IGPU FP16, CPU) e imgsz (320/480/640), 3 rodadas intercaladas de 40; tabela em `docs/BENCH_INFERENCIA.md`. A 480 px, idle: CUDA FP32 48,6/49,8 ms, CUDA FP16 45,0/46,4, iGPU 26,1/30,4, CPU 38,5/46,5. FP16 da MX110 confirmado 7% mais rapido (medicao antiga de "sem ganho" reusava um preditor) e sem mudanca nas 32 evidencias (classes iguais, conf +-0,004, IoU >= 0,997): CUDA passa a FP16 por `_PinnedPredict` (`quantize=16`, `CUDA_QUANTIZE`), sem editar o SDK; a chave do cache de device inclui a precisao. Defaults mantidos: `inference_device=AUTO` (idle a iGPU vence, mas sob a carga da missao mediu 45/72 ms contra 49/51 da CUDA; a escolha e feita no primeiro quadro real, sob carga) e `inference_imgsz=480` (validado em 4.5e). Testes: `test_bench_inference_devices.py` (9), `test_inference_device.py` (+4). |
+| 4.6 Calibracao por resolucao | feito (codigo); validacao ao vivo aguardando drone | `intrinsics.fit_calibration`: mesma razao de aspecto (tolerancia 1%) escala fx, cx, fy, cy com WARNING; aspecto diferente levanta `CalibrationMismatch` e o RTL recusa a pose (voa o retorno odometrico). `_build_sensor` passa o tamanho do stream. Testes: `test_camera_intrinsics.py` (+5). |
+| 4.7 Evidencia em resolucao nativa | feito (codigo); validacao ao vivo aguardando drone | Driver: `sendMediaRecordPictureV2`, `sendPictureSettingsPictureFormatSelection(JPEG)` na conexao, `PICTURESTATECHANGEDV2`/`PICTUREEVENTCHANGED` publicados em `states/picture_event` (`std_msgs/String` JSON `{sequence, kind, value, error, stamp}`, reliable depth 10). Missao: `telemetry/picture_ack.py` (`PictureAckTracker`, `wait_after`); `mission.py` assina o topico (`ctx.picture_ack`); `inspection._capture` dispara `snapshot()` antes do YOLO e espera o ACK no restante de `inspection.native_photo_ack_timeout_sec` (2,0 s contados do pedido), gravando `native_photo {requested_at_utc, acknowledged, event, error, remote_path, local_path}` no sidecar; `mission.capture_done` ganha `metadata` e `native_photo`. Relay de bancada encaminha `/bebop/states/picture_event`. GCS: `streamer/media_fetch.py` (ftplib, `192.168.42.1:21`, `internal_000/Bebop_2/media`; pareamento por ordem, nao por data, porque o relogio da aeronave nao e acertado; download atomico em `<output_dir>/native/`), disparado por `electron/nativePhotos.cjs` quando a missao que emitiu `mission.touchdown` termina (single-flight, timeout 120 s, relatorio em `bmg:native-photos`). Testes: `test_picture_ack.py` (8), `test_inspection_hover.py` (+2), `test_media_fetch.py` (6, FTP falso), `nativePhotos.test.ts` (6). |
+| 4.8 Meta de FPS medida | pendente | Exige drone. |
+
+### Fase 5 — Persistencia de parametros
+
+| Item | Estado | Notas |
+|---|---|---|
+| 5.1 Sem fallbacks; `--params-json` unica fonte | pendente | |
+| 5.2 Fonte unica de defaults (`--dump-defaults`) | pendente | |
+| 5.3 JSON invalido retorna `success:false` | pendente | |
+| 5.4 Preflight bloqueia com `status !== 'ready'` | pendente | |
+| 5.5 Falha de `params.save()` aborta | pendente | |
+| 5.6 Escrita atomica com fsync | pendente | |
+| 5.7 `countdown_sec` 0 respeitado | pendente | |
+| 5.8 `applyPreset` preserva PID, calibracao, `no_fly` | pendente | |
+| 5.9 Bancada salva `dirty` antes do spawn | pendente | |
+| 5.10 Testes de duas missoes e merge | pendente | |
+
+### Fase 6 — Telemetria e calibracoes com ACK
+
+| Item | Estado | Notas |
+|---|---|---|
+| 6.1 Driver: stamps ARSDK, invalidacao, pose | pendente | Validacao exige drone. |
+| 6.2 `telemetry_bridge.py` frescor e derivados | pendente | |
+| 6.3 Flat trim com ACK | pendente | Validacao exige drone. |
+| 6.4 Calibracao magnetica | pendente | Validacao exige drone. |
+
+### Fase 7 — Latencia de arranque
+
+| Item | Estado | Notas |
+|---|---|---|
+| 7.1 Import lazy do announcer | pendente | |
+| 7.2 Daemon ros2 obsoleto | pendente | |
+| 7.3 Limpeza de SHM orfao | pendente | |
+| 7.4 Warmup YOLO em paralelo | pendente | |
+| 7.5 `[TIMING] phase=` e `test_profiling.py` | pendente | |
+
+### Fase 8 — Validacao final
+
+| Item | Estado | Notas |
+|---|---|---|
+| 8.1 Suites completas e build npm | pendente | |
+| 8.2 colcon build missao e driver | pendente | |
+| 8.3 Ensaio completo em bancada | pendente | |
+| 8.4 Relatorio final | pendente | |
+| 8.5 git status e pedido de commits | pendente | |
+
+## Decisoes e desvios
+
+(registradas no formato `Ruling: <decisao> — <motivo> — <custo se errado>`)
+
+- 0B.4: Ruling: `nvidia-persistenced` e `nvidia-modprobe` nao sao purgados, e sim rebaixados para 580.178.04-1ubuntu1 e mantidos em hold — `libnvidia-compute-580` e `nvidia-kernel-common-580` do repositorio CUDA dependem deles (>= 580.178.04); o purge do plano deixa a transacao insoluvel (simulado) — custo se errado: nenhum alem de refazer a resolucao.
+- 0B.4: Ruling (revisado): a transacao unica nao funcionou, por dois motivos: o apt desta estacao nao aceita o sufixo `pkg_`, e o dpkg colide no unpack de `libnvidia-cfg1-580` contra `libnvidia-cfg1` 610, que compartilham `libnvidia-cfg.so.1`. A versao final do script (ajustada pelo usuario) simula a transacao, remove os pacotes 610 e depois instala o 580 com `--allow-downgrades` e `--force-overwrite`, fazendo purge do residual `rc` em seguida — custo: a remocao e a instalacao deixam de ser atomicas; se a instalacao falhar no meio, a estacao fica sem stack NVIDIA ate uma nova execucao, o que nao afeta o display (Intel).
+- 0B.4: Ruling: versao fixada em 580.178.04-1ubuntu1 (repositorio CUDA, prioridade 600) em vez da build do Ubuntu restricted — o pin 600 do CUDA ja preferiria essa origem e misturar origens quebra dependencias — custo se errado: trocar a origem e refazer 0B.4.
+- 0B.4: Ruling: `/etc/modprobe.d/bmg-blacklist-nouveau.conf` escrito so se nenhum blacklist de nouveau existir apos a instalacao, e `update-initramfs -u` explicito — o blacklist atual vem do pacote 610 que sera removido — custo se errado: arquivo redundante.
+- 0.3: Ruling: o relay tambem encaminha `/bebop/camera/image_raw/compressed` e classifica `/bebop/calibrate_magneto` como atuacao antes de existir — cobre as Fases 4.2 e 6.4 sem editar o relay depois — custo se errado: nenhum (topicos inertes).
+- 0B.6: Observacao para a Fase 4.5: com o 580 carregado, o OpenVINO passa a enumerar a MX110 via OpenCL como `GPU.1`. O device IGPU tem de ser endereçado explicitamente como `GPU.0` (ou pelo `FULL_DEVICE_NAME` com `iGPU`), nunca pelo alias `GPU`.
+- 0B.6: Observacao: `nectar-sdk/nectar/pyproject.toml` fixa `ultralytics==8.4.36`; o venv ja tinha 8.4.137 antes desta implementacao. Nao alterado.
+- 0B.7: Ruling: `torchaudio==2.9.1+cu126` instalado em vez de desinstalado — nenhum codigo do monorepo ou do SDK usa torchaudio, mas o pacote `silero-vad` 6.2.1 do venv o exige; desinstalar quebraria esse pacote — custo se errado: ~10 MB de disco.
+- 1.3: Ruling: `--max-wait-time-secs 5` acrescentado aos comandos CLI do plano (`-w 1 -t 10 -r 20`) — sem ele, com o driver fora do ar, o STOP espera um assinante indefinidamente (ate o kill de 20 s) e segura o LAND atras dele — custo se errado: um driver que demora mais de 5 s para parear perde o backup CLI (os caminhos A e B continuam).
+- 1.3: Ruling: o item "publicar Twist zero antes do land em cada iteracao" do runner ja era verdade no HEAD (`move_velocity` e depois `land` por iteracao, terminando em land); nao mudei o codigo, so fixei a ordem com teste — custo se errado: nenhum.
+- 1.4: Ruling: `method` de `mission.touchdown` e o metodo de confirmacao (`settled`, `stagnation`, `unconfirmed`), e `at_base` vem do chamador (True depois da centralizacao no marcador ou do station-keeping odometrico; False com o marcador nao avistado ou sem origem) — o plano nao define os valores — custo se errado: renomear strings no payload.
+- 1.4: Ruling: um abort sem exit reportado agora assenta em `aborted`, nao em `finished`, e o exit 3 nao toca o cue `complete` nem `fault` (o cue `abort` ja tocou no clique) — custo se errado: um cue a mais ou a menos.
+- 1.3: Ruling: a ponte residente espera ate 5 s o publisher de land parear antes do burst, em vez de mudar o significado de `ready` — um `ready` condicionado ao pareamento com o driver bloquearia gimbal e `goto_stage` na bancada sem driver — custo se errado: com o driver fora do ar, cada land pela ponte segura o stdin dela por 5 s (o backup CLI corre em paralelo).
+- 1.6: Ruling: a regra "recusar 2 enquanto o Stage 1 nao concluiu" foi estendida a 3 e 4 (estagios que pressupoem voo) e so vale quando o run contem o Stage 1; o 5 continua aceito durante a subida — o RTL por bateria salta para 5 de qualquer estagio — custo se errado: o operador nao consegue saltar para 3/4 durante o Stage 1.
+- 1.7: Ruling: missao orfa recebe SIGINT (pousa pelo proprio handler), nunca SIGKILL, e o lancamento e recusado enquanto ela existir — o plano pede reap por padrao de cmdline; SIGKILL deixaria uma aeronave no ar sem comando — custo se errado: uma orfa travada exige kill manual.
+- 1.8: Ruling: o teste de bench existente (`test_a_full_bench_run_crosses_every_milestone_in_flight_order`) passou a rodar em `ROS_DOMAIN_ID=86` — no dominio 14 ele moveria gimbal, flat trim e foto de um drone ligado — custo se errado: nenhum.
+- Observacao (preexistente, fora do escopo): `reapOrphanedServices` usa `execSync('pgrep -f <script> || true')`, que casa o proprio `sh -c` e o mata com SIGKILL; inofensivo (so gera aviso), nao alterado.
+- Observacao: `test_announcer_calls.py::test_a_prefetched_line_is_synthesized_once_and_played_on_request` e sensivel a carga (timeout de 5 s); falhou 1 vez na suite completa, passou 3/3 isolado e na suite da Fase 1.
+- 2.1: Ruling: `FinishLockInput` ganhou `benchFlyingState` (ultimo valor do simulador no run) e `exitedAt` — o bridge descarta o estado de bancada 3 s depois do fim do processo, e o "null por mais de 10 s apos o exit" do plano precisa do instante do exit — custo se errado: nenhum (campos a mais).
+- 2.2: Ruling: `link_lost` devolve `enabled: true` com `requiresConfirm: true` (o botao so age por hold); em execucao sem voo o motivo e "Missao em execucao: use Abortar Missao", e 4/8 mostram "Pousando..." — o plano lista motivos de exemplo — custo se errado: trocar strings.
+- 3.9/SIGABRT: causa provavel encontrada. Na suite da Fase 3, as duas missoes de bancada (standalone, com announcer local) sairam com SIGSEGV no teardown e o proprio pytest caiu com segfault ao sair; erro do PortAudio (`PaAlsaStream_SetUpBuffers`) no log. Thread de audio viva dentro do PortAudio durante a finalizacao do interpretador. Corrigido: `AudioPlaybackDevice.close` solta o lock e faz join do worker, que aborta o stream no proximo bloco; `atexit` fecha o announcer e o dispositivo globais. Depois: bench 6/6 e suite completa 1006 passed com exit 0.
+- 3.8: Ruling: sem teste vitest do caminho de abort do `main.cjs` — o harness que carrega o `main.cjs` real so mocka o `spawn`, e o abort executaria o `exec` real de `ros2 topic pub /bebop/land` no dominio do driver — custo se errado: o alerta `mission.abort` do main fica coberto so por inspecao.
+- 3.9: Ruling: o cache e aquecido no `mission.parameters` e nao no clique de lancamento — so ali os numeros sao os da missao (D2) — custo se errado: nenhum; frases ainda nao cacheadas sao sintetizadas em streaming.
+- Observacao: os testes de bancada que rodam `mission.py` fora da GCS usam o announcer local com audio e API reais (comportamento preexistente); agora tambem preenchem `~/.cache/bmg/speech` com audio real das frases.
+- Observacao (SIGABRT, historico): uma vez, na suite completa da Fase 2 (257 s, carga alta), a missao de bancada saiu com -6 (`malloc_consolidate(): invalid chunk size`) no teardown, depois do touchdown confirmado e do fechamento do ImageHandler. Nao reproduziu em 8 execucoes isoladas nem nas suites seguintes. Verificado: com o torch cu126 o `Detector` do SDK (`device='auto'`) passou a rodar na `cuda:0` sem benchmark nem fallback; a Fase 4.5 fixa o device. Reavaliar na Fase 8.
+- 3.0: Ruling: numeros falados em algarismos com virgula decimal ("2,3 metros", "0,35 metro por segundo") e singular abaixo de 2, a norma ja usada em `spokenMeters`; o TTS pronuncia "dois virgula tres" — o plano escreve o teste por extenso e com "metros por segundo" no plural — custo se errado: trocar o formatador.
+- 3.4: Ruling: a bancada adiada (estacao conta porque nao ha processo) mantem `scheduleScriptMilestones` e ganha `scheduleCountdownTicks`; so o lancamento completo perdeu o timer — custo se errado: nenhum.
+- Observacao: uma rodada de `pytest -k countdown` travou uma vez (>150 s, threads em futex) e nao repetiu com `faulthandler_timeout`; sem pilha capturada.
+- 4.3: Ruling: o `nectar-activate` e gerado pelo nectar-sdk (`make ros2-env`) e fica fora de qualquer repositorio; o export vai pelo `getNectarEnv()` (rastreado) e por uma etapa do `setup_station.sh`, e foi aplicado a esta estacao com backup — custo se errado: reverter com o backup.
+- 4.5d: Ruling: o orcamento de 6 s cobre so as inferencias cronometradas; carga e warmup ficam fora (1,9 s na primeira inferencia CUDA, ~1 s de compilacao na iGPU) — contados, deixavam os devices seguintes sem medida e o primeiro vencia por W.O. — custo se errado: a selecao fria leva ~6-8 s a mais uma vez por modelo/imgsz (depois usa o cache).
+- 4.5e: Ruling: `vision.model_path` continua `yolov8n.pt` (o plano sugeria trocar para o IR); o IR OpenVINO e derivado ao lado dos pesos (`<stem>_openvino_model`) — com o IR como `model_path` a MX110 ficaria sem pesos PyTorch — custo se errado: nenhum.
+- Observacao: `nectar-sdk` tem modificacoes locais sem commit que nao sao desta implementacao; o SDK carregado e esse working tree.
+- 4.1: Ruling: `video_stabilization` tem default vazio (nao envia o comando) — o plano nao fixa o modo e o default de fabrica do Bebop e ROLL_PITCH; mudar a estabilizacao altera o enquadramento usado na calibracao — custo se errado: passar o parametro no launch.
+- 4.7: Ruling: `media_fetch.py` fica em `bebop_mission_control/streamer/` (caminho do plano) e pareia fotos por ordem (as mais novas ainda nao baixadas, para os sidecars reconhecidos em ordem de pedido) — o driver nao acerta a data da aeronave (`sendCommonCommonCurrentDate/Time` existe no ARSDK, nao usado), entao o nome do arquivo nao data a foto — custo se errado: com fotos tiradas fora da missao entre o voo e o download, um sidecar recebe a foto errada; acertar o relogio no driver resolve.
+- 4.7: Ruling: o download so roda quando a missao termina depois de `mission.touchdown` — a transferencia divide o Wi-Fi com o video e nao deve rodar com a aeronave no ar — custo se errado: missao abortada sem touchdown confirmado nao baixa a foto (reexecutavel a mao).
+- 4.7: Observacao: na bancada (`--no-fly` + relay), `/bebop/photo` nao cruza o relay; o sidecar registra `acknowledged: false`, que e o correto.
+- 4.5g: Ruling: CUDA passa de FP32 para FP16 — medido 7% mais rapido e sem mudanca de deteccao no conjunto de evidencias; invalida a afirmacao anterior de "FP16 sem ganho" (erro de medicao) — custo se errado: `CUDA_QUANTIZE = 32`.
+- Correcao: dubles de `detect` em `test_stage_altitude_wiring.py` e `test_stage3_integration.py` nao aceitavam `imgsz` desde o 4.5e (8 testes quebrados); assinatura corrigida.
+
