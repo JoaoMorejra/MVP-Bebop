@@ -20,6 +20,8 @@ const {
   singleFlight,
 } = require('./missionLifecycle.cjs');
 const { MEDIA_FETCH_ARGS, createNativePhotoFetch } = require('./nativePhotos.cjs');
+const { readParameterFile, writeJsonAtomic } = require('./parameterStore.cjs');
+const { cleanOrphanShm, createSsidChangeDetector, restartRos2Daemon } = require('./rosHousekeeping.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 // The monorepo is checked out as <ws>/src/mvp_mission_bebop on every
@@ -38,7 +40,8 @@ const FASTDDS_PROFILE = path.join(__dirname, '..', 'config', 'fastdds_video.xml'
 const VENV_DIR = path.join(WORKSPACE_DIR, '.venv');
 const PYTHON_VENV = path.join(VENV_DIR, 'bin', 'python3');
 const NECTAR_ACTIVATOR = path.join(WORKSPACE_DIR, 'bin', 'nectar-activate');
-const CONFIG_PATH = path.join(MISSION_DIR, 'mission_config.json');
+/** `BMG_MISSION_CONFIG` redirects the store, for tests; the mission is given the same path. */
+const CONFIG_PATH = process.env.BMG_MISSION_CONFIG || path.join(MISSION_DIR, 'mission_config.json');
 const COMMAND_SCRIPT = path.join(STREAMER_DIR, 'command_bridge.py');
 const MEDIA_FETCH_SCRIPT = path.join(STREAMER_DIR, 'media_fetch.py');
 const MJPEG_PORT = 9090;
@@ -419,6 +422,7 @@ function ingestTelemetryLine(line) {
   }
   try {
     const parsed = JSON.parse(line.slice('BMG_TELEM:'.length).trim());
+    if (wifiNetworkChanged(parsed.wifi_ssid)) void refreshRos2Daemon('rede Wi-Fi mudou');
     latestTelemetry = { ...latestTelemetry, ...parsed };
     latestTelemetryAt = Date.now();
     send('bmg:telemetry-update', latestTelemetry);
@@ -576,6 +580,17 @@ function startBackgroundServices() {
   servicesStopping = false;
   reapOrphanedServices();
   interruptOrphanMissions();
+  // 7.3: checked now, before this call starts the bridges; see rosHousekeeping.cjs.
+  void cleanOrphanShm({ run: rosCommand })
+    .then((result) => {
+      recordLog('driver', {
+        type: 'stdout',
+        text: result.skipped
+          ? `[BMG] SHM do Fast DDS preservado: processos ROS vivos (${result.alive.join(', ')}).\n`
+          : `[BMG] fastdds shm clean: ${result.removed} segmento(s) órfão(s) removido(s) (${result.before} -> ${result.after}).\n`,
+      });
+    })
+    .catch((error) => recordLog('driver', { type: 'stderr', text: `[BMG] fastdds shm clean falhou: ${error.message}\n` }));
   mjpegProcess = superviseService('mjpeg', [
     path.join(STREAMER_DIR, 'mjpeg_server.py'),
     String(MJPEG_PORT),
@@ -1058,6 +1073,25 @@ function splitNmcliFields(line) {
  * `exec` would put an operator-supplied SSID through a shell, where a name
  * containing a backtick or `$(...)` is executed rather than joined.
  */
+/** A ROS 2 CLI command in the station environment, for rosHousekeeping.cjs. */
+function rosCommand(command, args, options = {}) {
+  return spawnP(command, args, { env: getNectarEnv(), ...options });
+}
+
+/**
+ * Restart the `ros2` daemon (7.2), one restart at a time; see
+ * rosHousekeeping.cjs for why a daemon older than the driver is wrong.
+ */
+const refreshRos2Daemon = singleFlight(async (reason) => {
+  const ok = await restartRos2Daemon(rosCommand);
+  recordLog('driver', {
+    type: ok ? 'stdout' : 'stderr',
+    text: `[BMG] ros2 daemon reiniciado (${reason})${ok ? '' : ': falhou'}.\n`,
+  });
+  return ok;
+});
+const wifiNetworkChanged = createSsidChangeDetector();
+
 function spawnP(command, args, options = {}) {
   return new Promise((resolve) => {
     let child;
@@ -1120,6 +1154,7 @@ ipcMain.handle('bmg:connect-wifi', async (_event, ssid) => {
   }
 
   latestTelemetry.wifi_ssid = target;
+  if (wifiNetworkChanged(target)) void refreshRos2Daemon('rede Wi-Fi mudou');
   // NetworkManager returns before DHCP has settled on the drone's side.
   await new Promise((r) => setTimeout(r, 1500));
 
@@ -1204,6 +1239,7 @@ async function startDriverProcess() {
   }
 
   await ensureDroneRoute();
+  await refreshRos2Daemon('driver iniciado pela estação');
 
   try {
     driverProcess = spawn('make', ['driver-bebop', `IP=${latestTelemetry.drone_ip || DRONE_IP}`], {
@@ -1521,47 +1557,75 @@ ipcMain.handle('bmg:check-driver-status', async () => {
 // IPC: mission parameters
 // -----------------------------------------------------------------------------
 ipcMain.handle('bmg:get-parameters', async () => {
-  if (fs.existsSync(CONFIG_PATH)) {
-    try {
-      return { success: true, params: JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8')) };
-    } catch (e) {
-      console.warn('[BMG] mission_config.json is unreadable, asking Python for defaults:', e.message);
-    }
-  }
-  return readDefaultParameters();
+  const stored = readParameterFile(CONFIG_PATH);
+  if (stored.success) return stored;
+  if (!stored.missing) return stored;
+  // A fresh station: no document yet, so the mission's own defaults are the
+  // document. Only a missing file gets here; a corrupt one is refused above.
+  const defaults = await readParameterDefaults();
+  return defaults.success ? { ...defaults, source: 'defaults' } : defaults;
 });
 
-function readDefaultParameters() {
+/**
+ * `MissionParameters.factory()`, from `mission.py --dump-defaults`.
+ *
+ * The one source of defaults for the station: "Restaurar Padrões" and a fresh
+ * store both read it, so the sheet never shows a default the mission does not
+ * hold.
+ */
+function readParameterDefaults() {
   return new Promise((resolve) => {
-    exec(
-      `${PYTHON_VENV} -c "import json; from mvp_mission_bebop.parameters import MissionParameters; print(json.dumps(MissionParameters().to_dict()))"`,
-      { cwd: MISSION_DIR, env: getNectarEnv(), timeout: 15000 },
-      (err, stdout, stderr) => {
-        if (err || !stdout) {
-          return resolve({ success: false, error: (stderr || err?.message || '').trim() });
-        }
-        try {
-          resolve({ success: true, params: JSON.parse(stdout.trim()) });
-        } catch (parseErr) {
-          resolve({ success: false, error: parseErr.message });
-        }
+    let child;
+    try {
+      child = spawn(NECTAR_ACTIVATOR, ['python3', path.join(MISSION_DIR, 'mission.py'), '--dump-defaults'], {
+        cwd: MISSION_DIR,
+        env: getNectarEnv(),
+      });
+    } catch (error) {
+      resolve({ success: false, error: error.message });
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30000);
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      resolve({ success: false, error: error.message });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve({ success: false, error: (stderr.trim().split('\n').pop() || `código ${code}`).trim() });
+        return;
       }
-    );
+      try {
+        const lines = stdout.trim().split('\n');
+        const params = JSON.parse(lines[lines.length - 1]);
+        if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('não é um objeto');
+        resolve({ success: true, params });
+      } catch (error) {
+        resolve({ success: false, error: `defaults ilegíveis: ${error.message}` });
+      }
+    });
   });
 }
 
-ipcMain.handle('bmg:get-default-parameters', async () => readDefaultParameters());
+ipcMain.handle('bmg:get-parameter-defaults', async () => readParameterDefaults());
 
 ipcMain.handle('bmg:save-parameters', async (_event, params) => {
-  if (!params || typeof params !== 'object') {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
     return { success: false, error: 'Payload de parâmetros vazio' };
   }
   try {
-    // Written through a temporary file so a mission reading the config never
-    // sees a half-written document.
-    const temporary = `${CONFIG_PATH}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(params, null, 2), 'utf-8');
-    fs.renameSync(temporary, CONFIG_PATH);
+    writeJsonAtomic(CONFIG_PATH, params);
     return { success: true };
   } catch (err) {
     console.error('[BMG] Failed to write mission_config.json:', err);
@@ -1914,6 +1978,26 @@ ipcMain.handle('bmg:camera-tilt', async (_event, payload = {}) => {
 ipcMain.handle('bmg:get-camera-tilt', async () => ({ tilt: lastCameraTilt }));
 
 /**
+ * Start (`start: true`) or abort the magnetometer calibration (6.4).
+ *
+ * Manual procedure, motors off: the operator turns the aircraft by hand while
+ * it reports each axis. Refused while a mission process exists, since the
+ * aircraft may then be airborne. The result is whatever the aircraft reports on
+ * `states/magneto_calibration`, read back through the telemetry bridge.
+ */
+ipcMain.handle('bmg:magneto-calibration', async (_event, payload = {}) => {
+  const start = payload && payload.start;
+  if (typeof start !== 'boolean') return { success: false, error: 'pedido inválido' };
+  if (start && missionProcess) {
+    return { success: false, error: 'Calibração bloqueada com a missão em execução.' };
+  }
+  if (!sendCommand({ op: 'magneto', start })) {
+    return { success: false, error: 'ponte de comando indisponível' };
+  }
+  return { success: true, start };
+});
+
+/**
  * Ask the running mission to continue at a different stage.
  *
  * Published on the aircraft's namespace as an Int32; `mission.py` subscribes,
@@ -2259,6 +2343,23 @@ ipcMain.handle('bmg:get-voice-level', async () => ({ volume: voiceVolume, muted:
  * process with `--no-fly` and a stage subset, so a rehearsal cannot diverge
  * from the flight it is rehearsing.
  */
+/**
+ * The parameter document of a launch, or null when it is not a JSON object.
+ *
+ * @param {unknown} paramsJson  Serialized document, or the document itself.
+ */
+function parseLaunchDocument(paramsJson) {
+  let doc = paramsJson;
+  if (typeof paramsJson === 'string') {
+    try {
+      doc = JSON.parse(paramsJson);
+    } catch (_error) {
+      return null;
+    }
+  }
+  return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : null;
+}
+
 async function startMissionProcess(options = {}) {
   if (missionProcess) return { success: false, message: 'Uma missão já está em andamento.' };
   const orphans = findOrphanMissions();
@@ -2279,30 +2380,18 @@ async function startMissionProcess(options = {}) {
   const scriptPath = path.join(MISSION_DIR, 'mission.py');
   const args = [scriptPath];
 
-  // `--params-json` carries the whole document and is applied first; the flags
-  // below then override individual fields, matching the order in
-  // `mission.py:main`.
-  if (options.paramsJson) {
-    args.push('--params-json', typeof options.paramsJson === 'string'
-      ? options.paramsJson
-      : JSON.stringify(options.paramsJson));
+  // `--params-json` is the only source of the flight parameters (5.1). The
+  // per-field flags it used to be followed by won over it, so a field that was
+  // not a finite number on the station side flew as a hardcoded fallback.
+  const doc = parseLaunchDocument(options.paramsJson);
+  if (!doc) {
+    return { success: false, error: 'Documento de parâmetros ausente ou inválido; lançamento bloqueado.' };
   }
+  args.push('--params-json', JSON.stringify(doc));
 
   const push = (flag, value) => {
     if (value !== undefined && value !== null && value !== '') args.push(flag, String(value));
   };
-
-  push('--countdown', options.countdown ?? 0);
-  push('--height', options.height ?? options.targetAltitude);
-  push('--velocity', options.velocity ?? options.speed ?? options.forwardSpeed);
-  push('--rtl-velocity', options.rtlVelocity);
-  push('--search-timeout', options.searchTimeout ?? options.search_timeout_sec);
-  push('--hover-duration', options.hoverDuration ?? options.hoverTime ?? options.hover_duration_sec);
-  push('--confidence', options.confidence ?? options.confidence_threshold);
-  push('--arrival-radius', options.arrivalRadius ?? options.arrival_radius_m);
-  push('--model-path', options.modelPath);
-  push('--ip', options.ip);
-  push('--detection-topic', options.detectionTopic);
 
   // Bench mode runs one routine rather than the sequence. The selection goes to
   // `mission.py --stages`, which takes it literally and in order.
@@ -2443,7 +2532,15 @@ ipcMain.handle('bmg:start-bench-stage', async (_event, options = {}) => {
   }
   cancelPendingBenchStage();
 
-  const spawnOptions = { ...options, stages: [stage], noFly: true, countdown: 0 };
+  const doc = parseLaunchDocument(options.paramsJson);
+  if (!doc) {
+    return { success: false, error: 'Documento de parâmetros ausente ou inválido; rotina bloqueada.' };
+  }
+  // The station counts the bench countdown itself (benchCountdown.cjs), so
+  // the routine is spawned with the document's countdown at zero rather than
+  // with a flag overriding it.
+  const benchDoc = { ...doc, kinematics: { ...(doc.kinematics || {}), countdown_sec: 0 } };
+  const spawnOptions = { ...options, paramsJson: JSON.stringify(benchDoc), stages: [stage], noFly: true, countdown: 0 };
   const countdown = Math.max(0, Number(options.countdown) || 0);
   if (countdown <= 0) return startMissionProcess(spawnOptions);
 

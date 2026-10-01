@@ -1,10 +1,11 @@
 /**
  * The editable surface of `mvp_mission_bebop.parameters.MissionParameters`.
  *
- * Deliberately small. The operator changes the six figures that define how the
+ * Deliberately small. The operator changes the figures that define how the
  * mission behaves — how high, how fast, how long it settles, where the camera
- * starts and where it stops, and how long each open-ended stage may run — and
- * nothing else. PID gains, jerk ceilings, dead reckoning and the vision
+ * starts and where it stops, how long each open-ended stage may run and how
+ * long the launch counts down — and nothing else. Defaults are not held here:
+ * they are `MissionParameters.factory()`, served by `mission.py --dump-defaults`. PID gains, jerk ceilings, dead reckoning and the vision
  * thresholds stay in `mission_config.json` untouched: the document round-trips
  * whole, so a save never resets a field this schema does not list.
  *
@@ -31,8 +32,6 @@ export interface NumberParameter extends Common {
   unit?: string;
   /** Decimal places used for display and for change detection. */
   precision: number;
-  /** The value "Restaurar padrões" puts back. */
-  defaultValue: number;
 }
 
 export type ParameterSpec = NumberParameter;
@@ -60,7 +59,6 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         step: 0.1,
         unit: 'm',
         precision: 1,
-        defaultValue: 1.8,
       },
       {
         kind: 'number',
@@ -72,7 +70,6 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         step: 0.01,
         unit: 'm/s',
         precision: 2,
-        defaultValue: 0.2,
       },
       {
         kind: 'number',
@@ -84,7 +81,6 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         step: 0.5,
         unit: 's',
         precision: 1,
-        defaultValue: 2,
       },
     ],
   },
@@ -103,7 +99,6 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         step: 1,
         unit: '°',
         precision: 0,
-        defaultValue: -20,
       },
       {
         kind: 'number',
@@ -115,14 +110,13 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         step: 1,
         unit: '°',
         precision: 0,
-        defaultValue: -69,
       },
     ],
   },
   {
     id: 'timeouts',
     title: 'Limites de Tempo',
-    summary: 'Quanto tempo a busca e o retorno podem durar antes do failsafe',
+    summary: 'Quanto tempo a busca e o retorno podem durar, e a contagem antes da decolagem',
     items: [
       {
         kind: 'number',
@@ -134,7 +128,6 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         step: 1,
         unit: 's',
         precision: 0,
-        defaultValue: 30,
       },
       {
         kind: 'number',
@@ -146,7 +139,17 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         step: 1,
         unit: 's',
         precision: 0,
-        defaultValue: 60,
+      },
+      {
+        kind: 'number',
+        path: 'kinematics.countdown_sec',
+        label: 'Contagem Regressiva',
+        hint: 'Janela entre o lançamento e a decolagem. Zero decola sem contagem.',
+        min: 0,
+        max: 30,
+        step: 1,
+        unit: 's',
+        precision: 0,
       },
     ],
   },
@@ -157,7 +160,7 @@ export const ALL_PARAMETERS: ParameterSpec[] = PARAMETER_GROUPS.flatMap((g) => g
 /**
  * Paths whose edits make the working document dirty.
  *
- * The six parameters, plus `no_fly`: the bench switch on the pre-flight screen
+ * The sheet parameters, plus `no_fly`: the bench switch on the pre-flight screen
  * edits the same document, and a toggle that never counted as a change would
  * never be committed to disk before launch.
  */

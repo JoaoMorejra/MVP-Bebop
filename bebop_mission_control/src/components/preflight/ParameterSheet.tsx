@@ -14,6 +14,8 @@ import { cn } from '../../lib/format';
 
 interface ParameterSheetProps {
   working: ParamsDoc;
+  /** `MissionParameters.factory()`; `null` until the mission has served it. */
+  defaults: ParamsDoc | null;
   changedPaths: Set<string>;
   dirty: boolean;
   saving: boolean;
@@ -33,9 +35,13 @@ const GROUP_ICON: Record<ParameterGroupId, React.ElementType> = {
   timeouts: Timer,
 };
 
-const readNumber = (doc: ParamsDoc, spec: ParameterSpec): number => {
+/**
+ * The figure at `spec.path`, or `null`. Never a default: a missing value shown
+ * as one would be launched as one, and the operator never chose it.
+ */
+const readNumber = (doc: ParamsDoc | null, spec: ParameterSpec): number | null => {
   const raw = getPath(doc, spec.path);
-  return typeof raw === 'number' && Number.isFinite(raw) ? raw : spec.defaultValue;
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
 };
 
 /**
@@ -45,12 +51,28 @@ const readNumber = (doc: ParamsDoc, spec: ParameterSpec): number => {
  */
 const ParameterControl: React.FC<{
   spec: ParameterSpec;
-  value: number;
+  value: number | null;
+  defaultValue: number | null;
   changed: boolean;
   onEdit: (path: string, value: unknown) => void;
-}> = ({ spec, value, changed, onEdit }) => {
-  const atDefault = Math.abs(value - spec.defaultValue) < 10 ** -(spec.precision + 1);
+}> = ({ spec, value, defaultValue, changed, onEdit }) => {
+  const atDefault =
+    value !== null && defaultValue !== null && Math.abs(value - defaultValue) < 10 ** -(spec.precision + 1);
   const edit = (next: number) => onEdit(spec.path, next);
+
+  if (value === null) {
+    return (
+      <div
+        data-missing-value={spec.path}
+        className="rounded-bezel border border-amber/45 bg-amber/[0.06] px-3.5 py-2.5"
+      >
+        <span className="font-sans text-sm font-medium text-frost">{spec.label}</span>
+        <p className="mt-0.5 font-sans text-2xs leading-relaxed text-amber">
+          Valor ausente no documento de parâmetros. Restaure os padrões ou ajuste antes de lançar.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -88,7 +110,7 @@ const ParameterControl: React.FC<{
         step={spec.step}
         precision={spec.precision}
         label={spec.label}
-        marker={spec.defaultValue}
+        marker={defaultValue ?? undefined}
         onChange={edit}
         className="mt-3"
       />
@@ -98,10 +120,12 @@ const ParameterControl: React.FC<{
           {spec.min.toFixed(spec.precision)}
           {spec.unit}
         </span>
-        <span className={cn('tnum', atDefault ? 'text-haze-deep' : 'text-haze')}>
-          padrão {spec.defaultValue.toFixed(spec.precision)}
-          {spec.unit}
-        </span>
+        {defaultValue !== null ? (
+          <span className={cn('tnum', atDefault ? 'text-haze-deep' : 'text-haze')}>
+            padrão {defaultValue.toFixed(spec.precision)}
+            {spec.unit}
+          </span>
+        ) : null}
         <span className="tnum">
           {spec.max.toFixed(spec.precision)}
           {spec.unit}
@@ -156,10 +180,11 @@ const GimbalArc: React.FC<{ searchDeg: number; nadirDeg: number }> = ({ searchDe
 const GroupCard: React.FC<{
   group: ParameterGroup;
   working: ParamsDoc;
+  defaults: ParamsDoc | null;
   changedPaths: Set<string>;
   onEdit: (path: string, value: unknown) => void;
   index: number;
-}> = ({ group, working, changedPaths, onEdit, index }) => {
+}> = ({ group, working, defaults, changedPaths, onEdit, index }) => {
   const Icon = GROUP_ICON[group.id];
   const changed = group.items.filter((item) => changedPaths.has(item.path)).length;
 
@@ -199,8 +224,8 @@ const GroupCard: React.FC<{
         {group.id === 'gimbal' ? (
           <div className="flex items-center gap-3 rounded-bezel border border-strut-soft bg-abyss/40 px-3 py-2">
             <GimbalArc
-              searchDeg={readNumber(working, group.items[0])}
-              nadirDeg={readNumber(working, group.items[1])}
+              searchDeg={readNumber(working, group.items[0]) ?? 0}
+              nadirDeg={readNumber(working, group.items[1]) ?? -90}
             />
             <p className="text-3xs leading-relaxed text-haze">
               A câmera desce do ângulo de varredura até apontar totalmente para baixo durante o
@@ -214,6 +239,7 @@ const GroupCard: React.FC<{
             key={spec.path}
             spec={spec}
             value={readNumber(working, spec)}
+            defaultValue={readNumber(defaults, spec)}
             changed={changedPaths.has(spec.path)}
             onEdit={onEdit}
           />
@@ -224,14 +250,16 @@ const GroupCard: React.FC<{
 };
 
 /**
- * The six parameters that define the mission, in three cards.
+ * The parameters that define the mission, in three cards.
  *
  * Saving writes the whole document, so the fields not shown here — PID gains,
  * jerk ceilings, calibration statistics — keep the values the mission last
- * wrote. "Restaurar padrões" resets only these six, for the same reason.
+ * wrote. "Restaurar padrões" resets only the sheet fields, for the same
+ * reason, to the mission's own defaults.
  */
 export const ParameterSheet: React.FC<ParameterSheetProps> = ({
   working,
+  defaults,
   changedPaths,
   dirty,
   saving,
@@ -244,8 +272,12 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
   onApplyPreset,
 }) => {
   const restoreDefaults = () => {
+    if (!defaults) return;
     for (const group of PARAMETER_GROUPS) {
-      for (const spec of group.items) onEdit(spec.path, spec.defaultValue);
+      for (const spec of group.items) {
+        const value = readNumber(defaults, spec);
+        if (value !== null) onEdit(spec.path, value);
+      }
     }
   };
 
@@ -254,7 +286,7 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
       <div className="flex shrink-0 items-center justify-between border-b border-strut-soft px-5 py-3.5">
         <div>
           <h2 className="font-cond text-lg font-semibold tracking-wide text-frost">Parâmetros de voo</h2>
-          <p className="text-2xs text-haze">Seis ajustes que definem o comportamento da missão.</p>
+          <p className="text-2xs text-haze">Os ajustes que definem o comportamento da missão.</p>
         </div>
       </div>
 
@@ -265,6 +297,7 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
             group={group}
             index={index}
             working={working}
+            defaults={defaults}
             changedPaths={changedPaths}
             onEdit={onEdit}
           />
@@ -272,7 +305,13 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
       </div>
 
       <div className="flex shrink-0 items-center gap-2 border-t border-strut-soft px-4 py-3">
-        <Button variant="quiet" onClick={restoreDefaults} icon={<RotateCcw size={13} />}>
+        <Button
+          variant="quiet"
+          onClick={restoreDefaults}
+          disabled={!defaults}
+          title={defaults ? undefined : 'Padrões da missão indisponíveis'}
+          icon={<RotateCcw size={13} />}
+        >
           Restaurar Padrões
         </Button>
         <Button

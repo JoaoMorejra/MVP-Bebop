@@ -28,7 +28,7 @@ interface CockpitScreenProps {
   captureFlash: boolean;
   captureCount: number;
   latestCapture: RawEvidence | null;
-  arrivalRadius: number;
+  arrivalRadius: number | null;
   /**
    * The aircraft is down from a flight that completed. Distinct from the
    * mission merely being over: a faulted flight has no assessment behind it,

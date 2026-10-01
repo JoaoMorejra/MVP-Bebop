@@ -6,6 +6,7 @@ import type { LinkProgressEvent, LinkReadiness, WifiNetwork } from '../../types/
 import type { LinkPhase } from '../../hooks/useLink';
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { getPath } from '../../lib/paths';
+import { preflightBlockedReason } from '../../lib/preflightGate';
 import { VideoBackdrop } from '../brand/VideoBackdrop';
 import { StatusBar } from '../shell/StatusBar';
 import { LaunchDial } from './LaunchDial';
@@ -32,6 +33,8 @@ interface PreflightScreenProps {
   onStopDriver: () => void;
 
   params: ParamsDoc | null;
+  /** `MissionParameters.factory()`, for "Restaurar Padrões"; `null` until served. */
+  paramDefaults: ParamsDoc | null;
   paramsStatus: 'loading' | 'ready' | 'saving' | 'error';
   paramsError: string | null;
   changedPaths: Set<string>;
@@ -106,35 +109,20 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
   const missingTopics = readiness?.missing ?? [];
 
 
-  /**
-   * What stops the mission from being commanded.
-   *
-   * Bench mode is the point at which these differ. `mission.py --no-fly` still
-   * needs the driver, because it connects to it and subscribes to the camera,
-   * but the kinematic simulator stands in for the airframe: there is no Wi-Fi
-   * link to the aircraft and no /bebop/odom to wait for.
-   */
-  const blockedReason = useMemo(() => {
-    if (paramsStatus === 'error') return 'Parâmetros indisponíveis';
-    if (!driverRunning) return 'Driver ROS 2 fora do ar';
-    if (benchMode) return null;
-    if (!telemetry.connected) return 'Conecte-se à rede da aeronave para liberar o comando';
-    if (!flightReady) {
-      return missingTopics.length
-        ? `Tópicos sem tráfego: ${missingTopics.join(', ')}`
-        : 'Validando tópicos da aeronave';
-    }
-    if (stale) return 'Sem odometria recente';
-    return null;
-  }, [
-    paramsStatus,
-    driverRunning,
-    benchMode,
-    telemetry.connected,
-    flightReady,
-    missingTopics,
-    stale,
-  ]);
+  /** What stops the mission from being commanded; see `lib/preflightGate.ts`. */
+  const blockedReason = useMemo(
+    () =>
+      preflightBlockedReason({
+        paramsStatus,
+        driverRunning,
+        benchMode,
+        connected: telemetry.connected,
+        flightReady,
+        missingTopics,
+        stale,
+      }),
+    [paramsStatus, driverRunning, benchMode, telemetry.connected, flightReady, missingTopics, stale]
+  );
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-abyss">
@@ -290,6 +278,7 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
             {params ? (
               <ParameterSheet
                 working={params}
+                defaults={props.paramDefaults}
                 changedPaths={props.changedPaths}
                 dirty={dirty}
                 saving={paramsStatus === 'saving'}

@@ -119,7 +119,7 @@ async function mount() {
 async function clickLaunch(): Promise<{ settled: Promise<{ success: boolean }> }> {
   let settled!: Promise<{ success: boolean }>;
   await act(async () => {
-    settled = probe.runtime.launch({ countdown: 10, noFly: false });
+    settled = probe.runtime.launch({ countdown: 10, noFly: false, paramsJson: '{}' });
   });
   return { settled };
 }
@@ -214,7 +214,7 @@ describe('pre-flight lock on the bench', () => {
     await mount();
     let settled!: Promise<{ success: boolean }>;
     await act(async () => {
-      settled = probe.runtime.launch({ countdown: 10, noFly: true });
+      settled = probe.runtime.launch({ countdown: 10, noFly: true, paramsJson: '{}' });
     });
     expect(homeAvailable()).toBe(false);
     await act(async () => bridge.spawn(true));

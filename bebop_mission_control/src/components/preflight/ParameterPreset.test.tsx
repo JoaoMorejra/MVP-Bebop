@@ -2,8 +2,9 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { completeDocument } from '../../lib/__fixtures__/missionDocument';
 import { ALL_PARAMETERS } from '../../lib/parameterSchema';
-import { setPath } from '../../lib/paths';
+import { getPath, setPath } from '../../lib/paths';
 import { matchesPreset, type ParamsDoc } from '../../hooks/useMissionParameters';
 import { ParameterSheet } from './ParameterSheet';
 import { DiscardChangesDialog } from './DiscardChangesDialog';
@@ -13,9 +14,7 @@ declare global {
 }
 
 function tuned(): ParamsDoc {
-  let doc: ParamsDoc = { no_fly: false, calibration: { samples: 12 } };
-  for (const spec of ALL_PARAMETERS) doc = setPath(doc, spec.path, spec.defaultValue);
-  return doc;
+  return completeDocument({ 'calibration.samples': 12 });
 }
 
 let container: HTMLDivElement;
@@ -39,7 +38,8 @@ describe('matchesPreset', () => {
   });
 
   it('breaks as soon as one flight parameter moves', () => {
-    const edited = setPath(tuned(), ALL_PARAMETERS[0].path, ALL_PARAMETERS[0].defaultValue + 1);
+    const path = ALL_PARAMETERS[0].path;
+    const edited = setPath(tuned(), path, Number(getPath(tuned(), path)) + 1);
     expect(matchesPreset(edited, tuned())).toBe(false);
   });
 
@@ -60,6 +60,7 @@ describe('ParameterSheet', () => {
       root.render(
         <ParameterSheet
           working={tuned()}
+          defaults={tuned()}
           changedPaths={new Set()}
           dirty={false}
           saving={false}

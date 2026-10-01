@@ -34,33 +34,13 @@ import { useVoiceLevel } from './hooks/useVoiceLevel';
 import { buildForensicReport } from './lib/forensics';
 import { LAUNCH_KEYS, reserveLaunchPhrase } from './lib/copilotPhrases';
 import { getPath } from './lib/paths';
+import { launchBlockers, launchCountdownSec } from './lib/launchDocument';
 import { isMissionOver } from './lib/missionOutcome';
 import { useFinishLock } from './hooks/useFinishLock';
 import { reportMayStart } from './lib/finishLock';
 import { useGuardedAsync } from './hooks/useGuardedAsync';
 import { useMissionCountdown } from './hooks/useMissionCountdown';
 import { runCriticalBatteryReturn } from './lib/batteryReturn';
-
-const num = (doc: unknown, path: string, fallback: number): number => {
-  const v = getPath(doc, path);
-  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
-};
-
-/** The launch countdown when the document does not ask for a longer one, in seconds. */
-const STATION_COUNTDOWN_SEC = 10;
-
-/**
- * The launch countdown for `doc`.
- *
- * `mission.py` persists `kinematics.countdown_sec` on every run, and its own
- * default is 0 (no countdown for a CLI run), so the stored figure is 0 unless
- * someone set it. Read literally, that skipped the countdown for every launch
- * from the station. A non-positive value therefore means the station standard.
- */
-function launchCountdownSec(doc: unknown): number {
-  const stored = num(doc, 'kinematics.countdown_sec', 0);
-  return stored > 0 ? stored : STATION_COUNTDOWN_SEC;
-}
 
 /** The station is two tabs; these open over whichever one is current. */
 type Overlay = 'none' | 'diagnostics';
@@ -160,7 +140,9 @@ export const App: React.FC = () => {
   const airborne = preflightLocked(mission.state, mission.ran);
 
   const committed = params.committed;
-  const arrivalRadius = num(committed, 'rtl.arrival_radius_m', 0.2);
+  const storedRadius = getPath(committed, 'rtl.arrival_radius_m');
+  const arrivalRadius =
+    typeof storedRadius === 'number' && Number.isFinite(storedRadius) ? storedRadius : null;
 
   /**
    * The copilot narrates every run the same way: a real flight, a bench
@@ -212,20 +194,47 @@ export const App: React.FC = () => {
     if (mission.state === 'idle') primeLaunchPhrases();
   }, [mission.state, primeLaunchPhrases]);
 
+  /**
+   * The document a launch or a bench routine is about to send, committed.
+   *
+   * Pending edits are saved first, because the mission merges what it is sent
+   * over `mission_config.json`; a save that fails, a document that is not
+   * ready, or one missing a required number stops the launch here with the
+   * reason on screen. Returns `null` in every one of those cases.
+   */
+  const commitLaunchDocument = useCallback(async (): Promise<Record<string, unknown> | null> => {
+    if (params.status !== 'ready') {
+      setLaunchError(
+        params.status === 'error'
+          ? 'Parâmetros indisponíveis; lançamento bloqueado.'
+          : 'Parâmetros ainda não carregados; lançamento bloqueado.'
+      );
+      return null;
+    }
+    if (params.dirty && !(await params.save())) {
+      setLaunchError('Não foi possível salvar os parâmetros; lançamento abortado.');
+      return null;
+    }
+    const doc = params.working ?? params.committed;
+    const missing = launchBlockers(doc);
+    if (!doc || missing.length) {
+      setLaunchError(`Parâmetros sem valor numérico válido: ${missing.join(', ')}.`);
+      return null;
+    }
+    return doc;
+  }, [params]);
+
   const launch = useCallback(async () => {
     if (launching.current) return;
     launching.current = true;
     primeLaunchPhrases();
     try {
-      // Commit any pending edits first: the mission reads mission_config.json,
-      // so an unsaved slider would otherwise not be the flight that happens.
-      if (params.dirty) await params.save();
-
-      const doc = params.working ?? params.committed;
-      // A real parameter rather than a UI flourish: the same figure goes to
-      // `mission.py --countdown`, so the overlay and the aircraft count the
-      // same window.
-      const seconds = launchCountdownSec(doc);
+      const doc = await commitLaunchDocument();
+      if (!doc) return;
+      // A real parameter rather than a UI flourish: the mission reads the same
+      // `kinematics.countdown_sec` from the document, so the overlay and the
+      // aircraft count the same window. Zero means no countdown.
+      const seconds = launchCountdownSec(doc) ?? 0;
 
       resetTrack();
       setLaunchError(null);
@@ -236,21 +245,12 @@ export const App: React.FC = () => {
       setPendingStage(null);
       setCountdownSeconds(seconds);
 
+      // The document is the only source of the flight parameters (5.1): no
+      // per-field option, so no fallback can stand in for a value the
+      // operator never set.
       const result = await mission.launch({
         countdown: seconds,
         noFly: Boolean(getPath(doc, 'no_fly')),
-        height: num(doc, 'kinematics.target_altitude_m', 1),
-        velocity: num(doc, 'kinematics.forward_cruise_velocity', 0.2),
-        rtlVelocity: num(doc, 'rtl.max_speed', 0.1),
-        searchTimeout: num(doc, 'timeouts.search_timeout_sec', 30),
-        hoverDuration: num(doc, 'kinematics.hover_duration_sec', 7),
-        confidence: num(doc, 'vision.confidence_threshold', 0.5),
-        arrivalRadius: num(doc, 'rtl.arrival_radius_m', 0.2),
-        modelPath: String(getPath(doc, 'vision.model_path') ?? 'yolov8n.pt'),
-        ip: String(getPath(doc, 'network.drone_ip') ?? '192.168.42.1'),
-        detectionTopic: String(
-          getPath(doc, 'network.detection_stream_topic') ?? '/bebop/camera/detections'
-        ),
         paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
       });
 
@@ -273,7 +273,7 @@ export const App: React.FC = () => {
     } finally {
       launching.current = false;
     }
-  }, [failsafe.thresholdPct, mission, params, primeLaunchPhrases, resetTrack]);
+  }, [commitLaunchDocument, failsafe.thresholdPct, mission, params, primeLaunchPhrases, resetTrack]);
 
   /**
    * One routine on the bench: same process, motors inert, and the same
@@ -284,7 +284,8 @@ export const App: React.FC = () => {
     async (stage: number) => {
       if (!bridge) return;
       primeLaunchPhrases();
-      const doc = params.working ?? params.committed;
+      const doc = await commitLaunchDocument();
+      if (!doc) return;
 
       // Only one mission process may exist, so switching routines means ending
       // the one that is up. Safe by construction here: everything the bench
@@ -294,7 +295,7 @@ export const App: React.FC = () => {
         await bridge.endMission().catch(() => undefined);
       }
 
-      const seconds = launchCountdownSec(doc);
+      const seconds = launchCountdownSec(doc) ?? 0;
       setLaunchError(null);
       setBenchStage(stage);
       setPendingStage(null);
@@ -305,11 +306,6 @@ export const App: React.FC = () => {
 
       const result = await bridge.startBenchStage({
         stage,
-        modelPath: String(getPath(doc, 'vision.model_path') ?? 'yolov8n.pt'),
-        ip: String(getPath(doc, 'network.drone_ip') ?? '192.168.42.1'),
-        detectionTopic: String(
-          getPath(doc, 'network.detection_stream_topic') ?? '/bebop/camera/detections'
-        ),
         paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
         countdown: seconds,
       });
@@ -327,16 +323,7 @@ export const App: React.FC = () => {
         setScreen('cockpit');
       }
     },
-    [
-      bridge,
-      narration,
-      failsafe.thresholdPct,
-      mission,
-      params.working,
-      params.committed,
-      primeLaunchPhrases,
-      resetTrack,
-    ]
+    [bridge, commitLaunchDocument, narration, failsafe.thresholdPct, mission, primeLaunchPhrases, resetTrack]
   );
 
   /**
@@ -624,6 +611,7 @@ export const App: React.FC = () => {
         onStartDriver={() => void link.startDriver()}
         onStopDriver={() => void link.stopDriver()}
         params={params.working}
+        paramDefaults={params.factory}
         paramsStatus={params.status}
         paramsError={params.error}
         changedPaths={params.changedPaths}
@@ -708,7 +696,12 @@ export const App: React.FC = () => {
         <div className="fixed inset-0 z-[60] flex flex-col bg-abyss/92 backdrop-blur-sm">
           <DiagnosticsOverlayHeader title="Diagnóstico · Terminal" onClose={() => setOverlay('none')} />
           <div className="min-h-0 flex-1">
-            <DiagnosticsScreen missionRunning={running} onLand={land} onClose={() => setOverlay('none')} />
+            <DiagnosticsScreen
+              missionRunning={running}
+              onLand={land}
+              onClose={() => setOverlay('none')}
+              magneto={telemetry.magneto_calibration ?? null}
+            />
           </div>
         </div>
       ) : null}

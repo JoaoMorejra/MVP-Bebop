@@ -33,7 +33,8 @@ interface TacticalMapProps {
   baseLatitude?: number | null;
   baseLongitude?: number | null;
   baseSource?: string;
-  arrivalRadius: number;
+  /** Metres; `null` when the parameter document does not hold it, and no circle is drawn. */
+  arrivalRadius: number | null;
   stale: boolean;
   /**
    * No mission yet: frame the surroundings rather than the trail. The trail is
@@ -601,17 +602,19 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           {showGrid ? <LocalGrid view={view} size={size} /> : null}
 
           {/* The radius the return has to land inside. */}
-          <circle
-            cx={homeX}
-            cy={homeY}
-            r={Math.max(arrivalRadius * view.pxPerMetre, 7)}
-            fill="#01D5A3"
-            fillOpacity="0.08"
-            stroke="#5CF2CE"
-            strokeOpacity="0.7"
-            strokeWidth="1.5"
-            strokeDasharray="4 3"
-          />
+          {arrivalRadius !== null ? (
+            <circle
+              cx={homeX}
+              cy={homeY}
+              r={Math.max(arrivalRadius * view.pxPerMetre, 7)}
+              fill="#01D5A3"
+              fillOpacity="0.08"
+              stroke="#5CF2CE"
+              strokeOpacity="0.7"
+              strokeWidth="1.5"
+              strokeDasharray="4 3"
+            />
+          ) : null}
 
           {/* A dark casing under the trail keeps it legible over bright tiles. */}
           {fullPath ? (

@@ -12,7 +12,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Final, List, Optional, Tuple, Union
 
 logger = logging.getLogger("MissionParameters")
 
@@ -403,6 +403,15 @@ class AltitudeGovernorConfig:
         return max(0.0, self.max_climb_speed) if self.hold_enabled else 0.0
 
 
+#: Floor of ``kinematics.countdown_sec``, seconds.
+#:
+#: Zero is a valid countdown, not a sentinel: the takeoff stage then warms the
+#: detector and samples the ground reference before liftoff without the
+#: countdown overlapping them (``steps/takeoff.py:_countdown``), and the
+#: three-second clearance call is raised at once. Negative and non-finite
+#: values are refused by ``mission.py`` before anything is persisted.
+COUNTDOWN_MIN_SEC: Final[float] = 0.0
+
 @dataclass
 class FlightKinematicsConfig:
     """Translational velocity caps and geometric safety envelopes."""
@@ -425,7 +434,13 @@ class FlightKinematicsConfig:
     #: cannot be satisfied costs nothing relative to the old wait.
     takeoff_stabilize_duration_sec: float = 4.0
     hover_duration_sec: float = 7.0
-    countdown_sec: float = 0.0
+    #: Pre-flight countdown, seconds; 0 means none. Taken literally by the
+    #: station and by the mission (see :data:`COUNTDOWN_MIN_SEC`).
+    #:
+    #: Was 0.0, which the station read as "unset" and replaced with its own 10 s,
+    #: so an operator who asked for no countdown got one. The default is now the
+    #: station's figure and every value, 0 included, means what it says.
+    countdown_sec: float = 10.0
     #: Metres per second produced by a unit normalized velocity command.
     #:
     #: ``BebopDrone.move_velocity`` publishes a Twist normalized to [-1, 1]
@@ -940,6 +955,11 @@ class InspectionConfig:
 class TimeoutsConfig:
     """Execution timeouts and sensor watchdog windows."""
 
+    #: Longest wait for ``FlatTrimChanged`` after the flat-trim request, in
+    #: seconds. The Bebop answers within a few hundred milliseconds on a level
+    #: surface; a real flight without the answer does not take off.
+    flat_trim_ack_timeout_sec: float = 3.0
+
     search_timeout_sec: float = 30.0
     #: Stage 3 window, sized from the standoff the approach has to close.
     #:
@@ -1034,6 +1054,15 @@ class MissionParameters:
         from mvp_mission_bebop.telemetry.battery import normalize_percentage
 
         return normalize_percentage(self.battery.land_pct, "battery.land_pct")
+
+    @classmethod
+    def factory(cls) -> "MissionParameters":
+        """The factory defaults: every field at its dataclass default.
+
+        The single source of defaults for the ground station, served by
+        ``mission.py --dump-defaults`` (``electron/main.cjs:readParameterDefaults``).
+        """
+        return cls()
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert parameter dataclasses to a plain nested dictionary.

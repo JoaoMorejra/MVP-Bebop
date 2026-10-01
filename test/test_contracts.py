@@ -309,7 +309,7 @@ def test_announcer_symbols_the_gcs_invokes_directly_exist():
     ],
 )
 def test_cli_flags_the_gcs_passes_are_accepted(flag, value, monkeypatch):
-    """electron/main.cjs:658-677 always spawns with these nine flags."""
+    """The CLI keeps these flags; the station now sends only --params-json and the arming flag."""
     from mvp_mission_bebop.mission import parse_arguments
 
     monkeypatch.setattr(sys, "argv", ["mission.py", flag, value])

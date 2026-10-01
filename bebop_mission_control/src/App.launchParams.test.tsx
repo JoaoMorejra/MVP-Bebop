@@ -16,8 +16,18 @@ declare global {
  * reaches the two real call sites and reads what they hand the host.
  */
 const hoisted = vi.hoisted(() => {
-  const doc = {
-    kinematics: { target_altitude_m: 1.6, countdown_sec: 0 },
+  const doc: Record<string, any> = {
+    kinematics: {
+      target_altitude_m: 1.6,
+      forward_cruise_velocity: 0.2,
+      takeoff_stabilize_duration_sec: 2,
+      hover_duration_sec: 7,
+      countdown_sec: 0,
+    },
+    gimbal: { search_tilt_deg: -20, nadir_tilt_deg: -69 },
+    timeouts: { search_timeout_sec: 30 },
+    rtl: { timeout_sec: 60, max_speed: 0.1, arrival_radius_m: 0.2 },
+    vision: { confidence_threshold: 0.5, model_path: 'yolov8n.pt' },
     network: { drone_ip: '192.168.42.1' },
     battery: { land_pct: 99 },
   };
@@ -55,7 +65,13 @@ const hoisted = vi.hoisted(() => {
       reset: () => undefined,
       beginBenchStage: () => undefined,
     },
-    params: { working: doc, committed: doc, dirty: false, save: async () => undefined },
+    params: {
+      working: doc as Record<string, any>,
+      committed: doc as Record<string, any>,
+      status: 'ready' as string,
+      dirty: false,
+      save: vi.fn(async (): Promise<boolean> => true),
+    },
     stream: { fps: 0 },
     camera: { tilt: -20, available: false, set: () => undefined, reset: () => undefined },
     copilot: { say: async () => undefined, cancel: () => undefined, prepare: () => undefined },
@@ -129,6 +145,11 @@ beforeEach(() => {
   window.history.replaceState(null, '', '/');
   hoisted.launch.mockClear();
   hoisted.startBenchStage.mockClear();
+  hoisted.stable.params.working = hoisted.doc;
+  hoisted.stable.params.committed = hoisted.doc;
+  hoisted.stable.params.status = 'ready';
+  hoisted.stable.params.dirty = false;
+  hoisted.stable.params.save = vi.fn(async (): Promise<boolean> => true);
   for (const key of Object.keys(hoisted.props)) delete hoisted.props[key];
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -213,3 +234,80 @@ describe('launchParamsJson', () => {
     expect(JSON.parse(launchParamsJson(null, 20))).toEqual({ battery: { land_pct: 20 } });
   });
 });
+
+describe('the parameter document as the only source of a launch', () => {
+  const sent = (options: Record<string, unknown> | undefined) => JSON.parse(String(options?.paramsJson));
+
+  it('sends no per-field option and the countdown literally, zero included', async () => {
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    const options = hoisted.launch.mock.calls[0][0];
+    expect(Object.keys(options).sort()).toEqual(['countdown', 'noFly', 'paramsJson']);
+    expect(options.countdown).toBe(0);
+    expect(sent(options).kinematics.countdown_sec).toBe(0);
+  });
+
+  it('blocks a launch whose document lacks a required number, naming it', async () => {
+    hoisted.stable.params.working = { ...hoisted.doc, rtl: { ...hoisted.doc.rtl, max_speed: null } };
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).not.toHaveBeenCalled();
+    expect(String(hoisted.props.preflight.launchError)).toContain('rtl.max_speed');
+  });
+
+  it('blocks a launch while the parameters are not ready', async () => {
+    hoisted.stable.params.status = 'loading';
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).not.toHaveBeenCalled();
+    expect(hoisted.props.preflight.launchError).toBeTruthy();
+  });
+
+  it('aborts the launch when saving the edits fails', async () => {
+    hoisted.stable.params.dirty = true;
+    hoisted.stable.params.save = vi.fn(async (): Promise<boolean> => false);
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.stable.params.save).toHaveBeenCalledTimes(1);
+    expect(hoisted.launch).not.toHaveBeenCalled();
+    expect(String(hoisted.props.preflight.launchError)).toMatch(/salvar/i);
+  });
+
+  it('saves the edits before a bench routine and stops if that fails', async () => {
+    hoisted.stable.params.dirty = true;
+    hoisted.stable.params.save = vi.fn(async (): Promise<boolean> => false);
+    window.history.replaceState(null, '', '/?screen=cockpit');
+    await mount();
+    await act(async () => {
+      await call('cockpit', 'onRunStage', 2);
+    });
+    expect(hoisted.stable.params.save).toHaveBeenCalledTimes(1);
+    expect(hoisted.startBenchStage).not.toHaveBeenCalled();
+  });
+
+  it('flies the edited values on the second mission of a session', async () => {
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    const edited = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, target_altitude_m: 2.4 } };
+    hoisted.stable.params.working = edited;
+    hoisted.stable.params.committed = edited;
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).toHaveBeenCalledTimes(2);
+    expect(sent(hoisted.launch.mock.calls[0][0]).kinematics.target_altitude_m).toBe(1.6);
+    expect(sent(hoisted.launch.mock.calls[1][0]).kinematics.target_altitude_m).toBe(2.4);
+  });
+});
+

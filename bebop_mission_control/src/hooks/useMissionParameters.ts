@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ALL_PARAMETERS, TRACKED_PATHS } from '../lib/parameterSchema';
+import { applySchemaFields } from '../lib/launchDocument';
 import { deepEqual, getPath, setPath } from '../lib/paths';
 import { useBridge } from './useBridge';
 
@@ -49,9 +50,10 @@ export function useMissionParameters() {
         if (stored) {
           const parsed = JSON.parse(stored) as ParamsDoc;
           if (!cancelled) {
+            // No bridge, so no mission to serve its defaults: "Restaurar
+            // Padrões" stays unavailable rather than restoring this copy.
             setCommitted(parsed);
             setWorking(parsed);
-            setFactory(parsed);
             setStatus('ready');
             return true;
           }
@@ -105,7 +107,7 @@ export function useMissionParameters() {
     })();
 
     void bridge
-      .getDefaultParameters()
+      .getParameterDefaults()
       .then((defaults) => {
         if (!cancelled && defaults.success && defaults.params) setFactory(defaults.params);
       })
@@ -172,12 +174,17 @@ export function useMissionParameters() {
     }
   }, [working]);
 
+  /**
+   * The preset and the factory defaults are whole documents, but applying one
+   * moves only the sheet fields: PID gains, the calibration the mission wrote
+   * back and the arming mode stay as they are (5.8).
+   */
   const applyPreset = useCallback(() => {
-    if (preset) setWorking(preset);
+    if (preset) setWorking((prev) => (prev ? applySchemaFields(prev, preset) : prev));
   }, [preset]);
 
   const applyFactory = useCallback(() => {
-    if (factory) setWorking(factory);
+    if (factory) setWorking((prev) => (prev ? applySchemaFields(prev, factory) : prev));
   }, [factory]);
 
   return {
