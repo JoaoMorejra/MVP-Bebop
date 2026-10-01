@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
+import hashlib
 import json
 import logging
 import os
+import pathlib
 import queue
 import random
 import sys
+import tempfile
 import threading
 import time
-from typing import Any, Dict, Final, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Final, List, Optional, Tuple
 
 try:
     from google import genai
@@ -189,6 +193,10 @@ def _resolve_auth_token() -> Optional[str]:
     return None
 
 
+#: Output written per call; a stop takes effect within one block.
+_PLAYBACK_BLOCK_SEC: Final[float] = 0.05
+
+
 class AudioPlaybackDevice:
     """Non-blocking PCM audio playback worker using sounddevice."""
 
@@ -202,7 +210,7 @@ class AudioPlaybackDevice:
         self.channels = channels
         self.dtype = dtype
 
-        self._queue: queue.Queue[Optional[bytes]] = queue.Queue()
+        self._queue: "queue.Queue[Optional[Tuple[int, bytes]]]" = queue.Queue()
         # Output level, applied to the samples on their way to the device.
         # Scaling PCM here rather than touching the host mixer keeps the
         # station's voice independent of everything else the machine is
@@ -212,7 +220,9 @@ class AudioPlaybackDevice:
         self._thread: Optional[threading.Thread] = None
         self._active: bool = False
         self._is_playing: bool = False
-        self._stop_requested: threading.Event = threading.Event()
+        #: Bumped by :meth:`stop_current`; buffers queued under an older value
+        #: are dropped, and the line being written is abandoned.
+        self._generation: int = 0
         self._playback_finished: threading.Event = threading.Event()
         self._playback_finished.set()
         self._lock = threading.Lock()
@@ -225,7 +235,6 @@ class AudioPlaybackDevice:
             try:
                 import sounddevice  # noqa: F401
                 self._active = True
-                self._stop_requested.clear()
                 self._thread = threading.Thread(
                     target=self._playback_worker,
                     name="AudioPlaybackWorker",
@@ -251,58 +260,96 @@ class AudioPlaybackDevice:
             return {"volume": self._volume, "muted": self._muted}
 
     def play_audio(self, pcm_data: bytes) -> None:
-        """Enqueue PCM audio buffer for sequential playback."""
+        """Enqueue PCM audio for playback, after whatever is already queued.
+
+        Consecutive buffers -- the lines of a report, or the chunks of one line
+        as synthesis streams them -- are written to one open output stream, so
+        a line can start on its first chunk and there is no device reopen
+        between them.
+        """
         if not pcm_data or not self._active:
             return
         self._playback_finished.clear()
-        self._queue.put(pcm_data)
+        self._queue.put((self._generation, pcm_data))
+
+    def _open_stream(self) -> Any:
+        import sounddevice as sd
+
+        stream = sd.RawOutputStream(samplerate=self.sample_rate, channels=self.channels, dtype=self.dtype)
+        stream.start()
+        return stream
+
+    @staticmethod
+    def _close_stream(stream: Any, *, abort: bool) -> None:
+        if stream is None:
+            return
+        try:
+            if abort:
+                stream.abort()
+            else:
+                stream.stop()
+            stream.close()
+        except Exception as exc:  # noqa: BLE001 - a dead stream is replaced on the next buffer
+            logger.debug("Output stream close: %s", exc)
 
     def _playback_worker(self) -> None:
         import numpy as np
-        import sounddevice as sd
+
+        stream = None
+        block_bytes = max(1, int(self.sample_rate * _PLAYBACK_BLOCK_SEC)) * 2 * self.channels
 
         while self._active:
             try:
-                data = self._queue.get(timeout=0.1)
-                if data is None:
-                    break
-
-                if self._stop_requested.is_set():
-                    self._queue.task_done()
-                    continue
-
-                if self._active and len(data) > 0:
-                    self._is_playing = True
-                    self._playback_finished.clear()
-                    try:
-                        samples = np.frombuffer(data, dtype=np.int16)
-                        with self._lock:
-                            gain = 0.0 if self._muted else self._volume
-                        if gain <= 0.0:
-                            # Nothing to play, but the timing still has to be
-                            # the timing: the station reveals a card per line
-                            # read, and a muted copilot returning instantly
-                            # would collapse the report into one frame. The
-                            # buffer's own duration is the honest wait.
-                            time.sleep(len(samples) / float(self.sample_rate))
-                        else:
-                            if gain < 1.0:
-                                samples = (samples.astype(np.float32) * gain).astype(np.int16)
-                            sd.play(samples, samplerate=self.sample_rate)
-                            sd.wait()
-                    except Exception as err:
-                        logger.debug("Sounddevice playback error: %s", err)
-
-                self._queue.task_done()
+                item = self._queue.get(timeout=0.1)
             except queue.Empty:
                 if self._is_playing:
                     self._is_playing = False
                     self._playback_finished.set()
                 continue
-            except Exception as e:
-                logger.debug("Playback worker exception: %s", e)
+            if item is None:
+                self._queue.task_done()
                 break
+            generation, data = item
+            try:
+                if generation != self._generation or not data:
+                    continue
+                self._is_playing = True
+                self._playback_finished.clear()
+                with self._lock:
+                    gain = 0.0 if self._muted else self._volume
+                # Written in blocks of _PLAYBACK_BLOCK_SEC and checked between
+                # them, so a cancel or an urgent line silences this one within
+                # one block (the target is under 100 ms).
+                if gain <= 0.0:
+                    # Nothing to play, but the timing still has to be the
+                    # timing: the station reveals a card per line read, and a
+                    # muted copilot returning instantly would collapse the
+                    # report into one frame. The buffer's duration is the wait.
+                    remaining = len(data) / (2.0 * self.channels * self.sample_rate)
+                    while remaining > 0.0 and generation == self._generation and self._active:
+                        step = min(_PLAYBACK_BLOCK_SEC, remaining)
+                        time.sleep(step)
+                        remaining -= step
+                    continue
+                if gain < 1.0:
+                    samples = np.frombuffer(data, dtype=np.int16)
+                    data = (samples.astype(np.float32) * gain).astype(np.int16).tobytes()
+                if stream is None:
+                    stream = self._open_stream()
+                for offset in range(0, len(data), block_bytes):
+                    if generation != self._generation or not self._active:
+                        self._close_stream(stream, abort=True)
+                        stream = None
+                        break
+                    stream.write(data[offset:offset + block_bytes])
+            except Exception as err:  # noqa: BLE001 - one bad buffer must not end playback
+                logger.debug("Sounddevice playback error: %s", err)
+                self._close_stream(stream, abort=True)
+                stream = None
+            finally:
+                self._queue.task_done()
 
+        self._close_stream(stream, abort=True)
         self._is_playing = False
         self._playback_finished.set()
 
@@ -315,7 +362,7 @@ class AudioPlaybackDevice:
         while not self._queue.empty():
             if timeout and (time.time() - start_time) > timeout:
                 return False
-            time.sleep(0.04)
+            time.sleep(0.02)
 
         remaining = None
         if timeout:
@@ -323,70 +370,131 @@ class AudioPlaybackDevice:
         return self._playback_finished.wait(timeout=remaining)
 
     def stop_current(self) -> None:
-        """Halt active playback and drain remaining audio queue."""
-        self._stop_requested.set()
+        """Halt active playback and drop the queued audio.
+
+        Bumps the playback generation: the worker drops every buffer queued
+        under the previous one and abandons the line it is writing at the next
+        block boundary. Nothing needs clearing afterwards, so a buffer queued
+        right after the stop plays normally.
+        """
+        with self._lock:
+            self._generation += 1
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
                 self._queue.task_done()
             except (queue.Empty, ValueError):
                 break
-
-        try:
-            import sounddevice as sd
-            sd.stop()
-        except Exception:
-            pass
-
         self._is_playing = False
         self._playback_finished.set()
-        self._stop_requested.clear()
 
     def close(self) -> None:
-        """Shut down playback worker."""
+        """Shut down the playback worker and wait for it to leave PortAudio.
+
+        The worker reads the gain under ``_lock``, so the lock is released
+        before joining it. It notices ``_active`` at the next block boundary
+        and aborts its stream; returning only once it has is what keeps a
+        thread from still being inside PortAudio when the interpreter
+        finalizes, which crashed the process on exit.
+        """
         with self._lock:
             self._active = False
-            self._queue.put(None)
-            try:
-                import sounddevice as sd
-                sd.stop()
-            except Exception:
-                pass
-            if self._thread and self._thread.is_alive():
-                self._thread.join(timeout=1.0)
-                self._thread = None
+            self._generation += 1
+            thread = self._thread
+            self._thread = None
+        self._queue.put(None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
 
 
 _global_playback_device: Optional[AudioPlaybackDevice] = None
 _playback_lock = threading.Lock()
 
 
+_audio_exit_registered: bool = False
+
+
+def _close_audio_at_exit() -> None:
+    """Stop the announcer and the playback worker before interpreter shutdown."""
+    announcer_instance = _global_announcer if "_global_announcer" in globals() else None
+    if announcer_instance is not None:
+        try:
+            announcer_instance.close()
+        except Exception:  # noqa: BLE001 - exit path
+            pass
+    device = _global_playback_device
+    if device is not None:
+        try:
+            device.close()
+        except Exception:  # noqa: BLE001 - exit path
+            pass
+
+
 def get_audio_playback_device() -> AudioPlaybackDevice:
-    """Retrieve or initialize singleton audio playback device."""
-    global _global_playback_device
+    """Retrieve or initialize singleton audio playback device.
+
+    The first call registers :func:`_close_audio_at_exit`: a playback thread
+    left running inside PortAudio when the interpreter finalizes crashed the
+    mission process on exit (SIGSEGV, SIGABRT ``malloc_consolidate``).
+    """
+    global _global_playback_device, _audio_exit_registered
     with _playback_lock:
         if _global_playback_device is None:
             _global_playback_device = AudioPlaybackDevice()
             _global_playback_device.start()
+        if not _audio_exit_registered:
+            atexit.register(_close_audio_at_exit)
+            _audio_exit_registered = True
         return _global_playback_device
+
+
+#: Failures that happen before or without flight: each names itself and its
+#: real reason. None of them lands anything unless the payload says the
+#: aircraft is airborne (``details["em_voo"]``).
+_GROUND_FAULT_ACTIONS: Final[Tuple[str, ...]] = (
+    "falha na inicialização",
+    "falha na calibração",
+    "falha na decolagem",
+    "falha na etapa",
+)
+
+#: Appended to a fault sentence only when the aircraft is airborne.
+_LANDING_CLAUSE: Final[str] = "Executando pouso seguro imediatamente."
+
+
+def _sentence(text: str) -> str:
+    """``text`` closed by exactly one period."""
+    return text.strip().rstrip(".").strip() + "."
 
 
 def _format_telemetry_statement(
     action: str,
     details: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Format structured telemetry action into concise aeronautical phrase."""
-    is_fault = (
-        (details and "erro" in details)
-        or ("erro" in action.lower())
-        or ("falha" in action.lower())
-    )
+    """Format structured telemetry action into concise aeronautical phrase.
 
+    A fault states its real reason (``details["erro"]`` or ``details["etapa"]``)
+    and claims a landing only when ``details["em_voo"]`` is true: a failure on
+    the ground used to be announced with "Executando pouso seguro" while the
+    aircraft sat on the pad.
+    """
+    details = details or {}
+    action_lower = action.strip().lower()
+    airborne = details.get("em_voo") is True
+    reason = details.get("erro", details.get("etapa"))
+
+    if action_lower in _GROUND_FAULT_ACTIONS:
+        head = action.strip() if not reason else f"{action.strip()}: {str(reason).strip()}"
+        statement = _sentence(head)
+        return f"{statement} {_LANDING_CLAUSE}" if airborne else statement
+
+    is_fault = "erro" in details or "erro" in action_lower or "falha" in action_lower
     if is_fault:
-        err = details.get("erro", action) if details else action
-        return f"Alerta de voo: {err}. Executando pouso seguro imediatamente."
+        err = str(details.get("erro", action)).strip()
+        if airborne:
+            return f"{_sentence(f'Alerta de voo: {err}')} {_LANDING_CLAUSE}"
+        return _sentence(f"Alerta de segurança: {err}")
 
-    action_lower = action.lower()
     if "abortar" in action_lower or "abortada" in action_lower or "abort" in action_lower:
         if details and "etapa" in details:
             return str(details["etapa"]).capitalize()
@@ -416,6 +524,57 @@ def _format_telemetry_statement(
     return f"Notificação de missão: {action}."
 
 
+#: Environment override of the phrase cache directory (tests, alternate stations).
+SPEECH_CACHE_ENV: Final[str] = "BMG_SPEECH_CACHE_DIR"
+
+
+class PhraseCache:
+    """Synthesized PCM on disk, one file per sentence, voice and model.
+
+    Every sentence the station speaks is known before the flight: the phrase
+    pools with the numbers already resolved from the mission's own parameters
+    (D2), the forensic report's finite combinations (D1) and the fixed alerts.
+    A line read from here starts in milliseconds instead of paying a Live turn.
+    The key covers the prompt mode as well, because a verbatim and a free
+    rendering of the same text are different audio.
+    """
+
+    def __init__(self, directory: Optional[pathlib.Path] = None) -> None:
+        override = os.environ.get(SPEECH_CACHE_ENV)
+        default = pathlib.Path.home() / ".cache" / "bmg" / "speech"
+        self.directory = directory or (pathlib.Path(override) if override else default)
+
+    def path_for(self, statement: str, verbatim: bool) -> pathlib.Path:
+        """Cache file of ``statement`` in the given prompt mode."""
+        key = "\x1f".join((statement.strip(), "verbatim" if verbatim else "free", SYNTHESIZER_VOICE, SYNTHESIZER_MODEL))
+        return self.directory / f"{hashlib.sha1(key.encode('utf-8')).hexdigest()}.pcm"
+
+    def get(self, statement: str, verbatim: bool) -> Optional[bytes]:
+        """The cached PCM, or None when absent or too short to be speech."""
+        try:
+            data = self.path_for(statement, verbatim).read_bytes()
+        except OSError:
+            return None
+        return data if len(data) >= _MIN_AUDIO_BYTES else None
+
+    def has(self, statement: str, verbatim: bool) -> bool:
+        """Whether a usable entry exists."""
+        return self.get(statement, verbatim) is not None
+
+    def put(self, statement: str, verbatim: bool, pcm: bytes) -> None:
+        """Store ``pcm`` atomically; a failed write only costs the next synthesis."""
+        if len(pcm) < _MIN_AUDIO_BYTES:
+            return
+        path = self.path_for(statement, verbatim)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            partial = path.with_suffix(f".{os.getpid()}.part")
+            partial.write_bytes(pcm)
+            os.replace(partial, path)
+        except OSError as exc:
+            logger.debug("Phrase cache write failed (%s): %s", path, exc)
+
+
 class MissionAudioAnnouncer:
     """Asynchronous priority-based audio announcer for mission flight milestones."""
 
@@ -437,6 +596,15 @@ class MissionAudioAnnouncer:
         #: Lines synthesized ahead of their request, by statement. Touched only
         #: on the announcer's event loop thread.
         self._prefetched: Dict[str, "asyncio.Future[bytes]"] = {}
+        #: Bumped by every cancel. The consumer drops audio synthesized under
+        #: an older generation instead of playing it after the cancel.
+        self._generation: int = 0
+        #: Synthesis of the line inside the consumer, cancelled by a cancel.
+        self._synthesis_task: Optional["asyncio.Task[bytes]"] = None
+        #: Monotonic instant until which an urgent line is playing; an urgent
+        #: line arriving before it waits instead of cutting it.
+        self._playing_urgent_until: float = 0.0
+        self._cache = PhraseCache()
 
         if types is not None:
             self.session_config = types.LiveConnectConfig(
@@ -545,8 +713,17 @@ class MissionAudioAnnouncer:
             return None, None
         return session, ctx
 
-    async def _synthesize_once(self, statement: str, verbatim: bool) -> Tuple[bytes, str]:
-        """One Live turn for ``statement``. Returns the PCM and why the read ended."""
+    async def _synthesize_once(
+        self,
+        statement: str,
+        verbatim: bool,
+        on_chunk: Optional[Callable[[bytes], Awaitable[None]]] = None,
+    ) -> Tuple[bytes, str]:
+        """One Live turn for ``statement``. Returns the PCM and why the read ended.
+
+        ``on_chunk`` receives each audio chunk as it arrives, so playback can
+        start on the first one instead of after the whole turn.
+        """
         session, ctx = await self._open_session()
         if session is None:
             return b"", "no_session"
@@ -583,6 +760,8 @@ class MissionAudioAnnouncer:
                         if part.inline_data and part.inline_data.data:
                             if "audio" in (part.inline_data.mime_type or "audio/pcm"):
                                 audio.extend(part.inline_data.data)
+                                if on_chunk is not None:
+                                    await on_chunk(bytes(part.inline_data.data))
                 if sc.turn_complete or sc.generation_complete:
                     reason = "complete"
                     break
@@ -596,17 +775,22 @@ class MissionAudioAnnouncer:
                     pass
         return bytes(audio), reason
 
-    async def _synthesize(self, statement: str, verbatim: bool) -> bytes:
+    async def _synthesize(
+        self,
+        statement: str,
+        verbatim: bool,
+        on_chunk: Optional[Callable[[bytes], Awaitable[None]]] = None,
+    ) -> bytes:
         """Synthesize ``statement``, retrying once on a fresh session if it produced nothing.
 
         A Live session occasionally stalls before its first chunk; waiting it
         out cost a silent line after 12 s. One retry on a new session answers
         in the usual two seconds when it does.
         """
-        audio, reason = await self._synthesize_once(statement, verbatim)
+        audio, reason = await self._synthesize_once(statement, verbatim, on_chunk)
         if len(audio) < _MIN_AUDIO_BYTES and reason != "no_session":
             logger.debug("Synthesis produced no audio (%s); retrying on a fresh session.", reason)
-            audio, reason = await self._synthesize_once(statement, verbatim)
+            audio, reason = await self._synthesize_once(statement, verbatim, on_chunk)
         logger.debug("Synthesis ended: %s, %d bytes.", reason, len(audio))
         return audio
 
@@ -640,7 +824,7 @@ class MissionAudioAnnouncer:
             return False
 
         def start() -> None:
-            if statement in self._prefetched:
+            if statement in self._prefetched or self._cache.has(statement, True):
                 return
             while len(self._prefetched) >= _PREFETCH_LIMIT:
                 oldest = next(iter(self._prefetched))
@@ -649,6 +833,39 @@ class MissionAudioAnnouncer:
 
         self._loop.call_soon_threadsafe(start)
         return True
+
+    def warm_cache(self, texts: List[str]) -> int:
+        """Synthesize, in the background, every verbatim sentence not yet cached.
+
+        Runs one sentence at a time and only while nothing is queued or being
+        synthesized for playback, so it never delays a line the operator is
+        waiting for. Returns how many sentences were scheduled.
+        """
+        pending: List[str] = []
+        for text in texts:
+            statement = str(text or "").strip()
+            if statement and statement not in pending and not self._cache.has(statement, True):
+                pending.append(statement)
+        if not pending or self._loop is None or self.session_config is None or not self._active:
+            return 0
+
+        async def fill() -> None:
+            for statement in pending:
+                while self._active and (not self._queue.empty() or self._synthesis_task is not None):
+                    await asyncio.sleep(0.1)
+                if not self._active:
+                    return
+                if self._cache.has(statement, True):
+                    continue
+                try:
+                    audio = await self._synthesize(statement, True)
+                except Exception as exc:  # noqa: BLE001 - the cache is an optimisation
+                    logger.debug("Cache warm-up failed for '%s': %s", statement[:40], exc)
+                    continue
+                self._cache.put(statement, True, audio)
+
+        self._loop.call_soon_threadsafe(lambda: self._loop.create_task(fill()))
+        return len(pending)
 
     def _drop_prefetched(self) -> None:
         for future in self._prefetched.values():
@@ -664,33 +881,94 @@ class MissionAudioAnnouncer:
             except Exception:
                 break
 
-            pri_int, seq, action, details, verbatim, done_fut = item
+            pri_int, seq, action, details, verbatim, done_fut, enqueued_at = item
+            generation = self._generation
 
-            # Preemption on urgent priority
+            # Preemption on urgent priority: narration is cut and dropped, but
+            # an alert never cuts or drops another alert -- "step failed"
+            # followed by "aborting" is heard in full, in order.
             if pri_int == 0:
-                self.device.stop_current()
+                if time.monotonic() >= self._playing_urgent_until:
+                    self.device.stop_current()
+                kept = []
                 while not self._queue.empty():
                     try:
                         q_item = self._queue.get_nowait()
                         self._queue.task_done()
-                        if q_item[5] and not q_item[5].done():
-                            q_item[5].set_result(False)
                     except (asyncio.QueueEmpty, ValueError):
                         break
+                    if q_item[0] == 0:
+                        kept.append(q_item)
+                    elif q_item[5] and not q_item[5].done():
+                        q_item[5].set_result(False)
+                for q_item in kept:
+                    self._queue.put_nowait(q_item)
 
             statement = action if verbatim else _format_telemetry_statement(action, details)
+            # The statement is final here: the phrase mapper already composed
+            # it, and it is what the log line below records. Synthesizing it
+            # verbatim makes the spoken sentence the logged one; the free
+            # prompt let the model reword it.
+            verbatim = True
             logger.info("Acoustic announcement: '%s' (Priority: %s)", statement, "URGENT" if pri_int == 0 else "NORMAL")
 
             prefetched = self._prefetched.pop(statement, None) if verbatim else None
-            audio: bytes = b""
-            if prefetched is not None:
+            audio: bytes = self._cache.get(statement, verbatim) or b""
+            source = "cache"
+            if len(audio) < _MIN_AUDIO_BYTES and prefetched is not None:
+                source = "prefetch"
                 try:
                     audio = await prefetched
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     audio = b""
+            streamed = False
+
+            def log_start(started_source: str) -> None:
+                # Request to audio start, on the monotonic clock. The
+                # station's latency targets (cold, warm, urgent after cancel)
+                # are read from these lines.
+                logger.info(
+                    "[SPEECH] '%s' latency_ms=%d source=%s priority=%s",
+                    statement[:48],
+                    int((time.monotonic() - enqueued_at) * 1000.0),
+                    started_source,
+                    "URGENT" if pri_int == 0 else "NORMAL",
+                )
+
+            async def feed(chunk: bytes) -> None:
+                nonlocal streamed
+                if generation != self._generation or not chunk:
+                    return
+                if not streamed:
+                    streamed = True
+                    if pri_int != 0:
+                        await asyncio.to_thread(self.device.wait_until_done, 20.0)
+                        if generation != self._generation:
+                            return
+                    log_start("stream")
+                self.device.play_audio(chunk)
+
             if len(audio) < _MIN_AUDIO_BYTES:
-                audio = await self._synthesize(statement, verbatim)
+                source = "synth"
+                task = asyncio.ensure_future(self._synthesize(statement, verbatim, on_chunk=feed))
+                self._synthesis_task = task
+                try:
+                    audio = await task
+                except asyncio.CancelledError:
+                    audio = b""
+                finally:
+                    self._synthesis_task = None
             audio_buffer = audio
+
+            if generation != self._generation:
+                # Cancelled while it was being synthesized: the operator asked
+                # for silence, and this line arriving afterwards was exactly
+                # the defect (a cancelled line played in full, 12 s later).
+                logger.info("Dropping cancelled line: '%s'", statement)
+                self._queue.task_done()
+                if done_fut and not done_fut.done():
+                    done_fut.set_result(False)
+                continue
 
             # Whether this line was actually spoken, as opposed to having been
             # processed. Reaching the end of this block proves nothing: the
@@ -701,7 +979,9 @@ class MissionAudioAnnouncer:
             # that was never uttered, and its forensic report -- which reveals a
             # card per line read -- then flashed all four at once.
             spoke = len(audio_buffer) >= _MIN_AUDIO_BYTES
-            if spoke:
+            if spoke and source != "cache":
+                self._cache.put(statement, verbatim, audio_buffer)
+            if spoke and not streamed:
                 if pri_int != 0:
                     # Bounded. This runs on the announcer's event loop thread,
                     # so a playback worker wedged inside sounddevice would
@@ -709,6 +989,11 @@ class MissionAudioAnnouncer:
                     # task with it -- the whole copilot, on one stuck buffer.
                     self.device.wait_until_done(timeout=20.0)
                 self.device.play_audio(bytes(audio_buffer))
+                log_start(source)
+            if spoke:
+                if pri_int == 0:
+                    rate = float(getattr(self.device, "sample_rate", 24000) or 24000)
+                    self._playing_urgent_until = time.monotonic() + len(audio_buffer) / (2.0 * rate)
 
             self._queue.task_done()
             if done_fut and not done_fut.done():
@@ -748,14 +1033,17 @@ class MissionAudioAnnouncer:
 
         self._loop.call_soon_threadsafe(
             self._queue.put_nowait,
-            (pri_int, seq, action, details, verbatim, done_fut),
+            (pri_int, seq, action, details, verbatim, done_fut, time.monotonic()),
         )
 
         if wait and done_event:
-            settled = done_event.wait(timeout=timeout or 15.0)
+            # One deadline for synthesis and playback together, so a caller's
+            # ceiling (the station's SPEECH_CEILING_SEC) is the ceiling.
+            deadline = time.monotonic() + (timeout or 14.0)
+            settled = done_event.wait(timeout=max(0.0, deadline - time.monotonic()))
             if not settled:
                 return False
-            self.device.wait_until_done(timeout=timeout or 15.0)
+            self.device.wait_until_done(timeout=max(0.0, deadline - time.monotonic()))
             # The future carries the verdict; the event only says one arrived.
             try:
                 return bool(done_fut.result()) if done_fut else True
@@ -784,6 +1072,9 @@ class MissionAudioAnnouncer:
 
         def drain() -> None:
             nonlocal dropped
+            self._generation += 1
+            if self._synthesis_task is not None and not self._synthesis_task.done():
+                self._synthesis_task.cancel()
             while True:
                 try:
                     item = self._queue.get_nowait()
@@ -846,6 +1137,55 @@ _ALERT_KEY_BY_ACTION: Final[Dict[str, str]] = {
 }
 
 
+#: File the station's copilot daemon (``--serve``) holds while it runs.
+PLAYER_LOCK_NAME: Final[str] = "bmg-announcer.lock"
+
+
+def _player_lock_path() -> pathlib.Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return pathlib.Path(runtime) / PLAYER_LOCK_NAME
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def acquire_player_lock() -> Optional[pathlib.Path]:
+    """Record this process as the station's one audio player. Returns the lock path, or None."""
+    path = _player_lock_path()
+    try:
+        path.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("Player lock not written (%s): %s", path, exc)
+        return None
+    return path
+
+
+def release_player_lock(path: Optional[pathlib.Path]) -> None:
+    """Remove the lock if it is still this process's."""
+    if path is None:
+        return
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _another_player_holds_the_lock() -> bool:
+    try:
+        pid = int(_player_lock_path().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return pid != os.getpid() and _pid_alive(pid)
+
+
 def station_narrates() -> bool:
     """Whether the ground station is this mission's only voice.
 
@@ -855,8 +1195,15 @@ def station_narrates() -> bool:
     synthesis session and a second hold on the audio device. So here no
     player is ever built: flight narration is left to the milestones the
     station already receives, and failures reach it as alerts.
+
+    True when the station launched this process (``BMG_GCS_SESSION=1``), or
+    when a live copilot daemon holds the player lock: a ``mission.py`` started
+    from a terminal the station did not configure must not open a second voice
+    either.
     """
-    return os.environ.get(GCS_SESSION_ENV, "").strip() == "1"
+    if os.environ.get(GCS_SESSION_ENV, "").strip() == "1":
+        return True
+    return _another_player_holds_the_lock()
 
 
 def _hand_to_station(
@@ -888,6 +1235,19 @@ def get_announcer() -> MissionAudioAnnouncer:
         return _global_announcer
 
 
+_alerts_raised: int = 0
+
+
+def alerts_raised() -> int:
+    """How many urgent announcements this process has raised so far.
+
+    The runner compares it across a step to tell whether the step already
+    alerted about its own failure, so the generic ``step_failed`` alert is not
+    spoken on top of the specific one.
+    """
+    return _alerts_raised
+
+
 def announce(
     action: str,
     details: Optional[Dict[str, Any]] = None,
@@ -902,6 +1262,9 @@ def announce(
     this process: urgent announcements become alerts on stdout, the rest is
     dropped. Standalone, it plays through the local announcer as before.
     """
+    global _alerts_raised
+    if _is_urgent(action, details, priority):
+        _alerts_raised += 1
     if station_narrates():
         return _hand_to_station(action, details, priority, verbatim)
     try:
@@ -1117,6 +1480,7 @@ def serve_stdin() -> int:
     then reveal the matching card.
     """
     announcer = get_announcer()
+    lock = acquire_player_lock()
     # Said once, at startup, so a station whose copilot cannot speak learns it
     # from the handshake rather than from four silent requests.
     _emit_speech_event(
@@ -1200,6 +1564,16 @@ def serve_stdin() -> int:
                 )
                 _emit_speech_event({"event": "level", **announcer.device.get_level()})
                 continue
+            if op == "cache":
+                # Every sentence this mission can speak, sent at launch: the
+                # numbers are the mission's own parameters (D2) and the report
+                # combinations are finite (D1), so all of it can be on disk
+                # before the flight. Filled in the background, idle time only.
+                texts = request.get("texts")
+                if isinstance(texts, list) and not announcer.device.get_level()["muted"]:
+                    scheduled = announcer.warm_cache([t for t in texts if isinstance(t, str)])
+                    _emit_speech_event({"event": "cache", "scheduled": scheduled, "requested": len(texts)})
+                continue
             if op == "prepare":
                 text = request.get("text")
                 if isinstance(text, str) and text.strip() and not announcer.device.get_level()["muted"]:
@@ -1230,6 +1604,7 @@ def serve_stdin() -> int:
         work.put(None)
         thread.join(timeout=2.0)
         announcer.close()
+        release_player_lock(lock)
 
     return 0
 
