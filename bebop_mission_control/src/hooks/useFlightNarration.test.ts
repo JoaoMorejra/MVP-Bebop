@@ -231,20 +231,28 @@ describe('phraseForMilestone', () => {
     random: () => 0,
   };
 
-  it('prefers the altitude the mission reports over the configured fallback', () => {
-    const line = phraseForMilestone('mission.takeoff', { altitude_m: 1.4 }, 3, noStorage);
+  it('speaks the altitude the mission reports in the milestone', () => {
+    const line = phraseForMilestone('mission.takeoff', { altitude_m: 1.4 }, {}, noStorage);
     expect(line).toContain('1,4 metro');
   });
 
-  it('falls back to the configured altitude when the payload has none', () => {
-    expect(phraseForMilestone('mission.takeoff', {}, 2.5, noStorage)).toContain('2,5 metros');
+  it('falls back to the mission.parameters document, never to a frontend default', () => {
+    const line = phraseForMilestone('mission.takeoff', {}, { target_altitude_m: 2.5 }, noStorage);
+    expect(line).toContain('2,5 metros');
+  });
+
+  it('without any mission value, speaks a variant that carries no number', () => {
+    for (let draw = 0; draw < 40; draw += 1) {
+      const line = phraseForMilestone('mission.takeoff', {}, {}, { storage: null, random: () => (draw % 10) / 10 });
+      expect(line).not.toMatch(/\d|metro|\{/);
+    }
   });
 
   it('places the target from the payload geometry', () => {
     const line = phraseForMilestone(
       'mission.target_found',
       { forward_m: 2.7, bearing_deg: -12 },
-      1,
+      {},
       noStorage
     );
     expect(line).toContain('a 2,7 metros à frente, à esquerda');
@@ -252,7 +260,7 @@ describe('phraseForMilestone', () => {
 
   it('never leaves a placeholder in the spoken line', () => {
     for (const key of ['mission.takeoff', 'mission.target_found', 'mission.landing'] as const) {
-      expect(phraseForMilestone(key, {}, Number.NaN, noStorage)).not.toMatch(/\{[a-z_]+\}/);
+      expect(phraseForMilestone(key, {}, {}, noStorage)).not.toMatch(/\{[a-z_]+\}/);
     }
   });
 });
@@ -289,7 +297,7 @@ describe('early detection on the bench, replayed', () => {
       arrived.set(key, Date.now());
       queue.enqueue(key, () => {
         speaking = key;
-        return phraseForMilestone(key, message.payload, 1, { storage: null });
+        return phraseForMilestone(key, message.payload, {}, { storage: null });
       });
     };
 

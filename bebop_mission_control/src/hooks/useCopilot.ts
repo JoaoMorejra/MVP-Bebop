@@ -1,14 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AnnouncePriority } from '../types/bmg';
 import type { Finding } from '../lib/forensics';
-import { findingGapMs } from '../lib/forensics';
+import { allFindingSentences, findingGapMs } from '../lib/forensics';
 import {
   alertSentence,
   isMilestoneKey,
   nextPhrase,
+  allMissionPhrases,
   phraseForMilestone,
   takeLaunchPhrase,
+  type MissionParametersPayload,
 } from '../lib/copilotPhrases';
+import { BATTERY_CALLS } from '../lib/batteryReturn';
+
+/** Alert sentences the station itself composes; the rest come from the mission. */
+const FIXED_ALERT_SENTENCES: readonly string[] = [
+  'Missão abortada. Pouso imediato comandado.',
+  ...Object.values(BATTERY_CALLS),
+];
 import { NarrationQueue } from '../lib/narrationQueue';
 import { useBridge } from './useBridge';
 
@@ -18,7 +27,7 @@ import { useBridge } from './useBridge';
  * that has stopped answering degrades the presentation to its own timing
  * instead of freezing it half-read.
  */
-const SPEECH_CEILING_MS = 14000;
+export const SPEECH_CEILING_MS = 14000;
 
 export interface Copilot {
   /** Speak one line. Resolves when the operator has heard it, or when it is clear they will not. */
@@ -111,7 +120,12 @@ export function useCopilot(): Copilot {
           pending.current.delete(id);
           resolve(ok);
         };
-        const timer = window.setTimeout(() => settle(false), SPEECH_CEILING_MS);
+        // Past the ceiling the line is written off here, so it is cancelled in
+        // the copilot too: otherwise it would still play, late, over the next.
+        const timer = window.setTimeout(() => {
+          settle(false);
+          void bridge.cancelSpeech().catch(() => undefined);
+        }, SPEECH_CEILING_MS);
         pending.current.set(id, settle);
       });
     },
@@ -133,8 +147,6 @@ export function useCopilot(): Copilot {
 
   return { say, prepare, cancel, available: Boolean(bridge) };
 }
-
-const TOUCHDOWN_CALL = 'Pouso seguro concluído com sucesso na base.';
 
 /** Queue group of the post-landing report's lines. */
 const REPORT_GROUP = 'forensic';
@@ -185,9 +197,10 @@ export function useNarrationQueue(copilot: Copilot): NarrationQueue {
  * the flight's first line. `flightKey` returning to null -- the cycle closed --
  * drops whatever is still queued.
  *
- * `altitudeM` is the configured target altitude, the fallback for a takeoff
- * milestone whose payload lacks one. Milestones are ignored while `enabled` is
- * false.
+ * Spoken numbers come from the mission alone (D2): the milestone's payload, or
+ * the `mission.parameters` document the mission emits once at start, held here
+ * for the rest of the flight. Nothing is defaulted from the station's own
+ * copy of the parameters. Milestones are ignored while `enabled` is false.
  *
  * Alerts are not. Under the station the mission has no voice of its own
  * (`announcer.station_narrates`), so a failure, abort or failsafe it reports is
@@ -195,18 +208,14 @@ export function useNarrationQueue(copilot: Copilot): NarrationQueue {
  */
 export function useFlightNarration(
   queue: NarrationQueue,
-  landed: boolean,
   enabled: boolean,
-  flightKey: number | null,
-  altitudeM: number = Number.NaN
+  flightKey: number | null
 ): void {
   const bridge = useBridge();
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
-  const altitude = useRef(altitudeM);
-  altitude.current = altitudeM;
+  const parameters = useRef<MissionParametersPayload>({});
   const spoken = useRef(new Set<string>());
-  const touchdownCalled = useRef(false);
 
   useEffect(() => {
     if (!bridge) return;
@@ -216,12 +225,25 @@ export function useFlightNarration(
         queue.preempt(event.key, () => alertSentence(payload), 'URGENT');
         return;
       }
+      if (event.key === 'mission.parameters') {
+        parameters.current = event.payload ?? {};
+        // Everything this mission can say is known now (D1, D2): have it
+        // synthesized to disk while the aircraft is still on the ground.
+        void bridge
+          .cacheSpeech?.([
+            ...allMissionPhrases(parameters.current),
+            ...allFindingSentences(),
+            ...FIXED_ALERT_SENTENCES,
+          ])
+          .catch(() => undefined);
+        return;
+      }
       if (!enabledRef.current || !isMilestoneKey(event.key)) return;
       const key = event.key;
       if (key === 'mission.start') {
         queue.reset();
         spoken.current.clear();
-        touchdownCalled.current = false;
+        parameters.current = {};
       }
       if (spoken.current.has(key)) return;
       spoken.current.add(key);
@@ -229,7 +251,7 @@ export function useFlightNarration(
       // A launch line drawn ahead (`reserveLaunchPhrase`) is spoken as drawn,
       // so the audio synthesized for it at the click is the audio played.
       const launchLine = takeLaunchPhrase(key);
-      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, altitude.current));
+      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, parameters.current));
     });
   }, [bridge, queue]);
 
@@ -237,11 +259,6 @@ export function useFlightNarration(
     if (flightKey === null) queue.reset();
   }, [flightKey, queue]);
 
-  useEffect(() => {
-    if (!landed || touchdownCalled.current) return;
-    touchdownCalled.current = true;
-    queue.enqueue('touchdown', () => TOUCHDOWN_CALL);
-  }, [landed, queue]);
 }
 
 /**
@@ -254,14 +271,12 @@ export function useFlightNarration(
  * -- the touchdown call first, then the report -- and a report torn down
  * midway drops only its own lines.
  *
- * Each reveal waits for the *later* of two things: the sentence having been
- * read, and a drawn beat of roughly two seconds. Waiting on the voice alone is
- * what puts the card on its own sentence, but a copilot that cannot speak -- no
- * API key, no network, no audio device -- answers every request in
- * milliseconds, and a report paced by that answer would dump all four findings
- * in a single frame. Taking whichever is longer gives the presentation one
- * rhythm: narrated when there is narration, and the same deliberate cadence
- * when there is not.
+ * Each reveal waits for its sentence having been read. Only when the copilot
+ * did not speak it -- no API key, no network, no audio device, all of which
+ * answer in milliseconds -- does the line hold a drawn beat of roughly two
+ * seconds (`fallbackMs`), so a silent report still keeps a deliberate cadence
+ * instead of dumping all four findings in a single frame, and a spoken one is
+ * never padded beyond its own sentence.
  *
  * Returns how many cards have been revealed, which is what the panel renders,
  * and the closing line as spoken, so the screen shows the same sentence.
@@ -294,18 +309,18 @@ export function useForensicNarration(
 
     queue.enqueue('inspection.intro', () => nextPhrase('inspection.intro'), {
       group: REPORT_GROUP,
-      minMs: findingGapMs(),
+      fallbackMs: findingGapMs(),
     });
     report.forEach((finding, index) => {
       queue.enqueue(`inspection.point_${index + 1}`, () => finding.speech, {
         group: REPORT_GROUP,
-        minMs: findingGapMs(),
+        fallbackMs: findingGapMs(),
         onDone: () => {
           if (live()) setRevealed(index + 1);
         },
       });
     });
-    queue.enqueue('inspection.outro', () => outro, { group: REPORT_GROUP, minMs: findingGapMs() });
+    queue.enqueue('inspection.outro', () => outro, { group: REPORT_GROUP, fallbackMs: findingGapMs() });
 
     return () => {
       runRef.current = token + 1;

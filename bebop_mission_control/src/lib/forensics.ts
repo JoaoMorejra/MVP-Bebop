@@ -178,6 +178,22 @@ export function buildForensicReport(
 }
 
 /**
+ * Every sentence a finding can be read as: each connector with each wording.
+ * The report stays drawn per flight (D1); this only lets its audio be
+ * synthesized ahead, for the copilot's phrase cache.
+ */
+export function allFindingSentences(): string[] {
+  const connectors = [...OPENERS, ...LINKERS, ...CLOSERS];
+  const out: string[] = [];
+  for (const topic of TOPICS) {
+    for (const wording of WORDINGS[topic]) {
+      for (const connector of connectors) out.push(`${connector} ${decapitalise(wording)}.`);
+    }
+  }
+  return out;
+}
+
+/**
  * The cadence between findings when the copilot is not the one setting it.
  *
  * With the voice bridge present each card waits for its own sentence to finish,

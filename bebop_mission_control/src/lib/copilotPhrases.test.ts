@@ -4,8 +4,11 @@ import {
   FLIGHT_CALL_MAX_SECONDS,
   HISTORY_STORAGE_KEY,
   HISTORY_WINDOW,
+  FIXED_POOLS,
   MILESTONE_KEYS,
   PHRASE_POOLS,
+  POOL_KEYS,
+  phraseForMilestone,
   type HistoryStore,
   type MilestoneKey,
   type StorageLike,
@@ -20,6 +23,8 @@ import {
   renderPhrase,
   saveHistory,
   spokenMeters,
+  spokenSpeed,
+  placeholdersOf,
 } from './copilotPhrases';
 
 /** Deterministic PRNG, so a failure is reproducible rather than flaky. */
@@ -52,6 +57,8 @@ const SPEC_KEYS: MilestoneKey[] = [
   'mission.capture_done',
   'mission.rtl_start',
   'mission.landing',
+  'mission.touchdown',
+  'mission.battery_warning',
   'inspection.intro',
   'inspection.outro',
 ];
@@ -59,25 +66,28 @@ const SPEC_KEYS: MilestoneKey[] = [
 describe('phrase pools', () => {
   it('cover exactly the synchronisation table keys', () => {
     expect([...MILESTONE_KEYS].sort()).toEqual([...SPEC_KEYS].sort());
-    expect(Object.keys(PHRASE_POOLS).sort()).toEqual([...SPEC_KEYS].sort());
+    for (const key of MILESTONE_KEYS) expect(POOL_KEYS).toContain(key);
   });
 
   it('hold more variants than the history window, so exclusion never empties a pool', () => {
-    for (const key of MILESTONE_KEYS) {
+    for (const key of POOL_KEYS) {
+      if (FIXED_POOLS.includes(key)) continue;
       expect(PHRASE_POOLS[key].length, key).toBeGreaterThan(HISTORY_WINDOW);
     }
   });
 
   it('hold distinct, non-empty variants', () => {
-    for (const key of MILESTONE_KEYS) {
+    for (const key of POOL_KEYS) {
       const pool = PHRASE_POOLS[key];
       expect(new Set(pool).size, key).toBe(pool.length);
       for (const line of pool) expect(line.trim().length, key).toBeGreaterThan(0);
     }
   });
 
-  it('cite the configured altitude in every takeoff variant', () => {
-    for (const line of PHRASE_POOLS['mission.takeoff']) expect(line).toContain('{altitude}');
+  it('offer takeoff variants with the configured altitude and without any number', () => {
+    const pool = PHRASE_POOLS['mission.takeoff'];
+    expect(pool.filter((line) => line.includes('{altitude}')).length).toBeGreaterThan(HISTORY_WINDOW);
+    expect(pool.filter((line) => !/\{[a-z_]+\}/.test(line)).length).toBeGreaterThanOrEqual(2);
   });
 
   it('place the target location in every target-found variant', () => {
@@ -88,8 +98,10 @@ describe('phrase pools', () => {
     const longest = {
       altitude: spokenMeters(12.5),
       location: describeTargetLocation({ forward_m: 12.5, bearing_deg: 5 }),
+      speed: spokenSpeed(0.35) ?? '',
+      threshold: '100 por cento',
     };
-    for (const key of MILESTONE_KEYS) {
+    for (const key of POOL_KEYS) {
       if (DESCRIPTIVE_KEYS.includes(key)) continue;
       for (const line of PHRASE_POOLS[key]) {
         const rendered = renderPhrase(line, longest);
@@ -101,8 +113,8 @@ describe('phrase pools', () => {
   });
 
   it('leave no placeholder unresolved in keys that take none', () => {
-    for (const key of MILESTONE_KEYS) {
-      if (key === 'mission.takeoff' || key === 'mission.target_found') continue;
+    for (const key of POOL_KEYS) {
+      if (['mission.takeoff', 'mission.target_found', 'mission.scan_start', 'mission.battery_warning'].includes(key)) continue;
       for (const line of PHRASE_POOLS[key]) expect(line, key).not.toMatch(/\{[a-z_]+\}/);
     }
   });
@@ -302,5 +314,145 @@ describe('launch phrase reservation', () => {
 
   it('never hands over a line for a key with placeholders', () => {
     expect(takeLaunchPhrase('mission.takeoff')).toBeUndefined();
+  });
+});
+
+describe('parameter-sourced numbers (D2)', () => {
+  it('speaks speeds with two decimals and the formal singular below two', () => {
+    expect(spokenSpeed(0.35)).toBe('0,35 metro por segundo');
+    expect(spokenSpeed(0.2)).toBe('0,2 metro por segundo');
+    expect(spokenSpeed(2.5)).toBe('2,5 metros por segundo');
+    expect(spokenSpeed(Number.NaN)).toBeNull();
+  });
+
+  it('lists the placeholders a variant needs', () => {
+    expect(placeholdersOf('Subindo para {altitude} a {speed}.')).toEqual(['altitude', 'speed']);
+    expect(placeholdersOf('Sem números.')).toEqual([]);
+  });
+
+  it('never draws a variant whose number the mission did not send', () => {
+    for (let seed = 1; seed <= 30; seed += 1) {
+      const line = nextPhrase('mission.scan_start', {}, { storage: null, random: seeded(seed) });
+      expect(line).not.toMatch(/\{|por segundo/);
+    }
+  });
+
+  it('draws the speed variants when the mission sent the configured speed', () => {
+    const lines = new Set<string>();
+    for (let step = 0; step < 20; step += 1) {
+      lines.add(nextPhrase('mission.scan_start', { speed: spokenSpeed(0.35) ?? '' }, { storage: null, random: () => step / 20 }));
+    }
+    expect([...lines].some((line) => line.includes('0,35 metro por segundo'))).toBe(true);
+  });
+});
+
+describe('touchdown (3.2)', () => {
+  const opts = { storage: null, random: () => 0.5 };
+
+  it('says "na base" only for a confirmed touchdown at the base', () => {
+    for (let step = 0; step < 10; step += 1) {
+      const random = () => step / 10;
+      const atBase = phraseForMilestone('mission.touchdown', { confirmed: true, at_base: true }, {}, { storage: null, random });
+      expect(atBase).toMatch(/base/);
+      const inPlace = phraseForMilestone('mission.touchdown', { confirmed: true, at_base: false }, {}, { storage: null, random });
+      expect(inPlace).not.toMatch(/base/);
+      expect(inPlace).toMatch(/[Pp]ouso/);
+    }
+  });
+
+  it('an unconfirmed touchdown says so, in the specified words', () => {
+    expect(phraseForMilestone('mission.touchdown', { confirmed: false, at_base: true }, {}, opts)).toBe(
+      'Pouso comandado. Confirmação de toque indisponível. Verifique visualmente.'
+    );
+  });
+
+  it('a payload without the confirmation flag is not a confirmed touchdown', () => {
+    expect(phraseForMilestone('mission.touchdown', {}, {}, opts)).toBe(
+      'Pouso comandado. Confirmação de toque indisponível. Verifique visualmente.'
+    );
+  });
+});
+
+describe('countdown call (3.4)', () => {
+  it('claims no checklist, validation or readiness the mission never performed', () => {
+    for (const line of PHRASE_POOLS['mission.countdown_3']) {
+      expect(line).not.toMatch(/checklist|valida|prontos?\b/i);
+    }
+  });
+});
+
+describe('conditional phrases (3.5)', () => {
+  const every = (key: MilestoneKey, payload: Record<string, unknown>) =>
+    Array.from({ length: 12 }, (_, step) =>
+      phraseForMilestone(key, payload, {}, { storage: null, random: () => step / 12 })
+    );
+
+  it('a capture without a confirmed target says so and claims no target', () => {
+    for (const line of every('mission.capture_done', { target_confirmed: false, settled: false })) {
+      expect(line).toMatch(/sem alvo confirmado/);
+      expect(line).not.toMatch(/sinistro|pericial/i);
+    }
+  });
+
+  it('no capture claims high fidelity before a native photo exists', () => {
+    for (const payload of [{ target_confirmed: true, settled: true }, { target_confirmed: false }]) {
+      for (const line of every('mission.capture_done', payload)) expect(line).not.toMatch(/alta fidelidade/i);
+    }
+  });
+
+  it('only an inspected return says the inspection is done or that it leaves the scene', () => {
+    for (const payload of [
+      { via_jump: true, inspected: true, marker_guided: true },
+      { via_jump: false, inspected: false, marker_guided: true },
+      {},
+    ]) {
+      for (const line of every('mission.rtl_start', payload)) {
+        expect(line).not.toMatch(/Inspeção concluída|Deixando o local/);
+      }
+    }
+    const inspected = every('mission.rtl_start', { via_jump: false, inspected: true, marker_guided: true });
+    expect(inspected.some((line) => /Inspeção concluída|Deixando o local/.test(line))).toBe(true);
+  });
+
+  it('a return without the marker never mentions the marker', () => {
+    for (const payload of [{ inspected: true, marker_guided: false }, { via_jump: true }]) {
+      for (const line of every('mission.rtl_start', payload)) expect(line).not.toMatch(/marcador/i);
+    }
+  });
+
+  it('a jump to the return says the station commanded it', () => {
+    for (const line of every('mission.rtl_start', { via_jump: true })) expect(line).toMatch(/comandad/);
+  });
+
+  it('a landing away from the base never says base', () => {
+    for (const line of every('mission.landing', { at_base: false })) expect(line).not.toMatch(/base/i);
+    for (const line of every('mission.landing', {})) expect(line).not.toMatch(/base/i);
+  });
+
+  it('an approach without IBVS claims no visual guidance', () => {
+    for (const line of every('mission.approaching', { ibvs: false })) {
+      expect(line).not.toMatch(/visual|Centralizando/i);
+    }
+    const guided = every('mission.approaching', { ibvs: true });
+    expect(guided.some((line) => /visual/i.test(line))).toBe(true);
+  });
+});
+
+describe('battery warning (3.7)', () => {
+  it('is narrated, citing the configured threshold and never the reading', () => {
+    expect(MILESTONE_KEYS).toContain('mission.battery_warning');
+    const lines = Array.from({ length: 10 }, (_, step) =>
+      phraseForMilestone('mission.battery_warning', { battery_pct: 13.4, threshold_pct: 15 }, {}, { storage: null, random: () => step / 10 })
+    );
+    for (const line of lines) {
+      expect(line).toMatch(/15 por cento/);
+      expect(line).not.toMatch(/13/);
+    }
+  });
+
+  it('without a threshold in the payload, speaks no number', () => {
+    const line = phraseForMilestone('mission.battery_warning', { battery_pct: 13.4 }, {}, { storage: null, random: () => 0 });
+    expect(line).not.toMatch(/\d/);
+    expect(line).toMatch(/[Bb]ateria/);
   });
 });

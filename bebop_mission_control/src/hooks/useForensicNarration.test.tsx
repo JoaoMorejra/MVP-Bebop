@@ -91,8 +91,8 @@ describe('useForensicNarration', () => {
     expect(seen.closing).toBe(outro);
   });
 
-  it('keeps the two-second floor when the copilot answers at once', async () => {
-    const queue = new NarrationQueue(async () => true, () => undefined);
+  it('keeps the two-second floor when the copilot cannot speak', async () => {
+    const queue = new NarrationQueue(async () => false, () => undefined);
     await act(async () => root.render(<Report queue={queue} active report={REPORT} />));
 
     await tick(1799);
@@ -102,6 +102,19 @@ describe('useForensicNarration', () => {
     await tick(1);
     expect(seen.revealed).toBe(1);
     await tick(1800 * 3);
+    expect(seen.revealed).toBe(4);
+  });
+
+  it('pads nothing after a finding the copilot actually read', async () => {
+    const queue = new NarrationQueue(
+      () => new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 900)),
+      () => undefined
+    );
+    await act(async () => root.render(<Report queue={queue} active report={REPORT} />));
+    // Intro 900 ms, then each finding 900 ms: no 1.8 s floor on heard lines.
+    await tick(900 * 2);
+    expect(seen.revealed).toBe(1);
+    await tick(900 * 3);
     expect(seen.revealed).toBe(4);
   });
 

@@ -9,6 +9,13 @@ export interface EnqueueOptions {
    * answers at once still paces what hangs off `onDone`.
    */
   minMs?: number;
+  /**
+   * The least time the item holds the queue *when its sentence was not heard*,
+   * in milliseconds: a copilot with no voice answers at once, and a
+   * presentation paced on that answer would flash through. Unlike `minMs` it
+   * adds nothing after a line that was actually spoken.
+   */
+  fallbackMs?: number;
   /** Called once the item ends, with whether the sentence was heard. Not called for a cut item. */
   onDone?: (heard: boolean) => void;
 }
@@ -21,6 +28,7 @@ interface Item {
   alert: boolean;
   group: string | null;
   minMs: number;
+  fallbackMs: number;
   onDone?: (heard: boolean) => void;
   /** Cut while playing; its `onDone` must not run. */
   cancelled: boolean;
@@ -90,6 +98,7 @@ export class NarrationQueue {
       alert: false,
       group: options.group ?? null,
       minMs: Math.max(0, options.minMs ?? 0),
+      fallbackMs: Math.max(0, options.fallbackMs ?? 0),
       onDone: options.onDone,
       cancelled: false,
     });
@@ -136,6 +145,7 @@ export class NarrationQueue {
       alert: true,
       group: null,
       minMs: 0,
+      fallbackMs: 0,
       cancelled: false,
     });
     if (this.current && !this.current.alert) this.cutCurrent();
@@ -161,6 +171,17 @@ export class NarrationQueue {
     this.current.cancelled = true;
     this.releaseBeat?.();
     this.interrupt();
+  }
+
+  /**
+   * Stop talking: every pending line goes, alerts included, and the one being
+   * spoken is cut. How ending the cycle or switching bench routines silences
+   * the station, through the queue rather than around it.
+   */
+  silence(): void {
+    this.items.length = 0;
+    if (this.current) this.cutCurrent();
+    else this.interrupt();
   }
 
   /**
@@ -207,8 +228,12 @@ export class NarrationQueue {
         this.current = item;
         this.prepareNext();
         let heard = false;
+        const started = Date.now();
         try {
           heard = (await Promise.all([this.say(text, item.priority), this.beat(item.minMs)]))[0];
+          if (!heard && !item.cancelled && item.fallbackMs > 0) {
+            await this.beat(item.fallbackMs - (Date.now() - started));
+          }
         } finally {
           this.current = null;
           this.releaseBeat = null;
