@@ -103,6 +103,8 @@ class BenchtopDroneProxy:
         # forgot to report its own motion. A tracker that is only as complete as
         # the discipline of five separate control loops is not a tracker.
         self.motion_tracker = motion_tracker
+        #: Whether :meth:`connect` found the driver; ``None`` before it ran.
+        self.driver_reachable: Optional[bool] = None
 
     @property
     def no_fly(self) -> bool:
@@ -226,17 +228,63 @@ class BenchtopDroneProxy:
             return
         self.drone.delay(seconds)
 
-    def connect(self) -> bool:
-        """Verify driver connectivity."""
+    def connect(
+        self,
+        graph_probe: Optional[Callable[[], bool]] = None,
+        restart_daemon: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """Verify driver connectivity through the SDK, recovering a stale daemon once.
+
+        Parameters
+        ----------
+        graph_probe : callable, optional
+            True when the mission's own node sees the driver in the live graph
+            (``driver_discovery.driver_in_graph``). Asked first.
+        restart_daemon : callable, optional
+            Restarts the ``ros2`` daemon (``driver_discovery.restart_ros2_daemon``).
+
+        Returns
+        -------
+        bool
+            Whether the mission may proceed: the SDK found the driver, or, under
+            ``--no-fly``, always. :attr:`driver_reachable` says which.
+
+        Notes
+        -----
+        The SDK checks with ``ros2 node list``, answered by the daemon's cached
+        graph. When the live graph shows the driver and the SDK does not, the
+        daemon is stale: it is restarted once and the SDK asked again. On the
+        bench, a driver absent from the live graph skips the SDK check.
+        """
+        seen = graph_probe() if graph_probe is not None else None
+        if self.no_fly and seen is False:
+            self.driver_reachable = False
+            logger.info("[NO-FLY] No driver in the graph. Benchtop proxy active. Motors unpowered.")
+            return True
+
+        reachable = self._sdk_connect()
+        if not reachable and seen:
+            logger.warning("ros2 daemon stale: the driver is in the graph but the SDK does not see it; restarting it.")
+            if restart_daemon is not None:
+                restart_daemon()
+            reachable = self._sdk_connect()
+        self.driver_reachable = reachable
+
         if self.no_fly:
-            try:
-                if self.drone.connect():
-                    return True
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("[NO-FLY] Driver unreachable (%s); continuing on the bench.", exc)
+            if not reachable:
+                logger.info("[NO-FLY] Driver unreachable; continuing on the bench.")
             logger.info("[NO-FLY] Benchtop proxy active. Motors unpowered.")
             return True
-        return self.drone.connect()
+        return reachable
+
+    def _sdk_connect(self) -> bool:
+        try:
+            return bool(self.drone.connect())
+        except Exception as exc:  # noqa: BLE001
+            if not self.no_fly:
+                raise
+            logger.debug("[NO-FLY] SDK connect raised (%s).", exc)
+            return False
 
     def cleanup(self) -> None:
         """Release the underlying drone resources."""
