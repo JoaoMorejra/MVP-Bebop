@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
@@ -186,16 +188,29 @@ class NadirInspectionStep(BaseStep):
             return False
 
         ctx.failsafe.notify_frame_received()
+
+        # The 14 MP photo is requested before the local inference so the
+        # aircraft's capture and its PictureEventChanged overlap the detector
+        # instead of following it; the frame above and this photo are then
+        # the same instant to within the request latency.
+        tracker = ctx.picture_ack
+        mark = tracker.sequence if tracker is not None else 0
+        requested_at = time.monotonic()
+        native_photo: Dict[str, Any] = {
+            "requested_at_utc": datetime.now(timezone.utc).isoformat(),
+            "acknowledged": False,
+            "event": None,
+            "error": None,
+            "remote_path": None,
+            "local_path": None,
+        }
+        ctx.drone.snapshot()
+
         nadir_conf = ctx.params.inspection.nadir_confidence_threshold
         result = ctx.detector.detect(
             frame, **detector_kwargs(nadir_conf, ctx.params.vision.inference_imgsz)
         )
         targets = result.filter_by_class(ctx.params.vision.target_classes)
-
-        # Trigger the 14 MP onboard camera. It acknowledges nothing and returns
-        # no path, so the local frames below are the evidence this mission can
-        # actually account for.
-        ctx.drone.snapshot()
 
         annotated = ctx.publish_annotated_stream(
             frame,
@@ -204,11 +219,24 @@ class NadirInspectionStep(BaseStep):
             f"| {'SETTLED' if settled else 'UNSETTLED'} | TARGETS: {len(targets)}",
         )
 
+        if tracker is not None:
+            window = ctx.params.inspection.native_photo_ack_timeout_sec
+            ack = tracker.wait_after(mark, window - (time.monotonic() - requested_at))
+            if ack is not None:
+                native_photo.update(acknowledged=ack["acknowledged"], event=ack["event"], error=ack["error"])
+        if not native_photo["acknowledged"]:
+            logger.warning(
+                "Native photo not acknowledged by the aircraft (event=%s, error=%s).",
+                native_photo["event"],
+                native_photo["error"],
+            )
+
         record = ctx.record_photographic_evidence(
             raw_frame=frame,
             annotated_frame=annotated if annotated is not None else frame,
             detections=list(targets),
             snapshot=ctx.odom_supervisor.snapshot(),
+            native_photo=native_photo,
         )
         ctx.blackboard.evidence = record
         if record.captured:
@@ -216,7 +244,12 @@ class NadirInspectionStep(BaseStep):
                 "mission.capture_done",
                 {
                     "raw_image": os.path.basename(record.raw_path) if record.raw_path else None,
+                    "metadata": (
+                        os.path.basename(record.metadata_path) if record.metadata_path else None
+                    ),
+                    "native_photo": bool(native_photo["acknowledged"]),
                     "settled": bool(settled),
+                    "target_confirmed": bool(ctx.blackboard.target_confirmed),
                 },
             )
         return record.captured

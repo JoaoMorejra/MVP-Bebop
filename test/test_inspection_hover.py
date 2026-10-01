@@ -79,6 +79,7 @@ class Blackboard:
     def __init__(self):
         self.evidence = EvidenceRecord()
         self.approach_finished = True
+        self.target_confirmed = True
 
 
 class Ctx:
@@ -108,6 +109,7 @@ class Ctx:
         self.detections = 0
         self.captures = 0
         self.perception = SynchronousPerception(self)
+        self.picture_ack = None
 
     def interrupted(self):
         return self.emergency_event.is_set() or self.stage_jump_event.is_set()
@@ -229,3 +231,57 @@ def test_settlement_holds_once_the_governor_is_idle():
     settled = _Step()._await_stillness(ctx)
 
     assert settled
+
+
+# ------------------------------------------------------------ native photo (4.7)
+
+
+def test_the_native_photo_is_requested_before_the_inference_and_its_ack_recorded():
+    from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
+
+    ctx = Ctx()
+    order = []
+    ctx.picture_ack = PictureAckTracker()
+    original_detect = ctx.detect
+
+    def detect(frame, **kwargs):
+        order.append("detect")
+        return original_detect(frame, **kwargs)
+
+    def snapshot():
+        order.append("snapshot")
+        ctx.picture_ack.update('{"sequence": 1, "kind": "event", "value": 0, "error": 0}')
+
+    ctx.detect = detect
+    ctx.drone.snapshot = snapshot
+    recorded = {}
+
+    def record(**kwargs):
+        recorded.update(kwargs)
+        return EvidenceRecord(raw_path="accident_raw_x.png", metadata_path="accident_metadata_x.json")
+
+    ctx.record_photographic_evidence = record
+
+    assert NadirInspectionStep()._capture(ctx, settled=True) is True
+    assert order[:2] == ["snapshot", "detect"]
+    assert recorded["native_photo"]["acknowledged"] is True
+    assert recorded["native_photo"]["event"] == "taken"
+    assert recorded["native_photo"]["requested_at_utc"]
+
+
+def test_a_missing_native_ack_is_recorded_as_such():
+    from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
+
+    ctx = Ctx()
+    ctx.picture_ack = PictureAckTracker()
+    recorded = {}
+
+    def record(**kwargs):
+        recorded.update(kwargs)
+        return EvidenceRecord(raw_path="accident_raw_x.png")
+
+    ctx.record_photographic_evidence = record
+    ctx.params.inspection.native_photo_ack_timeout_sec = 0.1
+    NadirInspectionStep()._capture(ctx, settled=True)
+    assert recorded["native_photo"]["acknowledged"] is False
+    assert recorded["native_photo"]["event"] is None

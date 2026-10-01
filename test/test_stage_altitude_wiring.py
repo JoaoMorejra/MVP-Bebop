@@ -164,6 +164,7 @@ class Ctx:
         # Inline perception: one frame, one inference, one overlay per control
         # cycle, so the stage's frame-counting logic is exercised exactly.
         self.perception = SynchronousPerception(self)
+        self.picture_ack = None
 
     def interrupted(self) -> bool:
         """Mirrors MissionContext.interrupted: an abort or a commanded stage jump."""
@@ -172,7 +173,7 @@ class Ctx:
     def grab_frame(self, timeout_sec=1.0):
         return object()
 
-    def detect(self, _frame, conf=0.5):
+    def detect(self, _frame, conf=0.5, imgsz=None):
         return DetectionResult([Detection()] if self._detections else [])
 
     def publish_annotated_stream(self, _frame, _result, _text):
@@ -286,7 +287,7 @@ def test_the_touchdown_sequence_can_never_climb():
 
     ctx = Ctx(altitude=0.10)
     ctx.params.rtl.touchdown_timeout_sec = 0.3
-    ClosedLoopRTLStep()._touchdown(ctx, None)
+    ClosedLoopRTLStep()._touchdown(ctx, None, at_base=True)
 
     assert ctx.vertical_commands, "the touchdown sent no commands at all"
     assert all(vz <= 0.0 for vz in ctx.vertical_commands)

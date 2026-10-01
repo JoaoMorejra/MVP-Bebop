@@ -217,7 +217,7 @@ class Ctx:
         """Mirrors MissionContext.interrupted: an abort or a commanded stage jump."""
         return self.emergency_event.is_set() or self.stage_jump_event.is_set()
 
-    def detect(self, _frame, conf=0.5):
+    def detect(self, _frame, conf=0.5, imgsz=None):
         self._cycle = getattr(self, "_cycle", -1) + 1
         if self._cycle in self.blackout:
             return DetectionResult([])
