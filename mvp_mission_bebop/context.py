@@ -430,6 +430,27 @@ class MissionContext:
 
         return record
 
+    def update_evidence_metadata(self, path: str, fields: Dict[str, Any]) -> None:
+        """Merge ``fields`` into an evidence sidecar, atomically.
+
+        Used for what arrives after the capture: the aircraft's acknowledgement
+        of the native photo (``steps/inspection.py:_resolve_native_ack``).
+
+        Raises
+        ------
+        OSError, ValueError
+            When the sidecar cannot be read or written.
+        """
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        payload.update(fields)
+        directory = os.path.dirname(path) or "."
+        base, extension = os.path.splitext(os.path.basename(path))
+        temporary = os.path.join(directory, f".{base}.tmp{extension}")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+        os.replace(temporary, path)
+
     def _write_atomic(self, path: str, image: np.ndarray, params: List[int]) -> Optional[str]:
         """Encode to a temporary file in the same directory, then rename.
 

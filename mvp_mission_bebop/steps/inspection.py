@@ -41,6 +41,8 @@ class NadirInspectionStep(BaseStep):
     """Holds a motionless nadir hover and records forensic evidence."""
 
     def __init__(self) -> None:
+        #: Native photo still awaiting the aircraft's PictureEventChanged.
+        self._pending_ack: Optional[Dict[str, Any]] = None
         super().__init__("STEP 4: Motionless Nadir Hover & Evidence Capture")
 
     def execute(self, ctx: MissionContext) -> StepStatus:
@@ -99,6 +101,8 @@ class NadirInspectionStep(BaseStep):
                 "No evidence was recorded during the hover window; attempting a final capture."
             )
             self._capture(ctx, settled, forced=True)
+
+        self._settle_native_ack(ctx)
 
         if ctx.blackboard.evidence.captured:
             self._announce("Registro concluído", "registro fotográfico do acidente concluído")
@@ -219,17 +223,14 @@ class NadirInspectionStep(BaseStep):
             f"| {'SETTLED' if settled else 'UNSETTLED'} | TARGETS: {len(targets)}",
         )
 
+        # Not waited for here: measured on the aircraft, the TAKEN arrives 2.5 s
+        # after the request, and blocking for it would leave the last Twist
+        # latched on the Bebop. An acknowledgement already in is recorded now;
+        # a later one is resolved by the hover loop (_resolve_native_ack).
         if tracker is not None:
-            window = ctx.params.inspection.native_photo_ack_timeout_sec
-            ack = tracker.wait_after(mark, window - (time.monotonic() - requested_at))
+            ack = tracker.wait_after(mark, 0.0)
             if ack is not None:
                 native_photo.update(acknowledged=ack["acknowledged"], event=ack["event"], error=ack["error"])
-        if not native_photo["acknowledged"]:
-            logger.warning(
-                "Native photo not acknowledged by the aircraft (event=%s, error=%s).",
-                native_photo["event"],
-                native_photo["error"],
-            )
 
         record = ctx.record_photographic_evidence(
             raw_frame=frame,
@@ -239,6 +240,17 @@ class NadirInspectionStep(BaseStep):
             native_photo=native_photo,
         )
         ctx.blackboard.evidence = record
+        self._pending_ack = None
+        if tracker is not None and native_photo["event"] is None and record.metadata_path:
+            self._pending_ack = {
+                "tracker": tracker,
+                "mark": mark,
+                "requested_at": requested_at,
+                "native_photo": native_photo,
+                "metadata_path": record.metadata_path,
+            }
+        elif native_photo["event"] is not None and not native_photo["acknowledged"]:
+            logger.warning("Native photo refused by the aircraft (error=%s).", native_photo["error"])
         if record.captured:
             emit_milestone(
                 "mission.capture_done",
@@ -297,6 +309,7 @@ class NadirInspectionStep(BaseStep):
 
                 self._hold(ctx)
                 rate.tick()
+                self._resolve_native_ack(ctx)
 
                 if captured:
                     continue
@@ -330,6 +343,60 @@ class NadirInspectionStep(BaseStep):
             logger.info("Hover loop cadence: %s.", rate.cadence_report())
 
         return StepStatus.SUCCESS
+
+    # ----------------------------------------------------------- native ACK
+
+    def _resolve_native_ack(self, ctx: MissionContext, *, final: bool = False) -> bool:
+        """Record the native photo's acknowledgement once it is in or overdue.
+
+        Non-blocking. The sidecar written by the capture says ``acknowledged:
+        false``; it is rewritten when PictureEventChanged arrives, or when
+        ``inspection.native_photo_ack_timeout_sec`` has passed since the
+        request (or ``final``) without one. Returns True while one is pending.
+        """
+        pending = self._pending_ack
+        if pending is None:
+            return False
+        native = pending["native_photo"]
+        ack = pending["tracker"].wait_after(pending["mark"], 0.0)
+        overdue = time.monotonic() - pending["requested_at"] >= ctx.params.inspection.native_photo_ack_timeout_sec
+        if ack is None and not overdue and not final:
+            return True
+        if ack is not None:
+            native.update(acknowledged=ack["acknowledged"], event=ack["event"], error=ack["error"])
+        native["ack_ms"] = (
+            int((time.monotonic() - pending["requested_at"]) * 1000.0) if ack is not None else None
+        )
+        self._pending_ack = None
+        if native["acknowledged"]:
+            logger.info("Native photo acknowledged by the aircraft after %d ms.", native["ack_ms"])
+        else:
+            logger.warning(
+                "Native photo not acknowledged by the aircraft (event=%s, error=%s).",
+                native["event"],
+                native["error"],
+            )
+        try:
+            ctx.update_evidence_metadata(pending["metadata_path"], {"native_photo": dict(native)})
+        except Exception as exc:  # noqa: BLE001 - evidence bookkeeping never ends the flight
+            logger.error("Could not update the evidence sidecar with the native photo ACK: %s", exc)
+        return False
+
+    def _settle_native_ack(self, ctx: MissionContext) -> None:
+        """Wait out a pending acknowledgement, still station keeping.
+
+        Bounded by the acknowledgement window counted from the request; an
+        emergency ends the wait at once and records what is known.
+        """
+        if self._pending_ack is None:
+            return
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        while self._resolve_native_ack(ctx):
+            if ctx.interrupted():
+                self._resolve_native_ack(ctx, final=True)
+                return
+            self._hold(ctx)
+            rate.tick()
 
     # ---------------------------------------------------------------- helpers
 

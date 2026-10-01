@@ -941,14 +941,14 @@ class InspectionConfig:
     #: silently discarded any operator setting above 0.30 and made that slider
     #: a no-op for the only inference the forensic record depends on.
     nadir_confidence_threshold: float = 0.30
-    #: Longest wait for the aircraft to report the native 14 MP photo
+    #: Window for the aircraft to report the native 14 MP photo
     #: (``PictureEventChanged``), counted from the request.
     #:
-    #: The request goes out before the local inference, so the detector and
-    #: the image writes run inside this window rather than after it; only the
-    #: remainder, if any, is spent waiting. A missing acknowledgement is
-    #: recorded in the sidecar and never fails the capture.
-    native_photo_ack_timeout_sec: float = 2.0
+    #: Measured on the aircraft: TAKEN 2.5 s after the request. The capture
+    #: does not block for it; the hover resolves it and rewrites the sidecar,
+    #: and the end of Stage 4 waits out the rest of the window while holding
+    #: station. A missing acknowledgement never fails the capture.
+    native_photo_ack_timeout_sec: float = 4.0
 
 
 @dataclass

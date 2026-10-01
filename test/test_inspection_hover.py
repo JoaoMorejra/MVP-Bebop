@@ -285,3 +285,59 @@ def test_a_missing_native_ack_is_recorded_as_such():
     NadirInspectionStep()._capture(ctx, settled=True)
     assert recorded["native_photo"]["acknowledged"] is False
     assert recorded["native_photo"]["event"] is None
+
+
+# ------------------------------------------------- asynchronous native ACK (4.7, live)
+#
+# Measured on the aircraft: PictureEventChanged (TAKEN) arrives 2.5 s after the
+# request, longer than the 2 s the capture used to block for; blocking for it
+# would also hold the last Twist open-loop on the Bebop for that long.
+
+
+def _ack_ctx(timeout):
+    from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
+
+    ctx = Ctx()
+    ctx.picture_ack = PictureAckTracker()
+    ctx.params.inspection.native_photo_ack_timeout_sec = timeout
+    ctx.updates = []
+    ctx.record_photographic_evidence = lambda **kw: EvidenceRecord(
+        raw_path="accident_raw_x.png", metadata_path="accident_metadata_x.json"
+    )
+    ctx.update_evidence_metadata = lambda path, fields: ctx.updates.append((path, fields))
+    return ctx
+
+
+def test_the_capture_does_not_wait_for_the_aircraft():
+    import time
+
+    ctx = _ack_ctx(timeout=4.0)
+    step = NadirInspectionStep()
+    started = time.monotonic()
+    assert step._capture(ctx, settled=True) is True
+    assert time.monotonic() - started < 0.5
+
+
+def test_an_acknowledgement_arriving_during_the_hover_updates_the_sidecar():
+    import threading
+
+    ctx = _ack_ctx(timeout=4.0)
+    step = NadirInspectionStep()
+    step._capture(ctx, settled=True)
+    threading.Timer(0.1, lambda: ctx.picture_ack.update('{"sequence": 9, "kind": "event", "value": 0, "error": 0}')).start()
+    step._hover(ctx, already_captured=True)
+    assert ctx.updates, "the sidecar was never updated"
+    path, fields = ctx.updates[-1]
+    assert path == "accident_metadata_x.json"
+    assert fields["native_photo"]["acknowledged"] is True
+    assert fields["native_photo"]["event"] == "taken"
+
+
+def test_no_acknowledgement_is_settled_by_the_end_of_the_stage_while_holding():
+    ctx = _ack_ctx(timeout=0.2)
+    step = NadirInspectionStep()
+    step._capture(ctx, settled=True)
+    commands = len(ctx.drone.commands)
+    step._settle_native_ack(ctx)
+    assert ctx.updates and ctx.updates[-1][1]["native_photo"]["acknowledged"] is False
+    assert len(ctx.drone.commands) > commands, "station keeping stopped while waiting"
