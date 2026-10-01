@@ -3,11 +3,12 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { Plus, X } from 'lucide-react';
-import type { TerminalIdentity } from '../../types/bmg';
+import type { MagnetoCalibration, TerminalIdentity } from '../../types/bmg';
 import { cn } from '../../lib/format';
 import { createLandInterceptor } from '../../lib/terminalInput';
 import { parseOsc7, tabLabel, terminalTitle } from '../../lib/terminalTitle';
 import { useBridge } from '../../hooks/useBridge';
+import { MagnetoCalibrationPanel } from './MagnetoCalibrationPanel';
 
 interface DiagnosticsScreenProps {
   /** `mission.py` is up (running or arming). */
@@ -16,6 +17,8 @@ interface DiagnosticsScreenProps {
   onLand: () => Promise<void> | void;
   /** The last shell tab ended (`exit`, Ctrl+D): the terminal closes with it. */
   onClose?: () => void;
+  /** Latest magnetometer calibration report from the aircraft. */
+  magneto?: MagnetoCalibration | null;
 }
 
 /** One shell tab. `identity` arrives with the PTY and follows the shell's `cd`. */
@@ -242,7 +245,18 @@ const ShellPane: React.FC<ShellPaneProps> = ({ active, onLand, onExit, onIdentit
  * drawn here: the host still mirrors them to the terminal that launched the
  * station (`recordLog` in electron/main.cjs).
  */
-export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({ missionRunning, onLand, onClose }) => {
+export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({
+  missionRunning,
+  onLand,
+  onClose,
+  magneto = null,
+}) => {
+  const bridge = useBridge();
+  const calibrateMagneto = useCallback(
+    async (start: boolean) =>
+      bridge ? bridge.calibrateMagneto(start) : { success: false, error: 'Sem ponte Electron.' },
+    [bridge]
+  );
   const [tabs, setTabs] = useState<ShellTab[]>([{ key: 1, identity: null }]);
   const [activeKey, setActiveKey] = useState(1);
   const nextKey = useRef(2);
@@ -283,7 +297,7 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({ missionRun
   const activeTab = tabs.find((tab) => tab.key === activeKey) ?? tabs[0];
 
   return (
-    <div className="flex h-full min-h-0 flex-col p-3">
+    <div className="flex h-full min-h-0 gap-3 p-3">
       <div
         className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-panel border border-[#0f2a36] shadow-2xl"
         style={{ background: TERMINAL_THEME.background }}
@@ -381,6 +395,9 @@ export const DiagnosticsScreen: React.FC<DiagnosticsScreenProps> = ({ missionRun
           <span>land = pouso de emergência · exit fecha a aba · Tab completa · Ctrl+C interrompe</span>
         </div>
       </div>
+      <aside className="w-[260px] shrink-0">
+        <MagnetoCalibrationPanel report={magneto} missionRunning={missionRunning} onCommand={calibrateMagneto} />
+      </aside>
     </div>
   );
 };

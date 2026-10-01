@@ -21,6 +21,7 @@ Protocol, one JSON object per line on stdin::
     {"op": "land"}               # emergency landing, published immediately
     {"op": "stop"}               # zero the velocity setpoint
     {"op": "stage", "stage": 4}  # ask the running mission to continue at stage 4
+    {"op": "magneto", "start": true}   # start (true) or abort (false) the magnetometer calibration
     {"op": "quit"}
 
 Replies, one per line on stdout, prefixed so they survive anything rclpy
@@ -41,13 +42,15 @@ import time
 import rclpy
 from geometry_msgs.msg import Twist, Vector3
 from rclpy.node import Node
-from std_msgs.msg import Empty, Int32
+from std_msgs.msg import Bool, Empty, Int32
 
 NAMESPACE = os.environ.get("BMG_BEBOP_NS", "/bebop")
 TOPIC_MOVE_CAMERA = f"{NAMESPACE}/move_camera"
 TOPIC_LAND = f"{NAMESPACE}/land"
 TOPIC_CMD_VEL = f"{NAMESPACE}/cmd_vel"
 TOPIC_GOTO_STAGE = f"{NAMESPACE}/mission/goto_stage"
+#: Magnetometer calibration start (true) or abort (false), driver subscription.
+TOPIC_CALIBRATE_MAGNETO = f"{NAMESPACE}/calibrate_magneto"
 
 EVENT_PREFIX = "BMG_CMD:"
 
@@ -84,6 +87,19 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def magneto_request(request: dict) -> "bool | None":
+    """``start`` of a ``magneto`` request, or ``None`` for anything else.
+
+    Only a JSON boolean is accepted: the calibration is a manual procedure the
+    operator starts deliberately, and a truthy string or number reaching the
+    aircraft as a start is not one.
+    """
+    if request.get("op") != "magneto":
+        return None
+    start = request.get("start")
+    return start if isinstance(start, bool) else None
+
+
 def main() -> int:
     rclpy.init(args=None)
     node = Node("bmg_command_bridge", start_parameter_services=False)
@@ -95,6 +111,7 @@ def main() -> int:
     land = node.create_publisher(Empty, TOPIC_LAND, 10)
     cmd_vel = node.create_publisher(Twist, TOPIC_CMD_VEL, 10)
     goto_stage = node.create_publisher(Int32, TOPIC_GOTO_STAGE, 10)
+    calibrate_magneto = node.create_publisher(Bool, TOPIC_CALIBRATE_MAGNETO, 1)
 
     emit(
         {
@@ -104,6 +121,7 @@ def main() -> int:
                 "land": TOPIC_LAND,
                 "cmd_vel": TOPIC_CMD_VEL,
                 "stage": TOPIC_GOTO_STAGE,
+                "magneto": TOPIC_CALIBRATE_MAGNETO,
             },
         }
     )
@@ -153,6 +171,16 @@ def main() -> int:
                     land.publish(Empty())
                 spin()
                 emit({"event": "land", "repeats": LAND_REPEATS, "matched": matched})
+                continue
+
+            if op == "magneto":
+                start = magneto_request(request)
+                if start is None:
+                    continue
+                matched = wait_for_reader(calibrate_magneto, LAND_MATCH_WAIT_SEC)
+                calibrate_magneto.publish(Bool(data=start))
+                spin()
+                emit({"event": "magneto", "start": start, "matched": matched})
                 continue
 
             if op == "stage":
