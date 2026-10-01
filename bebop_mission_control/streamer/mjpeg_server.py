@@ -52,7 +52,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 
@@ -62,11 +62,14 @@ DEFAULT_RAW_TOPIC = "/bebop/camera/image_raw"
 DEFAULT_BOXES_TOPIC = "/bebop/camera/detection_boxes"
 
 #: How long the annotated stream keeps priority after its last frame.
-DETECTION_PRIORITY_SEC = 1.5
+DETECTION_PRIORITY_SEC = 0.25
 #: Overlay schema this bridge understands. Mirrors
 #: `mvp_mission_bebop.perception.summary.DETECTION_SUMMARY_SCHEMA`; a message
 #: with any other schema is ignored rather than misdrawn.
 DETECTION_SUMMARY_SCHEMA = "bmg.detections.v1"
+#: The same plus landing-marker geometry
+#: (`mvp_mission_bebop.perception.summary.DETECTION_SUMMARY_SCHEMA_V2`).
+DETECTION_SUMMARY_SCHEMA_V2 = "bmg.detections.v2"
 #: Oldest detection overlay still drawn onto live frames, in seconds.
 #:
 #: An overlay is already one CPU inference (150-250 ms) behind the frame it is
@@ -79,6 +82,43 @@ FRAME_STALE_SEC = 2.0
 #: Upper bound on the rate at which frames are pushed to a connected client.
 STREAM_MAX_FPS = 30.0
 JPEG_QUALITY = 80
+#: Quality of a compressed frame re-encoded after the overlay is drawn on it.
+OVERLAY_JPEG_QUALITY = 75
+#: A compressed stream silent for longer than this hands over to the raw one.
+COMPRESSED_STALE_SEC = 1.0
+#: Period of the check that drops or restores the raw subscription.
+RAW_SUBSCRIPTION_CHECK_SEC = 1.0
+
+#: JPEG start-of-frame markers carrying the image geometry (baseline,
+#: extended, progressive, lossless).
+_JPEG_SOF_MARKERS = frozenset({0xC0, 0xC1, 0xC2, 0xC3})
+
+
+def jpeg_size(data: bytes) -> Optional[Tuple[int, int]]:
+    """``(width, height)`` from a JPEG's start-of-frame header, or None.
+
+    Read from the bytes rather than decoded: a frame that passes straight
+    through to the cockpit is never decompressed by this process.
+    """
+    if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+    index = 2
+    length = len(data)
+    while index + 9 < length:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker in _JPEG_SOF_MARKERS:
+            height = (data[index + 5] << 8) | data[index + 6]
+            width = (data[index + 7] << 8) | data[index + 8]
+            return (width, height) if width and height else None
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            index += 2
+            continue
+        segment = (data[index + 2] << 8) | data[index + 3]
+        index += 2 + segment
+    return None
 
 
 class FrameBuffer:
@@ -177,6 +217,8 @@ class DetectionSummary:
     status: str
     inference_ms: float
     detections: Tuple[BoxDetection, ...]
+    #: Landing markers (schema v2): ``(id, corners, axes or None)`` in frame pixels.
+    markers: Tuple[Tuple[int, Tuple[Tuple[float, float], ...], Optional[Dict[str, Tuple[float, float]]]], ...] = ()
 
 
 def parse_detection_summary(text: str) -> Optional[DetectionSummary]:
@@ -190,7 +232,10 @@ def parse_detection_summary(text: str) -> Optional[DetectionSummary]:
         payload = json.loads(text)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict) or payload.get("schema") != DETECTION_SUMMARY_SCHEMA:
+    if not isinstance(payload, dict) or payload.get("schema") not in (
+        DETECTION_SUMMARY_SCHEMA,
+        DETECTION_SUMMARY_SCHEMA_V2,
+    ):
         return None
 
     frame = payload.get("frame")
@@ -218,12 +263,29 @@ def parse_detection_summary(text: str) -> Optional[DetectionSummary]:
         inference_ms = float(payload.get("inference_ms", 0.0))
     except (TypeError, ValueError):
         inference_ms = 0.0
+    markers = []
+    for entry in payload.get("markers") or []:
+        try:
+            corners = tuple((float(x), float(y)) for x, y in entry["corners_px"])
+            marker_id = int(entry["id"])
+            raw_axes = entry.get("axes_px")
+            axes = (
+                {key: (float(raw_axes[key][0]), float(raw_axes[key][1])) for key in ("origin", "x", "y", "z")}
+                if raw_axes
+                else None
+            )
+        except (TypeError, KeyError, ValueError):
+            continue
+        if len(corners) != 4:
+            continue
+        markers.append((marker_id, corners, axes))
     return DetectionSummary(
         width=width,
         height=height,
         status=str(payload.get("status", "")),
         inference_ms=inference_ms,
         detections=tuple(detections),
+        markers=tuple(markers),
     )
 
 
@@ -296,6 +358,22 @@ def draw_detection_summary(frame: np.ndarray, summary: DetectionSummary) -> np.n
             1,
             cv2.LINE_AA,
         )
+
+    for marker_id, corners, axes in summary.markers:
+        points = np.array(
+            [[int(round(x * scale_x)), int(round(y * scale_y))] for x, y in corners], dtype=np.int32
+        )
+        cv2.polylines(canvas, [points], True, (0, 200, 255), 2)
+        cv2.putText(
+            canvas, f"ID {marker_id}", (int(points[0][0]), max(label_floor + 14, int(points[0][1]) - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA,
+        )
+        if axes:
+            origin = (int(round(axes["origin"][0] * scale_x)), int(round(axes["origin"][1] * scale_y)))
+            # OpenCV's drawFrameAxes palette: x red, y green, z blue.
+            for key, colour in (("x", (0, 0, 255)), ("y", (0, 255, 0)), ("z", (255, 0, 0))):
+                tip = (int(round(axes[key][0] * scale_x)), int(round(axes[key][1] * scale_y)))
+                cv2.line(canvas, origin, tip, colour, 2)
 
     cv2.drawMarker(
         canvas, (width // 2, height // 2), (0, 255, 255), cv2.MARKER_CROSS, 20, 1
@@ -389,20 +467,67 @@ class MJPEGNode(Node):
         #: Sources that have already announced their first good frame, so the
         #: log records the moment video started rather than every frame after.
         self._announced: set = set()
+        #: The driver's image_transport publisher also offers the JPEG stream.
+        #: Preferred: with nothing to draw it goes straight to the cockpit, and
+        #: 2.76 MB of raw BGR per frame no longer crosses DDS to this process.
+        self.compressed_topic = f"{raw_topic}/compressed"
+        self._last_compressed_at = 0.0
 
-        qos = QoSProfile(
+        self._qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
-        self.create_subscription(Image, detection_topic, self._on_detection, qos)
-        self.create_subscription(Image, raw_topic, self._on_raw, qos)
-        self.create_subscription(String, boxes_topic, self._on_boxes, qos)
+        self.create_subscription(Image, detection_topic, self._on_detection, self._qos)
+        self.create_subscription(CompressedImage, self.compressed_topic, self._on_compressed, self._qos)
+        self._raw_subscription = self.create_subscription(Image, raw_topic, self._on_raw, self._qos)
+        self.create_subscription(String, boxes_topic, self._on_boxes, self._qos)
+        self.create_timer(RAW_SUBSCRIPTION_CHECK_SEC, self._manage_raw_subscription)
 
         self.get_logger().info(
             f"MJPEG bridge subscribing to {detection_topic} (primary), "
-            f"{raw_topic} (live, overlaid with {boxes_topic} while it is fresh)"
+            f"{self.compressed_topic} (live), {raw_topic} (fallback), "
+            f"overlaid with {boxes_topic} while it is fresh"
         )
+
+    def _compressed_live(self) -> bool:
+        return time.monotonic() - self._last_compressed_at <= COMPRESSED_STALE_SEC
+
+    def _manage_raw_subscription(self) -> None:
+        """Hold the raw subscription only while the compressed stream is silent."""
+        if self._compressed_live():
+            if self._raw_subscription is not None:
+                self.destroy_subscription(self._raw_subscription)
+                self._raw_subscription = None
+                self.get_logger().info(f"Compressed stream live; raw {self.raw_topic} released.")
+        elif self._raw_subscription is None:
+            self._raw_subscription = self.create_subscription(Image, self.raw_topic, self._on_raw, self._qos)
+            self.get_logger().warning(f"Compressed stream silent; falling back to raw {self.raw_topic}.")
+
+    def _on_compressed(self, msg: CompressedImage) -> None:
+        self._last_compressed_at = time.monotonic()
+        if time.monotonic() - self._last_detection_at <= DETECTION_PRIORITY_SEC:
+            return
+        data = bytes(msg.data)
+        summary = OVERLAY.fresh(BOX_OVERLAY_MAX_AGE_SEC)
+        is_jpeg = "jpeg" in (msg.format or "").lower() or data[:2] == b"\xff\xd8"
+        size = jpeg_size(data) if is_jpeg else None
+        if summary is None and size is not None:
+            if self.compressed_topic not in self._announced:
+                self._announced.add(self.compressed_topic)
+                self.get_logger().info(f"First frame from {self.compressed_topic}: {size[0]}x{size[1]}, JPEG passthrough")
+            BUFFER.publish(data, self.compressed_topic, size)
+            return
+        frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None or frame.size == 0:
+            return
+        source = self.compressed_topic
+        if summary is not None:
+            frame = draw_detection_summary(frame, summary)
+            source = self.boxes_topic
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, OVERLAY_JPEG_QUALITY])
+        if ok:
+            BUFFER.publish(encoded.tobytes(), source, (int(frame.shape[1]), int(frame.shape[0])))
 
     def _on_detection(self, msg: Image) -> None:
         self._last_detection_at = time.monotonic()
@@ -421,8 +546,12 @@ class MJPEGNode(Node):
         OVERLAY.update(summary)
 
     def _on_raw(self, msg: Image) -> None:
+        # The compressed stream is the live source while it flows; raw is its
+        # fallback, released by `_manage_raw_subscription`.
+        if time.monotonic() - self._last_compressed_at <= COMPRESSED_STALE_SEC:
+            return
         # The annotated stream wins while it is alive: those are frames the
-        # mission composed itself (marker HUD, evidence capture).
+        # mission composed itself (the evidence capture).
         if time.monotonic() - self._last_detection_at <= DETECTION_PRIORITY_SEC:
             return
 
@@ -555,6 +684,9 @@ class StreamHandler(BaseHTTPRequestHandler):
     # -- routes --------------------------------------------------------------
 
     def _serve_stream(self) -> None:
+        # One small write per frame, sent at once: Nagle would otherwise hold
+        # the tail of each frame until the next one's header.
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.send_response(200)
         self.send_header("Age", "0")
         self.send_header("Cache-Control", "no-cache, private")
@@ -581,14 +713,13 @@ class StreamHandler(BaseHTTPRequestHandler):
                     time.sleep(min_period - (now - last_sent))
                 last_sent = time.monotonic()
 
-                header = (
+                self.wfile.write(
                     b"--FRAME\r\n"
                     b"Content-Type: image/jpeg\r\n"
                     b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
+                    + payload
+                    + b"\r\n"
                 )
-                self.wfile.write(header)
-                self.wfile.write(payload)
-                self.wfile.write(b"\r\n")
         except (BrokenPipeError, ConnectionResetError):
             pass  # the cockpit navigated away or reloaded
         except OSError:

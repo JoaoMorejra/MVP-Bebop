@@ -101,8 +101,10 @@ FLYING_STATE_LABELS = {
     7: "motor_ramping",
     8: "emergency_landing",
 }
-#: States in which the airframe is off the ground.
-AIRBORNE_STATES = {1, 2, 3, 4, 6, 8}
+#: States in which the airframe is off the ground with the rotors turning.
+#: Canonical set, mirrored from ``src/lib/flightState.ts:AIRBORNE_STATES`` and
+#: pinned by ``test/test_contracts.py``. ``usertakeoff`` (6) waits on the ground.
+AIRBORNE_STATES = {1, 2, 3, 4, 7, 8}
 
 BEBOP_IP = os.environ.get("BMG_BEBOP_IP", "192.168.42.1")
 

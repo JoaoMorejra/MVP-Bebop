@@ -28,7 +28,7 @@ decides to print::
 
     BMG_CMD:{"event": "ready"}
     BMG_CMD:{"event": "tilt", "tilt": -40.0, "pan": 0.0}
-    BMG_CMD:{"event": "land"}
+    BMG_CMD:{"event": "land", "repeats": 5, "matched": 1}
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 import rclpy
 from geometry_msgs.msg import Twist, Vector3
@@ -62,6 +63,16 @@ PAN_LIMIT_DEG = 35.0
 # best-effort transport is not a guarantee, so the abort sends several -- it
 # costs nothing and it is the difference between a landing and a hover.
 LAND_REPEATS = 5
+
+# Longest wait for the land publisher to match a subscription before the burst
+# goes out. `ready` is emitted when the node exists, not when DDS has paired it
+# with the driver; measured, a land written right after `ready` was lost in most
+# runs and delivered in every run after 5 s. A publish with no matched reader
+# reaches no one, so waiting for the match delays nothing that would have
+# arrived. Bounded so a driver that is down does not hold the pipe; 5 s covers
+# a missed initial SPDP announcement, after which Fast DDS re-announces on its
+# periodic cycle (a 3 s bound was exceeded in bench).
+LAND_MATCH_WAIT_SEC = 5.0
 
 
 def emit(payload: dict) -> None:
@@ -102,6 +113,14 @@ def main() -> int:
         # a turn of the executor -- without ever blocking the read loop.
         rclpy.spin_once(node, timeout_sec=0.0)
 
+    def wait_for_reader(publisher, timeout_sec: float) -> int:
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            count = publisher.get_subscription_count()
+            if count > 0 or time.monotonic() >= deadline:
+                return count
+            rclpy.spin_once(node, timeout_sec=0.01)
+
     try:
         for line in sys.stdin:
             line = line.strip()
@@ -126,13 +145,14 @@ def main() -> int:
                 continue
 
             if op == "land":
+                matched = wait_for_reader(land, LAND_MATCH_WAIT_SEC)
                 # Velocity first: an airframe still carrying a setpoint keeps
                 # translating through the descent.
                 cmd_vel.publish(Twist())
                 for _ in range(LAND_REPEATS):
                     land.publish(Empty())
                 spin()
-                emit({"event": "land", "repeats": LAND_REPEATS})
+                emit({"event": "land", "repeats": LAND_REPEATS, "matched": matched})
                 continue
 
             if op == "stage":
