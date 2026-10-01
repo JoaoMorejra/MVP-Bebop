@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
-from typing import Any, Final, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Final, Optional, Tuple
 
 import numpy as np
 
@@ -151,7 +151,57 @@ def resolve_driver_calibration_path() -> Optional[str]:
     return path if os.path.isfile(path) else None
 
 
-def apply_driver_calibration(detector: Any) -> Optional[CameraInfoCalibration]:
+#: Relative aspect-ratio difference within which a calibration is rescaled to
+#: the stream rather than refused. 1280x720 against 856x480 differs by 0.3 %.
+ASPECT_TOLERANCE: Final[float] = 0.01
+
+
+class CalibrationMismatch(ValueError):
+    """The stream's aspect ratio is not the calibration's: no metric pose from it."""
+
+
+def fit_calibration(calibration: CameraInfoCalibration, image_size: Tuple[int, int]) -> CameraInfoCalibration:
+    """The calibration expressed at the stream's resolution.
+
+    A pinhole calibration scales with the image: ``fx``, ``cx`` by the width
+    ratio, ``fy``, ``cy`` by the height ratio; distortion coefficients are
+    normalized and unchanged. Measured on 2026-09-30: the stream was 1280x720
+    while ``camera_info`` described the 856x480 calibration, so the ArUco pose
+    on the return leg used a principal point 213 px off.
+
+    Raises
+    ------
+    ValueError
+        If ``image_size`` is not two positive integers.
+    CalibrationMismatch
+        If the aspect ratios differ by more than :data:`ASPECT_TOLERANCE`:
+        a crop or a different sensor mode, which no rescale can describe.
+    """
+    width, height = (int(value) for value in image_size)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"image size must be positive, got {width}x{height}")
+    if (width, height) == (calibration.width, calibration.height):
+        return calibration
+    expected = calibration.width / float(calibration.height)
+    actual = width / float(height)
+    if abs(actual - expected) / expected > ASPECT_TOLERANCE:
+        raise CalibrationMismatch(
+            f"stream {width}x{height} (aspect {actual:.4f}) does not match the "
+            f"{calibration.width}x{calibration.height} calibration (aspect {expected:.4f})"
+        )
+    sx = width / float(calibration.width)
+    sy = height / float(calibration.height)
+    matrix = calibration.camera_matrix.astype(np.float64).copy()
+    matrix[0, 0] *= sx
+    matrix[0, 2] *= sx
+    matrix[1, 1] *= sy
+    matrix[1, 2] *= sy
+    return replace(calibration, camera_matrix=matrix, width=width, height=height)
+
+
+def apply_driver_calibration(
+    detector: Any, image_size: Optional[Tuple[int, int]] = None
+) -> Optional[CameraInfoCalibration]:
     """Replace a detector's intrinsics with the Bebop 2 calibration.
 
     Parameters
@@ -159,12 +209,24 @@ def apply_driver_calibration(detector: Any) -> Optional[CameraInfoCalibration]:
     detector : Any
         Object exposing ``camera_matrix`` and ``camera_distortion``, as
         ``nectar.vision.Aruco`` does.
+    image_size : tuple of int, optional
+        ``(width, height)`` of the frames the detector will see. When it
+        differs from the calibration's, the intrinsics are rescaled
+        (:func:`fit_calibration`) and a WARNING says so.
 
     Returns
     -------
     CameraInfoCalibration or None
         The calibration applied, or ``None`` when none was found or it could
         not be read, in which case the detector is left untouched.
+
+    Raises
+    ------
+    CalibrationMismatch
+        If the stream's aspect ratio is not the calibration's; the detector is
+        left untouched and no metric pose should be taken from it.
+    ValueError
+        If ``image_size`` is malformed.
     """
     path = resolve_driver_calibration_path()
     if path is None:
@@ -174,6 +236,22 @@ def apply_driver_calibration(detector: Any) -> Optional[CameraInfoCalibration]:
     except (OSError, ValueError) as exc:
         logger.warning("Bebop calibration at %s is unusable (%s); keeping the SDK intrinsics.", path, exc)
         return None
+
+    if image_size is not None:
+        fitted = fit_calibration(calibration, image_size)
+        if fitted is not calibration:
+            logger.warning(
+                "Camera stream is %dx%d but %s was captured at %dx%d; intrinsics rescaled "
+                "(principal point %.1f, %.1f).",
+                fitted.width,
+                fitted.height,
+                path,
+                calibration.width,
+                calibration.height,
+                float(fitted.camera_matrix[0, 2]),
+                float(fitted.camera_matrix[1, 2]),
+            )
+        calibration = fitted
 
     detector.camera_matrix = calibration.camera_matrix.copy()
     detector.camera_distortion = calibration.distortion.copy()

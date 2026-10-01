@@ -176,6 +176,7 @@ class RawBridge:
 
     def __init__(self, last_detection_at):
         self._last_detection_at = last_detection_at
+        self._last_compressed_at = 0.0
         self.published = []
 
     def _decode(self, _msg, _source):
@@ -269,3 +270,66 @@ def test_an_overlay_failure_never_reaches_the_worker():
         frame=np.zeros((480, 856, 3), dtype=np.uint8), result=[], stamp=0.0, generation=1
     )
     ctx.publish_detection_summary(sample, "")
+
+
+# ------------------------------------------------------------ markers, schema v2 (4.4)
+
+MARKER = {
+    "id": 7,
+    "corners_px": [[400.0, 200.0], [460.0, 200.0], [460.0, 260.0], [400.0, 260.0]],
+    "axes_px": {"origin": [430.0, 230.0], "x": [470.0, 230.0], "y": [430.0, 190.0], "z": [430.0, 230.0]},
+}
+
+
+def test_a_summary_with_markers_is_schema_v2_and_one_without_stays_v1():
+    from mvp_mission_bebop.perception.summary import DETECTION_SUMMARY_SCHEMA, DETECTION_SUMMARY_SCHEMA_V2
+
+    plain = json.loads(encoded())
+    assert plain["schema"] == DETECTION_SUMMARY_SCHEMA == "bmg.detections.v1"
+    with_marker = json.loads(
+        encode_detection_summary(
+            detections=[], frame_width=856, frame_height=480, status="STEP 5: RTL",
+            stamp_sec=1.0, inference_ms=0.0, markers=[MARKER],
+        )
+    )
+    assert with_marker["schema"] == DETECTION_SUMMARY_SCHEMA_V2 == "bmg.detections.v2"
+    assert with_marker["markers"][0]["id"] == 7
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"id": 1, "corners_px": [[0, 0], [1, 0], [1, 1]]},
+        {"id": 1, "corners_px": [[0, 0], [1, 0], [1, 1], [float("nan"), 1]]},
+        {"corners_px": [[0, 0], [1, 0], [1, 1], [0, 1]]},
+    ],
+)
+def test_a_malformed_marker_is_refused_by_the_encoder(marker):
+    with pytest.raises(ValueError):
+        encode_detection_summary(
+            detections=[], frame_width=856, frame_height=480, status="", stamp_sec=1.0,
+            inference_ms=0.0, markers=[marker],
+        )
+
+
+def test_the_bridge_decodes_and_draws_the_marker(bridge):
+    text = encode_detection_summary(
+        detections=[], frame_width=856, frame_height=480, status="STEP 5: RTL",
+        stamp_sec=1.0, inference_ms=0.0, markers=[MARKER],
+    )
+    summary = bridge.parse_detection_summary(text)
+    assert summary is not None and len(summary.markers) == 1
+    canvas = np.zeros((480, 856, 3), dtype=np.uint8)
+    bridge.draw_detection_summary(canvas, summary)
+    assert canvas[200, 430].any(), "marker outline not drawn"
+    assert canvas[230, 450].any(), "pose axis not drawn"
+
+
+def test_a_v1_summary_still_decodes_with_no_markers(bridge):
+    summary = bridge.parse_detection_summary(encoded())
+    assert summary is not None and summary.markers == ()
+
+
+def test_annotated_frames_hold_priority_only_briefly(bridge):
+    """1.5 s of priority held Stage 1 and the RTL at the annotated rate (~5 FPS)."""
+    assert bridge.DETECTION_PRIORITY_SEC == pytest.approx(0.25)

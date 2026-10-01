@@ -520,6 +520,16 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
         Acquisition timeout per cycle.
     name : str
         Thread name, visible in stack dumps.
+    min_period_sec : float
+        Least time from the start of one cycle to the start of the next
+        (``vision.inference_min_period_sec``). Unbounded, the detector ran as
+        fast as frames came and took 187 % of the station's CPU, starving the
+        video path; zero keeps that behaviour.
+
+    Raises
+    ------
+    ValueError
+        If ``min_period_sec`` is negative or not finite.
     """
 
     def __init__(
@@ -529,7 +539,12 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
         clock: Clock = time.monotonic,
         frame_timeout_sec: float = DEFAULT_FRAME_TIMEOUT_SEC,
         name: str = "mission_perception",
+        min_period_sec: float = 0.0,
     ) -> None:
+        period = float(min_period_sec)
+        if not math.isfinite(period) or period < 0.0:
+            raise ValueError(f"min_period_sec must be a finite non-negative number, got {min_period_sec!r}")
+        self._min_period = period
         PerceptionPipeline.__init__(self, ctx, clock=clock, frame_timeout_sec=frame_timeout_sec)
         threading.Thread.__init__(self, name=name, daemon=True)
         self._halt_event = threading.Event()
@@ -634,6 +649,7 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
         while not self._halt_event.is_set():
             if not self._engaged_event.wait(timeout=self._frame_timeout):
                 continue
+            cycle_started = time.monotonic()
             with self._cycle_lock:
                 # Re-checked under the lock: a disengage that cleared the flag
                 # between the wait above and the acquisition must win, or the
@@ -645,6 +661,10 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
                 except Exception as exc:  # noqa: BLE001 - perception must not kill the mission
                     self._log_fault(exc)
                     self._halt_event.wait(_FAULT_BACKOFF_SEC)
+            # Outside the cycle lock, so a disengage never waits on the pause.
+            pause = self._min_period - (time.monotonic() - cycle_started)
+            if pause > 0.0:
+                self._halt_event.wait(pause)
         logger.info("Perception worker stopped after %d cycles.", self._cycles)
 
     def _cycle(self) -> None:

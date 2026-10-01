@@ -67,8 +67,11 @@ def test_unset_keywords_are_omitted_rather_than_passed_as_none():
 # ------------------------------------------------------------- configuration
 
 
-def test_the_reduced_size_is_opt_in():
-    assert VisionConfig().inference_imgsz is None
+def test_the_default_size_is_the_one_validated_on_the_evidence_frames():
+    """480 px, validated against 640 px on the 35 recorded evidence frames
+    (2026-09-30): same classes on 33, the other two corrected to the true
+    target, and more target hits (24 against 22) with the .pt weights."""
+    assert VisionConfig().inference_imgsz == 480
 
 
 def test_the_new_fields_round_trip_through_the_config_file(tmp_path):
@@ -89,7 +92,7 @@ def test_a_config_written_before_the_fields_existed_still_loads(tmp_path):
     target = tmp_path / "mission_config.json"
     target.write_text(json.dumps({"vision": {"confidence_threshold": 0.6}}))
     loaded = MissionParameters.load_from_file(str(target))
-    assert loaded.vision.inference_imgsz is None
+    assert loaded.vision.inference_imgsz == VisionConfig().inference_imgsz
     assert loaded.vision.confidence_threshold == 0.6
 
 

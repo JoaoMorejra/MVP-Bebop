@@ -594,3 +594,40 @@ def test_a_stale_pipeline_keeps_the_cruise_alive():
     ForwardSearchStep().execute(ctx)
     assert max(vx for vx, *_ in ctx.drone.commands) > 0.0
     assert ctx.blackboard.target_confirmed is False
+
+
+# ------------------------------------------------------------ bounded cadence (4.5e)
+
+
+def test_the_minimum_period_caps_the_inference_rate(worker_factory):
+    """Unbounded, YOLO took 187 % of the CPU and starved the video path."""
+    ctx = PerceptionCtx()
+    worker = worker_factory(ctx, min_period_sec=0.1)
+    worker.engage()
+    time.sleep(0.55)
+    worker.disengage()
+    assert 3 <= len(ctx.detect_calls) <= 7
+
+
+def test_no_minimum_period_runs_as_fast_as_frames_come(worker_factory):
+    ctx = PerceptionCtx()
+    worker = worker_factory(ctx)
+    worker.engage()
+    time.sleep(0.3)
+    worker.disengage()
+    assert len(ctx.detect_calls) > 20
+
+
+@pytest.mark.parametrize("bad", [-0.1, float("nan"), float("inf")])
+def test_a_meaningless_minimum_period_is_refused(bad):
+    with pytest.raises(ValueError):
+        PerceptionWorker(PerceptionCtx(), min_period_sec=bad)
+
+
+def test_the_mission_parameter_reaches_the_worker():
+    import inspect
+
+    from mvp_mission_bebop import mission
+
+    source = inspect.getsource(mission)
+    assert "min_period_sec=params.vision.inference_min_period_sec" in source

@@ -122,3 +122,51 @@ def test_rtl_sensor_poses_with_the_bebop_calibration(monkeypatch, bebop_yaml, ca
 
     assert sensor is not None
     assert "do not match the live frame" not in caplog.text
+
+
+# ------------------------------------------------------------ resolution check (4.6)
+
+
+def test_a_stream_at_the_calibrated_size_is_used_unchanged(monkeypatch, bebop_yaml):
+    detector = SimpleNamespace(camera_matrix=SDK_SAMPLE_MATRIX.copy(), camera_distortion=np.zeros(5))
+    monkeypatch.setattr(intrinsics, "resolve_driver_calibration_path", lambda: bebop_yaml)
+
+    applied = intrinsics.apply_driver_calibration(detector, image_size=(856, 480))
+
+    assert applied is not None
+    assert detector.camera_matrix[0, 0] == pytest.approx(537.292878)
+    assert detector.camera_matrix[0, 2] == pytest.approx(427.331854)
+
+
+def test_a_larger_stream_with_the_same_aspect_gets_scaled_intrinsics(monkeypatch, bebop_yaml):
+    """Measured: the stream was 1280x720 while camera_info described 856x480."""
+    detector = SimpleNamespace(camera_matrix=SDK_SAMPLE_MATRIX.copy(), camera_distortion=np.zeros(5))
+    monkeypatch.setattr(intrinsics, "resolve_driver_calibration_path", lambda: bebop_yaml)
+
+    applied = intrinsics.apply_driver_calibration(detector, image_size=(1280, 720))
+
+    assert applied is not None
+    sx, sy = 1280 / 856, 720 / 480
+    assert detector.camera_matrix[0, 0] == pytest.approx(537.292878 * sx)
+    assert detector.camera_matrix[0, 2] == pytest.approx(427.331854 * sx)
+    assert detector.camera_matrix[1, 1] == pytest.approx(527.000348 * sy)
+    assert detector.camera_matrix[1, 2] == pytest.approx(240.226888 * sy)
+    assert detector.camera_matrix[2, 2] == pytest.approx(1.0)
+    assert (applied.width, applied.height) == (1280, 720)
+
+
+def test_a_stream_with_another_aspect_ratio_refuses_the_pose(monkeypatch, bebop_yaml):
+    detector = SimpleNamespace(camera_matrix=SDK_SAMPLE_MATRIX.copy(), camera_distortion=np.zeros(5))
+    monkeypatch.setattr(intrinsics, "resolve_driver_calibration_path", lambda: bebop_yaml)
+
+    with pytest.raises(intrinsics.CalibrationMismatch):
+        intrinsics.apply_driver_calibration(detector, image_size=(640, 480))
+    assert detector.camera_matrix[0, 2] == pytest.approx(298.57)
+
+
+@pytest.mark.parametrize("size", [(0, 480), (856, -1)])
+def test_a_meaningless_image_size_is_refused(monkeypatch, bebop_yaml, size):
+    detector = SimpleNamespace(camera_matrix=SDK_SAMPLE_MATRIX.copy(), camera_distortion=np.zeros(5))
+    monkeypatch.setattr(intrinsics, "resolve_driver_calibration_path", lambda: bebop_yaml)
+    with pytest.raises(ValueError):
+        intrinsics.apply_driver_calibration(detector, image_size=size)
