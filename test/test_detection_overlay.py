@@ -333,3 +333,46 @@ def test_a_v1_summary_still_decodes_with_no_markers(bridge):
 def test_annotated_frames_hold_priority_only_briefly(bridge):
     """1.5 s of priority held Stage 1 and the RTL at the annotated rate (~5 FPS)."""
     assert bridge.DETECTION_PRIORITY_SEC == pytest.approx(0.25)
+
+
+def test_display_class_name_maps_motorcycle_and_bicycle_to_acidente(bridge):
+    assert bridge._display_class_name("motorcycle") == "acidente"
+    assert bridge._display_class_name("Motorcycle") == "acidente"
+    assert bridge._display_class_name("bicycle") == "acidente"
+    assert bridge._display_class_name("Bicycle") == "acidente"
+    assert bridge._display_class_name("bycicle") == "acidente"
+    assert bridge._display_class_name("acidente") == "acidente"
+    assert bridge._display_class_name("car") == "car"
+    assert bridge._display_class_name("") == ""
+
+
+def test_bounding_box_label_written_as_acidente_on_live_frame(bridge, monkeypatch):
+    """When drawing bounding boxes on live frames, motorcycle/bicycle must be written as acidente."""
+    captured_labels = []
+
+    orig_put_text = bridge.cv2.putText
+
+    def mock_put_text(img, text, org, fontFace, fontScale, color, thickness=1, lineType=None):
+        captured_labels.append(text)
+        return orig_put_text(img, text, org, fontFace, fontScale, color, thickness, lineType)
+
+    monkeypatch.setattr(bridge.cv2, "putText", mock_put_text)
+
+    # Test with bicycle
+    frame = np.zeros((480, 856, 3), dtype=np.uint8)
+    summary_bicycle = bridge.parse_detection_summary(encoded(status="STEP 2: SEARCH"))
+    bridge.draw_detection_summary(frame, summary_bicycle)
+
+    assert any(label.startswith("acidente 0.78") for label in captured_labels)
+    assert not any("bicycle" in label.lower() for label in captured_labels)
+
+    # Test with motorcycle
+    captured_labels.clear()
+    payload = json.loads(encoded(status="STEP 2: SEARCH"))
+    payload["detections"] = [{"class_name": "motorcycle", "confidence": 0.85, "bbox_xyxy": [100, 100, 200, 200]}]
+    summary_motorcycle = bridge.parse_detection_summary(json.dumps(payload))
+    bridge.draw_detection_summary(frame, summary_motorcycle)
+
+    assert any(label.startswith("acidente 0.85") for label in captured_labels)
+    assert not any("motorcycle" in label.lower() for label in captured_labels)
+

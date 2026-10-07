@@ -89,9 +89,11 @@ class ForwardSearchStep(BaseStep):
         deadline = Deadline(timeout)
         rate = LoopRate(kinematics_cfg.control_loop_hz)
         ctx.failsafe.notify_frame_received()
-        emit_milestone(
-            "mission.scan_start", {"window_sec": timeout, "cruise_mps": round(cruise_mps, 3)}
-        )
+        bb = getattr(ctx, "blackboard", None)
+        if bb is None or getattr(bb, "takeoff_complete", False):
+            emit_milestone(
+                "mission.scan_start", {"window_sec": timeout, "cruise_mps": round(cruise_mps, 3)}
+            )
 
         with ctx.failsafe.altitude_hold_window(
             ctx.params.governor.climb_authority

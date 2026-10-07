@@ -40,6 +40,7 @@ import { useFinishLock } from './hooks/useFinishLock';
 import { reportMayStart } from './lib/finishLock';
 import { useGuardedAsync } from './hooks/useGuardedAsync';
 import { useMissionCountdown } from './hooks/useMissionCountdown';
+import { useLandProgress } from './hooks/useLandProgress';
 import { runCriticalBatteryReturn } from './lib/batteryReturn';
 
 /** The station is two tabs; these open over whichever one is current. */
@@ -101,6 +102,8 @@ export const App: React.FC = () => {
   const [overlay, setOverlay] = useState<Overlay>('none');
   const [counting, setCounting] = useState(() => previewCountdown() > 0);
   const [countdownSeconds, setCountdownSeconds] = useState(() => previewCountdown() || 0);
+  /** Click instant of the launch being counted down, epoch ms. */
+  const [launchAt, setLaunchAt] = useState<number | null>(null);
   /**
    * A launch click is being handled. Covers the pending-edit save as well as
    * the spawn, so a double click on the dial starts one flight and leaves no
@@ -131,6 +134,7 @@ export const App: React.FC = () => {
   const copilot = useCopilot();
   const narration = useNarrationQueue(copilot);
   const missionCountdown = useMissionCountdown();
+  const { phase: landProgress } = useLandProgress();
   const voice = useVoiceLevel();
 
   const running = mission.state === 'running' || mission.state === 'arming';
@@ -218,15 +222,23 @@ export const App: React.FC = () => {
     const doc = params.working ?? params.committed;
     const missing = launchBlockers(doc);
     if (!doc || missing.length) {
-      setLaunchError(`Parâmetros sem valor numérico válido: ${missing.join(', ')}.`);
+      setLaunchError(`Parâmetros ausentes ou fora da faixa permitida: ${missing.join(', ')}.`);
       return null;
     }
     return doc;
   }, [params]);
 
   const launch = useCallback(async () => {
-    if (launching.current) return;
+    // The dial keeps the keyboard focus under the countdown overlay. A second
+    // activation during a launch reached the runtime's "already running"
+    // refusal, which closed the overlay of the countdown still in progress.
+    if (launching.current || preflightLocked(mission.state, mission.ran)) return;
     launching.current = true;
+    // The click instant. The mission takes off at it plus the countdown
+    // (engine/launch.py) and the overlay counts towards the same instant, so
+    // the countdown starts here and not when the process answers: measured,
+    // that was 40 s later.
+    const clickedAt = Date.now();
     primeLaunchPhrases();
     try {
       const doc = await commitLaunchDocument();
@@ -244,6 +256,11 @@ export const App: React.FC = () => {
       setFailsafeTriggered(false);
       setPendingStage(null);
       setCountdownSeconds(seconds);
+      setLaunchAt(clickedAt);
+      // The countdown is the window in which walking away costs nothing; the
+      // mission runs its flat trim and ground reference inside it. The bench
+      // runs the same one, checklist and abort included.
+      if (seconds >= 1) setCounting(true);
 
       // The document is the only source of the flight parameters (5.1): no
       // per-field option, so no fallback can stand in for a value the
@@ -251,25 +268,19 @@ export const App: React.FC = () => {
       const result = await mission.launch({
         countdown: seconds,
         noFly: Boolean(getPath(doc, 'no_fly')),
+        launchAtMs: clickedAt,
         paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
       });
 
       if (!result.success) {
         // Stay put. Throwing the operator into the cockpit hides the control they
         // were using and gives them no way back to the thing that failed.
+        setCounting(false);
         setLaunchError(result.error ?? result.message ?? 'o processo não subiu');
         return;
       }
 
-      // The countdown is the window in which walking away costs nothing, and it
-      // is also the window the mission spends warming YOLO and taking its ground
-      // reference. The bench runs the same one, checklist and abort included, so
-      // a rehearsal looks and sounds like the flight it rehearses.
-      if (seconds >= 1) {
-        setCounting(true);
-      } else {
-        setScreen('cockpit');
-      }
+      if (seconds < 1) setScreen('cockpit');
     } finally {
       launching.current = false;
     }
@@ -283,6 +294,7 @@ export const App: React.FC = () => {
   const runBenchStage = useCallback(
     async (stage: number) => {
       if (!bridge) return;
+      const clickedAt = Date.now();
       primeLaunchPhrases();
       const doc = await commitLaunchDocument();
       if (!doc) return;
@@ -317,6 +329,7 @@ export const App: React.FC = () => {
       }
       if (seconds >= 1) {
         setCountdownSeconds(seconds);
+        setLaunchAt(clickedAt);
         setCounting(true);
       } else {
         // The rehearsal's own feed is the point of watching it.
@@ -589,6 +602,7 @@ export const App: React.FC = () => {
           onAbort={() => void land()}
           onFinish={() => void finishMission()}
           finishLock={finishLock}
+          landProgress={landProgress}
         />
       );
     }
@@ -684,7 +698,8 @@ export const App: React.FC = () => {
           seconds={countdownSeconds}
           remaining={missionCountdown.remaining}
           clearance={missionCountdown.clearance}
-          trimAcked={false}
+          trim={missionCountdown.trim}
+          launchAt={launchAt}
           stageReached={mission.stage >= 1}
           linkReady={benchMode || benchStage !== null ? link.driverRunning : link.flightReady}
           onDone={finishCountdown}

@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import type { MissionState, TelemetryView, TrackPoint } from '../../types/mission';
-import type { RawEvidence, VoiceLevel } from '../../types/bmg';
+import type { LandProgressPhase, RawEvidence, VoiceLevel } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
 import { StageBar } from './StageBar';
 import { OpticalFeed } from './OpticalFeed';
@@ -11,6 +11,19 @@ import { AbortControl } from './AbortControl';
 import { cn } from '../../lib/format';
 import { isMissionOver } from '../../lib/missionOutcome';
 import type { FinishLockResult } from '../../lib/finishLock';
+
+/**
+ * Checks whether the key event target is an interactive text input or embedded terminal.
+ * Used by R11 to prevent global Escape abort when typing.
+ */
+export function isTextInputOrTerminal(target: EventTarget | null): boolean {
+  if (!target || !(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (target.isContentEditable || target.getAttribute('contenteditable') === 'true') return true;
+  if (target.closest('.xterm, [data-terminal], [data-terminal-title], textarea, input, select')) return true;
+  return false;
+}
 
 interface CockpitScreenProps {
   telemetry: TelemetryView;
@@ -61,6 +74,8 @@ interface CockpitScreenProps {
   onFinish: () => void;
   /** The finish lock, evaluated by `useFinishLock` in the App. */
   finishLock: FinishLockResult;
+  /** Closed-loop land supervisor progress phase (R6). */
+  landProgress?: LandProgressPhase | null;
 }
 
 /**
@@ -107,9 +122,25 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   onAbort,
   onFinish,
   finishLock,
+  landProgress,
 }) => {
   const running = missionState === 'running' || missionState === 'arming';
   const over = isMissionOver(missionState);
+
+  // R11: Global Escape shortcut fires onAbort when abortEnabled,
+  // ignored inside interactive text fields or diagnostics terminal.
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (isTextInputOrTerminal(event.target)) return;
+      if (abortEnabled(missionState, telemetry.flying_state, landProgress)) {
+        event.preventDefault();
+        onAbort();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [missionState, telemetry.flying_state, landProgress, onAbort]);
 
   // The last gimbal command on /bebop/move_camera, from the mission's ramp or
   // the station's slider, as the telemetry bridge echoes it. A command, not a
@@ -157,11 +188,12 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
             />
 
             {/* Anchored on the seam between the feed and the map. */}
-            <div className="absolute inset-x-0 -bottom-5 z-30 flex justify-center">
+            <div className="absolute inset-x-0 -bottom-6 z-30 flex justify-center">
               <AbortControl
                 onAbort={onAbort}
-                disabled={!abortEnabled(missionState, telemetry.flying_state)}
+                disabled={!abortEnabled(missionState, telemetry.flying_state, landProgress)}
                 busy={missionState === 'aborting'}
+                landProgress={landProgress}
               />
             </div>
           </div>

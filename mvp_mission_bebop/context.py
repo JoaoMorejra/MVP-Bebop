@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import logging
@@ -114,6 +115,12 @@ class MissionContext:
         self.current_stage: Optional[int] = None
         #: Last ``/bebop/states/flying_state`` from the aircraft, or ``None``.
         self.flying_state: Optional[int] = None
+        #: Monotonic takeoff instant of a launch from standby (click plus the
+        #: countdown, ``engine/launch.py``); ``None`` counts from Stage 1.
+        self.launch_deadline: Optional[float] = None
+        #: Emits the countdown ticks of a launch deadline from the go
+        #: (``engine/launch.py:CountdownTicker``); ``None`` otherwise.
+        self.countdown_ticker: Optional[Any] = None
         #: FlatTrimChanged count from ``states/flat_trim``; ``None`` in unit doubles.
         self.flat_trim_ack: Optional[FlatTrimAckTracker] = None
         #: Publishes this mission's z0 on ``mission/ground_reference``; no-op until wired.
@@ -261,6 +268,44 @@ class MissionContext:
         self.frame_center_x = self.frame_width / 2.0
         self.frame_center_y = self.frame_height / 2.0
 
+    @staticmethod
+    def _result_for_annotation(result: Any) -> Any:
+        """Clone detection result replacing 'motorcycle' and 'bicycle' with 'acidente' for visual display."""
+        if result is None:
+            return None
+        detections = getattr(result, "detections", None)
+        if detections is not None:
+            has_target = any(
+                getattr(d, "class_name", "").lower() in ("motorcycle", "bicycle", "bycicle")
+                for d in detections
+            )
+            if not has_target:
+                return result
+            cloned = []
+            for d in detections:
+                cname = getattr(d, "class_name", "")
+                if cname.lower() in ("motorcycle", "bicycle", "bycicle"):
+                    d_copy = copy.copy(d)
+                    d_copy.class_name = "acidente"
+                    cloned.append(d_copy)
+                else:
+                    cloned.append(d)
+            res_copy = copy.copy(result)
+            res_copy.detections = cloned
+            return res_copy
+        if isinstance(result, list):
+            cloned = []
+            for d in result:
+                cname = getattr(d, "class_name", "")
+                if cname.lower() in ("motorcycle", "bicycle", "bycicle"):
+                    d_copy = copy.copy(d)
+                    d_copy.class_name = "acidente"
+                    cloned.append(d_copy)
+                else:
+                    cloned.append(d)
+            return cloned
+        return result
+
     def publish_annotated_stream(
         self, frame: Optional[np.ndarray], result: Any, status_text: str
     ) -> Optional[np.ndarray]:
@@ -276,9 +321,10 @@ class MissionContext:
             return None
 
         if self.detection_reveal_enabled:
+            annotated_result = self._result_for_annotation(result)
             annotated = self.detector.draw_detections(
                 image=frame,
-                result=result,
+                result=annotated_result,
                 show_labels=True,
                 show_confidence=True,
                 show_class=True,

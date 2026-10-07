@@ -249,11 +249,20 @@ export interface LogLine {
   at?: number;
 }
 
+export type LandProgressPhase = 'commanded' | 'landing' | 'landed' | 'unconfirmed';
+
+export interface LandProgressEvent {
+  phase: LandProgressPhase;
+  t: number;
+}
+
 /** Arguments forwarded to `mission.py` by `bmg:start-mission`. */
 export interface MissionLaunchOptions {
   /** Seconds the station counts; the mission reads the same `kinematics.countdown_sec`. */
   countdown?: number;
   noFly?: boolean;
+  /** Click instant, epoch ms: the takeoff is at it plus the countdown (engine/launch.py). */
+  launchAtMs?: number;
   /**
    * Full `MissionParameters` document, serialised: the only source of the
    * flight parameters. The host refuses a launch without one.
@@ -261,8 +270,8 @@ export interface MissionLaunchOptions {
   paramsJson: string;
 }
 
-/** How loudly the copilot may interrupt itself. `URGENT` pre-empts the queue. */
-export type AnnouncePriority = 'URGENT' | 'HIGH' | 'NORMAL';
+/** How loudly the copilot may interrupt itself. `LAND` cuts all speech; `URGENT` pre-empts normal. */
+export type AnnouncePriority = 'LAND' | 'URGENT' | 'HIGH' | 'NORMAL';
 
 export interface AnnounceRequest {
   text: string;
@@ -484,6 +493,7 @@ export interface BmgAPI {
   onDriverLog: (cb: (log: LogLine) => void) => () => void;
   onMissionExit: (cb: (event: MissionExitEvent) => void) => () => void;
   onLinkProgress: (cb: (event: LinkProgressEvent) => void) => () => void;
+  onLandProgress: (cb: (event: LandProgressEvent) => void) => () => void;
   onAnnounceDone: (cb: (event: AnnounceDoneEvent) => void) => () => void;
   onCameraTiltChanged: (cb: (event: CameraTiltEvent) => void) => () => void;
   onMissionReset: (cb: (event: MissionResetEvent) => void) => () => void;

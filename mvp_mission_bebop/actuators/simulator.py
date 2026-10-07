@@ -335,13 +335,13 @@ class KinematicSimulator:
                 self._airborne = False
                 self._launching = False
         elif self._airborne:
-            self._z = max(0.0, self._z + self._calibration.to_mps(self._vz) * dt)
+            self._z = max(0.0, self._z + self._calibration.to_mps(self._vz, axis="vertical") * dt)
 
         # Horizontal: body FLU commands rotated into the world frame.
         if self._airborne:
             self._yaw += self._vyaw * YAW_RATE_PER_UNIT * dt
-            speed_x = self._calibration.to_mps(self._vx)
-            speed_y = self._calibration.to_mps(self._vy)
+            speed_x = self._calibration.to_mps(self._vx, axis="forward")
+            speed_y = self._calibration.to_mps(self._vy, axis="lateral")
             cos_psi = math.cos(self._yaw)
             sin_psi = math.sin(self._yaw)
             self._x += (speed_x * cos_psi - speed_y * sin_psi) * dt

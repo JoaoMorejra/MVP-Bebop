@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Loader2, X } from 'lucide-react';
 import { Wordmark } from '../brand/Wordmark';
 import { cn } from '../../lib/format';
@@ -8,14 +8,23 @@ interface CountdownOverlayProps {
   seconds: number;
   /**
    * Whole seconds left as the mission last reported them (`mission.countdown`),
-   * or null before its countdown has begun. The overlay keeps no clock of its
-   * own: timed from the spawn it ran about 14 s ahead of the mission's.
+   * or null before its countdown has begun. Without `launchAt` the overlay
+   * follows it alone: timed from the spawn, a clock of its own ran about 14 s
+   * ahead of the mission's.
    */
   remaining: number | null;
   /** The mission made its clearance call (`mission.countdown_3`). */
   clearance: boolean;
-  /** The aircraft acknowledged the IMU flat trim. */
-  trimAcked: boolean;
+  /** Stage 1's flat trim (`mission.flat_trim`), or null before it ran. */
+  trim: 'acked' | 'skipped' | null;
+  /**
+   * Click instant, epoch ms. From standby the mission takes off at it plus
+   * `seconds` (`engine/launch.py`), so the overlay counts towards the same
+   * instant from the click, and it does not close before that instant whatever
+   * the mission reports; without it the overlay follows the mission's ticks
+   * only.
+   */
+  launchAt?: number | null;
   /** The mission process has reported it reached stage 1. */
   stageReached: boolean;
   /** Every essential topic is exchanging data with the airframe. */
@@ -51,7 +60,8 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
   seconds,
   remaining: reported,
   clearance,
-  trimAcked,
+  trim,
+  launchAt = null,
   stageReached,
   linkReady,
   onDone,
@@ -59,15 +69,50 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
 }) => {
   const total = Math.max(1, Math.ceil(seconds));
   const started = reported !== null;
-  const remaining = started ? Math.max(0, Math.min(total, reported)) : total;
   const done = useRef(false);
 
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (reported === 0 && !done.current) {
+    if (launchAt === null) return;
+    const id = window.setInterval(() => setNow(Date.now()), 200);
+    return () => window.clearInterval(id);
+  }, [launchAt]);
+
+  // From the click: the shared deadline on this clock, never later than a
+  // second the mission reported. At zero without the mission's own zero (its
+  // takeoff), the overlay waits for the aircraft rather than claim a liftoff.
+  // A zero reported before this clock ran out is not taken: a mission that
+  // read its deadline late reported one with the whole countdown to go.
+  const clockRemaining =
+    launchAt === null ? null : Math.max(0, Math.ceil(seconds - (now - launchAt) / 1000));
+  let remaining: number;
+  let phase: 'preparing' | 'counting' | 'waiting';
+  if (clockRemaining !== null) {
+    remaining = Math.min(total, reported !== null && reported > 0 ? Math.min(clockRemaining, reported) : clockRemaining);
+    phase = remaining > 0 || reported === 0 ? 'counting' : 'waiting';
+  } else {
+    remaining = started ? Math.max(0, Math.min(total, reported)) : total;
+    phase = started ? 'counting' : 'preparing';
+  }
+
+  // Seconds since the launch, shown until the mission's first tick. The
+  // mission reaches its countdown only after its start-up, Stage 1 entry, the
+  // flat trim and the ground reference -- seconds in which a static numeral
+  // read as a frozen countdown. This clock never drives the countdown itself.
+  const [preparingSec, setPreparingSec] = useState(0);
+  useEffect(() => {
+    if (phase === 'counting') return;
+    const id = window.setInterval(() => setPreparingSec((value) => value + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [phase]);
+
+  const clockDone = clockRemaining === null || clockRemaining <= 0;
+  useEffect(() => {
+    if (reported === 0 && clockDone && !done.current) {
       done.current = true;
       onDone();
     }
-  }, [reported, onDone]);
+  }, [reported, clockDone, onDone]);
 
   // Escape is the fastest possible path out of a launch already in motion.
   useEffect(() => {
@@ -96,7 +141,9 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
         return { ...item, state: linkReady ? 'done' : 'active' } as const;
       }
       if (item.id === 'imu') {
-        return { ...item, state: trimAcked ? 'done' : stageReached ? 'active' : 'pending' } as const;
+        if (trim === 'acked') return { ...item, state: 'done' } as const;
+        if (trim === 'skipped') return { ...item, label: `${item.label} (sem confirmação, bancada)`, state: 'skipped' } as const;
+        return { ...item, state: stageReached ? 'active' : 'pending' } as const;
       }
       if (item.id === 'clearance') {
         return { ...item, state: clearance ? 'done' : 'pending' } as const;
@@ -106,7 +153,7 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
       }
       return { ...item, state: started ? 'done' : stageReached ? 'active' : 'pending' } as const;
     });
-  }, [stageReached, linkReady, trimAcked, clearance, started]);
+  }, [stageReached, linkReady, trim, clearance, started]);
 
   return (
     <div
@@ -164,17 +211,37 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
             })}
           </svg>
 
-          <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-            <span
-              key={whole}
-              data-countdown-numeral
-              className="anim-tick tnum font-mono text-6xl font-medium leading-none text-frost"
-            >
-              {whole}
-            </span>
-            <span className="mt-3 font-cond text-sm tracking-wide text-haze">
-              {!started ? 'Aguardando a missão' : clearance ? 'decolagem autorizada' : 'segundos para decolar'}
-            </span>
+          <div
+            data-countdown-state={phase}
+            className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center"
+          >
+            {phase === 'counting' ? (
+              <>
+                <span
+                  key={whole}
+                  data-countdown-numeral
+                  className="anim-tick tnum font-mono text-6xl font-medium leading-none text-frost"
+                >
+                  {whole}
+                </span>
+                <span className="mt-3 font-cond text-sm tracking-wide text-haze">
+                  {clearance ? 'decolagem autorizada' : 'segundos para decolar'}
+                </span>
+              </>
+            ) : (
+              <>
+                <Loader2 size={44} strokeWidth={1.6} className="animate-spin text-mint" />
+                <span className="mt-4 font-cond text-base tracking-wide text-frost">
+                  {phase === 'waiting' ? 'Aguardando a aeronave' : 'Preparando a aeronave'}
+                </span>
+                <span data-preparing-elapsed className="tnum mt-1 font-mono text-xs text-haze">
+                  {preparingSec} s
+                </span>
+                <span className="mt-1 font-cond text-2xs tracking-wide text-haze-deep">
+                  {phase === 'waiting' ? 'decolagem assim que a missão estiver pronta' : `contagem de ${total} s em seguida`}
+                </span>
+              </>
+            )}
           </div>
         </div>
 
@@ -197,13 +264,16 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
                     'flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition-colors duration-300',
                     item.state === 'done' && 'border-mint bg-mint/15 text-mint',
                     item.state === 'active' && 'border-mint/50 text-mint',
-                    item.state === 'pending' && 'border-strut text-haze-deep'
+                    item.state === 'pending' && 'border-strut text-haze-deep',
+                    item.state === 'skipped' && 'border-amber/60 text-amber'
                   )}
                 >
                   {item.state === 'done' ? (
                     <Check size={11} strokeWidth={3} />
                   ) : item.state === 'active' ? (
                     <Loader2 size={11} strokeWidth={2.5} className="animate-spin" />
+                  ) : item.state === 'skipped' ? (
+                    <X size={11} strokeWidth={3} />
                   ) : (
                     <span className="h-1 w-1 rounded-full bg-current" />
                   )}

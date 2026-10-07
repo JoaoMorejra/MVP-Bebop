@@ -19,6 +19,21 @@ def test_conversions_are_inverses():
     assert calibration.to_normalized(calibration.to_mps(0.07)) == pytest.approx(0.07)
 
 
+def test_axis_conversions_use_per_axis_gains():
+    calibration = SpeedCalibration(
+        normalized_to_mps=1.0,
+        lateral_to_mps=1.5,
+        vertical_to_mps=2.5,
+    )
+    assert calibration.to_mps(0.20, axis="forward") == pytest.approx(0.20)
+    assert calibration.to_mps(0.20, axis="lateral") == pytest.approx(0.30)
+    assert calibration.to_mps(0.20, axis="vertical") == pytest.approx(0.50)
+
+    assert calibration.to_normalized(0.20, axis="forward") == pytest.approx(0.20)
+    assert calibration.to_normalized(0.30, axis="lateral") == pytest.approx(0.20)
+    assert calibration.to_normalized(0.50, axis="vertical") == pytest.approx(0.20)
+
+
 def test_identity_calibration_is_detected():
     assert SpeedCalibration(normalized_to_mps=1.0).is_identity
     assert not SpeedCalibration(normalized_to_mps=1.4).is_identity

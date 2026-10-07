@@ -12,9 +12,10 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from nav_msgs.msg import Odometry
@@ -39,6 +40,17 @@ from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
+from mvp_mission_bebop.engine.exit_codes import EXIT_ABORTED_LANDED
+from mvp_mission_bebop.engine.launch import (
+    EXIT_STANDBY_MISMATCH,
+    EXIT_STANDBY_STALE,
+    CountdownTicker,
+    STANDBY_READY_LINE,
+    critical_mismatches,
+    launch_deadline,
+    parse_go_command,
+)
+from mvp_mission_bebop.engine.process_reaper import install_exit_reaper
 from mvp_mission_bebop.engine.runner import MissionRunner
 from mvp_mission_bebop.engine.startup_timing import StartupTimer, process_age_ms
 from mvp_mission_bebop.engine.stage_gate import StageRequestHandler
@@ -231,6 +243,25 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--standby",
+        action="store_true",
+        default=False,
+        help=(
+            "Prepare everything (SDK, driver link, camera, detector) and wait on stdin "
+            "for a go command carrying the launch document and the click instant "
+            "(engine/launch.py). Nothing is commanded before the go."
+        ),
+    )
+    parser.add_argument(
+        "--launch-at-ms",
+        type=float,
+        default=None,
+        help=(
+            "Click instant, milliseconds since the epoch: the takeoff is at this "
+            "instant plus kinematics.countdown_sec rather than a countdown from Stage 1."
+        ),
+    )
+    parser.add_argument(
         "--dump-defaults",
         action="store_true",
         default=False,
@@ -281,6 +312,48 @@ def parse_stage_selection(raw: Optional[str]) -> Optional[List[int]]:
     return selection
 
 
+def _validate_countdown(params: MissionParameters) -> None:
+    """Refuse a countdown that is not a finite number of at least the floor.
+
+    Raises
+    ------
+    SystemExit
+        On an invalid ``kinematics.countdown_sec``.
+    """
+    countdown = params.kinematics.countdown_sec
+    if (
+        isinstance(countdown, bool)
+        or not isinstance(countdown, (int, float))
+        or not math.isfinite(countdown)
+        or countdown < COUNTDOWN_MIN_SEC
+    ):
+        raise SystemExit(
+            f"kinematics.countdown_sec must be a finite number >= {COUNTDOWN_MIN_SEC:g} s, "
+            f"got {countdown!r}; refusing to fly."
+        )
+    params.kinematics.countdown_sec = float(countdown)
+
+
+def _persist_parameters(params: MissionParameters, config_file: str) -> None:
+    """Write the tuning back to the store, never the arming state.
+
+    ``no_fly`` is a per-invocation decision made at the command line (see the
+    one-way latch in :func:`resolve_parameters`), so the file on disk always
+    keeps ``no_fly = False`` regardless of the current invocation's arming state.
+    """
+    try:
+        armed_for_this_run = params.no_fly
+        params.no_fly = False
+        params.save_to_file(config_file)
+        params.no_fly = armed_for_this_run
+    except Exception as save_err:
+        logger.warning("Could not persist active mission config: %s", save_err)
+
+
+def _config_file(args: argparse.Namespace) -> str:
+    return args.config or os.path.join(os.path.dirname(__file__), "mission_config.json")
+
+
 def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
     """Merge the parameter store, ``--params-json`` and the CLI flags, then persist.
 
@@ -306,8 +379,12 @@ def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
         or a countdown that is not a finite number of at least
         :data:`~mvp_mission_bebop.parameters.COUNTDOWN_MIN_SEC`.
     """
-    config_file = args.config or os.path.join(os.path.dirname(__file__), "mission_config.json")
+    config_file = _config_file(args)
     params = MissionParameters.load_from_file(config_file)
+    # The arming mode is never taken from the parameter store on disk.
+    # An invocation always defaults to armed (no_fly = False) unless
+    # explicitly commanded otherwise via --no-fly or --params-json.
+    params.no_fly = False
 
     if args.params_json:
         # A malformed payload is fatal, not a warning. This carries the whole
@@ -372,39 +449,126 @@ def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
         params.no_fly = False
     if args.countdown is not None:
         params.kinematics.countdown_sec = args.countdown
-    countdown = params.kinematics.countdown_sec
-    if (
-        isinstance(countdown, bool)
-        or not isinstance(countdown, (int, float))
-        or not math.isfinite(countdown)
-        or countdown < COUNTDOWN_MIN_SEC
-    ):
-        raise SystemExit(
-            f"kinematics.countdown_sec must be a finite number >= {COUNTDOWN_MIN_SEC:g} s, "
-            f"got {countdown!r}; refusing to fly."
-        )
-    params.kinematics.countdown_sec = float(countdown)
-
-    try:
-        # Persist the tuning, never the arming state: see the note above on the
-        # one-way latch. ``no_fly`` is a per-invocation decision made at the
-        # command line, so it is restored to whatever the file already held
-        # before the file is rewritten.
-        persisted = MissionParameters.load_from_file(config_file).no_fly if os.path.exists(
-            config_file
-        ) else False
-        armed_for_this_run = params.no_fly
-        params.no_fly = persisted
-        params.save_to_file(config_file)
-        params.no_fly = armed_for_this_run
-    except Exception as save_err:
-        logger.warning("Could not persist active mission config: %s", save_err)
+    _validate_countdown(params)
+    _persist_parameters(params, config_file)
     return params
+
+
+def _log_active_parameters(params: MissionParameters) -> None:
+    """Log the parameters this run flies and any value outside its envelope."""
+    logger.info(
+        "Active parameters: altitude=%.2fm, velocity=%.3fm/s, hover=%.1fs, "
+        "search_timeout=%.1fs, confidence=%.2f, confirmation_frames=%d, "
+        "classes=%s, rtl_radius=%.2fm, countdown=%.1fs, no_fly=%s, "
+        "aruco_id=%d, aruco_dict=%s, aruco_size=%.3fm, stabilize=%.1fs, "
+        "search_tilt=%.0fdeg, nadir_freeze_tilt=%.0fdeg (tol %.1fdeg), rtl_timeout=%.0fs",
+        params.kinematics.target_altitude_m,
+        params.kinematics.forward_cruise_velocity,
+        params.kinematics.hover_duration_sec,
+        params.timeouts.search_timeout_sec,
+        params.vision.confidence_threshold,
+        params.vision.confirmation_frames,
+        params.vision.target_classes,
+        params.rtl.arrival_radius_m,
+        params.kinematics.countdown_sec,
+        params.no_fly,
+        params.rtl.target_aruco_id,
+        params.rtl.marker_dict,
+        params.rtl.tag_size,
+        params.kinematics.takeoff_stabilize_duration_sec,
+        params.gimbal.search_tilt_deg,
+        params.gimbal.nadir_tilt_deg,
+        params.gimbal.nadir_tilt_tolerance_deg,
+        params.rtl.timeout_sec,
+    )
+    # Advisory only: a value outside its documented envelope is reported on the
+    # ground, where the operator can still act on it, and the mission proceeds.
+    log_envelope_divergences(params)
 
 
 #: Wait for the first camera frame, seconds; and the short wait when there is no camera.
 FIRST_FRAME_TIMEOUT_SEC = 2.5
 NO_CAMERA_TIMEOUT_SEC = 0.2
+
+
+def _await_go() -> Optional[dict]:
+    """Announce readiness and wait on stdin for the go; ``None`` on quit or EOF.
+
+    Malformed lines are logged and ignored: the only way out of standby is a
+    well-formed command, and nothing before it moves the aircraft.
+    """
+    print(STANDBY_READY_LINE, flush=True)
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            command = parse_go_command(line)
+        except ValueError as exc:
+            logger.warning("[STANDBY] Ignoring command: %s", exc)
+            continue
+        if command["op"] == "quit":
+            return None
+        return command
+    return None
+
+
+def _check_standby_preconditions(
+    *,
+    telemetry_node: Any,
+    params: MissionParameters,
+    actuator: BenchtopDroneProxy,
+    handler: ImageHandler,
+    odom_supervisor: Any,
+    battery_supervisor: Any,
+    flying_state: Optional[int],
+) -> Tuple[bool, str]:
+    """Verify system health on standby 'go' before committing to launch (R4b).
+
+    Requirements:
+    - driver in graph (in --fly or when driver was connected)
+    - camera frame < 1.0 s
+    - odometry heartbeat healthy
+    - battery known in --fly
+    - flying_state == 0 (landed)
+    """
+    if not params.no_fly:
+        if not driver_in_graph(telemetry_node, namespace=params.network.namespace, timeout_sec=0.2):
+            return False, "driver not in graph"
+    elif actuator.driver_reachable:
+        if not driver_in_graph(telemetry_node, namespace=params.network.namespace, timeout_sec=0.2):
+            return False, "driver not in graph"
+
+    # Frame freshness (< 1.0 s)
+    if not params.no_fly:
+        camera = getattr(handler, "camera", None)
+        if camera is not None and hasattr(camera, "get_frame"):
+            frame = camera.get_frame(wait_for_new=True, timeout=1.0)
+        else:
+            frame = handler.take_photo(timeout_sec=1.0)
+        if frame is None:
+            return False, "camera frame timeout (> 1.0 s)"
+    else:
+        frame = handler.take_photo(timeout_sec=1.0)
+        if frame is None:
+            return False, "camera frame timeout"
+
+    # Odometry heartbeat
+    if not odom_supervisor.is_telemetry_healthy():
+        return False, "odometry heartbeat stale"
+
+    # Battery known in --fly
+    if not params.no_fly and battery_supervisor.current_percentage() is None:
+        return False, "battery state unknown"
+
+    # Flying state == 0 (landed)
+    if not params.no_fly:
+        if flying_state != 0:
+            return False, f"flying_state is {flying_state} (expected 0)"
+    else:
+        if flying_state is not None and flying_state != 0:
+            return False, f"flying_state is {flying_state} (expected 0)"
+
+    return True, ""
 
 
 def first_frame_timeout(driver_reachable: Optional[bool], camera_publishers: int) -> float:
@@ -423,6 +587,9 @@ def first_frame_timeout(driver_reachable: Optional[bool], camera_publishers: int
 def main() -> None:
     """CLI initialization and mission lifecycle execution."""
     timer = StartupTimer()
+    # Before anything imports OpenVINO, whose telemetry forks a child that would
+    # otherwise hold the exit (engine/process_reaper.py).
+    install_exit_reaper()
     args = parse_arguments(MissionParameters())
     if args.dump_defaults:
         print(json.dumps(MissionParameters.factory().to_dict()))
@@ -503,34 +670,7 @@ def main() -> None:
         except Exception:  # noqa: BLE001 - exiting anyway
             pass
 
-    logger.info(
-        "Active parameters: altitude=%.2fm, velocity=%.3fm/s, hover=%.1fs, "
-        "search_timeout=%.1fs, confidence=%.2f, confirmation_frames=%d, "
-        "classes=%s, rtl_radius=%.2fm, countdown=%.1fs, no_fly=%s, "
-        "aruco_id=%d, aruco_dict=%s, aruco_size=%.3fm, stabilize=%.1fs, "
-        "search_tilt=%.0fdeg, nadir_freeze_tilt=%.0fdeg (tol %.1fdeg), rtl_timeout=%.0fs",
-        params.kinematics.target_altitude_m,
-        params.kinematics.forward_cruise_velocity,
-        params.kinematics.hover_duration_sec,
-        params.timeouts.search_timeout_sec,
-        params.vision.confidence_threshold,
-        params.vision.confirmation_frames,
-        params.vision.target_classes,
-        params.rtl.arrival_radius_m,
-        params.kinematics.countdown_sec,
-        params.no_fly,
-        params.rtl.target_aruco_id,
-        params.rtl.marker_dict,
-        params.rtl.tag_size,
-        params.kinematics.takeoff_stabilize_duration_sec,
-        params.gimbal.search_tilt_deg,
-        params.gimbal.nadir_tilt_deg,
-        params.gimbal.nadir_tilt_tolerance_deg,
-        params.rtl.timeout_sec,
-    )
-    # Advisory only: a value outside its documented envelope is reported on the
-    # ground, where the operator can still act on it, and the mission proceeds.
-    log_envelope_divergences(params)
+    _log_active_parameters(params)
 
     try:
         from mvp_mission_bebop.telemetry.announcer import announce_sync
@@ -583,7 +723,6 @@ def main() -> None:
     # D2: the station speaks the numbers of this document and of no other.
     # Emitted after every normalization above, so it is exactly what the steps
     # will fly.
-    emit_milestone("mission.parameters", spoken_parameters(params, calibration))
 
     # The aggregated motion sequence. Fed by the actuator proxy, so every
     # ``move_velocity`` the mission transmits is accounted for without any step
@@ -756,6 +895,41 @@ def main() -> None:
         params.battery_land_pct,
         BATTERY_WARNING_PCT,
     )
+
+    flying_state_data: Dict[str, Any] = {"state": None, "timestamp": 0.0}
+    flying_state_topic = f"/{params.network.namespace.strip('/')}/states/flying_state"
+    ctx_holder: List[Optional[MissionContext]] = [None]
+
+    def _on_flying_state(message: UInt8) -> None:
+        state = int(message.data)
+        now_mono = time.monotonic()
+        flying_state_data["state"] = state
+        flying_state_data["timestamp"] = now_mono
+        ctx = ctx_holder[0]
+        if ctx is not None:
+            ctx.flying_state = state
+            ctx.flying_state_timestamp = now_mono
+            if state in (7, 1):
+                if getattr(ctx.blackboard, "takeoff_committed", False) and not getattr(ctx.blackboard, "t_takeoff_started", None):
+                    ctx.blackboard.t_takeoff_started = now_mono
+                    logger.info("[TIMING] t_takeoff_started mono=%.3f state=%d", now_mono, state)
+            elif state in (4, 8):
+                ctx.blackboard.landing_started = True
+            elif state == 0:
+                took_off = (
+                    getattr(ctx.blackboard, "landing_started", False)
+                    or getattr(ctx.blackboard, "t_takeoff_started", None) is not None
+                )
+                if took_off and not getattr(ctx.blackboard, "t_touchdown", None):
+                    ctx.blackboard.t_touchdown = now_mono
+                    logger.info("[TIMING] t_touchdown mono=%.3f", now_mono)
+
+    telemetry_node.create_subscription(
+        UInt8,
+        flying_state_topic,
+        _on_flying_state,
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+    )
     nectar.add_node(telemetry_node)
 
     if simulator is not None:
@@ -770,10 +944,89 @@ def main() -> None:
             1.0 / params.kinematics.control_loop_hz, simulator.integrate
         )
 
+    # Minimal signal handler during standby and preflight before runner installation (R4b)
+    def _on_standby_signal(signum: int, _frame: Any) -> None:
+        logger.info("[STANDBY] Signal %d received during standby; exiting with code %d", signum, EXIT_ABORTED_LANDED)
+        try:
+            handler.cleanup()
+        except Exception:
+            pass
+        try:
+            nectar.shutdown()
+        except Exception:
+            pass
+        sys.exit(EXIT_ABORTED_LANDED)
+
+    signal.signal(signal.SIGINT, _on_standby_signal)
+    signal.signal(signal.SIGTERM, _on_standby_signal)
+
     # Two-sided altitude hold unless the configuration explicitly declines it.
     # The descent-only governor is kept as the escape hatch rather than deleted:
     # it is the reference behaviour above the setpoint, and a field session that
     # finds the hold misbehaving needs a way back that is not a code change.
+    launch_at_ms = args.launch_at_ms
+    if args.standby:
+        if not params.no_fly:
+            warm_deadline = time.monotonic() + 2.5
+            while time.monotonic() < warm_deadline:
+                if (
+                    odom_supervisor.sample_count > 0
+                    and battery_supervisor.current_percentage() is not None
+                    and flying_state_data["state"] is not None
+                ):
+                    break
+                time.sleep(0.05)
+        elif simulator is not None:
+            warm_deadline = time.monotonic() + 1.0
+            while time.monotonic() < warm_deadline and odom_supervisor.sample_count == 0:
+                time.sleep(0.05)
+
+        command = _await_go()
+        if command is None:
+            logger.info("[STANDBY] Released without a go; nothing was commanded.")
+            handler.cleanup()
+            nectar.shutdown()
+            sys.exit(0)
+        mismatched = critical_mismatches(params, command["params"])
+        if mismatched:
+            print(f"[STANDBY] mismatch: {', '.join(mismatched)}", flush=True)
+            handler.cleanup()
+            nectar.shutdown()
+            sys.exit(EXIT_STANDBY_MISMATCH)
+        params.update_from_dict(command["params"])
+        _validate_countdown(params)
+        _persist_parameters(params, _config_file(args))
+        try:
+            params.battery.land_pct = normalize_percentage(params.battery.land_pct, "battery.land_pct")
+        except (TypeError, ValueError) as exc:
+            logger.error("Invalid battery.land_pct (%s); keeping %.0f%%.", exc, battery_supervisor.land_pct)
+            params.battery.land_pct = battery_supervisor.land_pct
+        battery_supervisor.land_pct = params.battery.land_pct
+        logger.info("[STANDBY] Go received; launch document applied.")
+        _log_active_parameters(params)
+        launch_at_ms = command["launch_at_ms"]
+
+        ok, stale_reason = _check_standby_preconditions(
+            telemetry_node=telemetry_node,
+            params=params,
+            actuator=actuator,
+            handler=handler,
+            odom_supervisor=odom_supervisor,
+            battery_supervisor=battery_supervisor,
+            flying_state=flying_state_data["state"],
+        )
+        if not ok:
+            logger.critical("[STANDBY] Preconditions stale: %s. Exiting with %d.", stale_reason, EXIT_STANDBY_STALE)
+            print(f"[STANDBY] stale: {stale_reason}", flush=True)
+            handler.cleanup()
+            nectar.shutdown()
+            sys.exit(EXIT_STANDBY_STALE)
+
+    # D2: the station speaks the numbers of this document and of no other.
+    # Emitted after every normalization above (and, from standby, after the
+    # go), so it is exactly what the steps will fly.
+    emit_milestone("mission.parameters", spoken_parameters(params, calibration))
+
     governor_class = (
         AltitudeHoldGovernor if params.governor.hold_enabled else AltitudeAntiClimbGovernor
     )
@@ -816,11 +1069,33 @@ def main() -> None:
         frame_width=frame_width,
         frame_height=frame_height,
     )
+    ctx.flying_state = flying_state_data["state"]
+    ctx.flying_state_timestamp = flying_state_data["timestamp"]
+    ctx_holder[0] = ctx
 
     # Inference off the control thread. The worker idles until a stage engages
     # it, so the countdown warmup and the Stage 4 capture keep exclusive use of
     # the camera and detector, and the Stage 5 marker search is not competing
     # with it for frames.
+    if launch_at_ms is not None:
+        ctx.blackboard.t_click = launch_at_ms
+        logger.info("[TIMING] t_click wall_ms=%s", launch_at_ms)
+        now_wall = time.time()
+        pinned = launch_deadline(launch_at_ms, params.kinematics.countdown_sec, now_wall, time.monotonic())
+        if pinned is None:
+            logger.warning(
+                "Cold launch: the click is %.1f s old; Stage 1 counts the full %.1f s countdown.",
+                now_wall - launch_at_ms / 1000.0,
+                params.kinematics.countdown_sec,
+            )
+        else:
+            ctx.launch_deadline = pinned
+            logger.info("Takeoff deadline: %.1f s from now.", pinned - time.monotonic())
+            ctx.countdown_ticker = CountdownTicker(
+                pinned, lambda whole: emit_milestone("mission.countdown", {"remaining_sec": whole})
+            )
+            ctx.countdown_ticker.start()
+
     period = params.vision.inference_min_period_sec
     if isinstance(period, bool) or not isinstance(period, (int, float)) or not math.isfinite(period) or period < 0:
         fallback_period = VisionConfig().inference_min_period_sec
@@ -829,21 +1104,6 @@ def main() -> None:
     perception = PerceptionWorker(ctx, min_period_sec=params.vision.inference_min_period_sec)
     ctx.perception = perception
     perception.start()
-
-    # The aircraft's own FlyingStateChanged. Confirms the takeoff before
-    # `mission.takeoff` is raised (steps.takeoff.takeoff_confirmed); the driver
-    # publishes it reliable and transient-local at depth 1.
-    flying_state_topic = f"/{params.network.namespace.strip('/')}/states/flying_state"
-
-    def _on_flying_state(message: UInt8) -> None:
-        ctx.flying_state = int(message.data)
-
-    telemetry_node.create_subscription(
-        UInt8,
-        flying_state_topic,
-        _on_flying_state,
-        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
-    )
 
     # Native photo acknowledgements (RecordPictureV2), JSON from the driver;
     # reliable, volatile, depth 10 on the driver side.
@@ -875,6 +1135,8 @@ def main() -> None:
     ctx.publish_ground_reference = lambda z0: ground_reference_publisher.publish(Float32(data=float(z0)))
 
     def _release_mission_resources() -> None:
+        if ctx.countdown_ticker is not None:
+            ctx.countdown_ticker.stop()
         perception.stop()
         if simulator is not None and simulator.complete_landing():
             # Published on the bench topic before the node goes away, so the

@@ -27,11 +27,38 @@ export const REQUIRED_LAUNCH_NUMBERS: readonly string[] = Array.from(
   ])
 );
 
-/** Required paths of `doc` that do not hold a finite number, in declaration order. */
+/**
+ * Bounds of the required numbers outside the sheet, as `(low, high]` with
+ * `lowExclusive`. The sheet fields use their slider range, inclusive.
+ */
+const EXTRA_BOUNDS: Readonly<Record<string, { low: number; high: number; lowExclusive: boolean }>> = {
+  'vision.confidence_threshold': { low: 0, high: 1, lowExclusive: true },
+  'rtl.max_speed': { low: 0, high: Number.POSITIVE_INFINITY, lowExclusive: true },
+  'rtl.arrival_radius_m': { low: 0, high: Number.POSITIVE_INFINITY, lowExclusive: true },
+  'kinematics.hover_duration_sec': { low: 0, high: Number.POSITIVE_INFINITY, lowExclusive: true },
+};
+
+function inEnvelope(path: string, value: number): boolean {
+  const spec = ALL_PARAMETERS.find((item) => item.path === path);
+  if (spec) return value >= spec.min && value <= spec.max;
+  const bounds = EXTRA_BOUNDS[path];
+  if (!bounds) return true;
+  return (bounds.lowExclusive ? value > bounds.low : value >= bounds.low) && value <= bounds.high;
+}
+
+/**
+ * Required paths of `doc` that do not hold a finite number inside its
+ * envelope, in declaration order.
+ *
+ * The envelope is the parameter sheet's slider range for its fields, and a
+ * positive value (a confidence in (0, 1]) for the others. Measured: a test
+ * fixture with confidence 12 and the nadir tilt at +5 deg reached the station
+ * store; every finite, so it launched, and the detector refused to load.
+ */
 export function launchBlockers(doc: unknown): string[] {
   return REQUIRED_LAUNCH_NUMBERS.filter((path) => {
     const value = getPath(doc, path);
-    return typeof value !== 'number' || !Number.isFinite(value);
+    return typeof value !== 'number' || !Number.isFinite(value) || !inEnvelope(path, value);
   });
 }
 

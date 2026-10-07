@@ -6,9 +6,14 @@ export interface MissionCountdown {
   remaining: number | null;
   /** The mission made its clearance call (`mission.countdown_3`). */
   clearance: boolean;
+  /**
+   * Stage 1's flat trim (`mission.flat_trim`): acknowledged by the aircraft,
+   * skipped without acknowledgement (the bench continues), or not yet done.
+   */
+  trim: 'acked' | 'skipped' | null;
 }
 
-const IDLE: MissionCountdown = { remaining: null, clearance: false };
+const IDLE: MissionCountdown = { remaining: null, clearance: false, trim: null };
 
 /**
  * The launch countdown as the mission process reports it.
@@ -34,6 +39,9 @@ export function useMissionCountdown(): MissionCountdown {
         setState((previous) => ({ ...previous, remaining: Math.max(0, Math.round(value)) }));
       } else if (event.key === 'mission.countdown_3') {
         setState((previous) => ({ ...previous, clearance: true }));
+      } else if (event.key === 'mission.flat_trim') {
+        const trim = event.payload?.acknowledged === true ? 'acked' : 'skipped';
+        setState((previous) => ({ ...previous, trim }));
       }
     });
   }, [bridge]);

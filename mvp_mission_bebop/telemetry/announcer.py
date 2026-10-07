@@ -359,11 +359,23 @@ class AudioPlaybackDevice:
                         self._close_stream(stream, abort=True)
                         stream = None
                         break
-                    stream.write(data[offset:offset + block_bytes])
-            except Exception as err:  # noqa: BLE001 - one bad buffer must not end playback
-                logger.debug("Sounddevice playback error: %s", err)
-                self._close_stream(stream, abort=True)
-                stream = None
+                    try:
+                        if stream is not None:
+                            stream.write(data[offset:offset + block_bytes])
+                    except Exception as stream_err:
+                        logger.warning("Sounddevice stream write error (%s); retrying reopen once", stream_err)
+                        self._close_stream(stream, abort=True)
+                        stream = self._open_stream()
+                        if stream is not None:
+                            try:
+                                stream.write(data[offset:offset + block_bytes])
+                            except Exception as retry_err:
+                                logger.warning("Sounddevice stream write retry failed: %s", retry_err)
+                                self._close_stream(stream, abort=True)
+                                stream = None
+                                break
+                        else:
+                            break
             finally:
                 self._queue.task_done()
 
@@ -623,6 +635,7 @@ class MissionAudioAnnouncer:
         #: Monotonic instant until which an urgent line is playing; an urgent
         #: line arriving before it waits instead of cutting it.
         self._playing_urgent_until: float = 0.0
+        self._warm_cache_task: Optional[asyncio.Task] = None
         self._cache = PhraseCache()
 
         _, types_module = _load_genai()
@@ -686,7 +699,7 @@ class MissionAudioAnnouncer:
                 return
             client = _get_synthesis_client(token)
             ctx = client.aio.live.connect(model=SYNTHESIZER_MODEL, config=self.session_config)
-            session = await ctx.__aenter__()
+            session = await asyncio.wait_for(ctx.__aenter__(), timeout=3.0)
             self._warm_ctx = ctx
             self._warm_session = session
             self._warm_session_time = time.time()
@@ -727,7 +740,7 @@ class MissionAudioAnnouncer:
         try:
             client = _get_synthesis_client(token)
             ctx = client.aio.live.connect(model=SYNTHESIZER_MODEL, config=self.session_config)
-            session = await ctx.__aenter__()
+            session = await asyncio.wait_for(ctx.__aenter__(), timeout=3.0)
         except Exception as exc:  # noqa: BLE001 - reported as an unspoken line
             logger.debug("Speech synthesis session failure: %s", exc)
             return None, None
@@ -871,21 +884,35 @@ class MissionAudioAnnouncer:
             return 0
 
         async def fill() -> None:
-            for statement in pending:
-                while self._active and (not self._queue.empty() or self._synthesis_task is not None):
-                    await asyncio.sleep(0.1)
-                if not self._active:
-                    return
-                if self._cache.has(statement, True):
-                    continue
-                try:
-                    audio = await self._synthesize(statement, True)
-                except Exception as exc:  # noqa: BLE001 - the cache is an optimisation
-                    logger.debug("Cache warm-up failed for '%s': %s", statement[:40], exc)
-                    continue
-                self._cache.put(statement, True, audio)
+            try:
+                for statement in pending:
+                    while self._active and (not self._queue.empty() or self._synthesis_task is not None):
+                        await asyncio.sleep(0.1)
+                    if not self._active:
+                        return
+                    if self._cache.has(statement, True):
+                        continue
+                    try:
+                        audio = await self._synthesize(statement, True)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - the cache is an optimisation
+                        logger.debug("Cache warm-up failed for '%s': %s", statement[:40], exc)
+                        continue
+                    self._cache.put(statement, True, audio)
+            except asyncio.CancelledError:
+                logger.debug("Cache warm-up task cancelled")
+                return
+            finally:
+                if getattr(self, "_warm_cache_task", None) is asyncio.current_task():
+                    self._warm_cache_task = None
 
-        self._loop.call_soon_threadsafe(lambda: self._loop.create_task(fill()))
+        def start_fill() -> None:
+            if getattr(self, "_warm_cache_task", None) and not self._warm_cache_task.done():
+                self._warm_cache_task.cancel()
+            self._warm_cache_task = self._loop.create_task(fill())
+
+        self._loop.call_soon_threadsafe(start_fill)
         return len(pending)
 
     def _drop_prefetched(self) -> None:
@@ -905,10 +932,26 @@ class MissionAudioAnnouncer:
             pri_int, seq, action, details, verbatim, done_fut, enqueued_at = item
             generation = self._generation
 
-            # Preemption on urgent priority: narration is cut and dropped, but
-            # an alert never cuts or drops another alert -- "step failed"
-            # followed by "aborting" is heard in full, in order.
-            if pri_int == 0:
+            # Preemption:
+            # - LAND priority (pri_int < 0) cuts ANY speech currently playing
+            # - URGENT priority (pri_int == 0) cuts narration, but lets another alert finish
+            if pri_int < 0:
+                self.device.stop_current()
+                self._playing_urgent_until = 0.0
+                kept = []
+                while not self._queue.empty():
+                    try:
+                        q_item = self._queue.get_nowait()
+                        self._queue.task_done()
+                    except (asyncio.QueueEmpty, ValueError):
+                        break
+                    if q_item[0] <= 0:
+                        kept.append(q_item)
+                    elif q_item[5] and not q_item[5].done():
+                        q_item[5].set_result(False)
+                for q_item in kept:
+                    self._queue.put_nowait(q_item)
+            elif pri_int == 0:
                 if time.monotonic() >= self._playing_urgent_until:
                     self.device.stop_current()
                 kept = []
@@ -918,7 +961,7 @@ class MissionAudioAnnouncer:
                         self._queue.task_done()
                     except (asyncio.QueueEmpty, ValueError):
                         break
-                    if q_item[0] == 0:
+                    if q_item[0] <= 0:
                         kept.append(q_item)
                     elif q_item[5] and not q_item[5].done():
                         q_item[5].set_result(False)
@@ -999,7 +1042,7 @@ class MissionAudioAnnouncer:
             # success told the ground station the operator had heard a sentence
             # that was never uttered, and its forensic report -- which reveals a
             # card per line read -- then flashed all four at once.
-            spoke = len(audio_buffer) >= _MIN_AUDIO_BYTES
+            spoke = len(audio_buffer) >= _MIN_AUDIO_BYTES and getattr(self.device, "_active", True)
             if spoke and source != "cache":
                 self._cache.put(statement, verbatim, audio_buffer)
             if spoke and not streamed:
@@ -1014,7 +1057,7 @@ class MissionAudioAnnouncer:
             if spoke:
                 rate = float(getattr(self.device, "sample_rate", 24000) or 24000)
                 audio_sec = len(audio_buffer) / (2.0 * rate)
-                if pri_int == 0:
+                if pri_int <= 0:
                     self._playing_urgent_until = time.monotonic() + audio_sec
                 # Paired with the `[SPEECH]` start line: start plus audio_ms is
                 # when the line stops sounding (scripts/bench_rehearsal.py).
@@ -1022,7 +1065,7 @@ class MissionAudioAnnouncer:
                     "[SPEECH_DONE] '%s' audio_ms=%d priority=%s",
                     statement[:48],
                     int(audio_sec * 1000.0),
-                    "URGENT" if pri_int == 0 else "NORMAL",
+                    "LAND" if pri_int < 0 else "URGENT" if pri_int == 0 else "NORMAL",
                 )
 
             self._queue.task_done()
@@ -1048,7 +1091,15 @@ class MissionAudioAnnouncer:
         if not self._active or self._loop is None or self._queue is None:
             return False
 
-        pri_int = 0 if _is_urgent(action, details, priority) else 1
+        if str(priority).upper() == "LAND" or "abort" in action.lower():
+            pri_int = -1
+        elif _is_urgent(action, details, priority):
+            pri_int = 0
+        else:
+            pri_int = 1
+
+        if pri_int <= 0 and getattr(self, "_warm_cache_task", None) and not self._warm_cache_task.done():
+            self._loop.call_soon_threadsafe(self._warm_cache_task.cancel)
 
         with self._lock:
             self._seq += 1
@@ -1138,7 +1189,7 @@ _announcer_lock = threading.Lock()
 
 #: Priorities the playback queue serves first, and that the ground station
 #: receives as alerts rather than as nothing.
-_URGENT_PRIORITIES: Final = ("URGENT", "CRITICAL", "EMERGENCY")
+_URGENT_PRIORITIES: Final = ("URGENT", "CRITICAL", "EMERGENCY", "LAND")
 
 
 def _is_urgent(action: str, details: Optional[Dict[str, Any]], priority: str) -> bool:
@@ -1183,6 +1234,15 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+
+    cmdline_path = pathlib.Path(f"/proc/{pid}/cmdline")
+    if cmdline_path.exists():
+        try:
+            cmd = cmdline_path.read_text(encoding="utf-8", errors="replace").lower()
+            if "python" not in cmd:
+                return False
+        except (OSError, PermissionError):
+            pass
     return True
 
 

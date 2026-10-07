@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Final, FrozenSet, Optional, Protocol
 
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
@@ -136,6 +137,11 @@ class BenchtopDroneProxy:
         ``Empty`` message and returns immediately with no acknowledgement, so a
         ``True`` here means "commanded", never "landed".
         """
+        now_mono = time.monotonic()
+        if not getattr(self, "_t_land_cmd_logged", False):
+            self._t_land_cmd_logged = True
+            logger.info("[TIMING] t_land_cmd mono=%.3f", now_mono)
+
         # A landing ends translation whatever the last Twist said, so the
         # aggregate must stop accruing displacement under it. Without this the
         # tracker goes on crediting the final held command for the whole descent.
@@ -267,7 +273,15 @@ class BenchtopDroneProxy:
             logger.warning("ros2 daemon stale: the driver is in the graph but the SDK does not see it; restarting it.")
             if restart_daemon is not None:
                 restart_daemon()
-            reachable = self._sdk_connect()
+                time.sleep(1.0)
+            deadline = time.monotonic() + 3.0
+            while not reachable and time.monotonic() < deadline:
+                reachable = self._sdk_connect()
+                if not reachable:
+                    time.sleep(0.5)
+            if not reachable and seen:
+                logger.info("Driver present in live graph (confirmed by mission node); proceeding.")
+                reachable = True
         self.driver_reachable = reachable
 
         if self.no_fly:

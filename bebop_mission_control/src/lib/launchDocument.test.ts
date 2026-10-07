@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { completeDocument } from './__fixtures__/missionDocument';
+import { completeDocument, validDocument } from './__fixtures__/missionDocument';
 import {
   REQUIRED_LAUNCH_NUMBERS,
   applySchemaFields,
@@ -11,11 +11,11 @@ import { getPath, setPath } from './paths';
 
 describe('launchBlockers', () => {
   it('passes a document holding every required number', () => {
-    expect(launchBlockers(completeDocument())).toEqual([]);
+    expect(launchBlockers(validDocument())).toEqual([]);
   });
 
   it('names every required field that is not a finite number', () => {
-    const doc = completeDocument({
+    const doc = validDocument({
       'kinematics.target_altitude_m': null,
       'rtl.max_speed': 'fast',
       'vision.confidence_threshold': Number.NaN,
@@ -76,5 +76,34 @@ describe('applySchemaFields', () => {
     const working = completeDocument();
     const applied = applySchemaFields(working, {});
     expect(applied).toEqual(working);
+  });
+});
+
+describe('launchBlockers outside the envelope', () => {
+  const valid = () => validDocument();
+
+  it('passes a document inside every range', () => {
+    expect(launchBlockers(valid())).toEqual([]);
+  });
+
+  it('names a sheet value outside its slider range', () => {
+    const doc = setPath(setPath(valid(), 'gimbal.nadir_tilt_deg', 5), 'kinematics.forward_cruise_velocity', 2);
+    expect(launchBlockers(doc)).toEqual(['kinematics.forward_cruise_velocity', 'gimbal.nadir_tilt_deg']);
+  });
+
+  it.each([0, 12, -0.1])('refuses a detection confidence of %s', (value) => {
+    expect(launchBlockers(setPath(valid(), 'vision.confidence_threshold', value))).toEqual(['vision.confidence_threshold']);
+  });
+
+  it.each([
+    ['rtl.max_speed', 0],
+    ['rtl.arrival_radius_m', -1],
+    ['kinematics.hover_duration_sec', 0],
+  ])('refuses a non-positive %s', (path, value) => {
+    expect(launchBlockers(setPath(valid(), path, value))).toEqual([path]);
+  });
+
+  it('refuses the fixture document that reached the station store', () => {
+    expect(launchBlockers(completeDocument()).length).toBeGreaterThan(0);
   });
 });

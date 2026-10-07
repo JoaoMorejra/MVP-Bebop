@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { completeDocument } from './__fixtures__/missionDocument';
 import { loadMain, type Spawned } from './__fixtures__/mainHarness';
 
@@ -12,13 +12,17 @@ let main: ReturnType<typeof loadMain>;
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'bmg-launch-'));
   config = join(dir, 'mission_config.json');
-  main = loadMain({ BMG_MISSION_CONFIG: config });
+  main = loadMain({ BMG_MISSION_CONFIG: config, BMG_SKIP_READINESS: '1' });
 });
 afterAll(() => {
   main.restore();
   rmSync(dir, { recursive: true, force: true });
 });
-afterEach(() => {
+afterEach(async () => {
+  // A test that failed before ending its mission would leave the host holding
+  // it, and every later launch would be refused as already running.
+  for (const spawned of main.spawned) if (!spawned.child.closed) spawned.child.emit('close', 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
   main.spawned.length = 0;
   rmSync(config, { force: true });
 });
@@ -94,6 +98,31 @@ describe('bmg:start-bench-stage', () => {
     expect(sent.kinematics.countdown_sec).toBe(0);
     expect(sent.kinematics.target_altitude_m).toBe(doc.kinematics && (doc.kinematics as Record<string, unknown>).target_altitude_m);
     expect(args).toContain('--no-fly');
+    expect(args).not.toContain('--launch-at-ms');
+    await endMission(missionSpawn());
+  });
+
+  it('counts the whole countdown on the station before it spawns the routine', async () => {
+    vi.useFakeTimers();
+    try {
+      const doc = completeDocument({ 'kinematics.countdown_sec': 3 });
+      const result = (await main.handlers['bmg:start-bench-stage']({}, {
+        stage: 2,
+        countdown: 3,
+        paramsJson: JSON.stringify(doc),
+      })) as { success: boolean; deferred?: boolean };
+      expect(result).toMatchObject({ success: true, deferred: true });
+      expect(missionSpawn()).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(2_900);
+      expect(missionSpawn()).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(200);
+      const args = missionSpawn()!.args;
+      expect(args[args.indexOf('--stages') + 1]).toBe('2');
+      expect(args).not.toContain('--launch-at-ms');
+      expect(JSON.parse(args[args.indexOf('--params-json') + 1]).kinematics.countdown_sec).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
     await endMission(missionSpawn());
   });
 });
@@ -143,3 +172,114 @@ describe('parameter IPC', () => {
     expect(readdirSync(dir)).toEqual(['mission_config.json']);
   });
 });
+
+describe('instant launch from a prepared mission', () => {
+  const standbySpawns = () => main.spawned.filter((child) => child.args.includes('--standby'));
+  const freshSpawns = () =>
+    main.spawned.filter((child) => child.args.some((arg) => arg.endsWith('mission.py')) && !child.args.includes('--standby') && !child.args.includes('--dump-defaults'));
+
+  it('prepares a standby mission from the saved document', async () => {
+    const doc = completeDocument({ no_fly: true, 'network.drone_ip': '10.0.0.1' });
+    await main.handlers['bmg:save-parameters']({}, doc);
+    const standby = standbySpawns().slice(-1)[0];
+    expect(standby.args).toContain('--no-fly');
+    expect(JSON.parse(standby.args[standby.args.indexOf('--params-json') + 1])).toEqual(doc);
+    expect(standby.env.BMG_GCS_SESSION).toBe('1');
+  });
+
+  it('hands the click instant to the prepared mission instead of spawning one', async () => {
+    const doc = completeDocument({ no_fly: true, 'network.drone_ip': '10.0.0.2' });
+    await main.handlers['bmg:save-parameters']({}, doc);
+    const standby = standbySpawns().slice(-1)[0];
+    standby.child.stdout.emit('data', '[STANDBY] ready\n');
+    const writes: string[] = [];
+    standby.child.stdin.write = ((text: string) => writes.push(text) > 0) as never;
+    const result = (await main.handlers['bmg:start-mission']({}, {
+      noFly: true,
+      countdown: 10,
+      launchAtMs: 4242,
+      paramsJson: JSON.stringify(doc),
+    })) as { success: boolean };
+    expect(result.success).toBe(true);
+    expect(freshSpawns()).toHaveLength(0);
+    const go = JSON.parse(writes[0]);
+    expect(go.op).toBe('go');
+    expect(go.launch_at_ms).toBe(4242);
+    expect(go.params.kinematics).toEqual(doc.kinematics);
+    standby.child.emit('close', 0, null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  const missionLog = async (): Promise<string> => {
+    const history = (await main.handlers['bmg:get-log-history']({})) as { mission: { text: string }[] };
+    return history.mission.map((entry) => entry.text).join('');
+  };
+
+  it('spawns a cold launch without the click instant, stopping the standby first and saying why', async () => {
+    // Regression: the cold spawn was handed the click instant, read it after
+    // its own 6-12 s start-up and took off on a deadline already behind it.
+    const doc = completeDocument({ no_fly: true, 'network.drone_ip': '10.0.0.3' });
+    await main.handlers['bmg:save-parameters']({}, doc);
+    const standby = standbySpawns().slice(-1)[0];
+    const killed: string[] = [];
+    standby.child.kill = ((signal: string) => killed.push(signal) > 0) as never;
+    await main.handlers['bmg:start-mission']({}, { noFly: true, launchAtMs: 777, paramsJson: JSON.stringify(doc) });
+    const fresh = freshSpawns().slice(-1)[0];
+    expect(fresh.args).not.toContain('--launch-at-ms');
+    expect(killed).toEqual(['SIGTERM']);
+    expect(await missionLog()).toContain('[BMG] Lançamento frio (missão em espera ainda em preparo)');
+    fresh.child.emit('close', 0, null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it('launches a second time, before the standby is prepared again, cold and unpinned', async () => {
+    const doc = completeDocument({ no_fly: true, 'network.drone_ip': '10.0.0.4' });
+    await main.handlers['bmg:save-parameters']({}, doc);
+    const first = standbySpawns().slice(-1)[0];
+    first.child.stdout.emit('data', '[STANDBY] ready\n');
+    const launchDoc = { paramsJson: JSON.stringify(doc), noFly: true, countdown: 10 };
+    await main.handlers['bmg:start-mission']({}, { ...launchDoc, launchAtMs: 1000 });
+    expect(freshSpawns()).toHaveLength(0);
+    first.child.emit('close', 0, null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const rearmed = standbySpawns().slice(-1)[0];
+    expect(rearmed).not.toBe(first);
+
+    await main.handlers['bmg:start-mission']({}, { ...launchDoc, launchAtMs: 2000 });
+    const second = freshSpawns().slice(-1)[0];
+    expect(second.args).not.toContain('--launch-at-ms');
+    expect(await missionLog()).toContain('[BMG] Lançamento frio (missão em espera ainda em preparo)');
+    second.child.emit('close', 0, null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it('names the start-up fields a standby was prepared for differently', async () => {
+    const doc = completeDocument({ no_fly: true, 'network.drone_ip': '10.0.0.5' });
+    await main.handlers['bmg:save-parameters']({}, doc);
+    standbySpawns().slice(-1)[0].child.stdout.emit('data', '[STANDBY] ready\n');
+    const other = completeDocument({ no_fly: true, 'network.drone_ip': '10.0.0.6' });
+    await main.handlers['bmg:start-mission']({}, { noFly: true, launchAtMs: 3000, paramsJson: JSON.stringify(other) });
+    const fresh = freshSpawns().slice(-1)[0];
+    expect(fresh.args).not.toContain('--launch-at-ms');
+    expect(await missionLog()).toContain('[BMG] Lançamento frio (missão em espera preparada para outro network.drone_ip)');
+    fresh.child.emit('close', 0, null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+});
+
+describe('the parameter store a mission writes back to', () => {
+  it('is the station store, for a standby and for a fresh spawn alike', async () => {
+    const doc = completeDocument({ no_fly: true, 'network.drone_ip': '10.0.0.9' });
+    await main.handlers['bmg:save-parameters']({}, doc);
+    const standby = main.spawned.filter((child) => child.args.includes('--standby')).slice(-1)[0];
+    expect(standby.args[standby.args.indexOf('--config') + 1]).toBe(config);
+    await main.handlers['bmg:start-mission']({}, { noFly: true, launchAtMs: 1, paramsJson: JSON.stringify(doc) });
+    const fresh = main.spawned
+      .filter((child) => child.args.some((arg) => arg.endsWith('mission.py')) && !child.args.includes('--standby'))
+      .slice(-1)[0];
+    expect(fresh.args[fresh.args.indexOf('--config') + 1]).toBe(config);
+    fresh.child.emit('close', 0, null);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+});
+

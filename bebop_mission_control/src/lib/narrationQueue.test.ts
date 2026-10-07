@@ -76,3 +76,21 @@ describe('silence', () => {
     expect(spoken).toEqual(heardBefore);
   });
 });
+
+describe('pruneEarlierStages', () => {
+  it('discards pending lines belonging to earlier stages when stage advances', async () => {
+    const queue = new NarrationQueue(async () => true);
+    queue.enqueue('stage1_a', () => 'a', { stage: 1 });
+    queue.enqueue('stage1_b', () => 'b', { stage: 1 });
+    queue.enqueue('stage2_a', () => 'c', { stage: 2 });
+    queue.enqueue('stage3_a', () => 'd', { stage: 3 });
+
+    expect(queue.labels()).toEqual(['stage1_b', 'stage2_a', 'stage3_a']);
+    queue.pruneEarlierStages(2);
+    // stage 1 items dropped, stage 2 and 3 kept
+    expect(queue.labels()).toEqual(['stage2_a', 'stage3_a']);
+
+    queue.pruneEarlierStages(3);
+    expect(queue.labels()).toEqual(['stage3_a']);
+  });
+});

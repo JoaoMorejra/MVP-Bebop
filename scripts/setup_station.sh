@@ -139,6 +139,25 @@ step_dds_profile() {
     log "4.3 ${activator} now exports FASTRTPS_DEFAULT_PROFILES_FILE"
 }
 
+step_openvino_telemetry() {
+    # The OpenVINO runtime sends usage telemetry unless the user opted out, from
+    # a forked child process; forked inside mission.py it inherited the
+    # mission's signal handlers and held the exit after touchdown
+    # (mvp_mission_bebop/engine/process_reaper.py). Official opt-out, per user.
+    local consent="${TARGET_HOME}/intel/openvino_telemetry"
+    if [[ -f "${consent}" && "$(cat "${consent}")" == "0" ]]; then
+        log "7.x OpenVINO telemetry already opted out"
+        return
+    fi
+    local tool="${TARGET_HOME}/ros2_ws/.venv/bin/opt_in_out"
+    if [[ ! -x "${tool}" ]]; then
+        log "7.x ${tool} not found; run 'opt_in_out --opt_out' in the venv manually"
+        return
+    fi
+    sudo -u "${TARGET_USER}" -H "${tool}" --opt_out > /dev/null
+    log "7.x OpenVINO telemetry opted out for ${TARGET_USER}"
+}
+
 write_pin() {
     local desired
     desired="$(cat <<'EOF'
@@ -283,6 +302,7 @@ case "${MODE}" in
         step_groups
         step_sysctl
         step_dds_profile
+        step_openvino_telemetry
         step_nvidia
         report
         ;;

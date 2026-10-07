@@ -125,3 +125,24 @@ def test_the_alert_claims_no_landing_on_the_ground():
     )
     assert sentence.startswith("Nivelamento sem confirmação")
     assert "pouso" not in sentence.lower()
+
+
+@pytest.mark.parametrize("no_fly, ack, expected", [(False, True, True), (True, False, False)])
+def test_the_flat_trim_outcome_is_reported_to_the_station(announced, monkeypatch, no_fly, ack, expected):
+    """The countdown overlay's IMU item follows this milestone (it stayed spinning forever)."""
+    from mvp_mission_bebop.steps import takeoff as takeoff_module
+
+    emitted = []
+    monkeypatch.setattr(takeoff_module, "emit_milestone", lambda key, payload=None: emitted.append((key, payload)))
+    ctx = make_ctx(no_fly=no_fly, ack=ack)
+    TakeoffStep()._flat_trim(ctx)
+    assert emitted == [("mission.flat_trim", {"acknowledged": expected})]
+
+
+def test_a_refused_flat_trim_is_reported_too(announced, monkeypatch):
+    from mvp_mission_bebop.steps import takeoff as takeoff_module
+
+    emitted = []
+    monkeypatch.setattr(takeoff_module, "emit_milestone", lambda key, payload=None: emitted.append((key, payload)))
+    TakeoffStep()._flat_trim(make_ctx(no_fly=False, ack=False))
+    assert emitted == [("mission.flat_trim", {"acknowledged": False})]

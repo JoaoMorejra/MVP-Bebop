@@ -16,6 +16,12 @@ export interface PreflightGateInput {
   flightReady: boolean;
   missingTopics: string[];
   stale: boolean;
+  flyingState?: number | null;
+  batteryPct?: number | null;
+  batteryKnown?: boolean;
+  batteryFailsafeThreshold?: number;
+  magnetoRequired?: boolean;
+  bridgeReady?: boolean;
 }
 
 const PARAMS_REASON: Record<Exclude<PreflightGateInput['paramsStatus'], 'ready'>, string> = {
@@ -35,5 +41,21 @@ export function preflightBlockedReason(input: PreflightGateInput): string | null
       : 'Validando tópicos da aeronave';
   }
   if (input.stale) return 'Sem odometria recente';
+  if (typeof input.flyingState === 'number' && input.flyingState !== 0) {
+    return `Aeronave não está em solo (flying_state ${input.flyingState})`;
+  }
+  const minBattery = Math.max((input.batteryFailsafeThreshold ?? 20) + 10, 30);
+  if (input.batteryKnown === false) {
+    return 'Bateria da aeronave desconhecida';
+  }
+  if (typeof input.batteryPct === 'number' && input.batteryPct < minBattery) {
+    return `Bateria insuficiente para voo real (${input.batteryPct}% < ${minBattery}%)`;
+  }
+  if (input.magnetoRequired === true) {
+    return 'Calibração do magnetômetro necessária';
+  }
+  if (input.bridgeReady === false) {
+    return 'Ponte de comando não está pronta';
+  }
   return null;
 }

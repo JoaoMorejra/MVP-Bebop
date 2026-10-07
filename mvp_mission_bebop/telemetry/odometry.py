@@ -217,6 +217,7 @@ class OdometrySupervisor:
         self._buffer_z: List[float] = []
         self._buffer_x: List[float] = []
         self._buffer_y: List[float] = []
+        self._ceiling_breach_streak: int = 0
 
     # --------------------------------------------------------------- ingestion
 
@@ -330,6 +331,11 @@ class OdometrySupervisor:
             self.current_yaw = yaw
             self.last_odometry_timestamp = time.monotonic()
             self.sample_count += 1
+            rel_alt = z if self.ground_reference_altitude is None else z - self.ground_reference_altitude
+            if rel_alt > self.altitude_ceiling:
+                self._ceiling_breach_streak += 1
+            else:
+                self._ceiling_breach_streak = 0
 
             if self.ground_reference_altitude is None:
                 depth = self.calibration_cfg.sample_buffer_size
@@ -433,6 +439,7 @@ class OdometrySupervisor:
             self.ground_reference_altitude = z0
             self.takeoff_x = x0
             self.takeoff_y = y0
+            self._ceiling_breach_streak = 0
 
         logger.info(
             "Ground reference calibrated from %d samples: x0=%.3f m, y0=%.3f m, z0=%.3f m "
@@ -497,8 +504,16 @@ class OdometrySupervisor:
         return self.telemetry_health(timeout_sec).is_healthy
 
     def is_ceiling_breached(self) -> bool:
-        """True when the relative altitude exceeds the safety ceiling."""
-        return self.snapshot().relative_altitude > self.altitude_ceiling
+        """True when the relative altitude exceeds the safety ceiling for consecutive samples."""
+        streak_threshold = max(1, getattr(self.kinematics_cfg, "ceiling_breach_streak", 3))
+        with self._lock:
+            return self._ceiling_breach_streak >= streak_threshold
+
+    @property
+    def ceiling_breach_streak(self) -> int:
+        """Current count of consecutive samples above the safety ceiling."""
+        with self._lock:
+            return self._ceiling_breach_streak
 
     # ------------------------------------------------ backwards-compatible API
 

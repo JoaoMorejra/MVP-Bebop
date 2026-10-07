@@ -1,6 +1,8 @@
 import { EventEmitter } from 'node:events';
+import { mkdtempSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 const require = createRequire(import.meta.url);
 export const MAIN = resolve(__dirname, '../../../electron/main.cjs');
@@ -11,6 +13,8 @@ export type FakeChild = EventEmitter & {
   stdin: EventEmitter & { write: () => boolean; end: () => void; setEncoding: () => void };
   kill: () => boolean;
   pid: number;
+  /** Set once the test has emitted `close`: what a teardown still has to end. */
+  closed: boolean;
 };
 
 export interface Spawned {
@@ -24,9 +28,17 @@ export interface Spawned {
  * The real main.cjs, with `electron` and `child_process.spawn` stood in for, so
  * the arguments and environment each child would be given can be read, and its
  * output scripted, without starting one. `env` is applied to `process.env`
- * before the module loads (for example `BMG_MISSION_CONFIG`).
+ * before the module loads.
+ *
+ * `BMG_MISSION_CONFIG` always points at a scratch file unless the caller names
+ * one: a test that saved parameters through the real default path once wrote
+ * its fixture document into the station's mission_config.json.
  */
-export function loadMain(env: Record<string, string> = {}) {
+export function loadMain(overrides: Record<string, string> = {}) {
+  const env: Record<string, string> = {
+    BMG_MISSION_CONFIG: join(mkdtempSync(join(tmpdir(), 'bmg-harness-')), 'mission_config.json'),
+    ...overrides,
+  };
   const Module = require('node:module') as {
     _load: (request: string, parent: { filename?: string } | undefined, isMain: boolean) => unknown;
   };
@@ -47,6 +59,10 @@ export function loadMain(env: Record<string, string> = {}) {
     child.stdin = Object.assign(new EventEmitter(), { write: () => true, end: () => undefined, setEncoding: () => undefined });
     child.kill = () => true;
     child.pid = 4242;
+    child.closed = false;
+    child.once('close', () => {
+      child.closed = true;
+    });
     return child;
   };
 
@@ -78,6 +94,7 @@ export function loadMain(env: Record<string, string> = {}) {
   return {
     handlers,
     spawned,
+    configPath: env.BMG_MISSION_CONFIG,
     restore: () => {
       Module._load = original;
       for (const [key, value] of Object.entries(previousEnv)) {

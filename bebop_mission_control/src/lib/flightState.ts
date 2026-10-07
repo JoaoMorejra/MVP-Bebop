@@ -1,4 +1,5 @@
 import type { MissionState } from '../types/mission';
+import type { LandProgressPhase } from '../types/bmg';
 
 /**
  * The canonical airborne set: ARSDK flying states in which the rotors are
@@ -29,13 +30,16 @@ export function rotorsTurning(flyingState: number | null | undefined): boolean {
 /**
  * Whether the abort control can be pressed.
  *
- * While a mission is arming or running, and whenever the aircraft reports an
- * airborne state regardless of the mission process: a process that died with
- * the aircraft in the air used to take the only landing control on the
- * cockpit with it. With no process the abort publishes the landing through
- * the resident command bridge (`bmg:abort-mission`).
+ * While a mission is arming or running, whenever the aircraft reports an
+ * airborne state regardless of the mission process, or when landing is
+ * unconfirmed (R6 / L2), enabling the operator to re-send the land command.
  */
-export function abortEnabled(missionState: MissionState, flyingState: number | null | undefined): boolean {
+export function abortEnabled(
+  missionState: MissionState,
+  flyingState: number | null | undefined,
+  landProgress?: LandProgressPhase | null
+): boolean {
+  if (landProgress === 'unconfirmed') return true;
   return missionState === 'running' || missionState === 'arming' || isAirborne(flyingState);
 }
 
@@ -49,4 +53,22 @@ export function abortEnabled(missionState: MissionState, flyingState: number | n
 export function flyingStateLabel(label: string | undefined, connected: boolean): string {
   if (label && label !== 'unknown') return label;
   return connected ? 'estado desconhecido' : '—';
+}
+
+/**
+ * Human-readable label for the land progress phase (R6).
+ */
+export function landProgressLabel(phase: LandProgressPhase | null | undefined): string | null {
+  switch (phase) {
+    case 'commanded':
+      return 'Pouso comandado';
+    case 'landing':
+      return 'Pousando';
+    case 'landed':
+      return 'Pousada';
+    case 'unconfirmed':
+      return 'Pouso não confirmado: reenviar';
+    default:
+      return null;
+  }
 }

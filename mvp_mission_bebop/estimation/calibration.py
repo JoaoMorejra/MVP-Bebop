@@ -144,13 +144,25 @@ class SpeedCalibration:
 
     # ------------------------------------------------------------- conversions
 
-    def to_mps(self, normalized: float) -> float:
+    def to_mps(self, normalized: float, *, axis: str = "forward") -> float:
         """Convert a normalized command into metres per second."""
-        return normalized * self.normalized_to_mps
+        gain = {
+            "forward": self.normalized_to_mps,
+            "lateral": self.lateral_gain,
+            "vertical": self.vertical_gain,
+        }[axis]
+        return normalized * gain
 
-    def to_normalized(self, mps: float) -> float:
+    def to_normalized(self, mps: float, *, axis: str = "forward") -> float:
         """Convert a physical velocity into a normalized command."""
-        return mps / self.normalized_to_mps
+        gain = {
+            "forward": self.normalized_to_mps,
+            "lateral": self.lateral_gain,
+            "vertical": self.vertical_gain,
+        }[axis]
+        if gain <= 0.0:
+            return 0.0
+        return mps / gain
 
     def effective_mps(self, normalized: float, *, axis: str = "forward") -> float:
         """Speed the airframe actually reaches under a held command.

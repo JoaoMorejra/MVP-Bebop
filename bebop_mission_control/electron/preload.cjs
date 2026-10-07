@@ -96,6 +96,7 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   onDriverLog: subscribe('bmg:driver-log'),
   onMissionExit: subscribe('bmg:mission-exit'),
   onLinkProgress: subscribe('bmg:link-progress'),
+  onLandProgress: subscribe('bmg:land-progress'),
   onAnnounceDone: subscribe('bmg:announce-done'),
   onCameraTiltChanged: subscribe('bmg:camera-tilt-changed'),
   onMissionReset: subscribe('bmg:mission-reset'),

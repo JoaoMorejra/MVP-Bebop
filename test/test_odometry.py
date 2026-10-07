@@ -227,8 +227,32 @@ def test_ceiling_breach_is_detected():
 
     sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.10)
     assert not sup.is_ceiling_breached()
+
+    # 1 or 2 samples above ceiling (1.25 m) do not declare breach (debounce):
+    sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.40)
+    assert not sup.is_ceiling_breached()
+    assert sup.ceiling_breach_streak == 1
+
+    sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.40)
+    assert not sup.is_ceiling_breached()
+    assert sup.ceiling_breach_streak == 2
+
+    # 3 consecutive samples trigger breach:
     sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.40)
     assert sup.is_ceiling_breached()
+    assert sup.ceiling_breach_streak == 3
+
+    # An in-envelope sample resets the streak immediately:
+    sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.00)
+    assert not sup.is_ceiling_breached()
+    assert sup.ceiling_breach_streak == 0
+
+
+def test_default_ceiling_margin_and_streak():
+    """The default margin is 0.60 m and streak is 3 samples (~200 ms)."""
+    cfg = FlightKinematicsConfig()
+    assert cfg.altitude_ceiling_margin_m == 0.60
+    assert cfg.ceiling_breach_streak == 3
 
 
 # ------------------------------------------- ceiling across a Stage 1 ascent
@@ -264,7 +288,8 @@ def test_ceiling_breach_is_detected_during_an_ascent():
     sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.00)
     assert not sup.is_ceiling_breached()
 
-    sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.20)
+    for _ in range(sup.kinematics_cfg.ceiling_breach_streak):
+        sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.20)
     assert sup.is_ceiling_breached()
 
 

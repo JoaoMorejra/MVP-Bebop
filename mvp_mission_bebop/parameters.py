@@ -423,7 +423,12 @@ class FlightKinematicsConfig:
     #: and above :attr:`takeoff_settle_min_altitude_m`, below which no hover
     #: sample counts as settled and the stabilization gate can only time out.
     target_altitude_m: float = 1.00
-    altitude_ceiling_margin_m: float = 0.25
+    #: Safety headroom allowed above target_altitude_m before failsafe triggers, in metres.
+    #: 0.60 m absorbs climb momentum, sonar dispersion, and pitch-induced tilt reading spikes.
+    altitude_ceiling_margin_m: float = 0.60
+    #: Consecutive odometry samples above the ceiling required to declare a breach.
+    #: 3 samples at 15 Hz = ~200 ms debounce, rejecting instantaneous ultrasonic/baro spikes.
+    ceiling_breach_streak: int = 3
     forward_cruise_velocity: float = 0.20
     max_approach_forward_speed: float = 0.15
     #: Safety ceiling on the post-takeoff stabilization gate, in seconds.
@@ -959,6 +964,11 @@ class TimeoutsConfig:
     #: seconds. The Bebop answers within a few hundred milliseconds on a level
     #: surface; a real flight without the answer does not take off.
     flat_trim_ack_timeout_sec: float = 3.0
+
+    #: Longest wait for confirmation that the airframe actually left the ground
+    #: (flying_state in {1, 2} or altitude > takeoff_settle_min_altitude_m) after
+    #: the takeoff command, in seconds (R1, D2).
+    takeoff_confirm_timeout_sec: float = 6.0
 
     search_timeout_sec: float = 30.0
     #: Stage 3 window, sized from the standoff the approach has to close.

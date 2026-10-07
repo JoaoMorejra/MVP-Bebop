@@ -22,4 +22,10 @@ describe('abortEnabled', () => {
     expect(abortEnabled('finished', 0)).toBe(false);
     expect(abortEnabled('faulted', null)).toBe(false);
   });
+
+  it('re-enables abort control when landProgress is unconfirmed (R6 / L2)', () => {
+    expect(abortEnabled('aborted', 0, 'unconfirmed')).toBe(true);
+    expect(abortEnabled('aborted', null, 'unconfirmed')).toBe(true);
+    expect(abortEnabled('idle', 0, 'unconfirmed')).toBe(true);
+  });
 });

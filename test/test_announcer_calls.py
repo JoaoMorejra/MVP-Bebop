@@ -1105,3 +1105,27 @@ def test_the_global_device_is_closed_at_exit(monkeypatch):
     assert len(registered) == 1
     registered[0]()
     assert Fake.closed is True
+
+
+def test_pid_alive_rejects_unrelated_process_reusing_pid(monkeypatch, tmp_path):
+    fake_proc = tmp_path / "proc_fake"
+    fake_proc.mkdir()
+    fake_cmdline = fake_proc / "cmdline"
+    fake_cmdline.write_text("systemd\x00--user\x00")
+
+    monkeypatch.setattr(announcer.pathlib, "Path", lambda p: fake_cmdline if str(p).startswith("/proc/") else announcer.pathlib.Path(p))
+    monkeypatch.setattr(announcer.os, "kill", lambda pid, sig: None)
+
+    assert announcer._pid_alive(99999) is False
+
+
+def test_land_priority_cuts_playing_speech_and_clears_normal_queue():
+    """V8: LAND cuts any speech immediately."""
+    ann = announcer.MissionAudioAnnouncer.__new__(announcer.MissionAudioAnnouncer)
+    ann._active = True
+    ann.device = announcer.AudioPlaybackDevice()
+    ann._loop = None
+    ann._queue = None
+
+    assert announcer._is_urgent("Missão abortada", None, "LAND") is True
+    assert announcer._is_urgent("Normal call", None, "NORMAL") is False

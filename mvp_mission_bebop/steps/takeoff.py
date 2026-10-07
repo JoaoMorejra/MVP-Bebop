@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Final, FrozenSet, Optional
+import time
+from typing import Any, Dict, Final, FrozenSet, Optional
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.profiling import (
@@ -77,12 +78,34 @@ class TakeoffStep(BaseStep):
         ):
             return
         self._takeoff_called = True
-        emit_milestone("mission.takeoff", {"altitude_m": round(kinematics.target_altitude_m, 2)})
+        payload: Dict[str, Any] = {"altitude_m": round(kinematics.target_altitude_m, 2)}
+        bb = getattr(ctx, "blackboard", None)
+        if bb is not None:
+            for attr in ("t_click", "t_takeoff_cmd", "t_takeoff_started", "t_takeoff_confirmed"):
+                val = getattr(bb, attr, None)
+                if val is not None:
+                    payload[attr] = round(val, 3) if isinstance(val, float) else val
+        emit_milestone("mission.takeoff", payload)
 
     def execute(self, ctx: MissionContext) -> StepStatus:
         logger.info("--- [%s] ---", self.name)
         self._takeoff_called = False
+        status = self._ground_sequence(ctx)
+        if status is not StepStatus.SUCCESS:
+            # The countdown ticks must not keep running towards a takeoff
+            # that is not going to happen.
+            self._stop_ticker(ctx)
+            return status
+        return self._flight_sequence(ctx)
 
+    @staticmethod
+    def _stop_ticker(ctx: MissionContext) -> None:
+        ticker = getattr(ctx, "countdown_ticker", None)
+        if ticker is not None:
+            ticker.stop()
+
+    def _ground_sequence(self, ctx: MissionContext) -> StepStatus:
+        """Pre-arm checks, gimbal, flat trim, ground reference and the countdown."""
         if not self._check_prearm_battery(ctx):
             return StepStatus.FAILURE
 
@@ -95,11 +118,13 @@ class TakeoffStep(BaseStep):
         if not self._calibrate(ctx):
             return StepStatus.FAILURE
 
-        status = self._countdown(ctx)
-        if status is not StepStatus.SUCCESS:
-            return status
+        return self._countdown(ctx)
 
-        ctx.blackboard.takeoff_committed = True
+    def _flight_sequence(self, ctx: MissionContext) -> StepStatus:
+        """Takeoff, stabilization, ascent and the airborne origin."""
+        bb = getattr(ctx, "blackboard", None)
+        if bb is not None:
+            bb.takeoff_committed = True
         status = self._launch(ctx)
         if status is not StepStatus.SUCCESS:
             return status
@@ -114,7 +139,8 @@ class TakeoffStep(BaseStep):
 
         status = self._finalize(ctx)
         if status is StepStatus.SUCCESS:
-            ctx.blackboard.takeoff_complete = True
+            if bb is not None:
+                bb.takeoff_complete = True
         return status
 
     # --------------------------------------------------------------- flat trim
@@ -139,6 +165,7 @@ class TakeoffStep(BaseStep):
         ctx.drone.flat_trim()
         timeout = ctx.params.timeouts.flat_trim_ack_timeout_sec
         acknowledged = tracker is not None and tracker.wait_after(mark, timeout)
+        emit_milestone("mission.flat_trim", {"acknowledged": bool(acknowledged)})
         if acknowledged:
             logger.info("Flat trim acknowledged by the aircraft.")
         elif ctx.drone.no_fly:
@@ -234,8 +261,27 @@ class TakeoffStep(BaseStep):
         compiles, and paying that cost here rather than in the first search
         iteration keeps the search loop's cadence honest from its first cycle.
         """
-        duration = ctx.params.kinematics.countdown_sec
+        floor = ctx.params.kinematics.countdown_sec
+        duration = floor
+        # A launch from standby counts towards the click plus the countdown,
+        # the instant the station's overlay counts to as well; the flat trim
+        # and the ground reference ran inside that window.
+        launch_deadline = getattr(ctx, "launch_deadline", None)
+        ticker = getattr(ctx, "countdown_ticker", None)
+        if launch_deadline is not None:
+            duration = max(0.0, launch_deadline - time.monotonic())
+            # A passed deadline authorizes the takeoff only if its window was
+            # counted where the operator sees it. Otherwise the time went to a
+            # start-up, and the countdown is never shortened by one.
+            if duration <= 0.0 and floor > 0.0 and not getattr(ticker, "shown", False):
+                logger.warning(
+                    "Launch deadline passed with no countdown shown: counting the full %.1f s.", floor
+                )
+                self._stop_ticker(ctx)
+                ticker = None
+                duration = floor
         if duration <= 0.0:
+            self._stop_ticker(ctx)
             emit_milestone("mission.countdown_3", {"remaining_sec": 0})
             emit_milestone("mission.countdown", {"remaining_sec": 0})
             return StepStatus.SUCCESS
@@ -263,7 +309,7 @@ class TakeoffStep(BaseStep):
 
                 remaining = deadline.remaining_sec
                 whole = int(math.ceil(max(0.0, remaining)))
-                if whole != last_whole and whole > 0:
+                if ticker is None and whole != last_whole and whole > 0:
                     last_whole = whole
                     emit_milestone("mission.countdown", {"remaining_sec": whole})
                 ctx.perception.set_status(f"CONTAGEM REGRESSIVA: {remaining:.1f}s | YOLO PRONTO")
@@ -282,6 +328,7 @@ class TakeoffStep(BaseStep):
 
                 rate.tick()
 
+        self._stop_ticker(ctx)
         if not announced:
             emit_milestone("mission.countdown_3", {"remaining_sec": 0})
         emit_milestone("mission.countdown", {"remaining_sec": 0})
@@ -305,17 +352,107 @@ class TakeoffStep(BaseStep):
             ctx.odom_supervisor.altitude_ceiling,
         )
 
+        t_cmd_mono = time.monotonic()
+        t_cmd_wall = time.time()
+        bb = getattr(ctx, "blackboard", None)
+        if bb is not None:
+            bb.t_takeoff_cmd = t_cmd_mono
+            bb.t_takeoff_cmd_wall = t_cmd_wall
+        logger.info("[TIMING] t_takeoff_cmd mono=%.3f wall=%.3f", t_cmd_mono, t_cmd_wall)
+
         if not ctx.drone.takeoff(altitude=target_altitude):
             logger.critical("Autonomous takeoff rejected by the flight controller.")
+            ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
+            if bb is not None:
+                bb.landing_started = True
+            for _ in range(5):
+                ctx.drone.land()
+                time.sleep(0.05)
             self._announce(
                 "Falha na decolagem",
                 "decolagem rejeitada pela controladora de voo",
                 priority="CRITICAL",
+                details={"em_voo": False},
                 wait=True,
             )
+            if bb is not None:
+                bb.takeoff_committed = False
             return StepStatus.FAILURE
 
+        no_fly = getattr(ctx.drone, "no_fly", getattr(ctx.params, "no_fly", True))
+        if not no_fly:
+            confirmed = self._wait_for_takeoff_confirmation(ctx, t_cmd_mono)
+            if not confirmed:
+                logger.critical("Takeoff confirmation timed out (R1). Landing aircraft.")
+                ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
+                if bb is not None:
+                    bb.landing_started = True
+                for _ in range(5):
+                    ctx.drone.land()
+                    time.sleep(0.05)
+                self._announce(
+                    "Falha na decolagem",
+                    "decolagem não confirmada pela aeronave",
+                    priority="CRITICAL",
+                    details={"em_voo": False},
+                    wait=True,
+                )
+                if bb is not None:
+                    bb.takeoff_committed = False
+                return StepStatus.FAILURE
+
         return StepStatus.SUCCESS
+
+    def _wait_for_takeoff_confirmation(self, ctx: MissionContext, t_cmd_mono: float) -> bool:
+        """Wait for fresh telemetry confirming the airframe left the ground (R1).
+
+        Parameters
+        ----------
+        ctx : MissionContext
+            Runtime context with telemetry and blackboard.
+        t_cmd_mono : float
+            Monotonic timestamp when the takeoff command was transmitted. Only
+            samples with timestamp >= t_cmd_mono count towards confirmation.
+
+        Returns
+        -------
+        bool
+            True if confirmed within ``timeouts.takeoff_confirm_timeout_sec``;
+            False on timeout or abort.
+        """
+        timeout_sec = ctx.params.timeouts.takeoff_confirm_timeout_sec
+        deadline = Deadline(timeout_sec)
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        min_altitude = ctx.params.kinematics.takeoff_settle_min_altitude_m
+
+        while deadline.active:
+            if ctx.interrupted():
+                return False
+
+            if ctx.grab_frame(timeout_sec=0.1) is not None:
+                ctx.failsafe.notify_frame_received()
+
+            rate.tick()
+
+            fs_mono = getattr(ctx, "flying_state_timestamp", 0.0)
+            fresh_state = ctx.flying_state if fs_mono >= t_cmd_mono else None
+            snapshot = ctx.odom_supervisor.snapshot()
+
+            if takeoff_confirmed(fresh_state, snapshot.relative_altitude, min_altitude):
+                t_confirmed = time.monotonic()
+                bb = getattr(ctx, "blackboard", None)
+                if bb is not None:
+                    bb.t_takeoff_confirmed = t_confirmed
+                logger.info(
+                    "[TIMING] t_takeoff_confirmed mono=%.3f state=%s alt=%.3f",
+                    t_confirmed,
+                    fresh_state,
+                    snapshot.relative_altitude,
+                )
+                self._call_takeoff_once_confirmed(ctx, snapshot.relative_altitude)
+                return True
+
+        return False
 
     def _stabilize(self, ctx: MissionContext) -> StepStatus:
         """Hover until the liftoff transient decays, bounded by a safety ceiling.
@@ -538,15 +675,28 @@ class TakeoffStep(BaseStep):
 
                 # Feedforward: the fastest ascent that can still be arrested
                 # within the remaining distance, saturated at the authorized
-                # climb rate. Aiming at the edge of the arrival window rather
-                # than at the point target keeps the profile from asymptoting.
-                desired = braking_velocity(
-                    remaining,
-                    kinematics.max_accel_mps2,
-                    cruise_velocity=kinematics.max_climb_speed_mps,
-                    arrival_tolerance=deadband,
+                # climb rate. For the operational climb (<= 0.30 m/s), size the
+                # deceleration at 0.12 m/s^2 so easing begins ~0.25 m out and
+                # stops inside the 0.25 m ceiling margin rather than overshooting.
+                climb_decel = (
+                    min(kinematics.max_accel_mps2, 0.12)
+                    if kinematics.max_climb_speed_mps <= 0.30
+                    else kinematics.max_accel_mps2
                 )
-                profiled = profile.step(desired, dt)
+                if remaining > 0.0:
+                    desired = braking_velocity(
+                        remaining,
+                        climb_decel,
+                        cruise_velocity=kinematics.max_climb_speed_mps,
+                        arrival_tolerance=deadband,
+                    )
+                    profiled = max(0.0, profile.step(desired, dt))
+                else:
+                    desired = 0.0
+                    profiled = max(0.0, profile.step(0.0, dt))
+                    if profiled < 0.01:
+                        profile.reset(0.0, 0.0)
+                        profiled = 0.0
 
                 safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(
                     profiled, 0.0, allow_climb=True
@@ -554,7 +704,7 @@ class TakeoffStep(BaseStep):
                 ctx.drone.move_velocity(
                     vx=0.0,
                     vy=0.0,
-                    vz=ctx.speed_calibration.to_normalized(safe_vz),
+                    vz=ctx.speed_calibration.to_normalized(safe_vz, axis="vertical"),
                     vyaw=safe_vyaw,
                 )
 
@@ -656,6 +806,11 @@ class TakeoffStep(BaseStep):
         ctx.odom_supervisor.freeze_hover_takeoff_origin()
         self._arm_dead_reckoning(ctx)
         snapshot = ctx.odom_supervisor.snapshot()
+        t_hover = time.monotonic()
+        bb = getattr(ctx, "blackboard", None)
+        if bb is not None:
+            bb.t_hover = t_hover
+        logger.info("[TIMING] t_hover mono=%.3f", t_hover)
 
         logger.info(
             "Stage 1 complete: relative altitude %.2f m, residual speed %.3f m/s.",
@@ -690,12 +845,20 @@ class TakeoffStep(BaseStep):
 
     @staticmethod
     def _announce(
-        action: str, detail: str, *, priority: Optional[str] = None, wait: bool = False
+        action: str,
+        detail: str,
+        *,
+        priority: Optional[str] = None,
+        wait: bool = False,
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         try:
             from mvp_mission_bebop.telemetry.announcer import announce_sync
 
-            kwargs = {"details": {"etapa": detail}, "wait": wait}
+            payload: Dict[str, Any] = {"etapa": detail}
+            if details:
+                payload.update(details)
+            kwargs = {"details": payload, "wait": wait}
             if priority is not None:
                 kwargs["priority"] = priority
             announce_sync(action, **kwargs)

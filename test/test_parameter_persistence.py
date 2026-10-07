@@ -84,3 +84,29 @@ def test_the_countdown_default_and_floor():
     assert MissionParameters().kinematics.countdown_sec == pytest.approx(10.0)
     assert COUNTDOWN_MIN_SEC == 0.0
     assert math.isfinite(MissionParameters().kinematics.countdown_sec)
+
+
+def test_default_invocation_arms_motors_even_if_store_had_no_fly_true(monkeypatch, tmp_path):
+    """Running mission.py without flags arms the motors (no_fly=False) and persists no_fly=False."""
+    stored = {"no_fly": True, "kinematics": {"target_altitude_m": 1.5}}
+    params, config = resolve(monkeypatch, tmp_path, [], stored)
+    assert params.no_fly is False
+    written = json.loads(config.read_text())
+    assert written["no_fly"] is False
+
+
+def test_no_fly_flag_sets_no_fly_true_without_persisting_it(monkeypatch, tmp_path):
+    """--no-fly enables benchtop mode for this run, but disk store remains no_fly=False."""
+    params, config = resolve(monkeypatch, tmp_path, ["--no-fly"])
+    assert params.no_fly is True
+    written = json.loads(config.read_text())
+    assert written["no_fly"] is False
+
+
+def test_fly_flag_explicitly_arms_motors(monkeypatch, tmp_path):
+    """--fly explicitly arms the motors."""
+    params, config = resolve(monkeypatch, tmp_path, ["--fly"])
+    assert params.no_fly is False
+    written = json.loads(config.read_text())
+    assert written["no_fly"] is False
+

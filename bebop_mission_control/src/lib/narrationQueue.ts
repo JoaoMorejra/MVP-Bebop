@@ -3,6 +3,8 @@ import type { AnnouncePriority } from '../types/bmg';
 export interface EnqueueOptions {
   /** Lines that belong together and are dropped together (`resetGroup`). */
   group?: string;
+  /** Stage this line belongs to (used by `pruneEarlierStages` when stage advances). */
+  stage?: number;
   /**
    * The least time the item holds the queue, in milliseconds. It ends at the
    * later of its sentence having been heard and this beat, so a copilot that
@@ -26,6 +28,7 @@ interface Item {
   priority: AnnouncePriority;
   /** Raised with `preempt`: a failure, abort or failsafe, not narration. */
   alert: boolean;
+  stage: number | null;
   group: string | null;
   minMs: number;
   fallbackMs: number;
@@ -96,6 +99,7 @@ export class NarrationQueue {
       compose,
       priority: 'NORMAL',
       alert: false,
+      stage: options.stage ?? null,
       group: options.group ?? null,
       minMs: Math.max(0, options.minMs ?? 0),
       fallbackMs: Math.max(0, options.fallbackMs ?? 0),
@@ -132,24 +136,41 @@ export class NarrationQueue {
    * The station is the system's only voice, so a failure the mission reports
    * cannot wait behind the flight script it has just made obsolete: pending
    * narration is dropped, the narration line playing now is cut, and the alert
-   * is next. Alerts never cut or drop each other; a second one waits for the
-   * first, so "step failed" followed by "aborting" is heard in full, in order.
+   * is next. `LAND` priority cuts any speech currently sounding, even another alert.
+   * Other alerts never cut each other; a second one waits for the first.
    */
   preempt(label: string, compose: () => string, priority: AnnouncePriority = 'URGENT'): void {
+    const isLand = priority === 'LAND';
     const alerts = this.items.filter((item) => item.alert);
     this.items.length = 0;
-    this.items.push(...alerts, {
+    const newItem: Item = {
       label,
       compose,
       priority,
       alert: true,
+      stage: null,
       group: null,
       minMs: 0,
       fallbackMs: 0,
       cancelled: false,
-    });
-    if (this.current && !this.current.alert) this.cutCurrent();
+    };
+    if (isLand) {
+      this.items.push(newItem, ...alerts);
+      if (this.current) this.cutCurrent();
+    } else {
+      this.items.push(...alerts, newItem);
+      if (this.current && !this.current.alert) this.cutCurrent();
+    }
     void this.drain();
+  }
+
+  /** Drop pending lines from stages older than `currentStage`. */
+  pruneEarlierStages(currentStage: number): void {
+    const kept = this.items.filter((item) => item.stage === null || item.stage >= currentStage);
+    if (kept.length !== this.items.length) {
+      this.items.length = 0;
+      this.items.push(...kept);
+    }
   }
 
   /**
@@ -218,6 +239,13 @@ export class NarrationQueue {
     this.draining = true;
     try {
       for (let item = this.items.shift(); item; item = this.items.shift()) {
+        if (!item.alert && this.items.some((i) => i.alert)) {
+          this.items.unshift(item);
+          const alertIndex = this.items.findIndex((i) => i.alert);
+          if (alertIndex >= 0) {
+            item = this.items.splice(alertIndex, 1)[0];
+          }
+        }
         let text: string;
         try {
           text = item.text ?? item.compose();

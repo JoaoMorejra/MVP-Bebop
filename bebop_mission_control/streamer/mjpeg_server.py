@@ -306,6 +306,20 @@ _PALETTE = (
 _BANNER_BOTTOM = 48
 
 
+def _display_class_name(name: str) -> str:
+    """Map raw detector class names to operator-facing mission terms.
+
+    In this mission, YOLO detects a bicycle or motorcycle representing
+    the traffic accident scene. On the cockpit stream, the operator needs
+    to see 'acidente' instead of the raw COCO class labels.
+    """
+    if not name:
+        return ""
+    if name.lower() in ("motorcycle", "bicycle", "bycicle"):
+        return "acidente"
+    return name
+
+
 def _class_colour(name: str) -> Tuple[int, int, int]:
     return _PALETTE[zlib.crc32(name.encode("utf-8")) % len(_PALETTE)]
 
@@ -332,10 +346,11 @@ def draw_detection_summary(frame: np.ndarray, summary: DetectionSummary) -> np.n
         x1, y1, x2, y2 = detection.bbox
         top_left = (int(round(x1 * scale_x)), int(round(y1 * scale_y)))
         bottom_right = (int(round(x2 * scale_x)), int(round(y2 * scale_y)))
-        colour = _class_colour(detection.class_name)
+        display_name = _display_class_name(detection.class_name)
+        colour = _class_colour(display_name)
         cv2.rectangle(canvas, top_left, bottom_right, colour, 2)
 
-        label = f"{detection.class_name} {detection.confidence:.2f}"
+        label = f"{display_name} {detection.confidence:.2f}"
         (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
         label_height = text_h + baseline + 4
         label_top = top_left[1] - label_height

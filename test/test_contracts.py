@@ -380,6 +380,7 @@ SPEC_MILESTONE_KEYS = (
     "mission.battery_warning",
     "mission.touchdown",
     "mission.parameters",
+    "mission.flat_trim",
 )
 
 
@@ -560,6 +561,7 @@ def test_a_full_bench_run_crosses_every_milestone_in_flight_order(tmp_path):
     assert sequence == [
         "mission.parameters",
         "STEP 1",
+        "mission.flat_trim",
         "mission.countdown_3",
         "mission.countdown",
         "mission.takeoff",

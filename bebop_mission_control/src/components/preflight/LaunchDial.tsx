@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback, useRef } from 'react';
 import { Lock, Play } from 'lucide-react';
 import { cn } from '../../lib/format';
 
@@ -49,11 +49,8 @@ const THEME = {
  * there is exactly one thing an operator does on this screen and everything
  * else on it is there to tell them whether they should.
  *
- * Locked is a visible state rather than a greyed-out one: the ring keeps its
- * geometry and the padlock replaces the play mark. The reason sits inside the
- * dial, directly under the word it qualifies, so the operator reads why the
- * command is held without looking away from it. On the bench the same place
- * says "Motores desligados", which is the one fact that makes a bench run safe.
+ * Clicking initiates the mission sequence (with countdown floor) in both
+ * real flight ("VOO REAL: motores serão armados") and bench mode ("Motores desligados").
  */
 export const LaunchDial: React.FC<LaunchDialProps> = ({
   ready,
@@ -63,25 +60,38 @@ export const LaunchDial: React.FC<LaunchDialProps> = ({
   onLaunch,
 }) => {
   const theme = benchMode ? THEME.bench : THEME.flight;
+  const launchedRef = useRef(false);
+
+  const handleClick = useCallback(() => {
+    if (!ready) return;
+    if (launchedRef.current) return;
+    launchedRef.current = true;
+    onLaunch();
+    setTimeout(() => {
+      launchedRef.current = false;
+    }, 1000);
+  }, [ready, onLaunch]);
 
   return (
     <div className="flex flex-col items-center gap-5">
       <button
         type="button"
-        onClick={onLaunch}
+        onClick={handleClick}
         disabled={!ready}
         title={blockedReason ?? undefined}
         aria-label={
           ready
             ? benchMode
               ? 'Iniciar missão em bancada, motores desligados'
-              : 'Iniciar missão'
+              : 'Iniciar missão, voo real'
             : `Iniciar missão, bloqueado: ${blockedReason ?? ''}`
         }
         className={cn(
-          'group relative grid h-[248px] w-[248px] place-items-center rounded-full',
+          'group relative grid h-[248px] w-[248px] place-items-center rounded-full select-none',
           'transition-transform duration-300 ease-settle',
-          ready ? 'cursor-pointer hover:scale-[1.02] active:scale-[0.99]' : 'cursor-not-allowed'
+          ready
+            ? 'cursor-pointer hover:scale-[1.02] active:scale-[0.99]'
+            : 'cursor-not-allowed'
         )}
       >
         {/* Outer halo. Present when the command is cleared. */}
@@ -111,9 +121,7 @@ export const LaunchDial: React.FC<LaunchDialProps> = ({
             ready || benchMode ? theme.ringInner : 'border-frost/[0.07]'
           )}
         />
-        {/* A dark pane inside the ring. The film behind this screen is bright and
-            green at the top of its loop, and a tinted interior disappeared into
-            it — the command has to read as an instrument over every frame. */}
+        {/* Dark interior pane */}
         <span
           aria-hidden
           className={cn(
@@ -128,8 +136,7 @@ export const LaunchDial: React.FC<LaunchDialProps> = ({
           }}
         />
 
-        {/* A single sweeping tick, so a cleared dial reads as armed and waiting
-            rather than as a static graphic. */}
+        {/* Sweeping tick */}
         {ready ? (
           <span
             aria-hidden
@@ -166,25 +173,32 @@ export const LaunchDial: React.FC<LaunchDialProps> = ({
           </span>
 
           {/* State, inside the dial, directly under the command it qualifies. */}
-          {benchMode || blockedReason ? (
-            <span className="flex min-h-[2.25rem] flex-col items-center gap-1">
-              {benchMode ? (
-                <span className="font-cond text-2xs font-semibold uppercase tracking-[0.18em] text-cyan">
-                  Motores desligados
-                </span>
-              ) : null}
-              {blockedReason ? (
-                <span
-                  className={cn(
-                    'line-clamp-3 text-center font-mono text-3xs leading-snug',
-                    benchMode ? 'text-frost/60' : 'text-amber/90'
-                  )}
-                >
-                  {blockedReason}
-                </span>
-              ) : null}
-            </span>
-          ) : null}
+          <span className="flex min-h-[2.25rem] flex-col items-center gap-1">
+            {benchMode ? (
+              <span className="font-cond text-2xs font-semibold uppercase tracking-[0.18em] text-cyan">
+                Motores desligados
+              </span>
+            ) : (
+              <span
+                className={cn(
+                  'font-cond text-2xs font-semibold uppercase tracking-[0.18em] transition-colors',
+                  ready ? 'text-mint/90' : 'text-frost/40'
+                )}
+              >
+                VOO REAL: motores serão armados
+              </span>
+            )}
+            {blockedReason ? (
+              <span
+                className={cn(
+                  'line-clamp-3 text-center font-mono text-3xs leading-snug',
+                  benchMode ? 'text-frost/60' : 'text-amber/90'
+                )}
+              >
+                {blockedReason}
+              </span>
+            ) : null}
+          </span>
         </span>
       </button>
 

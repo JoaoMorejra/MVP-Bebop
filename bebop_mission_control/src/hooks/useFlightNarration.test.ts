@@ -223,6 +223,32 @@ describe('NarrationQueue preemption', () => {
     await flush();
     expect(spoken).toEqual(['first', 'second']);
   });
+
+  it('LAND priority cuts even an alert currently sounding', async () => {
+    const spoken: string[] = [];
+    const pending: Array<(ok: boolean) => void> = [];
+    let interrupted = 0;
+    const queue = new NarrationQueue(
+      (text) =>
+        new Promise<boolean>((resolve) => {
+          spoken.push(text);
+          pending.push(resolve);
+        }),
+      () => {
+        interrupted += 1;
+        pending.splice(0).forEach((resolve) => resolve(false));
+      }
+    );
+    queue.preempt('mission.step_failed', () => 'first', 'URGENT');
+    await flush();
+    expect(spoken).toEqual(['first']);
+
+    queue.preempt('mission.abort', () => 'land', 'LAND');
+    await flush();
+
+    expect(interrupted).toBe(1);
+    expect(spoken).toEqual(['first', 'land']);
+  });
 });
 
 describe('phraseForMilestone', () => {

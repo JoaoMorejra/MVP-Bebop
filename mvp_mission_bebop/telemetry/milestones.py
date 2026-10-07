@@ -73,6 +73,9 @@ MILESTONE_KEYS: Final[Tuple[str, ...]] = (
     "mission.battery_warning",
     "mission.touchdown",
     "mission.parameters",
+    #: Outcome of the Stage 1 flat trim, ``{"acknowledged": bool}``: the
+    #: countdown overlay's IMU item follows it. Not narrated.
+    "mission.flat_trim",
 )
 
 

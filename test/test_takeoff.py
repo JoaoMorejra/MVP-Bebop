@@ -458,6 +458,9 @@ def milestones(monkeypatch):
         "mvp_mission_bebop.steps.takeoff.emit_milestone",
         lambda key, payload=None: emitted.append((key, dict(payload or {}))),
     )
+    # Outside a station session the first announcement builds an audio player
+    # (1.9 s measured) inside the countdown loop and a whole tick goes by.
+    monkeypatch.setattr(TakeoffStep, "_announce", staticmethod(lambda *args, **kwargs: None))
     return emitted
 
 
@@ -544,6 +547,56 @@ def test_a_zero_countdown_still_clears_and_reports_zero(milestones):
     TakeoffStep()._countdown(countdown_ctx(0.0))
     assert [key for key, _ in milestones] == ["mission.countdown_3", "mission.countdown"]
     assert milestones[-1][1] == {"remaining_sec": 0}
+
+
+def test_a_launch_deadline_counts_only_what_is_left_of_it(milestones):
+    """Launch from standby: the click was 2 s ago, so 2 s of a 4 s countdown remain."""
+    ctx = countdown_ctx(4.0)
+    ctx.launch_deadline = time.monotonic() + 2.0
+    started = time.monotonic()
+    TakeoffStep()._countdown(ctx)
+    ticks = [payload["remaining_sec"] for key, payload in milestones if key == "mission.countdown"]
+    assert ticks == [2, 1, 0]
+    assert 1.8 <= time.monotonic() - started < 2.6
+
+
+def test_a_deadline_nobody_saw_counted_runs_the_whole_countdown(milestones):
+    """Regression: a cold launch read its deadline after a 6-12 s start-up.
+
+    The deadline was already behind it, the ticker had nothing to show, and
+    Stage 1 took off with no countdown at all. The floor is never shortened by
+    a start-up: unless the window was counted, it runs whole from here.
+    """
+    ctx = countdown_ctx(4.0)
+    ctx.launch_deadline = time.monotonic() - 1.0
+    started = time.monotonic()
+    TakeoffStep()._countdown(ctx)
+    ticks = [payload["remaining_sec"] for key, payload in milestones if key == "mission.countdown"]
+    assert ticks == [4, 3, 2, 1, 0]
+    assert time.monotonic() - started >= 3.9
+
+
+def test_a_deadline_the_ticker_counted_takes_off_at_once(milestones):
+    """Launch from standby whose ground sequence outlasted the window it counted."""
+    ctx = countdown_ctx(10.0)
+    ctx.launch_deadline = time.monotonic() - 1.0
+    ctx.countdown_ticker = types.SimpleNamespace(shown=True, stop=lambda: None)
+    started = time.monotonic()
+    TakeoffStep()._countdown(ctx)
+    assert time.monotonic() - started < 0.3
+    assert milestones[-1] == ("mission.countdown", {"remaining_sec": 0})
+    assert "mission.countdown_3" in [key for key, _ in milestones]
+
+
+def test_a_zero_countdown_with_a_deadline_is_still_no_countdown(milestones):
+    """``countdown_sec = 0`` means no countdown on purpose, pinned or not."""
+    ctx = countdown_ctx(0.0)
+    ctx.launch_deadline = time.monotonic()
+    ctx.countdown_ticker = types.SimpleNamespace(shown=False, stop=lambda: None)
+    started = time.monotonic()
+    TakeoffStep()._countdown(ctx)
+    assert time.monotonic() - started < 0.3
+    assert [key for key, _ in milestones] == ["mission.countdown_3", "mission.countdown"]
 
 
 # ------------------------------------------------ countdown through the worker (4.5e / 4.4)

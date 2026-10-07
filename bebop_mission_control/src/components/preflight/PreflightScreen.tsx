@@ -120,8 +120,28 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
         flightReady,
         missingTopics,
         stale,
+        flyingState: telemetry.flying_state,
+        batteryPct: telemetry.battery_pct,
+        batteryKnown: telemetry.battery_known,
+        batteryFailsafeThreshold: props.failsafe?.thresholdPct,
+        magnetoRequired: Boolean(telemetry.magneto_calibration && telemetry.magneto_calibration.required === 1),
+        bridgeReady: readiness?.ready,
       }),
-    [paramsStatus, driverRunning, benchMode, telemetry.connected, flightReady, missingTopics, stale]
+    [
+      paramsStatus,
+      driverRunning,
+      benchMode,
+      telemetry.connected,
+      telemetry.flying_state,
+      telemetry.battery_pct,
+      telemetry.battery_known,
+      telemetry.magneto_calibration?.required,
+      flightReady,
+      missingTopics,
+      stale,
+      props.failsafe?.thresholdPct,
+      readiness?.ready,
+    ]
   );
 
   return (

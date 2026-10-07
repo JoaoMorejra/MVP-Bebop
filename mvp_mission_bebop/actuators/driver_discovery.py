@@ -20,7 +20,7 @@ logger = logging.getLogger("DriverDiscovery")
 #: Node names ``ros2_bebop_driver`` registers under, by launch file and by executable.
 DRIVER_NODE_NAMES: Final[Tuple[str, ...]] = ("bebop_driver", "bebop_driver_node")
 #: Longest active wait for the driver to appear in the graph, seconds.
-DRIVER_PROBE_SEC: Final[float] = 2.0
+DRIVER_PROBE_SEC: Final[float] = 5.0
 #: Ceiling on each ``ros2 daemon`` command, seconds.
 DAEMON_COMMAND_TIMEOUT_SEC: Final[float] = 10.0
 

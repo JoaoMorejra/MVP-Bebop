@@ -19,6 +19,7 @@ const hoisted = vi.hoisted(() => {
   const doc: Record<string, any> = {
     kinematics: {
       target_altitude_m: 1.6,
+      altitude_ceiling_margin_m: 0.6,
       forward_cruise_velocity: 0.2,
       takeoff_stabilize_duration_sec: 2,
       hover_duration_sec: 7,
@@ -84,7 +85,7 @@ const hoisted = vi.hoisted(() => {
 
 vi.mock('./components/preflight/PreflightScreen', () => ({ PreflightScreen: hoisted.capture('preflight') }));
 vi.mock('./components/cockpit/CockpitScreen', () => ({ CockpitScreen: hoisted.capture('cockpit') }));
-vi.mock('./components/preflight/CountdownOverlay', () => ({ CountdownOverlay: () => null }));
+vi.mock('./components/preflight/CountdownOverlay', () => ({ CountdownOverlay: hoisted.capture('countdown') }));
 vi.mock('./components/diagnostics/DiagnosticsScreen', () => ({ DiagnosticsScreen: () => null }));
 vi.mock('./components/diagnostics/DiagnosticsOverlayHeader', () => ({
   DiagnosticsOverlayHeader: () => null,
@@ -150,6 +151,7 @@ beforeEach(() => {
   hoisted.stable.params.status = 'ready';
   hoisted.stable.params.dirty = false;
   hoisted.stable.params.save = vi.fn(async (): Promise<boolean> => true);
+  hoisted.stable.mission.state = 'idle';
   for (const key of Object.keys(hoisted.props)) delete hoisted.props[key];
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -221,6 +223,23 @@ describe('battery.land_pct in the bench-stage payload', () => {
   });
 });
 
+describe('a bench routine and its countdown', () => {
+  it('has the station count the whole countdown from the click, the mission spawned at its end', async () => {
+    hoisted.stable.params.working = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, countdown_sec: 10 } };
+    window.history.replaceState(null, '', '/?screen=cockpit');
+    await mount();
+    const before = Date.now();
+    await act(async () => {
+      await call('cockpit', 'onRunStage', 3);
+    });
+    const options = hoisted.startBenchStage.mock.calls[0][0];
+    expect(options.countdown).toBe(10);
+    expect(Object.keys(options)).not.toContain('launchAtMs');
+    expect(hoisted.props.countdown?.seconds).toBe(10);
+    expect(Number(hoisted.props.countdown?.launchAt)).toBeGreaterThanOrEqual(before);
+  });
+});
+
 describe('launchParamsJson', () => {
   it('writes the threshold under battery.land_pct and keeps every other field', () => {
     const doc = { rtl: { timeout_sec: 60 }, battery: { other: 1 } };
@@ -244,7 +263,7 @@ describe('the parameter document as the only source of a launch', () => {
       await call('preflight', 'onLaunch');
     });
     const options = hoisted.launch.mock.calls[0][0];
-    expect(Object.keys(options).sort()).toEqual(['countdown', 'noFly', 'paramsJson']);
+    expect(Object.keys(options).sort()).toEqual(['countdown', 'launchAtMs', 'noFly', 'paramsJson']);
     expect(options.countdown).toBe(0);
     expect(sent(options).kinematics.countdown_sec).toBe(0);
   });
@@ -308,6 +327,76 @@ describe('the parameter document as the only source of a launch', () => {
     expect(hoisted.launch).toHaveBeenCalledTimes(2);
     expect(sent(hoisted.launch.mock.calls[0][0]).kinematics.target_altitude_m).toBe(1.6);
     expect(sent(hoisted.launch.mock.calls[1][0]).kinematics.target_altitude_m).toBe(2.4);
+  });
+});
+
+describe('the countdown starts at the click', () => {
+  it('opens before the mission process answers, counting from the click instant', async () => {
+    hoisted.stable.params.working = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, countdown_sec: 10 } };
+    let resolveLaunch: (value: { success: boolean }) => void = () => undefined;
+    hoisted.launch.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveLaunch = resolve;
+      })
+    );
+    await mount();
+    const before = Date.now();
+    let pending: Promise<unknown> | undefined;
+    await act(async () => {
+      pending = call('preflight', 'onLaunch') as Promise<unknown>;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(hoisted.props.countdown, 'the overlay waited for the process').toBeDefined();
+    const launchAt = Number(hoisted.props.countdown.launchAt);
+    expect(launchAt).toBeGreaterThanOrEqual(before);
+    expect(hoisted.launch.mock.calls[0][0].launchAtMs).toBe(launchAt);
+    await act(async () => {
+      resolveLaunch({ success: true });
+      await pending;
+    });
+  });
+
+  it('ignores the dial while its own launch is counting down', async () => {
+    // Section 1.5 of docs/PROMPT_FIX_LANCAMENTO_CONTAGEM.md: the dial keeps the
+    // keyboard focus under the overlay, and a second activation reached the
+    // runtime's "already running" refusal, which closed the overlay of the
+    // countdown still in progress.
+    hoisted.stable.params.working = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, countdown_sec: 10 } };
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).toHaveBeenCalledTimes(1);
+    hoisted.stable.mission.state = 'running';
+    await act(async () => {
+      root.render(<App />);
+    });
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).toHaveBeenCalledTimes(1);
+    delete hoisted.props.countdown;
+    await act(async () => {
+      root.render(<App />);
+    });
+    expect(hoisted.props.countdown, 'the countdown in progress was closed').toBeDefined();
+    expect(hoisted.props.preflight.launchError ?? null).toBeNull();
+  });
+
+  it('closes the overlay when the launch fails', async () => {
+    hoisted.stable.params.working = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, countdown_sec: 10 } };
+    hoisted.launch.mockImplementationOnce(async () => ({ success: false, error: 'spawn failed' }) as never);
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    delete hoisted.props.countdown;
+    await act(async () => {
+      root.render(<App />);
+    });
+    expect(hoisted.props.countdown).toBeUndefined();
+    expect(String(hoisted.props.preflight.launchError)).toContain('spawn failed');
   });
 });
 

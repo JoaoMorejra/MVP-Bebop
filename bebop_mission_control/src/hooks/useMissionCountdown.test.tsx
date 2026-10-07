@@ -44,24 +44,33 @@ afterEach(() => {
 
 describe('useMissionCountdown', () => {
   it('follows the mission ticks and its clearance call', () => {
-    expect(seen).toEqual({ remaining: null, clearance: false });
+    expect(seen).toEqual({ remaining: null, clearance: false, trim: null });
     send('mission.start', { countdown_sec: 5 });
     send('mission.countdown', { remaining_sec: 5 });
-    expect(seen).toEqual({ remaining: 5, clearance: false });
+    expect(seen).toEqual({ remaining: 5, clearance: false, trim: null });
     send('mission.countdown_3', { remaining_sec: 3.2 });
     send('mission.countdown', { remaining_sec: 3 });
-    expect(seen).toEqual({ remaining: 3, clearance: true });
+    expect(seen).toEqual({ remaining: 3, clearance: true, trim: null });
   });
 
   it('a new launch starts from nothing', () => {
     send('mission.countdown', { remaining_sec: 2 });
     send('mission.countdown_3', {});
     send('mission.start', { countdown_sec: 10 });
-    expect(seen).toEqual({ remaining: null, clearance: false });
+    expect(seen).toEqual({ remaining: null, clearance: false, trim: null });
   });
 
   it('ignores a malformed tick', () => {
     send('mission.countdown', { remaining_sec: 'x' });
     expect(seen?.remaining).toBeNull();
+  });
+
+  it('follows the flat trim outcome and forgets it on a new launch', () => {
+    send('mission.flat_trim', { acknowledged: true });
+    expect(seen?.trim).toBe('acked');
+    send('mission.start', { countdown_sec: 10 });
+    expect(seen?.trim).toBeNull();
+    send('mission.flat_trim', { acknowledged: false });
+    expect(seen?.trim).toBe('skipped');
   });
 });

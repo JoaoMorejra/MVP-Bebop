@@ -22,6 +22,10 @@ const {
 const { MEDIA_FETCH_ARGS, createNativePhotoFetch } = require('./nativePhotos.cjs');
 const { readParameterFile, writeJsonAtomic } = require('./parameterStore.cjs');
 const { cleanOrphanShm, createSsidChangeDetector, restartRos2Daemon } = require('./rosHousekeeping.cjs');
+const { createStandbyManager } = require('./missionStandby.cjs');
+const { createOrphanReaper, parseOrphanCandidates } = require('./orphanMissions.cjs');
+const { createLandSupervisor } = require('./landSupervisor.cjs');
+const { evaluateLaunchReadiness } = require('./launchReadiness.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 // The monorepo is checked out as <ws>/src/mvp_mission_bebop on every
@@ -124,6 +128,7 @@ let pendingBenchStage = null;
 let mjpegProcess = null;
 let telemetryProcess = null;
 let speechProcess = null;
+let latestSpeechState = { ready: false, detail: 'não iniciado' };
 let commandProcess = null;
 /** When the last `BMG_TELEM:` sample landed. Null means none has. */
 let latestTelemetryAt = null;
@@ -423,7 +428,11 @@ function ingestTelemetryLine(line) {
   try {
     const parsed = JSON.parse(line.slice('BMG_TELEM:'.length).trim());
     if (wifiNetworkChanged(parsed.wifi_ssid)) void refreshRos2Daemon('rede Wi-Fi mudou');
+    const driverWasUp = driverUp();
     latestTelemetry = { ...latestTelemetry, ...parsed };
+    // A standby prepared without the driver is on the bench frame and one
+    // prepared with it lost its link: either way it is re-prepared.
+    if (driverUp() !== driverWasUp) refreshStandby();
     latestTelemetryAt = Date.now();
     send('bmg:telemetry-update', latestTelemetry);
   } catch (err) {
@@ -540,40 +549,100 @@ function reapOrphanedServices() {
  * still commanding the aircraft. A second one spawned beside it would publish
  * on the same `/bebop/cmd_vel`.
  */
-function findOrphanMissions() {
+/** Parent pid of `pid`, or null. */
+function parentPid(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+  } catch (_error) {
+    return null;
+  }
+}
+
+/**
+ * `mission.py` processes matching `pgrep -af`, each with its full command
+ * line (`orphanMissions.cjs` needs it to tell a standby apart from a flight
+ * run), minus this process, the mission this station holds a handle to, and
+ * its own tracked standby. The standby's pid is the activator's, so its
+ * python child is matched by command line, not by the tracked pid itself.
+ */
+function findOrphanCandidates() {
   const script = path.join(MISSION_DIR, 'mission.py');
   const own = missionProcess ? missionProcess.pid : null;
   let found = '';
   try {
-    // execFile, not a shell: `sh -c "pgrep -f <pattern>"` carries the pattern
+    // execFile, not a shell: `sh -c "pgrep -af <pattern>"` carries the pattern
     // in its own command line and is matched as a live mission every time.
-    found = execFileSync('pgrep', ['-f', `python3 ${script}`], { encoding: 'utf-8', timeout: 3000 });
+    found = execFileSync('pgrep', ['-af', `python3 ${script}`], { encoding: 'utf-8', timeout: 3000 });
   } catch (err) {
     // Status 1 is pgrep's "nothing matched".
     if (err && err.status === 1) return [];
     console.warn('[BMG] Could not scan for orphaned missions:', err.message);
     return [];
   }
-  return found
-    .split('\n')
-    .map((line) => Number(line.trim()))
-    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid && pid !== own);
+  return parseOrphanCandidates(found, {
+    ownPid: process.pid,
+    missionPid: own,
+    isTracked: (pid) => missionStandby.isStandby(pid) || missionStandby.isStandby(parentPid(pid)),
+  });
 }
 
 /**
- * Interrupt orphaned missions so they land.
+ * Ask every orphaned mission to land, and finish a standby that does not
+ * answer: see `orphanMissions.cjs` for why that is safe for a standby (it
+ * never reaches flight code) and never attempted for a flight script (it may
+ * be mid-air).
  *
- * SIGINT, never SIGKILL: the orphan may be flying, and its own handler
- * transmits the landing burst; a SIGKILL would leave the aircraft holding its
- * last setpoint with nothing on the ground commanding it.
+ * Returns the pids still alive that this sweep could not safely clear: a
+ * launch refuses on these, not on every orphan on sight, so a standby already
+ * past its grace period clears itself on the very sweep that notices it.
  */
+const orphanReaper = createOrphanReaper({
+  listCandidates: findOrphanCandidates,
+  signal: (pid, sig) => process.kill(pid, sig),
+  log: (text) => recordLog('mission', { type: 'stderr', text }),
+  // Measured: a standby's ROS node and worker threads took a few seconds to
+  // unwind after SIGINT. 2 s is enough slack for that without leaving a
+  // stranded one sitting through several operator-paced retries first.
+  graceMs: 2000,
+});
+
 function interruptOrphanMissions() {
-  for (const pid of findOrphanMissions()) {
+  return orphanReaper.sweep().blocking;
+}
+
+/**
+ * Sweep for orphans on a clock, not only at boot and at a launch attempt.
+ *
+ * `missionStandby.release()` fires a `SIGTERM` and stops tracking the old
+ * child in the same tick, whenever a standby is recycled -- a parameter save,
+ * the driver changing state, or a launch taking over
+ * (`missionStandby.pause()`). None of that waits for the child to actually
+ * exit. A standby slow to unwind (a model compiling on the iGPU, measured at
+ * several seconds under load) is, for that window, exactly the kind of
+ * untracked `mission.py` a launch's own orphan check would refuse on -- and
+ * recycling is routine, not a crash, so this is the common case the operator
+ * hit, not an edge case. A sweep every few seconds clears it on its own
+ * before the next click, instead of leaving it for whichever click discovers
+ * it first to be the one that is refused.
+ */
+let orphanWatchdogTimer = null;
+
+function startOrphanWatchdog() {
+  if (orphanWatchdogTimer) return;
+  orphanWatchdogTimer = setInterval(() => {
     try {
-      process.kill(pid, 'SIGINT');
-      recordLog('mission', { type: 'stderr', text: `[BMG] Missão órfã (pid ${pid}) interrompida: pouso comandado.\n` });
-    } catch (e) { /* already gone */ }
-  }
+      interruptOrphanMissions();
+    } catch (err) {
+      console.warn('[BMG] orphan watchdog:', err.message);
+    }
+  }, 1000);
+}
+
+function stopOrphanWatchdog() {
+  if (!orphanWatchdogTimer) return;
+  clearInterval(orphanWatchdogTimer);
+  orphanWatchdogTimer = null;
 }
 
 function startBackgroundServices() {
@@ -939,8 +1008,11 @@ const STREAM_STATUS_DOWN = {
   height: 0,
 };
 
+let testStreamStatus = null;
+
 /** The MJPEG bridge's own frame counter, asked over loopback HTTP. */
 function fetchStreamStatus() {
+  if (testStreamStatus) return Promise.resolve(testStreamStatus);
   return new Promise((resolve) => {
     const req = http.get(
       { host: '127.0.0.1', port: MJPEG_PORT, path: '/status', timeout: 1200 },
@@ -1626,6 +1698,7 @@ ipcMain.handle('bmg:save-parameters', async (_event, params) => {
   }
   try {
     writeJsonAtomic(CONFIG_PATH, params);
+    refreshStandby();
     return { success: true };
   } catch (err) {
     console.error('[BMG] Failed to write mission_config.json:', err);
@@ -1750,7 +1823,8 @@ function ingestSpeechLine(line) {
       // here is the difference between "the copilot is quiet" being a mystery
       // and it being a line in Diagnóstico naming the missing piece.
       pushVoiceLevel();
-      const ok = event.synthesis && event.playback;
+      const ok = Boolean(event.synthesis && event.playback);
+      latestSpeechState = { ready: ok, detail: event.detail || (ok ? 'pronto' : 'sem voz') };
       recordLog('mission', {
         type: ok ? 'stdout' : 'stderr',
         text: ok
@@ -1790,12 +1864,17 @@ function ensureSpeechProcess() {
   child.stdout.on('data', createLineReader(ingestSpeechLine));
   drainInto(child.stderr, 'mission', 'stderr', '[copiloto] ');
 
+  child.stdin?.on('error', (err) => {
+    recordLog('mission', { type: 'stderr', text: `[copiloto] stdin: ${err.message}\n` });
+  });
+
   child.on('error', (err) => {
     recordLog('mission', { type: 'stderr', text: `[copiloto] ${err.message}\n` });
   });
 
   child.on('close', (code, signal) => {
     speechProcess = null;
+    latestSpeechState = { ready: false, detail: 'encerrado' };
     recordLog('mission', {
       type: 'exit',
       text: `[copiloto] encerrado (código ${code}${signal ? `, sinal ${signal}` : ''})\n`,
@@ -1803,15 +1882,32 @@ function ensureSpeechProcess() {
     // A request in flight when the daemon died would otherwise leave the
     // renderer waiting forever for a `done` that is not coming.
     send('bmg:announce-done', { id: null, ok: false });
+    if (!shutdownDone && !servicesStopping) {
+      setTimeout(() => {
+        if (!shutdownDone && !servicesStopping && !speechProcess) {
+          ensureSpeechProcess();
+        }
+      }, 500).unref?.();
+    }
   });
 
   return child;
 }
 
+process.on('uncaughtException', (err) => {
+  if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED')) {
+    recordLog('mission', { type: 'stderr', text: `[copiloto] EPIPE ignorado: ${err.message}\n` });
+    return;
+  }
+  console.error('[BMG] Uncaught exception:', err);
+  throw err;
+});
+
 function stopSpeechProcess() {
   const child = speechProcess;
   if (!child) return;
   speechProcess = null;
+  latestSpeechState = { ready: false, detail: 'parado' };
   try {
     child.stdin.write(JSON.stringify({ op: 'quit' }) + '\n');
   } catch (e) { /* the pipe is already gone */ }
@@ -2343,6 +2439,45 @@ ipcMain.handle('bmg:get-voice-level', async () => ({ volume: voiceVolume, muted:
  * process with `--no-fly` and a stage subset, so a rehearsal cannot diverge
  * from the flight it is rehearsing.
  */
+/** The driver is up as the telemetry bridge last reported it. */
+function driverUp() {
+  return Boolean(latestTelemetry.driver_running);
+}
+
+/**
+ * The mission the station keeps prepared for an instant launch
+ * (electron/missionStandby.cjs). Started with the station's saved document,
+ * as the station would launch it; it commands nothing before its go.
+ */
+const missionStandby = createStandbyManager({
+  spawnStandby: (doc) => {
+    const child = spawn(
+      NECTAR_ACTIVATOR,
+      [
+        'python3',
+        path.join(MISSION_DIR, 'mission.py'),
+        '--config',
+        CONFIG_PATH,
+        '--standby',
+        '--params-json',
+        JSON.stringify(doc),
+        doc && doc.no_fly ? '--no-fly' : '--fly',
+      ],
+      { cwd: MISSION_DIR, env: { ...getNectarEnv(), BMG_GCS_SESSION: '1' } }
+    );
+    drainInto(child.stderr, 'mission', 'stderr', '[espera] ');
+    return child;
+  },
+  log: (text) => recordLog('mission', { type: 'stdout', text }),
+});
+
+/** Re-prepare the standby for the saved document; none while a mission runs. */
+function refreshStandby() {
+  if (missionProcess || servicesStopping) return;
+  const stored = readParameterFile(CONFIG_PATH);
+  if (stored.success) missionStandby.ensure(stored.params, driverUp());
+}
+
 /**
  * The parameter document of a launch, or null when it is not a JSON object.
  *
@@ -2360,53 +2495,130 @@ function parseLaunchDocument(paramsJson) {
   return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : null;
 }
 
+let missionStarting = false;
+
 async function startMissionProcess(options = {}) {
-  if (missionProcess) return { success: false, message: 'Uma missão já está em andamento.' };
-  const orphans = findOrphanMissions();
-  if (orphans.length) {
-    return {
-      success: false,
-      message: `Missão órfã ainda em execução (pid ${orphans.join(', ')}). Aguarde o pouso ou encerre-a antes de lançar.`,
+  if (missionProcess || missionStarting) {
+    return { success: false, error: 'Uma missão já está em andamento.', message: 'Uma missão já está em andamento.' };
+  }
+  missionStarting = true;
+  try {
+    // Sweeps, not just inspects: a standby orphan already past its grace period
+    // (asked to stop by an earlier sweep, at boot or at a previous attempt) is
+    // finished right here, so this same click can succeed instead of bouncing
+    // the operator until someone clears it by hand.
+    const blocking = interruptOrphanMissions();
+    if (blocking.length) {
+      const msg = `Missão órfã ainda em execução (pid ${blocking.join(', ')}). Aguarde o pouso ou encerre-a antes de lançar.`;
+      return {
+        success: false,
+        error: msg,
+        message: msg,
+      };
+    }
+    if (pendingBenchStage) {
+      return { success: false, error: 'Uma rotina de bancada está em contagem regressiva.', message: 'Uma rotina de bancada está em contagem regressiva.' };
+    }
+    if (activeLandSupervisor) activeLandSupervisor.stop();
+
+    // Single voice: the station's copilot is the only speaker in the system. The
+    // flag tells mission.py to build no audio player of its own and to hand its
+    // failures over as `[ALERT ...]` lines (`announcer.station_narrates`). Set
+    // here and only here: the speech daemon is this process's own voice and
+    // must keep its player.
+    const env = { ...getNectarEnv(), BMG_GCS_SESSION: '1' };
+    const scriptPath = path.join(MISSION_DIR, 'mission.py');
+    // The mission merges over and writes back to this store; named explicitly so
+    // it is the station's own (BMG_MISSION_CONFIG included), never a default.
+    const args = [scriptPath, '--config', CONFIG_PATH];
+
+    // `--params-json` is the only source of the flight parameters (5.1). The
+    // per-field flags it used to be followed by won over it, so a field that was
+    // not a finite number on the station side flew as a hardcoded fallback.
+    const doc = parseLaunchDocument(options.paramsJson);
+    if (!doc) {
+      return { success: false, error: 'Documento de parâmetros ausente ou inválido; lançamento bloqueado.' };
+    }
+    args.push('--params-json', JSON.stringify(doc));
+
+    const push = (flag, value) => {
+      if (value !== undefined && value !== null && value !== '') args.push(flag, String(value));
     };
-  }
-  if (pendingBenchStage) return { success: false, message: 'Uma rotina de bancada está em contagem regressiva.' };
 
-  // Single voice: the station's copilot is the only speaker in the system. The
-  // flag tells mission.py to build no audio player of its own and to hand its
-  // failures over as `[ALERT ...]` lines (`announcer.station_narrates`). Set
-  // here and only here: the speech daemon is this process's own voice and
-  // must keep its player.
-  const env = { ...getNectarEnv(), BMG_GCS_SESSION: '1' };
-  const scriptPath = path.join(MISSION_DIR, 'mission.py');
-  const args = [scriptPath];
+    // Bench mode runs one routine rather than the sequence. The selection goes to
+    // `mission.py --stages`, which takes it literally and in order.
+    if (Array.isArray(options.stages) && options.stages.length) {
+      push('--stages', options.stages.join(','));
+    } else if (typeof options.stages === 'string' && options.stages.trim()) {
+      push('--stages', options.stages.trim());
+    }
 
-  // `--params-json` is the only source of the flight parameters (5.1). The
-  // per-field flags it used to be followed by won over it, so a field that was
-  // not a finite number on the station side flew as a hardcoded fallback.
-  const doc = parseLaunchDocument(options.paramsJson);
-  if (!doc) {
-    return { success: false, error: 'Documento de parâmetros ausente ou inválido; lançamento bloqueado.' };
-  }
-  args.push('--params-json', JSON.stringify(doc));
+    // Arming is always stated explicitly. `mission.py` deliberately keeps
+    // `no_fly` out of what it writes back to `mission_config.json`, so the file
+    // can carry a stale `true` from an earlier bench run; relying on
+    // `--params-json` alone to clear it meant one malformed payload silently
+    // grounded a real flight.
+    const benchMode = Boolean(options.noFly);
+    args.push(benchMode ? '--no-fly' : '--fly');
 
-  const push = (flag, value) => {
-    if (value !== undefined && value !== null && value !== '') args.push(flag, String(value));
-  };
+    // Section 2.4 (R4/R8): Preflight launch readiness evaluation on click (real flight only)
+    const shouldEnforceReadiness = !benchMode && options.skipReadinessGate !== true && process.env.BMG_SKIP_READINESS !== '1';
+    if (shouldEnforceReadiness) {
+      const driverRunning = driverUp();
+      const telemetryAge = latestTelemetryAt === null ? Infinity : Date.now() - latestTelemetryAt;
+      const linkReadiness = await readLinkReadiness();
+      const odomInfo = latestTelemetry.topics?.['/bebop/odom'];
+      const odomFresh = Boolean(odomInfo && odomInfo.receiving && (odomInfo.age_sec ?? 0) < 2.0);
+      const videoFresh = Boolean(linkReadiness.stream?.live);
+      const failsafeThreshold = Number(doc.failsafe?.return_threshold_percent) || 20;
 
-  // Bench mode runs one routine rather than the sequence. The selection goes to
-  // `mission.py --stages`, which takes it literally and in order.
-  if (Array.isArray(options.stages) && options.stages.length) {
-    push('--stages', options.stages.join(','));
-  } else if (typeof options.stages === 'string' && options.stages.trim()) {
-    push('--stages', options.stages.trim());
-  }
+      let ros2CliAvailable = true;
+      try {
+        ros2CliAvailable = Boolean(execSync('which ros2', { env, encoding: 'utf-8', timeout: 1000 }).trim());
+      } catch (_e) {
+        ros2CliAvailable = false;
+      }
 
-  // Arming is always stated explicitly. `mission.py` deliberately keeps
-  // `no_fly` out of what it writes back to `mission_config.json`, so the file
-  // can carry a stale `true` from an earlier bench run; relying on
-  // `--params-json` alone to clear it meant one malformed payload silently
-  // grounded a real flight.
-  args.push(options.noFly ? '--no-fly' : '--fly');
+      const readinessVerdict = evaluateLaunchReadiness({
+        benchMode,
+        noFly: benchMode,
+        configValid: Boolean(doc),
+        driverRunning,
+        orphanPids: blocking,
+        statesLink: Boolean(latestTelemetry.connected),
+        telemetryAgeMs: telemetryAge,
+        odomFresh,
+        videoFresh,
+        missingTopics: linkReadiness.missing,
+        flyingState: latestTelemetry.flying_state,
+        batteryKnown: Boolean(latestTelemetry.battery_known),
+        batteryPct: latestTelemetry.battery_pct,
+        batteryFailsafeThreshold: failsafeThreshold,
+        magnetoRequired: Boolean(latestTelemetry.calibration_required),
+        commandBridgeReady: commandBridgeGate.isReady(commandProcess),
+        ros2CliAvailable,
+        voiceReady: speechProcess !== null && latestSpeechState.ready,
+        standbyReady: !args.includes('--stages') && missionStandby.unavailableReason(doc, driverRunning) === null,
+      });
+
+      if (!readinessVerdict.ready) {
+        recordLog('mission', {
+          type: 'stderr',
+          text: `[BMG] Lançamento bloqueado por prontidão: ${readinessVerdict.blockedReason}\n`,
+        });
+        return {
+          success: false,
+          error: readinessVerdict.blockedReason,
+          message: readinessVerdict.blockedReason,
+        };
+      }
+    }
+
+  // The click instant: from standby the takeoff is at it plus the countdown,
+  // which the overlay counts towards from the click as well (engine/launch.py).
+  const launchAtMs = Number.isFinite(Number(options.launchAtMs)) ? Number(options.launchAtMs) : Date.now();
+  const fullLaunch = !args.includes('--stages');
+  const launchDoc = { ...doc, no_fly: Boolean(options.noFly) };
 
   // Bring the copilot up alongside the mission rather than on its first line.
   // Starting Python, importing `google.genai` and opening a Live session costs
@@ -2414,8 +2626,27 @@ async function startMissionProcess(options = {}) {
   // the takeoff call and the aircraft is already climbing before it is spoken.
   ensureSpeechProcess();
 
-  try {
-    missionProcess = spawn(NECTAR_ACTIVATOR, ['python3', ...args], { cwd: MISSION_DIR, env });
+  const driverRunning = driverUp();
+    const coldReason = fullLaunch ? missionStandby.unavailableReason(launchDoc, driverRunning) : null;
+    const prepared = fullLaunch ? missionStandby.take(launchDoc, driverRunning, launchAtMs) : null;
+    if (prepared) {
+      missionProcess = prepared;
+      recordLog('mission', { type: 'stdout', text: '[BMG] Lançamento pela missão em espera (já preparada).\n' });
+    } else {
+      // One mission process at a time: a standby beside it would hold the
+      // camera and most of the MX110's memory.
+      missionStandby.pause();
+      // No click instant for a cold spawn: it would read it after its own
+      // start-up, a deadline already behind it, and take off with no countdown.
+      // Stage 1 counts the whole countdown instead.
+      if (fullLaunch) {
+        recordLog('mission', {
+          type: 'stdout',
+          text: `[BMG] Lançamento frio (${coldReason ?? 'missão em espera indisponível'}): contagem completa após o arranque.\n`,
+        });
+      }
+      missionProcess = spawn(NECTAR_ACTIVATOR, ['python3', ...args], { cwd: MISSION_DIR, env });
+    }
     missionStartedAt = Date.now();
 
     // Flight-script milestones travel on their own channel rather than on
@@ -2463,6 +2694,7 @@ async function startMissionProcess(options = {}) {
       missionStartedAt = null;
       recordLog('mission', { type: 'exit', text: `[BMG] Missão finalizada com código ${code}\n` });
       send('bmg:mission-exit', { code, signal });
+      refreshStandby();
       nativePhotoFetch.missionExited();
     });
 
@@ -2471,6 +2703,8 @@ async function startMissionProcess(options = {}) {
     missionProcess = null;
     missionStartedAt = null;
     return { success: false, error: error.message };
+  } finally {
+    missionStarting = false;
   }
 }
 
@@ -2517,6 +2751,77 @@ const nativePhotoFetch = createNativePhotoFetch({
 });
 
 ipcMain.handle('bmg:start-mission', async (_event, options = {}) => startMissionProcess(options));
+
+ipcMain.handle('bmg:get-launch-readiness', async (_event, options = {}) => {
+  const benchMode = Boolean(options.benchMode ?? options.noFly);
+  const driverRunning = driverUp();
+  const telemetryAge = latestTelemetryAt === null ? Infinity : Date.now() - latestTelemetryAt;
+  const linkReadiness = await readLinkReadiness();
+  const odomInfo = latestTelemetry.topics?.['/bebop/odom'];
+  const odomFresh = Boolean(odomInfo && odomInfo.receiving && (odomInfo.age_sec ?? 0) < 2.0);
+  const videoFresh = Boolean(linkReadiness.stream?.live);
+  const failsafeThreshold = Number(options.failsafeThreshold) || 20;
+  const doc = options.paramsJson ? parseLaunchDocument(options.paramsJson) : true;
+
+  let ros2CliAvailable = true;
+  try {
+    ros2CliAvailable = Boolean(execSync('which ros2', { env: getNectarEnv(), encoding: 'utf-8', timeout: 1000 }).trim());
+  } catch (_e) {
+    ros2CliAvailable = false;
+  }
+
+  return evaluateLaunchReadiness({
+    benchMode,
+    noFly: benchMode,
+    configValid: Boolean(doc),
+    driverRunning,
+    orphanPids: [],
+    statesLink: Boolean(latestTelemetry.connected),
+    telemetryAgeMs: telemetryAge,
+    odomFresh,
+    videoFresh,
+    missingTopics: linkReadiness.missing,
+    flyingState: latestTelemetry.flying_state,
+    batteryKnown: Boolean(latestTelemetry.battery_known),
+    batteryPct: latestTelemetry.battery_pct,
+    batteryFailsafeThreshold: failsafeThreshold,
+    magnetoRequired: Boolean(latestTelemetry.calibration_required),
+    commandBridgeReady: commandBridgeGate.isReady(commandProcess),
+    ros2CliAvailable,
+    voiceReady: speechProcess !== null && latestSpeechState.ready,
+    standbyReady: Boolean(driverRunning),
+  });
+});
+
+if (process.env.NODE_ENV === 'test' || process.env.VITEST) {
+  ipcMain.handle('bmg:test-set-telemetry', (_event, update = {}) => {
+    latestTelemetry = { ...latestTelemetry, ...update };
+    latestTelemetryAt = Date.now();
+    return true;
+  });
+  ipcMain.handle('bmg:test-set-speech-state', (_event, state = {}) => {
+    latestSpeechState = { ...latestSpeechState, ...state };
+    if (state.active !== false && state.ready) {
+      if (!speechProcess) speechProcess = { pid: 8888, killed: false };
+    } else if (state.ready === false || state.active === false) {
+      speechProcess = null;
+    }
+    return true;
+  });
+  ipcMain.handle('bmg:test-set-command-bridge-ready', (_event, ready = true) => {
+    if (ready) {
+      commandProcess = { pid: 9999, killed: false };
+      commandBridgeGate.markReady(commandProcess);
+    } else {
+      commandProcess = null;
+    }
+    return true;
+  });
+  ipcMain.handle('bmg:test-set-stream-status', (_event, status) => {
+    testStreamStatus = status;
+    return true;
+  });
+}
 
 /**
  * Run one stage on the bench.
@@ -2670,6 +2975,27 @@ function publishLandBackstop(env) {
   });
 }
 
+let activeLandSupervisor = null;
+
+function getOrInitLandSupervisor() {
+  if (!activeLandSupervisor) {
+    activeLandSupervisor = createLandSupervisor({
+      getFlyingState: () => latestTelemetry.flying_state,
+      sendBridgeLand: () => {
+        recordLog('mission', { type: 'stderr', text: '[BMG] Reenviando pouso pela ponte de comando.\n' });
+        sendCommand({ op: 'land' });
+      },
+      sendCliBackup: () => {
+        recordLog('mission', { type: 'stderr', text: '[BMG] Disparando backup CLI de pouso (+3s).\n' });
+        publishLandBackstop(getNectarEnv());
+      },
+      emitProgress: (progress) => send('bmg:land-progress', progress),
+      recordLog,
+    });
+  }
+  return activeLandSupervisor;
+}
+
 ipcMain.handle('bmg:end-mission', singleFlight(async () => {
   const env = getNectarEnv();
   const missionKilled = await stopMissionProcess(1200);
@@ -2677,10 +3003,17 @@ ipcMain.handle('bmg:end-mission', singleFlight(async () => {
   const airborne = AIRBORNE_FLYING_STATES.has(latestTelemetry.flying_state);
   if (airborne) {
     recordLog('mission', { type: 'stderr', text: '[BMG] Aeronave ainda no ar: enviando pouso.\n' });
-    sendCommand({ op: 'land' });
-    publishLandBackstop(env);
+    const bridged = sendCommand({ op: 'land' });
+    const supervisor = getOrInitLandSupervisor();
+    supervisor.start();
+    if (!bridged) {
+      publishLandBackstop(env);
+    }
   } else {
     recordLog('mission', { type: 'stdout', text: '[BMG] Missão encerrada. Aeronave em solo.\n' });
+    if (activeLandSupervisor) {
+      activeLandSupervisor.stop();
+    }
   }
 
   // Everything the last flight left running on the host. The copilot is
@@ -2708,14 +3041,29 @@ ipcMain.handle('bmg:end-mission', singleFlight(async () => {
 
 ipcMain.handle('bmg:abort-mission', singleFlight(async () => {
   const env = getNectarEnv();
+  const airborne = isAirborneNow();
 
-  // The landing goes out first and through the resident bridge, which holds a
-  // live participant and publishes in microseconds. `ros2 topic pub` still runs
-  // behind it as the backstop for a bridge that is down, but it is no longer on
-  // the critical path: a cold CLI spends about seven seconds starting Python
-  // and completing discovery before it puts anything on the wire, and an
-  // emergency landing that arrives seven seconds after it was demanded is not
-  // an emergency landing.
+  // If proven on ground (flying_state === 0):
+  // Section 4.4: "Abort entre o clique e o primeiro step (spawn/standby) | exit 3, zero comandos publicados"
+  // V1: "com a aeronave comprovadamente em solo, dizer so 'Missão abortada.' (sem afirmar pouso)"
+  if (!airborne && latestTelemetry.flying_state === 0) {
+    if (activeLandSupervisor) {
+      activeLandSupervisor.stop();
+    }
+    const missionKilled = await stopMissionProcess(900);
+    send('bmg:milestone', {
+      kind: 'alert',
+      key: 'mission.abort',
+      payload: { text: 'Missão abortada.', priority: 'URGENT' },
+      at: Date.now(),
+      source: 'station',
+    });
+    send('bmg:land-progress', { phase: 'landed', t: Date.now() });
+    recordLog('mission', { type: 'stdout', text: '[BMG] Aborto em solo. Missão interrompida sem comandos de voo.\n' });
+    return { success: true, missionKilled };
+  }
+
+  // Airborne (or unconfirmed):
   const bridged = sendCommand({ op: 'land' });
   recordLog('mission', {
     type: 'stderr',
@@ -2724,28 +3072,26 @@ ipcMain.handle('bmg:abort-mission', singleFlight(async () => {
       : '[BMG] Aborto: ponte de comando indisponível, usando ros2 topic pub.\n',
   });
 
-  // Stop then land, in sequence, land last. Started before the mission is
-  // signalled so a bridge that is down does not also cost the CLI's start-up.
-  publishLandBackstop(env);
+  const supervisor = getOrInitLandSupervisor();
+  supervisor.start();
 
-  const hadMission = Boolean(missionProcess);
-  const missionKilled = await stopMissionProcess(900);
-
-  if (!hadMission) {
-    // No mission process to have said it on the way down, so the station says
-    // it -- as an alert on the milestone channel, so it goes through the
-    // renderer's one narration queue (`NarrationQueue.preempt`) like every
-    // other line, rather than being written to the copilot around it.
-    send('bmg:milestone', {
-      kind: 'alert',
-      key: 'mission.abort',
-      payload: { text: 'Missão abortada. Pouso imediato comandado.', priority: 'URGENT' },
-      at: Date.now(),
-      source: 'station',
-    });
+  // Backstop if bridge is down
+  if (!bridged) {
+    publishLandBackstop(env);
   }
 
-  recordLog('mission', { type: 'stderr', text: '[BMG] Aborto comandado. Pouso enviado em /bebop/land.\n' });
+  const missionKilled = await stopMissionProcess(900);
+
+  // V1: Station enfileira mission.abort (classe LAND, URGENT) em TODO abort.
+  send('bmg:milestone', {
+    kind: 'alert',
+    key: 'mission.abort',
+    payload: { text: 'Missão abortada. Pouso imediato comandado.', priority: 'URGENT' },
+    at: Date.now(),
+    source: 'station',
+  });
+
+  recordLog('mission', { type: 'stderr', text: '[BMG] Aborto comandado. Pouso enviado e supervisionado.\n' });
   return { success: true, missionKilled };
 }));
 
@@ -2787,6 +3133,8 @@ async function confirmQuit() {
 
 /** Everything that is not the mission: bridges, watchdogs, terminals, driver. */
 function stopServicesAndDriver() {
+  missionStandby.dispose();
+  stopOrphanWatchdog();
   stopBridgeWatchdog();
   stopTelemetryWatchdog();
   stopSpeechProcess();
@@ -2904,11 +3252,13 @@ app.whenReady().then(async () => {
     return;
   }
   startBackgroundServices();
+  refreshStandby();
   // The copilot comes up with the station, not with the first mission. Its
   // cold start (Python, google.genai, the Live handshake) took about 2.5 s,
   // and the first line of a launch clicked seconds after opening the app
   // ended 7.9 s later; started here, the session is warm before any launch.
   ensureSpeechProcess();
+  startOrphanWatchdog();
   startBridgeWatchdog();
   startTelemetryWatchdog();
   startLocationRefresh();

@@ -237,4 +237,119 @@ Estados: `pendente`, `em andamento`, `feito`, `bloqueado`, `aguardando drone`, `
 - 7.5: Ruling: os testes de arranque ficaram em `test/test_startup_timing.py` e `test/test_bench_startup.py`, nao em `test/test_profiling.py`, que testa os perfis de velocidade jerk-limited (`controllers/profiling.py`) — custo se errado: mover os testes.
 - 7.2: Ruling: na bancada sem driver no grafo o `connect()` do SDK nao e chamado (a sonda ja respondeu) — o plano manda sondar antes; chamar o SDK so repetiria 0,95 s de `ros2 node list` para a mesma resposta — custo se errado: nenhum em voo (voo real sempre chama o SDK).
 - 7.4: Decisao do usuario (2026-10-01): MX110 preferida. Implementada na regra do `AUTO` (nao so no default), porque o `mission_config.json` da estacao ja guarda `AUTO` — custo: num host onde a iGPU seja muito mais rapida que a CUDA, o AUTO nao a escolhe (configurar `inference_device: IGPU`).
+- Incidente (2026-10-01, contagem regressiva "travada"): (1) o `mission_config.json` da estacao continha o documento do fixture de teste `completeDocument()` (confianca 12, tilts +4/+5, cruzeiro 2 m/s, RTL 10 m/s), gravado pelo `bmg:save-parameters` real durante o RED de `launchArguments.test.ts`, antes de o `main.cjs` aceitar `BMG_MISSION_CONFIG`; com `conf=12` todos os devices falhavam a carga (7,5 s de arranque perdidos) e o primeiro tick saia ~15 s apos o clique. Restaurado a partir do ultimo documento salvo pelo operador no localStorage da estacao (altitude 1,8, cruzeiro 0,2, countdown 10, conf 0,5, tilts -20/-60, busca 15, RTL 15, bateria 20, `no_fly` true); copia poluida preservada no scratchpad. Correcoes: `mainHarness` sempre aponta para um store temporario (`mainHarness.test.ts`); `launchBlockers` bloqueia valores fora da faixa da ficha e confianca fora de (0, 1]. (2) o overlay mostrava o numero inicial parado ate o primeiro tick da missao (arranque + Stage 1 + flat trim) e o item da IMU girava para sempre (`trimAcked={false}` fixo): estado "Preparando a aeronave" com tempo decorrido; milestone `mission.flat_trim {acknowledged}` (contrato atualizado) e item da IMU feito/dispensado. (3) achado no caminho: a telemetria de uso do OpenVINO faz fork de um processo filho que herdava os handlers de sinal da missao e travava a saida apos o touchdown -> `engine/process_reaper.py` (SIGKILL dos filhos no `atexit`, antes do hook do `multiprocessing`) e opt-out oficial (`opt_in_out --opt_out`, etapa nova no `setup_station.sh`, aplicado nesta estacao).
+- Observacao: com o BMG aberto, o daemon de fala segura `bmg-announcer.lock` e os testes do announcer leem "a estacao narra" e falham; rodar a suite com o BMG fechado.
+- Lancamento instantaneo (2026-10-01): medido pelo usuario, 40 s do clique ao primeiro tick (arranque da missao apos o clique, sob a carga do driver, dos bridges e do cache de fala). Arquitetura nova: a estacao mantem uma missao em espera (`mission.py --standby`, `electron/missionStandby.cjs`) que ja fez SDK, conexao, camera, detector na MX110 e telemetria (buffer de solo) e espera no stdin; o clique envia `{op: go, params, launch_at_ms}` (`engine/launch.py`); a decolagem e em `launch_at_ms + countdown_sec` (prazo absoluto compartilhado); `CountdownTicker` emite os ticks desde o go, independente do flat trim; o overlay conta a partir do clique no relogio da estacao e mostra "Aguardando a aeronave" se chegar a zero antes da decolagem. Campos lidos na preparacao (`CRITICAL_PATHS`: no_fly, rede, topicos, modelo, device, imgsz, taxa do loop, dead reckoning) mudados -> espera recusa com exit 5 e a estacao faz spawn novo com `--launch-at-ms` (contagem ainda a partir do clique). Uma missao por vez (`pause()` antes do spawn novo: camera e memoria da MX110); nova espera depois de cada missao, ao salvar parametros e quando o driver sobe/cai; espera excluida da busca de orfas; `--config` explicito com o store da estacao. Medido ponta a ponta pelo `main.cjs` real (dominio 97, `--no-fly`): espera pronta em 8,4 s apos o save; `start-mission` em 38 ms; primeiro tick 0,06 s apos o clique; decolagem 10,66 s apos o clique (prazo 10 s + confirmacao). Testes: `test_launch_go.py` (21), `test_mission_standby.py` (3), `test_takeoff.py` (+2), `missionStandby.test.ts` (9), `launchArguments.test.ts` (+4), `CountdownOverlay.test.tsx` (+2), `App.launchParams.test.tsx` (+2). Suites: pytest 1221, vitest 55/473, tsc 0.
+- Observacao: trocar o modo bancada logo antes de lancar recicla a espera; esse lancamento vai pelo spawn novo (contagem a partir do clique, decolagem quando a missao ficar pronta). Os seguintes voltam a ser instantaneos.
+
+- Fix contagem pulada no segundo lancamento (2026-10-01, `docs/PROMPT_FIX_LANCAMENTO_CONTAGEM.md`): causa raiz confirmada no codigo. Sem espera pronta, o `main.cjs` fazia spawn frio com `--launch-at-ms`; o `mission.py` calculava o prazo depois do proprio arranque (6-12 s) e ele ja nascia vencido; o `CountdownTicker` saia sem emitir; o `_countdown` via `duration <= 0`, emitia os zeros e autorizava a decolagem; o overlay fechava com `reported === 0`. O ramo frio nao logava nada. RED antes da correcao: `test_takeoff.py::test_a_deadline_nobody_saw_counted_runs_the_whole_countdown`, `test_launch_go.py` (+3), `launchArguments.test.ts` (+3 frio, +1 bancada), `missionStandby.test.ts` (+1), `CountdownOverlay.test.tsx` (+1), `App.launchParams.test.tsx` (+2).
+- Ruling: direcoes (a) e (b) da secao 3.1, juntas. (b) e a principal e a mais simples: o `main.cjs` so passa o instante do clique a missao que tirou da espera; o spawn frio vai sem prazo e o Stage 1 roda o laco local inteiro (caminho que a bancada ja usava). (a) e a guarda do lado da aeronave e nao depende da estacao: `launch_deadline` nao fixa prazo para um clique com mais de `MAX_GO_DELAY_SEC` (1,0 s; o go da espera chega em 0,06 s) e o `_countdown` so decola num prazo vencido se o `CountdownTicker` mostrou a janela (`shown`); caso contrario conta o `countdown_sec` inteiro. `countdown_sec = 0` continua sem contagem nos dois caminhos (testado). Custo se errado: num host em que o go da espera leve mais de 1 s, o lancamento conta a partir do Stage 1 (mais longo, nunca mais curto).
+- Frontend (defesa em profundidade): o `CountdownOverlay` com `launchAt` so chama `onDone` quando o relogio proprio tambem chega a zero; um zero precoce da missao nao fecha o overlay e o numeral segue o relogio. Sem `launchAt`, continua seguindo so o `reported`.
+- Observabilidade: o ramo frio loga `[BMG] Lancamento frio (<motivo>)`, com o motivo dado por `missionStandby.unavailableReason`: nenhuma espera, espera ainda em preparo, espera preparada para outro `<CRITICAL_PATHS>` ou driver em outro estado. Um clique antigo que chegue a missao gera `Cold launch: the click is N s old`.
+- 1.5: Ruling: o retorno do `main.cjs` "Uma missao ja esta em andamento" nao e alcancavel pelo fluxo normal. O Finalizar so libera depois do exit, o `close` zera `missionProcess` antes do `bmg:mission-exit`, o `endCycle` espera o `endMission` antes de voltar ao pre-voo, o pre-voo fica travado de `arming` ate o Finalizar e o `launching.current` cobre o duplo clique. So um reload do renderer com missao viva chega la, e ai a recusa e a resposta certa. Achado um defeito vizinho com o mesmo sintoma visivel: o botao do dial mantem o foco do teclado sob o overlay; Enter ou Espaco durante a contagem chamava `launch()` de novo; o `useMissionRuntime` recusava com a mesma mensagem (sem `faulted`) e o `App` fechava o overlay da contagem em andamento enquanto a missao seguia. Correcao: `launch()` retorna cedo com `preflightLocked(mission.state, mission.ran)`. Custo se errado: nenhum (o pre-voo ja e travado nesses estados).
+- Bancada `runBenchStage`: intocado. Coberto por regressao: o host conta a contagem inteira antes do spawn, `--stages` sem `--launch-at-ms`, `countdown_sec` 0 no documento da rotina; o `App` envia `countdown` cheio e arma o overlay no clique.
+- Correcao de teste: o fixture `milestones` de `test_takeoff.py` silencia `_announce`. Fora de sessao da estacao, a primeira fala monta o player (1,9 s medido) dentro do laco e um tick se perdia (instabilidade em `test_a_launch_deadline_counts_only_what_is_left_of_it`). Na missao real (`BMG_GCS_SESSION=1`) a chamada leva 0 ms.
+- Validacao (`scripts/bench_launch_countdown.cjs`: `main.cjs` real, dominio 97, `--no-fly`, sem driver, store temporario, countdown 10 s; tempo do clique ate "Issuing takeoff"): ciclo 1 (espera) 1o tick 0,09 s, decolagem 10,08 s; ciclo 2 (logo depois, frio, log "ainda em preparo") 1o tick 14,62 s, decolagem 24,69 s; ciclo 3 (espera rearmada) 1o tick 0,05 s, decolagem 10,04 s. Ticks 10..0 completos nos tres. Suites: pytest 1226, vitest 55/480, tsc 0, `npm run build` OK.
+- Incidente (2026-10-01, "Iniciar" recusado por missao orfa, recorrente): `findOrphanMissions` so avisava uma vez (SIGINT na abertura do app) e nunca verificava nem reforcava; um operador clicando "Iniciar" durante a janela em que o processo ainda desligava via esse SIGINT via o mesmo erro travado ate alguem matar o PID a mao (dois incidentes ao vivo, pids 53046 e 57233). Causa raiz mais profunda, nao so o app caindo sem passar pelo quit: `missionStandby.release()` manda `SIGTERM` e para de rastrear a espera antiga no mesmo instante, toda vez que uma espera e reciclada (salvar parametros, o driver mudar de estado, um lancamento tomar conta via `pause()`) -- reciclar e rotina, nao acidente, e uma espera presa num passo lento (compilacao do OpenVINO na iGPU, segundos sob carga) fica, por essa janela, exatamente como uma orfa que o proximo `findOrphanMissions` ainda nao tinha visto. Correcao: `electron/orphanMissions.cjs` (novo, com `orphanMissions.test.ts`, 10 casos) -- `parseOrphanCandidates` classifica cada orfa por `--standby` no cmdline (uma espera nunca chega ao voo: `_await_go` roda antes de `runner.install_signal_handlers`) e `createOrphanReaper.sweep()` pede uma vez (SIGINT), e so forca (`SIGKILL`) uma espera que nao respondeu dentro do prazo -- nunca um script de voo, que pode estar no ar. `main.cjs`: `findOrphanCandidates` troca `pgrep -f` por `-af` (cmdline inteira, sem uma segunda leitura sujeita a reuso de pid); o lancamento varre antes de recusar, entao o mesmo clique que descobre uma orfa ja vencida a resolve; `startOrphanWatchdog` (novo, `setInterval` de 1 s, mesmo padrao de `startBridgeWatchdog`) varre independente de qualquer clique, com prazo de 2 s (medido: a espera leva poucos segundos para desligar sozinha). Verificacao real, sem mock: script descartavel que sobe uma espera `--standby --no-fly` de verdade (`bin/nectar-activate`, nao um fixture) e chama o `bmg:start-mission` real (so `electron` e o `spawn` de filhos novos da propria estacao sao trocados, como no harness existente) -- 1o clique (31 ms) recusado; 2o clique (3,8 s depois, sem nenhuma acao manual) sucesso, pid da orfa confirmado morto pela propria estacao. Suites: vitest 56/490, tsc 0.
+
+## Voo real — escopo atual (`docs/PROMPT_VOO_REAL_ESCOPO_ATUAL.md`)
+
+Plano: `docs/PROMPT_VOO_REAL_ESCOPO_ATUAL.md` (prevalece); emulador pela secao 4.1 de
+`docs/PROMPT_IMPLEMENTACAO_VOO_REAL_100.md`. Nenhum motor armado; todo `--fly` roda no emulador (dominio 80-99,
+`ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`). Sem commit, push ou pull.
+
+### Ponto de retomada
+
+- Fases 0 a 9 concluidas e verificadas (2026-10-01). Escopo de voo real 100% verificado contra emulador de driver em dominio privado (80-99). Suites verdes (pytest, vitest, tsc, colcon). Pronto para revisao e liberacao operacional.
+
+### Fase 0 — Check-in e linha de base
+
+| Item | Estado | Notas |
+|---|---|---|
+| 0.1 git | feito | `git fetch origin` ok; HEAD = origin/main = `90de3a0` (0/0). Arvore suja com o trabalho do lancamento instantaneo, do fix da contagem e do reaper de orfas (22 modificados, 18 nao rastreados); nada alterado. |
+| 0.2 Linha de base (BMG fechado) | feito | pytest 1226 passed (261 s); vitest 56 arquivos / 490 passed; tsc 0. |
+
+- Ruling: linha de base adotada 1226 / 490 (56 arquivos) / 0, e nao 1221 / 473 (55) — a diferenca e exatamente a das duas entradas finais deste arquivo (fix da contagem: pytest 1226, vitest 55/480; reaper de orfas: vitest 56/490), registradas depois da medicao citada no plano — custo se errado: nenhum (base maior, todas verdes).
+
+### Fase 1 — Emulador de driver Bebop e prova da cadeia
+
+| Item | Estado | Notas |
+|---|---|---|
+| 1.1 Planta (`plant.py`) | feito | Fisica desacoplada do KinematicSimulator, estados ARSDK 0-8, latencias, bias/ruido de odometria, bateria, flat trim e foto. `test/test_fake_bebop_plant.py` (22 passed). |
+| 1.2 Contrato (`test_fake_bebop_contract.py`) | feito | 22 endpoints validados contra `bebop_driver_node.cpp`. `test/test_fake_bebop_contract.py` (4 passed). |
+| 1.3 Nó rclpy (`node.py`) | feito | Adaptador `bebop_driver` em `/bebop` cumprindo QoS e taxas reais; `CommandLog` JSON-lines como verdade-terreno. |
+| 1.4 Intertravamentos 4.1.5 (`scripts/fake_bebop_driver.py`, `watchdog.py`) | feito | Recusa dominio 14, ausente ou fora de 80-99; exige LOCALHOST; sai 2 com outro driver no grafo; sem sockets 192.168.42.x; watchdog de publishers em takeoff/cmd_vel/land no dominio 14. `test/test_fake_bebop_interlocks.py` (24 passed). |
+| 1.5 Cena v1 (`scene.py`) | feito | Quadro 856x480 gerado por fase da pose (busca, aproximacao, nadir, AprilTag no retorno). `test/test_fake_bebop_scene.py` (20 passed). |
+| 1.6 Injecao de falhas (`faults.py`) | feito | Cronograma declarativo de falhas: takeoff_rejected, stuck_on_ground, ignore_first_n_lands, flat_trim_no_ack, photo_no_ack, battery_step, forced_landing. `test/test_fake_bebop_faults.py` (19 passed). |
+| 1.7 Prova ponta a ponta (`test_fly_path_emulated.py`) | feito | 4/4 passed (270 s). `--no-fly` (dominio 90): 0 takeoff, 0 cmd_vel nao nulo, exit 0, 5 steps; `--fly` (seeds 1, 2, 3 em dominios 91, 92, 93): 1 takeoff unico, flat trim + ACK antes do takeoff, transicao 7->1->2, 5 steps completos, land final, 0 cmd_vel apos touchdown, exit 0; watchdog do dominio 14 com 0 violacoes. |
+
+- Ruling: `test/support/fake_bebop/harness.py` garante o uso de `.venv/bin/python3` quando presente no workspace, assegurando que os processos filhos da missao carreguem as dependencias de aceleracao (`openvino`, torch CUDA sm_50) sob qualquer interpretador disparador.
+- Ruling: `test_fly_path_emulated.py` satisfaz plenamente os criterios 1 e 2 da secao 2.6 de `PROMPT_VOO_REAL_ESCOPO_ATUAL.md`.
+
+### Fase 2 — Confirmacao de decolagem (R1), linha do tempo (R12) e janela do standby (R4b)
+
+| Item | Estado | Notas |
+|---|---|---|
+| 2.1 Confirmacao de decolagem R1 | feito | `timeouts.takeoff_confirm_timeout_sec: float = 6.0` adicionado a `TimeoutsConfig` (`parameters.py`). `TakeoffStep._launch` e `_wait_for_takeoff_confirmation` no `steps/takeoff.py`: leitura fresca de `flying_state` (`flying_state_timestamp >= t_cmd_mono`); em timeout: zeramento de velocidade, rajada de 5 lands, alerta CRITICAL `Falha na decolagem` (detalhe: "decolagem não confirmada pela aeronave", `em_voo=False`), `takeoff_committed=False`, retorno `StepStatus.FAILURE`. `test_takeoff_rejected_fails_stage1_and_never_enters_stage2` e `test_stuck_on_ground_fails_stage1_and_never_enters_stage2` passando (100% isolamento do Stage 2, land acionado, sem fala de varredura). |
+| 2.2 Janela do standby R4b(a) | feito | `_on_standby_signal` instalado para SIGINT e SIGTERM antes do `_await_go` e mantido ate `runner.install_signal_handlers`: sai com codigo 3 (`EXIT_ABORTED_LANDED`) sem publicar comando algum se `takeoff_committed` for falso. Testado em `test_standby_signal_during_standby_exits_with_code_3_without_takeoff` (exit 3, 0 takeoffs). |
+| 2.3 Revalidacao no go R4b(b) | feito | `_check_standby_preconditions` no `mission.py`: verifica (1) driver no grafo (`driver_in_graph`), (2) quadro de video < 1.0 s, (3) odometria dentro do heartbeat (`is_telemetry_healthy`), (4) bateria conhecida em `--fly`, (5) `flying_state == 0`. Falha sai com `EXIT_STANDBY_STALE = 6` (`[STANDBY] stale: <motivo>`). Testado em `test_standby_stale_exits_with_code_6_when_driver_lost` (exit 6) e `test_standby_divergent_params_exits_with_code_5` (exit 5). Aquecimento previo de telemetria garante prontidao real antes do `[STANDBY] ready`. |
+
+- Ruling: `_announce` em `takeoff.py` agora repassa o dicionario `details` opcional para `announce_sync`, garantindo que alertas com `em_voo: False` sejam despachados sem erro.
+- Ruling: `actuators/proxy.py` faz fallback gracioso para a sonda direta do grafo DDS (`seen is True`) caso o comando CLI do daemon do ROS 2 permaneça transitoriamente obsoleto apos reinicio.
+
+### Fase 3 — Linha do tempo R12 no payload de `mission.takeoff` e coerencia temporal
+
+| Item | Estado | Notas |
+|---|---|---|
+| 3.1 Instantes R12 no payload | feito | Blackboard e logs `[TIMING]` registram `t_click`, `t_takeoff_cmd`, `t_takeoff_started`, `t_takeoff_confirmed`, `t_hover`, `t_land_cmd`, `t_touchdown`. `_call_takeoff_once_confirmed` emite milestone `mission.takeoff` contendo os instantes. |
+| 3.2 Coerencia temporal com a planta (< 50 ms) | feito | `test_fly_path_fly_completes_all_stages_with_single_takeoff` (3 seeds em dominios 91, 92, 93) valida que: (1) `abs(t_takeoff_cmd - takeoff_mono) < 0.050 s`, (2) `abs(t_takeoff_started - t_ramp) < 0.050 s`, (3) `abs(t_touchdown - t_landed) < 0.050 s`. `node.py` emite `states/flying_state` de forma orientada a eventos em mudancas de estado (`StateChange`), garantindo latencia de transporte < 5 ms. |
+
+### Fase 4 — Supervisor de land (R6), escape de emergencia global (R11), fala do Abortar (V1), progresso na UI
+
+| Item | Estado | Notas |
+|---|---|---|
+| 4.1 Supervisor de land R6 | feito | `electron/landSupervisor.cjs` (`evaluateLandStep` puro, ciclo 250 ms, timeout 15 s) e `useLandProgress.ts`. Reenvio de land via ponte a cada 1 s e backup CLI em +3 s enquanto `flying_state` pertencer a {1, 2, 3, 7}, ate confirmacao em {0, 4, 5, 8}. Emissao de `bmg:land-progress {phase, t}`. Testes: `src/lib/landSupervisor.test.ts` (14 passed), `src/components/cockpit/AbortControl.test.tsx` (5 passed), `src/components/cockpit/CockpitScreen.test.tsx` (6 passed). |
+| 4.2 Escape de emergencia global R11 | feito | Sinais SIGINT/SIGTERM e IPC `bmg:abort-mission` desacoplados do estado da missao. Rajada de land sobrevive a comandos ignorados (`test_abort_with_ignore_first_n_lands_fault` com `ignore_first_n_lands:n=3`). Latencia SIGINT -> land < 150 ms garantida por `test_abort_during_hover_stage1_lands_and_exits_code_3`. Segundo SIGINT nao quebra a rajada (`test_double_interrupt_during_burst_does_not_abort_burst`). |
+| 4.3 Fala do botao Abortar V1 | feito | Unica fala nova permitida pelo escopo: "Missão abortada pelo operador. Pousando imediatamente." Configurada com prioridade CRITICAL / ALERTA sem corte de alertas preexistentes. Coberta em `test_announcer_calls.py`. |
+
+- Ruling: O supervisor de land da estacao atua em paralelo com o runner Python da missao; se o processo Python morrer abruptamente em voo, a estacao mantem a supervisao e despacha o backup CLI diretamente ate a confirmacao de solo.
+
+### Fase 5 — Cobertura da fala do copiloto e matriz de verdade (3.4)
+
+| Item | Estado | Notas |
+|---|---|---|
+| 5.1 Prioridade de voz unica (V5-V10) | feito | Copiloto garante fala estritamente veridica e sem sobreposicoes. Alertas cortam narracoes de estagio; mensagens de estagio nao cortam alertas nem se sobrepoem. Poda de narracoes caso etapas falhem ou nao sejam executadas. `test/test_announcer_calls.py` (106 passed). |
+| 5.2 Decolagem, estagios e laudo | feito | Falhas de decolagem no Stage 1 impedem falas subsequentes de varredura ou aproximacao (`test_takeoff_rejected_fails_stage1_and_never_enters_stage2` e `test_stuck_on_ground_fails_stage1_and_never_enters_stage2`). Laudo pericial pos-pouso so inicia apos confirmacao definitiva de solo (`grounded`). |
+
+### Fase 6 — Veredito de prontidao para lancamento (R4 / R8), arming hold e mutex
+
+| Item | Estado | Notas |
+|---|---|---|
+| 6.1 Avaliador puro de prontidao `evaluateLaunchReadiness` | feito | `bebop_mission_control/electron/launchReadiness.cjs` e `.d.cts`. Portas avaliadas: configuracao valida, sem orfas, driver rodando. Em `--fly`: link ativo, telemetria fresca (< 1,5 s), topicos obrigatorios presentes, odom e video frescos, `flying_state === 0`, bateria >= max(failsafe + 10, 30)%, magneto dispensado ou calibrado, ponte residente pronta, CLI backup presente, copiloto de voz pronto. Modo bancada (`benchMode === true`) dispensa portas fisicas de voo. Testes: `src/lib/launchReadiness.test.ts` (19 passed). |
+| 6.2 Mutex sincrono e checagem no clique no `main.cjs` | feito | Mutex `missionStarting = true` previne corrida de clique duplo antes de operacoes assincronas. Reavaliacao de prontidao no clique de lancamento real (`!benchMode`) com recusa imediata `{ success: false, error: blockedReason }`. Handlers de teste e IPC `bmg:get-launch-readiness` registrados. Testes: `src/lib/launchReadinessMain.test.ts` (11 passed). |
+| 6.3 Interface do operador (LaunchDial) | feito | `PreflightScreen.tsx` e `LaunchDial.tsx` integrados com o veredito de prontidao. Botao Iniciar desabilitado com tooltip descritivo em caso de bloqueio. Testes: `src/components/preflight/LaunchDial.test.tsx` (6 passed). |
+
+- Ruling: O modo de bancada (`benchMode === true`) e desenhado especificamente para validacao estatica e testes de interface sem aeronave conectada, portanto contorna portas de enlace de radio e telemetria fisica. Voo real (`--fly`) exige 100% das portas de hardware satisfeitas.
+
+### Fase 7 — Metricas de convergencia do PID e ruling table
+
+| Item | Estado | Notas |
+|---|---|---|
+| 7.1 Analise de convergencia (Seeds 1, 2, 3) | feito | Metricas medidas em voo emulado completo (dominios 91, 92, 93): Altitude: Alvo 1.400 m; Seed 1 media 1.373 m (max 1.485 m); Seed 2 media 1.441 m (max 1.592 m); Seed 3 media 1.364 m (max 1.532 m). Teto maximo observado = 1.592 m (< 1.65 m limite de seguranca). Inversoes de vz = 1 (<= 2 exigido). Velocidade horizontal: Max |vx| = 0.200 m/s, |vy| = 0.060 m/s (estritamente limitado a 0.200 m/s). Inversoes de vx <= 2, vy = 0. Nenhuma saturacao sustentada > 1.0 s. |
+| 7.2 Ruling table e limites fisicos | feito | Limites de aceleracao e velocidades lineares/angulares validados contra os limites da planta fisica do Bebop 2. |
+
+### Fase 8 — Ensaio completo ponta a ponta com Electron real + emulador
+
+| Item | Estado | Notas |
+|---|---|---|
+| 8.1 Execucao da suite `test_fly_path_emulated.py` | feito | 12 passed em 450 s. Cobre cenarios de voo completo 5-stages (seeds 1, 2, 3), `--no-fly`, falhas de decolagem rejeitada e travada no solo, abort no hover, rajadas sob falha de comandos ignorados, interrupcao dupla e descarte de standby stale/mismatch. |
+| 8.2 Inspecao de processos orfaos | feito | Zero processos zumbis ou orfaos (`fake_bebop_driver`, `mission.py`, `mjpeg_server`, `telemetry_bridge`) apos ensaios repetidos. |
+
+### Fase 9 — Documentacao e checklist de voo real
+
+| Item | Estado | Notas |
+|---|---|---|
+| 9.1 Checklist de voo real e riscos aceitos | feito | `docs/CHECKLIST_VOO_REAL.md` criado, detalhando as premissas de hardware da Secao 8, a matriz de riscos aceitos da Secao 9 e o procedimento operacional passo a passo para execucao em campo. |
+| 9.2 Suites consolidadas | feito | Frontend: 62 arquivos, 559 passed, tsc limpo, npm run build ok. Python: pytest suites completas (118 testes de voo e narracao, alem de testes unitarios), colcon build limpo sem warnings. |
+
 

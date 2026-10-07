@@ -16,8 +16,26 @@ import { BATTERY_CALLS } from '../lib/batteryReturn';
 /** Alert sentences the station itself composes; the rest come from the mission. */
 const FIXED_ALERT_SENTENCES: readonly string[] = [
   'Missão abortada. Pouso imediato comandado.',
+  'Missão abortada.',
   ...Object.values(BATTERY_CALLS),
+  'Falha na decolagem: decolagem não confirmada pela aeronave.',
+  'Falha na decolagem.',
+  'Falha de segurança.',
+  'Falha na etapa.',
 ];
+
+const MILESTONE_STAGE: Record<string, number> = {
+  'mission.start': 1,
+  'countdown_3': 1,
+  'mission.takeoff': 1,
+  'mission.scan_start': 2,
+  'mission.target_found': 2,
+  'mission.approach': 3,
+  'mission.capture_done': 4,
+  'mission.rtl_start': 5,
+  'mission.landing': 5,
+  'mission.touchdown': 5,
+};
 import { NarrationQueue } from '../lib/narrationQueue';
 import { useBridge } from './useBridge';
 
@@ -219,10 +237,11 @@ export function useFlightNarration(
 
   useEffect(() => {
     if (!bridge) return;
-    return bridge.onMilestone((event) => {
+    const unsubMilestone = bridge.onMilestone((event) => {
       if (event.kind === 'alert') {
         const payload = event.payload ?? {};
-        queue.preempt(event.key, () => alertSentence(payload), 'URGENT');
+        const pri = event.key === 'mission.abort' ? 'LAND' : 'URGENT';
+        queue.preempt(event.key, () => alertSentence(payload), pri);
         return;
       }
       if (event.key === 'mission.parameters') {
@@ -245,14 +264,28 @@ export function useFlightNarration(
         spoken.current.clear();
         parameters.current = {};
       }
+      if (key === 'mission.scan_start' && !spoken.current.has('mission.takeoff')) return;
       if (spoken.current.has(key)) return;
       spoken.current.add(key);
       const payload = event.payload ?? {};
       // A launch line drawn ahead (`reserveLaunchPhrase`) is spoken as drawn,
       // so the audio synthesized for it at the click is the audio played.
       const launchLine = takeLaunchPhrase(key);
-      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, parameters.current));
+      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, parameters.current), {
+        stage: MILESTONE_STAGE[key],
+      });
     });
+
+    const unsubStep = bridge.onStepChange?.((event) => {
+      if (typeof event?.stepNumber === 'number') {
+        queue.pruneEarlierStages(event.stepNumber);
+      }
+    });
+
+    return () => {
+      unsubMilestone();
+      unsubStep?.();
+    };
   }, [bridge, queue]);
 
   useEffect(() => {

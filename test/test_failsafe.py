@@ -201,8 +201,14 @@ def test_ceiling_breach_is_reported_as_unhealthy_during_a_climb():
     odom_sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.50)
     assert failsafe.evaluate_system_health()[0] is True
 
-    # Ceiling is target + margin = 2.05 m.
-    odom_sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.40)
+    # Ceiling is target + margin = 1.80 + 0.60 = 2.40 m.
+    # Single sample > 2.40 m should be debounced and NOT trigger failsafe immediately:
+    odom_sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.50)
+    assert failsafe.evaluate_system_health()[0] is True
+
+    # Reaching the streak threshold (3 samples) trips the failsafe:
+    odom_sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.50)
+    odom_sup.inject_synthetic_sample(x=0.0, y=0.0, z=2.50)
     healthy, reason = failsafe.evaluate_system_health()
 
     assert healthy is False
