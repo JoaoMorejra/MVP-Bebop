@@ -14,9 +14,16 @@ may travel and still stop within the distance remaining. This is a statement
 about whether the vehicle *can* stop, which a ramp defined on displacement is
 not.
 
-*Feedback* is a filtered PD on the along-track and cross-track errors. It
+*Feedback* is a filtered PD on the return-track and off-track errors. It
 requests a velocity; the braking profile caps it. Near the origin the PD
 dominates and the approach is gentle; far away the cap saturates at cruise.
+
+*Channels.* The outbound search flies to the left along body Y, so the return
+cruise is flown on body Y, to the right: ``vy`` carries the braking profile at
+the ``max_speed`` cap and the ``lateral_kp``/``lateral_kd`` gains. Body X only
+trims the off-track error, bilaterally, under the ``max_lateral_speed`` cap and
+the ``kp``/``kd`` gains. The field names predate the lateral flight pattern and
+are part of the GCS contract, so they are kept.
 
 *Shaping* applies a jerk limit, then converts to the actuator's normalized
 domain, then renders sub-threshold demands through a sigma-delta modulator so
@@ -33,15 +40,15 @@ sequence by default, odometry when dead reckoning is unavailable. The guidance
 mathematics is identical either way, which is the point: choosing an estimator
 is a mission decision and not a control-law one.
 
-``vx`` is backward-only with one bounded exception. Holding it strictly
-non-positive was the original rule, and it deadlocked: a braking profile plus
-odometry lag almost always leaves the drone a little *past* the origin, and with
-forward flight prohibited the along-track axis was pinned at zero, the distance
-stopped changing, and arrival could never confirm. The drone hovered at the
-takeoff point until the return window expired. The invariant now permits a
-forward trim capped at ``overshoot_recovery_speed`` and only within
+``vy`` is rightward-only with one bounded exception. Holding the return channel
+strictly one-signed was the original rule, and it deadlocked: a braking profile
+plus odometry lag almost always leaves the drone a little *past* the origin, and
+with the outbound direction prohibited the return axis was pinned at zero, the
+distance stopped changing, and arrival could never confirm. The drone hovered at
+the takeoff point until the return window expired. The invariant now permits a
+leftward trim capped at ``overshoot_recovery_speed`` and only within
 ``overshoot_recovery_radius_m`` -- enough to null a terminal overshoot, far too
-little to constitute forward flight.
+little to constitute outbound flight.
 
 **Two laws live in this module.** :class:`RTLGuidanceController`, described
 above, closes on an *estimate* of where the launch origin is; it is what flies
@@ -132,9 +139,9 @@ class ReturnReference:
     to it.
     """
 
-    #: Along-track error in body FLU: positive when the origin lies ahead.
+    #: Off-track error along body X: positive when the origin lies ahead.
     ex_body_m: float
-    #: Cross-track error in body FLU: positive when the origin lies to the left.
+    #: Return-track error along body Y: positive when the origin lies to the left.
     ey_body_m: float
     #: Planar range to the origin, metres.
     distance_m: float
@@ -170,11 +177,12 @@ class GuidanceCommand:
     vyaw: float
     #: Planar range to the launch origin, metres.
     distance_m: float
-    #: Along-track error in body FLU: negative when the origin lies behind.
+    #: Off-track error along body X: positive when the origin lies ahead.
     ex_body_m: float
-    #: Cross-track error in body FLU: positive when the origin lies to the left.
+    #: Return-track error along body Y: positive when the origin lies to the left.
     ey_body_m: float
-    #: Physical along-track speed the profile settled on, m/s.
+    #: Physical speed the return-channel (body Y) profile settled on, m/s.
+    #: Negative while returning to the right.
     target_speed_mps: float
     phase: RTLPhase
     #: Full multivariate settlement: inside the radius, low dispersion, low mean
@@ -196,11 +204,16 @@ class GuidanceCommand:
 
 
 class RTLGuidanceController:
-    """Closed-loop backward navigation to the launch origin.
+    """Closed-loop rightward navigation to the launch origin.
+
+    The return cruise is flown on body Y (``vy <= 0``, to the right, except for
+    the bounded overshoot recovery); body X carries only a small bilateral
+    off-track trim; ``vyaw`` is structurally zero.
 
     All internal computation is in metres and metres per second. Conversion to
     the Bebop's normalized command domain happens once, at the output, through
-    :class:`~mvp_mission_bebop.estimation.calibration.SpeedCalibration`.
+    :class:`~mvp_mission_bebop.estimation.calibration.SpeedCalibration`, on the
+    lateral gain for ``vy`` and the longitudinal gain for ``vx``.
     """
 
     def __init__(
@@ -231,16 +244,18 @@ class RTLGuidanceController:
         )
 
         # Configuration arrives in normalized units for historical reasons (the
-        # names are part of the GCS contract); the law works in m/s.
-        self._cruise_mps = self.calibration.to_mps(rtl_cfg.max_speed)
-        self._max_lateral_mps = self.calibration.to_mps(rtl_cfg.max_lateral_speed)
+        # names are part of the GCS contract); the law works in m/s. The return
+        # cruise is flown on body Y, so ``max_speed`` converts on the lateral
+        # gain; ``max_lateral_speed`` caps the off-track trim on body X.
+        self._cruise_mps = self.calibration.to_mps(rtl_cfg.max_speed, axis="lateral")
+        self._trim_mps = self.calibration.to_mps(rtl_cfg.max_lateral_speed)
 
         self._longitudinal = FilteredPID(
             PIDGains(
                 kp=rtl_cfg.kp,
                 ki=0.0,
                 kd=rtl_cfg.kd,
-                output_limits=(-self._cruise_mps, self._cruise_mps),
+                output_limits=(-self._trim_mps, self._trim_mps),
                 error_deadband=rtl_cfg.deadband_m,
             )
         )
@@ -249,21 +264,21 @@ class RTLGuidanceController:
                 kp=rtl_cfg.lateral_kp,
                 ki=0.0,
                 kd=rtl_cfg.lateral_kd,
-                output_limits=(-self._max_lateral_mps, self._max_lateral_mps),
+                output_limits=(-self._cruise_mps, self._cruise_mps),
                 error_deadband=rtl_cfg.deadband_m,
             )
         )
 
         self._longitudinal_profile = JerkLimitedProfile(
             ProfileLimits(
-                max_velocity=self._cruise_mps,
+                max_velocity=self._trim_mps,
                 max_accel=rtl_cfg.max_accel_mps2,
                 max_jerk=rtl_cfg.max_jerk_mps3,
             )
         )
         self._lateral_profile = JerkLimitedProfile(
             ProfileLimits(
-                max_velocity=self._max_lateral_mps,
+                max_velocity=self._cruise_mps,
                 max_accel=rtl_cfg.max_accel_mps2,
                 max_jerk=rtl_cfg.max_jerk_mps3,
             )
@@ -304,7 +319,7 @@ class RTLGuidanceController:
 
     @property
     def cruise_speed_mps(self) -> float:
-        """Cruise speed cap in physical units."""
+        """Return-channel (body Y) cruise speed cap in physical units."""
         return self._cruise_mps
 
     @property
@@ -374,16 +389,19 @@ class RTLGuidanceController:
         if phase is RTLPhase.STATION_KEEPING:
             speed_cap *= STATION_KEEPING_SPEED_RATIO
 
-        # ``ex`` is the along-track error (positive with the origin ahead of the
-        # nose) and ``ey`` the cross-track error (positive with the origin to
+        # ``ex`` is the off-track error (positive with the origin ahead of the
+        # nose) and ``ey`` the return-track error (positive with the origin to
         # the left), per ``OdometrySnapshot.body_frame_launch_error``. Each
         # channel is fed the error on its own axis.
-        longitudinal_mps, note = self._compute_longitudinal(ex, dt, speed_cap)
-        lateral_mps = self._compute_lateral(ey, dt, speed_cap)
+        lateral_mps, note = self._compute_lateral(ey, dt, speed_cap)
+        longitudinal_mps = self._compute_longitudinal(ex, dt, speed_cap)
 
         # Convert once, at the boundary, then render onto the quantized channel.
         vx = self._shaper_x.shape(self.calibration.to_normalized(longitudinal_mps), dt)
-        vy = self._shaper_y.shape(self.calibration.to_normalized(lateral_mps), dt)
+        vy = self._shaper_y.shape(
+            self.calibration.to_normalized(lateral_mps, axis="lateral"), dt
+        )
+        trim_cap = abs(self.rtl_cfg.max_lateral_speed)
 
         # Position from the reference, speed from odometry. They are not
         # interchangeable and the split is deliberate: the dispersion term is
@@ -416,11 +434,13 @@ class RTLGuidanceController:
         ready_to_land = self._commit_dwell >= self.rtl_cfg.landing_commit_dwell_sec
 
         return GuidanceCommand(
-            # Backward-only, except for the bounded terminal overshoot trim,
-            # which is capped in _compute_longitudinal and can never exceed
+            # The off-track trim is bilateral and small; the sigma-delta dither
+            # may round one grid step above the cap, so the cap is reapplied.
+            vx=max(-trim_cap, min(trim_cap, vx)),
+            # Rightward-only, except for the bounded terminal overshoot trim,
+            # which is capped in _compute_lateral and can never exceed
             # ``overshoot_recovery_speed``.
-            vx=max(-1.0, min(self.rtl_cfg.overshoot_recovery_speed, vx)),
-            vy=vy,
+            vy=max(-1.0, min(self.rtl_cfg.overshoot_recovery_speed, vy)),
             # Saturated onto the authorized band. Descent is unbounded here and
             # bounded at the actuator by the governor's own cap; ascent is
             # bounded to exactly what altitude hold was configured to allow,
@@ -430,7 +450,7 @@ class RTLGuidanceController:
             distance_m=distance,
             ex_body_m=ex,
             ey_body_m=ey,
-            target_speed_mps=longitudinal_mps,
+            target_speed_mps=lateral_mps,
             phase=phase,
             arrived=report.settled,
             ready_to_land=ready_to_land,
@@ -440,19 +460,35 @@ class RTLGuidanceController:
 
     # ---------------------------------------------------------------- channels
 
-    def _compute_longitudinal(self, ex: float, dt: float, speed_cap: float) -> tuple[float, str]:
-        """Along-track law: PD demand, capped by what can still be stopped."""
-        if abs(ex) < self.rtl_cfg.deadband_m:
-            return self._longitudinal_profile.step(0.0, dt), ""
+    def _compute_lateral(self, ey: float, dt: float, speed_cap: float) -> tuple[float, str]:
+        """Return-track law on body Y: PD demand, capped by what can still be stopped.
+
+        Parameters
+        ----------
+        ey : float
+            Return-track error, metres: positive when the origin lies to the left.
+        dt : float
+            Interval since the previous cycle, seconds.
+        speed_cap : float
+            Cruise ceiling for this phase, m/s.
+
+        Returns
+        -------
+        tuple[float, str]
+            Profiled return velocity in m/s (negative is to the right) and the
+            overshoot note, empty when no overshoot is being handled.
+        """
+        if abs(ey) < self.rtl_cfg.deadband_m:
+            return self._lateral_profile.step(0.0, dt), ""
 
         # The controlled variable is the drone's displacement from the origin
-        # along body-x, which is the negation of the error vector pointing at it.
-        demand = self._longitudinal.update(-ex, dt)
+        # along body-y, which is the negation of the error vector pointing at it.
+        demand = self._lateral.update(-ey, dt)
 
         # Feedforward ceiling: the fastest speed from which the remaining
         # distance is still enough to come to rest.
         ceiling = braking_velocity(
-            abs(ex),
+            abs(ey),
             self.rtl_cfg.max_accel_mps2,
             cruise_velocity=speed_cap,
             arrival_tolerance=self.rtl_cfg.deadband_m,
@@ -461,9 +497,9 @@ class RTLGuidanceController:
 
         note = ""
         if target > 0.0:
-            # The origin is ahead of the nose: the drone overshot it. A braking
-            # profile plus odometry lag makes that close to inevitable in the
-            # terminal regime, so it has to be recoverable.
+            # The origin is to the left: the drone overshot it to the right. A
+            # braking profile plus odometry lag makes that close to inevitable in
+            # the terminal regime, so it has to be recoverable.
             #
             # It used to be unrecoverable. The axis was held at exactly zero and
             # the code relied on "the arrival window" to absorb the residual --
@@ -472,46 +508,62 @@ class RTLGuidanceController:
             # arrival radius was therefore a fixed point: the drone hovered a
             # few tens of centimetres past the origin, never confirmed arrival,
             # and only reached the ground when the whole return window expired.
-            # In flight this read as returning to the takeoff point and never
-            # landing.
             #
-            # The backward-only rule protects a straight reverse line with no
+            # The rightward-only rule protects a straight return line with no
             # yaw, which is what keeps the optical-flow estimate trustworthy. A
-            # bounded forward trim over the last metre does not threaten that.
+            # bounded leftward trim over the last metre does not threaten that.
             # Hovering off-target until a timeout does.
-            recovery_cap = self.calibration.to_mps(self.rtl_cfg.overshoot_recovery_speed)
-            if ex <= self.rtl_cfg.overshoot_recovery_radius_m:
+            recovery_cap = self.calibration.to_mps(
+                self.rtl_cfg.overshoot_recovery_speed, axis="lateral"
+            )
+            if ey <= self.rtl_cfg.overshoot_recovery_radius_m:
                 target = min(target, recovery_cap)
-                note = f"overshoot recovery ({ex:+.2f} m ahead)"
+                note = f"overshoot recovery ({ey:+.2f} m to the left)"
             else:
-                # Further ahead than an overshoot explains. Something is wrong
-                # with the origin or the odometry, and creeping forward on a bad
-                # estimate is not the answer.
+                # Further left than an overshoot explains. Something is wrong
+                # with the origin or the odometry, and creeping back along the
+                # outbound direction on a bad estimate is not the answer.
                 target = 0.0
-                note = f"overshoot {ex:.2f} m ahead, beyond recovery range: axis held"
+                note = f"overshoot {ey:.2f} m to the left, beyond recovery range: axis held"
             if not self._overshoot_logged:
                 logger.warning(
-                    "Launch origin is %.2f m ahead of the nose. %s",
-                    ex,
+                    "Launch origin is %.2f m to the left of the airframe. %s",
+                    ey,
                     (
-                        f"Applying bounded forward recovery at up to {recovery_cap:.3f} m/s."
-                        if ex <= self.rtl_cfg.overshoot_recovery_radius_m
-                        else "Beyond the recovery range; holding the along-track axis."
+                        f"Applying bounded leftward recovery at up to {recovery_cap:.3f} m/s."
+                        if ey <= self.rtl_cfg.overshoot_recovery_radius_m
+                        else "Beyond the recovery range; holding the return axis."
                     ),
                 )
                 self._overshoot_logged = True
 
-        return self._longitudinal_profile.step(target, dt), note
+        return self._lateral_profile.step(target, dt), note
 
-    def _compute_lateral(self, ey: float, dt: float, speed_cap: float) -> float:
-        """Cross-track law: filtered PD, jerk-limited."""
-        if abs(ey) < self.rtl_cfg.deadband_m:
-            return self._lateral_profile.step(0.0, dt)
+    def _compute_longitudinal(self, ex: float, dt: float, speed_cap: float) -> float:
+        """Off-track trim on body X: bilateral filtered PD, jerk-limited.
 
-        lateral_cap = min(self._max_lateral_mps, speed_cap)
-        demand = self._lateral.update(-ey, dt)
-        target = max(-lateral_cap, min(lateral_cap, demand))
-        return self._lateral_profile.step(target, dt)
+        Parameters
+        ----------
+        ex : float
+            Off-track error, metres: positive when the origin lies ahead.
+        dt : float
+            Interval since the previous cycle, seconds.
+        speed_cap : float
+            Cruise ceiling for this phase, m/s. The trim is bounded by the
+            smaller of it and ``max_lateral_speed``.
+
+        Returns
+        -------
+        float
+            Profiled trim velocity in m/s, positive forward.
+        """
+        if abs(ex) < self.rtl_cfg.deadband_m:
+            return self._longitudinal_profile.step(0.0, dt)
+
+        trim_cap = min(self._trim_mps, speed_cap)
+        demand = self._longitudinal.update(-ex, dt)
+        target = max(-trim_cap, min(trim_cap, demand))
+        return self._longitudinal_profile.step(target, dt)
 
 
 # ════════════════════════════════════════════════════ ArUco terminal guidance
@@ -1005,18 +1057,22 @@ class ArucoCenteringController:
             # above uses, deliberately: one reading of "error" across the module.
             longitudinal_demand = self._longitudinal.update(-ex_body, dt)
             lateral_demand = self._lateral.update(-ey_body, dt)
-            # The rear field of view at a steep camera_tilt_deg is narrow, so any
-            # forward overshoot risks losing the marker outright rather than just
-            # costing a correction cycle. A PD term alone does not guarantee the
-            # airframe can stop before it crosses the marker -- gain, filtering
-            # lag and profile inertia all sit between "demand" and "velocity
-            # actually flown". braking_velocity is the same stopping-distance
-            # feedforward RTLGuidanceController._compute_longitudinal already
-            # applies: the ceiling on how fast the airframe may move given how
+            # The body-X error is recovered through the tilt projection and the
+            # ground footprint along the nose is the image's vertical extent,
+            # the narrower of the two, so an overshoot on X risks losing the
+            # marker outright rather than just costing a correction cycle. A PD
+            # term alone does not guarantee the airframe can stop before it
+            # crosses the marker -- gain, filtering lag and profile inertia all
+            # sit between "demand" and "velocity actually flown". braking_velocity
+            # is the same stopping-distance feedforward
+            # RTLGuidanceController._compute_lateral applies on its return
+            # channel: the ceiling on how fast the airframe may move given how
             # far it still has to travel and how hard it can decelerate. Bounding
             # only the longitudinal channel is deliberate -- the lateral error is
             # read off the camera's unprojected x-axis and is not starved by the
-            # tilt, so it keeps its full authority. arrival_tolerance is the
+            # tilt, so it keeps its full authority; a lateral overshoot, the one
+            # the rightward return makes, is re-framed by the leftward creep in
+            # _coast. arrival_tolerance is the
             # deadband, not the (larger) convergence tolerance: the tolerance
             # boundary is where the "within" branch above takes over outright,
             # and anchoring the ceiling's zero-crossing there too would make the
@@ -1091,14 +1147,16 @@ class ArucoCenteringController:
     # ---------------------------------------------------------------- helpers
 
     def _coast(self, dt: float) -> CenteringCommand:
-        """Hold station -- or, close-in and mid-approach, creep aft -- through a
+        """Hold station -- or, close-in and mid-approach, creep left -- through a
         cycle that carried no usable observation.
 
-        A marker lost while the airframe was still actively closing on it, from
-        inside ``reacquire_creep_range_m``, is very often a marker that has just
-        slipped out of the narrow rear field of view a steep ``camera_tilt_deg``
-        produces: the classic overshoot-loses-the-tag failure. A brief, bounded
-        aft creep re-frames it directly rather than waiting out
+        The return leg is flown to the right, so the marker enters the frame on
+        its right side and an overshot marker leaves it on the left. A marker
+        lost while the airframe was still actively closing on it, from inside
+        ``reacquire_creep_range_m``, is very often a marker that has just
+        slipped past the left edge of the frame: the classic
+        overshoot-loses-the-tag failure. A brief, bounded leftward creep
+        (``vy > 0``, never ``vx``) re-frames it directly rather than waiting out
         ``lost_frames_tolerance`` on the chance the airframe drifts back into
         view on its own. A marker lost while the airframe was already at rest
         and centred is a different event entirely -- an occlusion, not an
@@ -1121,7 +1179,7 @@ class ArucoCenteringController:
         # two would let whichever is shorter silently truncate the other -- at
         # a typical control-loop rate, lost_frames_tolerance (a few tenths of a
         # second) elapses well before a profile decelerating from cruise speed
-        # can actually cross zero into the negative creep target.
+        # can actually cross zero into the leftward creep target.
         creeping = (
             self._last_radial_m is not None
             and self._last_speed_mps is not None
@@ -1129,9 +1187,9 @@ class ArucoCenteringController:
             and self._last_speed_mps > self._settle_speed_mps
             and self._lost_elapsed_sec <= self.rtl_cfg.reacquire_creep_sec
         )
-        longitudinal_target = -self._creep_speed_mps if creeping else 0.0
-        longitudinal_mps = self._longitudinal_profile.step(longitudinal_target, dt)
-        lateral_mps = self._lateral_profile.step(0.0, dt)
+        lateral_target = self._creep_speed_mps if creeping else 0.0
+        longitudinal_mps = self._longitudinal_profile.step(0.0, dt)
+        lateral_mps = self._lateral_profile.step(lateral_target, dt)
 
         tolerated = self._lost_frames <= self._lost_tolerance
         if not tolerated:
@@ -1145,7 +1203,7 @@ class ArucoCenteringController:
 
         if creeping:
             note = (
-                f"marker lost {self._lost_frames} frames: creeping aft to reframe "
+                f"marker lost {self._lost_frames} frames: creeping left to reframe "
                 f"({self._lost_elapsed_sec:.2f}/{self.rtl_cfg.reacquire_creep_sec:.2f} s)"
             )
         elif not tolerated:

@@ -447,3 +447,63 @@ def test_feedforward_respects_positional_calls_without_vx_commanded():
     governor = hold(feedforward_gain=0.05)
     command = governor.compute_vz(TARGET_M, DT)
     assert command == pytest.approx(0.0)
+
+
+# ------------------------------------------------- re-entry descent over the pad edge
+
+
+def _reentry_governor(demanded, state="entering", shaper=False):
+    from mvp_mission_bebop.estimation.platform_monitor import PlatformReport, PlatformState
+    from mvp_mission_bebop.parameters import PlatformConfig
+
+    platform = PlatformConfig(height_m=1.0, edge_ahead_m=0.30, guard_vertical_shaper=shaper)
+    platform_state = PlatformState(state)
+    report = PlatformReport(
+        platform_state,
+        platform_state in (PlatformState.LEAVING, PlatformState.ENTERING),
+        1.0,
+        0.59,
+        -1,
+        5.0,
+    )
+    governor = AltitudeHoldGovernor(
+        0.8,
+        AltitudeGovernorConfig(),
+        guard_source=lambda: report,
+        platform_cfg=platform,
+        descent_demand=lambda: demanded,
+    )
+    return governor, platform
+
+
+def test_a_re_entry_breach_commands_the_full_guard_descent():
+    """A few centimetres over the target would ask for a gentle descent; a breach asks for all of it."""
+    governor, platform = _reentry_governor(demanded=True)
+    commands = [governor.compute_vz(0.85, DT) for _ in range(30)]
+    assert commands[-1] == pytest.approx(-platform.guard_descent_cap)
+
+
+def test_without_the_breach_the_same_error_descends_gently():
+    governor, platform = _reentry_governor(demanded=False)
+    commands = [governor.compute_vz(0.85, DT) for _ in range(30)]
+    assert -platform.guard_descent_cap < commands[-1] < 0.0
+
+
+def test_the_full_descent_is_reached_through_the_profile_not_a_step():
+    governor, _ = _reentry_governor(demanded=True)
+    commands = [0.0] + [governor.compute_vz(0.85, DT) for _ in range(30)]
+    steps = [abs(b - a) for a, b in zip(commands, commands[1:])]
+    assert max(steps) <= AltitudeGovernorConfig().max_accel_mps2 * DT + 1e-9
+
+
+@pytest.mark.parametrize("state", ["off", "leaving", "on"])
+def test_the_full_descent_is_reserved_for_the_re_entry(state):
+    governor, platform = _reentry_governor(demanded=True, state=state)
+    commands = [governor.compute_vz(0.85, DT) for _ in range(30)]
+    assert commands[-1] > -platform.guard_descent_cap + 1e-6
+
+
+def test_the_full_descent_survives_the_vertical_shaper():
+    governor, platform = _reentry_governor(demanded=True, shaper=True)
+    commands = [governor.compute_vz(0.85, DT) for _ in range(30)]
+    assert commands[-1] == pytest.approx(-platform.guard_descent_cap, abs=1e-5)

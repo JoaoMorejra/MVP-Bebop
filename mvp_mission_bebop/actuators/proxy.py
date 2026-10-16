@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable, Final, FrozenSet, Optional, Protocol
 
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
+from mvp_mission_bebop.actuators.yaw_authority import YawAuthority
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
 
 logger = logging.getLogger("ActuatorProxy")
@@ -94,8 +95,10 @@ class BenchtopDroneProxy:
         no_fly: bool = False,
         simulator: Optional[KinematicSimulator] = None,
         motion_tracker: Optional[DeadReckoningTracker] = None,
+        yaw_authority: Optional[YawAuthority] = None,
     ) -> None:
         self._no_fly: bool = bool(no_fly)
+        self.yaw_authority: YawAuthority = yaw_authority if yaw_authority is not None else YawAuthority()
         self.drone = _NoFlyInterlock(drone) if self._no_fly else drone
         self.simulator = simulator
         # Dead reckoning is fed here rather than by the steps, and that is the
@@ -191,22 +194,29 @@ class BenchtopDroneProxy:
         clamps and publishes them as a Twist that the firmware interprets as a
         throttle fraction. The command is latched until another arrives.
 
-        ``vyaw`` is forced to zero here unconditionally. The mission's vertical
-        invariant is that the airframe never rotates -- the Bebop derives its
-        odometry from optical flow, and any yaw rate corrupts the horizontal
-        position estimate every guidance law in this package depends on. Every
-        guidance law was audited and none currently emits a nonzero ``vyaw``;
-        this clamp is defense in depth against a future regression, applied at
-        the single point every velocity command in the mission passes through,
-        rather than trusted to hold at every call site independently.
+        ``vyaw`` is clamped by :attr:`yaw_authority` and is therefore zero
+        unless a :class:`YawAuthority` window is open. The invariant is that the
+        airframe holds its heading: the Bebop derives its horizontal odometry
+        from optical flow, and a yaw rate corrupts the position estimate the
+        translating guidance laws depend on. The single scoped exception is the
+        Simple profile, whose Stages 2 to 4 (rotating scan, yaw servoing and the
+        heading restore after the capture) open a window bounded by
+        ``yaw_pattern.max_vyaw``; that profile never uses horizontal position.
+        The window closes on exit, exception included, and every other stage
+        and profile commands zero yaw. The clamp sits at the single point every
+        velocity command in the mission passes through, independently of the
+        same clamp in ``FailsafeSupervisor.clamp_kinematics``, rather than being
+        trusted to hold at every call site.
         """
-        if vyaw != 0.0:
+        allowed = self.yaw_authority.clamp(vyaw)
+        if allowed != vyaw:
             logger.error(
-                "Rejected a nonzero vyaw=%.4f from a velocity command; the yaw "
-                "invariant forbids rotation for the whole mission. Forcing to 0.0.",
+                "Rejected vyaw=%.4f from a velocity command; the yaw authority allows %.4f "
+                "(rotation is authorized only inside a yaw window).",
                 vyaw,
+                allowed,
             )
-            vyaw = 0.0
+            vyaw = allowed
 
         if self.motion_tracker is not None:
             self.motion_tracker.command(vx=vx, vy=vy, vz=vz, vyaw=vyaw, duration=duration)

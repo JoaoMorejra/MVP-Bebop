@@ -119,6 +119,25 @@ class FilteredPID:
         """
         self._integral *= max(0.0, min(1.0, retention))
 
+    def retune(self, gains: PIDGains) -> None:
+        """Replace the gains in force without resetting the controller state.
+
+        The integral, the filtered derivative and the last measurement carry
+        over, so a gain schedule switched mid-correction continues the
+        correction instead of restarting it. The integral is clamped into the
+        new integral limits.
+
+        Parameters
+        ----------
+        gains : PIDGains
+            Gains and limits to apply from the next update.
+        """
+        if not isinstance(gains, PIDGains):
+            raise TypeError(f"gains must be PIDGains, got {type(gains).__name__}")
+        self._gains = gains
+        low, high = gains.integral_limits
+        self._integral = max(low, min(high, self._integral))
+
     def reset(self) -> None:
         """Clear integral, derivative, and the priming state."""
         self._integral = 0.0

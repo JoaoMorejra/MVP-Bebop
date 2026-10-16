@@ -11,6 +11,7 @@ from mvp_mission_bebop.controllers.geometry import (
     GroundProjection,
     project_to_ground,
 )
+from mvp_mission_bebop.controllers.gimbal_framing import FramingCommand, GimbalFramingController
 from mvp_mission_bebop.controllers.pid import FilteredPID, PIDGains
 from mvp_mission_bebop.controllers.profiling import (
     JerkLimitedProfile,
@@ -41,6 +42,8 @@ __all__ = [
     "CameraIntrinsics",
     "CenteringCommand",
     "FilteredPID",
+    "FramingCommand",
+    "GimbalFramingController",
     "GroundProjection",
     "GuidanceCommand",
     "JerkLimitedProfile",

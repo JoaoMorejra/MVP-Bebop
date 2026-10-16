@@ -79,7 +79,12 @@ def test_a_driver_absent_from_both_is_not_retried():
 
 def test_a_still_failing_sdk_after_the_restart_fails():
     drone = Drone([False, False])
-    assert proxy(drone, False).connect(graph_probe=lambda: True, restart_daemon=lambda: None) is False
+    assert proxy(drone, False).connect(graph_probe=None, restart_daemon=lambda: None) is False
+
+
+def test_fallback_to_live_graph_when_sdk_fails_after_restart():
+    drone = Drone([False, False])
+    assert proxy(drone, False).connect(graph_probe=lambda: True, restart_daemon=lambda: None) is True
 
 
 def test_the_bench_without_a_driver_skips_the_sdk_probe():
