@@ -33,13 +33,16 @@ import {
 import { useVoiceLevel } from './hooks/useVoiceLevel';
 import { buildForensicReport } from './lib/forensics';
 import { LAUNCH_KEYS, reserveLaunchPhrase } from './lib/copilotPhrases';
-import { getPath } from './lib/paths';
-import { launchBlockers, launchCountdownSec } from './lib/launchDocument';
+import { deepEqual, getPath } from './lib/paths';
+import { readMissionMode, type MissionMode } from './lib/missionMode';
+import { launchBlockers, launchCountdownSec, reconcileCoupledPaths } from './lib/launchDocument';
+import { blockingConflicts } from './lib/parameterConflicts';
 import { isMissionOver } from './lib/missionOutcome';
 import { useFinishLock } from './hooks/useFinishLock';
 import { reportMayStart } from './lib/finishLock';
 import { useGuardedAsync } from './hooks/useGuardedAsync';
 import { useMissionCountdown } from './hooks/useMissionCountdown';
+import { useModeEcho } from './hooks/useModeEcho';
 import { useLandProgress } from './hooks/useLandProgress';
 import { runCriticalBatteryReturn } from './lib/batteryReturn';
 
@@ -110,7 +113,15 @@ export const App: React.FC = () => {
    * refusal message behind on the pre-flight screen.
    */
   const launching = useRef(false);
+  /**
+   * A launch or bench click is being handled, from the click to the answer of
+   * the host. The mission mode selector is frozen from that click: the
+   * document it sends is the one read at the click.
+   */
+  const [launchPending, setLaunchPending] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  /** Profile of the launch in progress, as read from the document at the click. */
+  const [launchedMode, setLaunchedMode] = useState<MissionMode | null>(null);
   const [benchStage, setBenchStage] = useState<number | null>(null);
   const [pendingStage, setPendingStage] = useState<number | null>(null);
   const [report, setReport] = useState<Finding[] | null>(null);
@@ -142,6 +153,7 @@ export const App: React.FC = () => {
   const benchMode = Boolean(getPath(params.working ?? params.committed, 'no_fly'));
   /** The aircraft is committed: pre-flight is locked until it is back down. See `preflightLocked`. */
   const airborne = preflightLocked(mission.state, mission.ran);
+  const modeLocked = launchPending || counting || running || params.status === 'saving';
 
   const committed = params.committed;
   const storedRadius = getPath(committed, 'rtl.arrival_radius_m');
@@ -215,11 +227,25 @@ export const App: React.FC = () => {
       );
       return null;
     }
-    if (params.dirty && !(await params.save())) {
+    const current = params.working ?? params.committed;
+    // The working copy is coupled on load; a document that still differs from
+    // its coupled form is one the store has not been given yet.
+    const doc = current ? reconcileCoupledPaths(current) : current;
+    // An inexecutable combination is refused before anything is saved, with
+    // the conflicts named rather than the bare paths; the hook's own save
+    // refuses it as well.
+    const conflicts = blockingConflicts(doc);
+    if (conflicts.length) {
+      setLaunchError(
+        `Combinação de parâmetros inexecutável: ${conflicts.map((c) => c.title).join('; ')}. Ajuste na ficha de parâmetros.`
+      );
+      return null;
+    }
+    const uncommitted = params.dirty || (doc !== null && !deepEqual(doc, params.committed));
+    if (uncommitted && !(await params.save())) {
       setLaunchError('Não foi possível salvar os parâmetros; lançamento abortado.');
       return null;
     }
-    const doc = params.working ?? params.committed;
     const missing = launchBlockers(doc);
     if (!doc || missing.length) {
       setLaunchError(`Parâmetros ausentes ou fora da faixa permitida: ${missing.join(', ')}.`);
@@ -234,15 +260,17 @@ export const App: React.FC = () => {
     // refusal, which closed the overlay of the countdown still in progress.
     if (launching.current || preflightLocked(mission.state, mission.ran)) return;
     launching.current = true;
-    // The click instant. The mission takes off at it plus the countdown
-    // (engine/launch.py) and the overlay counts towards the same instant, so
-    // the countdown starts here and not when the process answers: measured,
-    // that was 40 s later.
-    const clickedAt = Date.now();
-    primeLaunchPhrases();
+    setLaunchPending(true);
     try {
+      // The click instant. The mission takes off at it plus the countdown
+      // (engine/launch.py) and the overlay counts towards the same instant, so
+      // the countdown starts here and not when the process answers: measured,
+      // that was 40 s later.
+      const clickedAt = Date.now();
+      primeLaunchPhrases();
       const doc = await commitLaunchDocument();
       if (!doc) return;
+      setLaunchedMode(readMissionMode(doc));
       // A real parameter rather than a UI flourish: the mission reads the same
       // `kinematics.countdown_sec` from the document, so the overlay and the
       // aircraft count the same window. Zero means no countdown.
@@ -283,6 +311,7 @@ export const App: React.FC = () => {
       if (seconds < 1) setScreen('cockpit');
     } finally {
       launching.current = false;
+      setLaunchPending(false);
     }
   }, [commitLaunchDocument, failsafe.thresholdPct, mission, params, primeLaunchPhrases, resetTrack]);
 
@@ -296,44 +325,50 @@ export const App: React.FC = () => {
       if (!bridge) return;
       const clickedAt = Date.now();
       primeLaunchPhrases();
-      const doc = await commitLaunchDocument();
-      if (!doc) return;
+      setLaunchPending(true);
+      try {
+        const doc = await commitLaunchDocument();
+        if (!doc) return;
 
-      // Only one mission process may exist, so switching routines means ending
-      // the one that is up. Safe by construction here: everything the bench
-      // runs is `--no-fly`, so there is nothing in the air to interrupt.
-      if (mission.state === 'running' || mission.state === 'arming') {
-        narration.silence();
-        await bridge.endMission().catch(() => undefined);
-      }
+        // Only one mission process may exist, so switching routines means ending
+        // the one that is up. Safe by construction here: everything the bench
+        // runs is `--no-fly`, so there is nothing in the air to interrupt.
+        if (mission.state === 'running' || mission.state === 'arming') {
+          narration.silence();
+          await bridge.endMission().catch(() => undefined);
+        }
 
-      const seconds = launchCountdownSec(doc) ?? 0;
-      setLaunchError(null);
-      setBenchStage(stage);
-      setPendingStage(null);
-      resetTrack();
-      // The runtime is told a process is starting; without this the strip would
-      // still be showing the previous routine's terminal state.
-      mission.beginBenchStage();
+        const seconds = launchCountdownSec(doc) ?? 0;
+        setLaunchError(null);
+        setBenchStage(stage);
+        setPendingStage(null);
+        resetTrack();
+        // The runtime is told a process is starting; without this the strip would
+        // still be showing the previous routine's terminal state.
+        mission.beginBenchStage();
 
-      const result = await bridge.startBenchStage({
-        stage,
-        paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
-        countdown: seconds,
-      });
+        const result = await bridge.startBenchStage({
+          stage,
+          paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
+          countdown: seconds,
+        });
 
-      if (!result.success) {
-        setBenchStage(null);
-        setLaunchError(result.error ?? result.message ?? 'a rotina de bancada não subiu');
-        return;
-      }
-      if (seconds >= 1) {
-        setCountdownSeconds(seconds);
-        setLaunchAt(clickedAt);
-        setCounting(true);
-      } else {
-        // The rehearsal's own feed is the point of watching it.
-        setScreen('cockpit');
+        if (!result.success) {
+          mission.refuseBenchStage();
+          setBenchStage(null);
+          setLaunchError(result.error ?? result.message ?? 'a rotina de bancada não subiu');
+          return;
+        }
+        if (seconds >= 1) {
+          setCountdownSeconds(seconds);
+          setLaunchAt(clickedAt);
+          setCounting(true);
+        } else {
+          // The rehearsal's own feed is the point of watching it.
+          setScreen('cockpit');
+        }
+      } finally {
+        setLaunchPending(false);
       }
     },
     [bridge, commitLaunchDocument, narration, failsafe.thresholdPct, mission, primeLaunchPhrases, resetTrack]
@@ -391,6 +426,16 @@ export const App: React.FC = () => {
     setCounting(false);
     await mission.abort();
   }, [mission]);
+
+  useModeEcho({
+    requested: launchedMode,
+    onMismatch: (reported, requested) => {
+      setLaunchError(
+        `A missão iniciou no modo "${reported}", mas o modo "${requested}" foi selecionado. Missão abortada antes da decolagem.`
+      );
+      void cancelCountdown();
+    },
+  });
 
   const abort = useCallback(async () => {
     await mission.abort();
@@ -465,14 +510,14 @@ export const App: React.FC = () => {
       say: (label, text) => narration.preempt(label, () => text, 'URGENT'),
       gotoStage: () => (bridge ? bridge.gotoStage(RTL_STAGE) : Promise.resolve({ success: false })),
       land: () => landRef.current(),
-    });
+    }, launchedMode ?? readMissionMode(params.working ?? params.committed));
     if (taken !== 'rtl') return;
     clearRtlWatchdog();
     rtlWatchdogRef.current = window.setTimeout(() => {
       rtlWatchdogRef.current = null;
       if (stageRef.current !== RTL_STAGE) void landRef.current();
     }, RTL_ACK_TIMEOUT_MS);
-  }, [bridge, clearRtlWatchdog, narration, running]);
+  }, [bridge, clearRtlWatchdog, launchedMode, narration, params.committed, params.working, running]);
 
   useEffect(() => {
     if (!failsafe.enabled || !inFlight || failsafeFiredRef.current) return;
@@ -520,6 +565,7 @@ export const App: React.FC = () => {
     setReport(null);
     setReportDismissed(false);
     setLaunchError(null);
+    setLaunchedMode(null);
     setCounting(false);
     failsafeFiredRef.current = false;
     setFailsafeTriggered(false);
@@ -571,6 +617,7 @@ export const App: React.FC = () => {
           missionState={mission.state}
           stage={mission.stage}
           stageName={mission.stageName}
+          missionMode={readMissionMode(params.working ?? params.committed)}
           streamFps={Math.round(stream.fps)}
           streamBridgeUp={stream.running}
           streamLive={stream.live}
@@ -633,7 +680,9 @@ export const App: React.FC = () => {
         hasPreset={Boolean(params.preset)}
         presetActive={params.isPresetActive}
         onEdit={params.edit}
+        onModeChange={(mode) => void params.switchMode(mode)}
         onSave={() => void params.save()}
+        saveAttempted={params.saveAttempted}
         onDiscard={params.discard}
         onSavePreset={params.saveAsPreset}
         onApplyPreset={params.applyPreset}
@@ -646,6 +695,7 @@ export const App: React.FC = () => {
         launchError={launchError}
         onLaunch={() => void launch()}
         onOpenDiagnostics={() => setOverlay('diagnostics')}
+        modeLocked={modeLocked}
       />
     );
   }, [
@@ -677,6 +727,9 @@ export const App: React.FC = () => {
     failsafe,
     changeFailsafe,
     failsafeTriggered,
+    modeLocked,
+    params.working,
+    params.committed,
   ]);
 
   return (
@@ -715,7 +768,6 @@ export const App: React.FC = () => {
               missionRunning={running}
               onLand={land}
               onClose={() => setOverlay('none')}
-              magneto={telemetry.magneto_calibration ?? null}
             />
           </div>
         </div>

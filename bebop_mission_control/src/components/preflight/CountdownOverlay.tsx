@@ -96,9 +96,9 @@ export const CountdownOverlay: React.FC<CountdownOverlayProps> = ({
   }
 
   // Seconds since the launch, shown until the mission's first tick. The
-  // mission reaches its countdown only after its start-up, Stage 1 entry, the
-  // flat trim and the ground reference -- seconds in which a static numeral
-  // read as a frozen countdown. This clock never drives the countdown itself.
+  // mission ticks only from its Stage 1 entry, after its start-up -- seconds
+  // in which a static numeral read as a frozen countdown. This clock never
+  // drives the countdown itself.
   const [preparingSec, setPreparingSec] = useState(0);
   useEffect(() => {
     if (phase === 'counting') return;

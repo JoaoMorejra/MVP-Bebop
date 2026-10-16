@@ -9,15 +9,19 @@ import {
   allMissionPhrases,
   phraseForMilestone,
   takeLaunchPhrase,
+  isMilestoneAllowed,
   type MissionParametersPayload,
 } from '../lib/copilotPhrases';
-import { BATTERY_CALLS } from '../lib/batteryReturn';
+import { batteryCalls } from '../lib/batteryReturn';
+import { parseMissionMode, type MissionMode } from '../lib/missionMode';
 
 /** Alert sentences the station itself composes; the rest come from the mission. */
 const FIXED_ALERT_SENTENCES: readonly string[] = [
   'Missão abortada. Pouso imediato comandado.',
   'Missão abortada.',
-  ...Object.values(BATTERY_CALLS),
+  ...Object.values(batteryCalls('advanced')),
+  ...Object.values(batteryCalls('intermediate')),
+  ...Object.values(batteryCalls('simple')),
   'Falha na decolagem: decolagem não confirmada pela aeronave.',
   'Falha na decolagem.',
   'Falha de segurança.',
@@ -31,6 +35,7 @@ const MILESTONE_STAGE: Record<string, number> = {
   'mission.scan_start': 2,
   'mission.target_found': 2,
   'mission.approach': 3,
+  'mission.approaching': 3,
   'mission.capture_done': 4,
   'mission.rtl_start': 5,
   'mission.landing': 5,
@@ -220,6 +225,9 @@ export function useNarrationQueue(copilot: Copilot): NarrationQueue {
  * for the rest of the flight. Nothing is defaulted from the station's own
  * copy of the parameters. Milestones are ignored while `enabled` is false.
  *
+ * The profile comes from the `mission.mode` milestone, never from the interface:
+ * it is what the mission resolved. Without one the full repertoire is spoken.
+ *
  * Alerts are not. Under the station the mission has no voice of its own
  * (`announcer.station_narrates`), so a failure, abort or failsafe it reports is
  * heard only if this says it: every alert preempts the narration, bench or not.
@@ -234,6 +242,7 @@ export function useFlightNarration(
   enabledRef.current = enabled;
   const parameters = useRef<MissionParametersPayload>({});
   const spoken = useRef(new Set<string>());
+  const missionMode = useRef<MissionMode | null>(null);
 
   useEffect(() => {
     if (!bridge) return;
@@ -244,13 +253,17 @@ export function useFlightNarration(
         queue.preempt(event.key, () => alertSentence(payload), pri);
         return;
       }
+      if (event.key === 'mission.mode') {
+        missionMode.current = parseMissionMode((event.payload ?? {}).mode);
+        return;
+      }
       if (event.key === 'mission.parameters') {
         parameters.current = event.payload ?? {};
         // Everything this mission can say is known now (D1, D2): have it
         // synthesized to disk while the aircraft is still on the ground.
         void bridge
           .cacheSpeech?.([
-            ...allMissionPhrases(parameters.current),
+            ...allMissionPhrases(parameters.current, missionMode.current ?? 'advanced'),
             ...allFindingSentences(),
             ...FIXED_ALERT_SENTENCES,
           ])
@@ -263,15 +276,18 @@ export function useFlightNarration(
         queue.reset();
         spoken.current.clear();
         parameters.current = {};
+        missionMode.current = null;
       }
       if (key === 'mission.scan_start' && !spoken.current.has('mission.takeoff')) return;
+      const mode = missionMode.current ?? 'advanced';
+      if (!isMilestoneAllowed(key, mode)) return;
       if (spoken.current.has(key)) return;
       spoken.current.add(key);
       const payload = event.payload ?? {};
       // A launch line drawn ahead (`reserveLaunchPhrase`) is spoken as drawn,
       // so the audio synthesized for it at the click is the audio played.
       const launchLine = takeLaunchPhrase(key);
-      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, parameters.current), {
+      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, parameters.current, {}, mode), {
         stage: MILESTONE_STAGE[key],
       });
     });

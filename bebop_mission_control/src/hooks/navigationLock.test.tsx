@@ -236,6 +236,16 @@ describe('pre-flight lock on the bench', () => {
     await act(async () => probe.runtime.reset());
     expect(homeAvailable()).toBe(true);
   });
+
+  it('frees the tab when the host refuses a bench routine', async () => {
+    await mount();
+    await act(async () => probe.runtime.beginBenchStage());
+    expect(homeAvailable()).toBe(false);
+    await act(async () => probe.runtime.refuseBenchStage());
+    expect(probe.runtime.state).toBe('faulted');
+    expect(probe.runtime.ran).toBe(false);
+    expect(homeAvailable()).toBe(true);
+  });
 });
 
 describe('preflightLocked', () => {

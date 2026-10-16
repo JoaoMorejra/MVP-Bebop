@@ -1,16 +1,25 @@
-import React from 'react';
-import { Camera, Plane, RotateCcw, Save, Star, Timer, Undo2 } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Camera, Plane, RotateCcw, Save, Settings2, Star, Timer, Undo2 } from 'lucide-react';
 import {
   PARAMETER_GROUPS,
+  groupsForMode,
   type ParameterGroup,
   type ParameterGroupId,
   type ParameterSpec,
 } from '../../lib/parameterSchema';
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { getPath } from '../../lib/paths';
+import { MISSION_MODES, readMissionMode } from '../../lib/missionMode';
 import { Button } from '../ui/Button';
 import { ExactValueField, HybridSlider } from '../ui/HybridSlider';
 import { cn } from '../../lib/format';
+import { AdvancedSettingsDialog } from './AdvancedSettingsDialog';
+import { ParameterConflictDialog } from './ParameterConflictDialog';
+import {
+  activeConflicts,
+  type ConflictSeverity,
+  type ParameterConflict,
+} from '../../lib/parameterConflicts';
 
 interface ParameterSheetProps {
   working: ParamsDoc;
@@ -22,11 +31,30 @@ interface ParameterSheetProps {
   hasPreset: boolean;
   /** The working values are the operator's preset: the star is filled. */
   presetActive: boolean;
+  /** The mission parameters refused a save for an error conflict (`useMissionParameters`). */
+  saveAttempted?: boolean;
   onEdit: (path: string, value: unknown) => void;
   onSave: () => void;
   onDiscard: () => void;
   onSavePreset: () => void;
   onApplyPreset: () => void;
+}
+
+/** The conflict a field is marked with: its most severe one, by title. */
+export type FieldConflict = { severity: ConflictSeverity; title: string };
+
+/** Each involved path's most severe conflict; an error outranks a warning. */
+function conflictsByPath(conflicts: ParameterConflict[]): Partial<Record<string, FieldConflict>> {
+  const byPath: Partial<Record<string, FieldConflict>> = {};
+  for (const conflict of conflicts) {
+    for (const path of conflict.paths) {
+      const current = byPath[path];
+      if (!current || (current.severity === 'warning' && conflict.severity === 'error')) {
+        byPath[path] = { severity: conflict.severity, title: conflict.title };
+      }
+    }
+  }
+  return byPath;
 }
 
 const GROUP_ICON: Record<ParameterGroupId, React.ElementType> = {
@@ -54,8 +82,10 @@ const ParameterControl: React.FC<{
   value: number | null;
   defaultValue: number | null;
   changed: boolean;
+  /** Shown only once a save was attempted; follows the edits live. */
+  conflict?: FieldConflict;
   onEdit: (path: string, value: unknown) => void;
-}> = ({ spec, value, defaultValue, changed, onEdit }) => {
+}> = ({ spec, value, defaultValue, changed, conflict, onEdit }) => {
   const atDefault =
     value !== null && defaultValue !== null && Math.abs(value - defaultValue) < 10 ** -(spec.precision + 1);
   const edit = (next: number) => onEdit(spec.path, next);
@@ -76,9 +106,17 @@ const ParameterControl: React.FC<{
 
   return (
     <div
+      data-parameter={spec.path}
+      data-conflict={conflict?.severity}
       className={cn(
         'rounded-bezel border px-3.5 py-2.5 transition-colors duration-200',
-        changed ? 'border-mint/45 bg-mint/[0.06]' : 'border-strut-soft bg-abyss/40'
+        conflict?.severity === 'error'
+          ? 'border-ember/60 bg-ember/[0.06]'
+          : conflict?.severity === 'warning'
+            ? 'border-amber/55 bg-amber/[0.06]'
+            : changed
+              ? 'border-mint/45 bg-mint/[0.06]'
+              : 'border-strut-soft bg-abyss/40'
       )}
     >
       <div className="flex items-start justify-between gap-3">
@@ -131,6 +169,16 @@ const ParameterControl: React.FC<{
           {spec.unit}
         </span>
       </div>
+      {conflict ? (
+        <p
+          className={cn(
+            'mt-1.5 font-sans text-2xs leading-relaxed',
+            conflict.severity === 'error' ? 'text-ember' : 'text-amber'
+          )}
+        >
+          {conflict.title}
+        </p>
+      ) : null}
     </div>
   );
 };
@@ -182,11 +230,19 @@ const GroupCard: React.FC<{
   working: ParamsDoc;
   defaults: ParamsDoc | null;
   changedPaths: Set<string>;
+  /** Conflicts to mark, empty until a save was attempted. */
+  marked: ParameterConflict[];
   onEdit: (path: string, value: unknown) => void;
   index: number;
-}> = ({ group, working, defaults, changedPaths, onEdit, index }) => {
+}> = ({ group, working, defaults, changedPaths, marked, onEdit, index }) => {
   const Icon = GROUP_ICON[group.id];
   const changed = group.items.filter((item) => changedPaths.has(item.path)).length;
+  const groupPaths = new Set(group.items.map((item) => item.path));
+  const conflictCount = marked.filter((conflict) => conflict.paths.some((path) => groupPaths.has(path))).length;
+  const groupErrors = marked.some(
+    (conflict) => conflict.severity === 'error' && conflict.paths.some((path) => groupPaths.has(path))
+  );
+  const byPath = conflictsByPath(marked);
 
   return (
     <section
@@ -213,6 +269,18 @@ const GroupCard: React.FC<{
           </div>
           <p className="line-clamp-2 font-sans text-2xs text-haze">{group.summary}</p>
         </div>
+        {conflictCount > 0 ? (
+          <span
+            data-group-conflicts={group.id}
+            title="Conflitos entre parâmetros"
+            className={cn(
+              'tnum rounded-full px-2 py-0.5 font-mono text-3xs',
+              groupErrors ? 'bg-ember/15 text-ember' : 'bg-amber/15 text-amber'
+            )}
+          >
+            {conflictCount}
+          </span>
+        ) : null}
         {changed > 0 ? (
           <span className="tnum rounded-full bg-mint/15 px-2 py-0.5 font-mono text-3xs text-mint">
             {changed}
@@ -241,6 +309,7 @@ const GroupCard: React.FC<{
             value={readNumber(working, spec)}
             defaultValue={readNumber(defaults, spec)}
             changed={changedPaths.has(spec.path)}
+            conflict={byPath[spec.path]}
             onEdit={onEdit}
           />
         ))}
@@ -265,12 +334,39 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
   saving,
   hasPreset,
   presetActive,
+  saveAttempted = false,
   onEdit,
   onSave,
   onDiscard,
   onSavePreset,
   onApplyPreset,
 }) => {
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [conflictMode, setConflictMode] = useState<'blocked' | 'confirm' | null>(null);
+  const [attempted, setAttempted] = useState(false);
+  const conflicts = useMemo(() => activeConflicts(working), [working]);
+  const missionMode = readMissionMode(working);
+  const groups = useMemo(() => groupsForMode(missionMode, working), [missionMode, working]);
+  useEffect(() => {
+    if (missionMode === 'intermediate') setAdvancedOpen(false);
+  }, [missionMode]);
+  const modeLabel = MISSION_MODES.find((mode) => mode.id === missionMode)?.label ?? missionMode;
+  // Marks appear after the first attempt to save and follow the edits live;
+  // a save that went through, or a discard, leaves nothing pending to mark.
+  useEffect(() => {
+    if (!dirty) setAttempted(false);
+  }, [dirty]);
+  const marked = attempted || saveAttempted ? conflicts : [];
+
+  const requestSave = () => {
+    if (conflicts.length === 0) {
+      onSave();
+      return;
+    }
+    setAttempted(true);
+    setConflictMode(conflicts.some((conflict) => conflict.severity === 'error') ? 'blocked' : 'confirm');
+  };
+
   const restoreDefaults = () => {
     if (!defaults) return;
     for (const group of PARAMETER_GROUPS) {
@@ -287,11 +383,12 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
         <div>
           <h2 className="font-cond text-lg font-semibold tracking-wide text-frost">Parâmetros de voo</h2>
           <p className="text-2xs text-haze">Os ajustes que definem o comportamento da missão.</p>
+          <p className="text-2xs text-haze">Modo: {modeLabel}</p>
         </div>
       </div>
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto p-4 lg:grid-cols-3">
-        {PARAMETER_GROUPS.map((group, index) => (
+        {groups.map((group, index) => (
           <GroupCard
             key={group.id}
             group={group}
@@ -299,6 +396,7 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
             working={working}
             defaults={defaults}
             changedPaths={changedPaths}
+            marked={marked}
             onEdit={onEdit}
           />
         ))}
@@ -338,6 +436,11 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
         >
           Salvar como meu ajuste
         </Button>
+        {missionMode !== 'intermediate' ? (
+          <Button variant="ghost" onClick={() => setAdvancedOpen(true)} icon={<Settings2 size={13} />}>
+            Configurações Avançadas
+          </Button>
+        ) : null}
 
         <div className="ml-auto flex items-center gap-2">
           {dirty ? (
@@ -354,7 +457,7 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
           )}
           <Button
             variant={dirty ? 'primary' : 'quiet'}
-            onClick={onSave}
+            onClick={requestSave}
             disabled={!dirty || saving}
             icon={<Save size={13} />}
           >
@@ -362,6 +465,30 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
           </Button>
         </div>
       </div>
+
+      {advancedOpen && missionMode !== 'intermediate' ? (
+        <AdvancedSettingsDialog
+          working={working}
+          defaults={defaults}
+          changedPaths={changedPaths}
+          conflicts={conflictsByPath(marked)}
+          onEdit={onEdit}
+          onClose={() => setAdvancedOpen(false)}
+        />
+      ) : null}
+
+      {conflictMode !== null ? (
+        <ParameterConflictDialog
+          mode={conflictMode}
+          conflicts={conflicts}
+          working={working}
+          onBack={() => setConflictMode(null)}
+          onConfirm={() => {
+            setConflictMode(null);
+            onSave();
+          }}
+        />
+      ) : null}
     </div>
   );
 };

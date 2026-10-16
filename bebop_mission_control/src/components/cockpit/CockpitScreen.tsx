@@ -3,10 +3,12 @@ import type { MissionState, TelemetryView, TrackPoint } from '../../types/missio
 import type { LandProgressPhase, RawEvidence, VoiceLevel } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
 import { StageBar } from './StageBar';
+import type { MissionMode } from '../../lib/missionMode';
 import { OpticalFeed } from './OpticalFeed';
 import { TacticalMap } from './TacticalMap';
 import { ForensicPanel } from './ForensicPanel';
 import { abortEnabled } from '../../lib/flightState';
+import { isAbortShortcut } from '../../lib/abortShortcut';
 import { AbortControl } from './AbortControl';
 import { cn } from '../../lib/format';
 import { isMissionOver } from '../../lib/missionOutcome';
@@ -32,6 +34,7 @@ interface CockpitScreenProps {
   missionState: MissionState;
   stage: number;
   stageName: string;
+  missionMode?: MissionMode;
   streamFps: number;
   streamBridgeUp: boolean;
   streamLive: boolean;
@@ -94,6 +97,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   missionState,
   stage,
   stageName,
+  missionMode,
   streamFps,
   streamBridgeUp,
   streamLive,
@@ -127,11 +131,13 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   const running = missionState === 'running' || missionState === 'arming';
   const over = isMissionOver(missionState);
 
-  // R11: Global Escape shortcut fires onAbort when abortEnabled,
-  // ignored inside interactive text fields or diagnostics terminal.
+  // R11: Escape and Ctrl/Cmd+C fire onAbort exactly as the button does, while
+  // the abort is available. Ignored inside text fields and the diagnostics
+  // terminal, where Ctrl+C is copy / interrupt. When the abort is not
+  // available the event is left alone, so copy still works on the ground.
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
+      if (isAbortShortcut(event) === null) return;
       if (isTextInputOrTerminal(event.target)) return;
       if (abortEnabled(missionState, telemetry.flying_state, landProgress)) {
         event.preventDefault();
@@ -156,6 +162,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
       <StageBar
         stage={stage}
         stageName={stageName}
+        missionMode={missionMode}
         state={missionState}
         benchMode={benchMode}
         benchStage={benchStage}
@@ -200,16 +207,9 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
 
           <TacticalMap
             track={track}
-            latitude={telemetry.latitude}
-            longitude={telemetry.longitude}
             heading={telemetry.heading}
-            gpsFix={Boolean(telemetry.gps_fix)}
-            baseLatitude={telemetry.base_known ? telemetry.base_latitude : null}
-            baseLongitude={telemetry.base_known ? telemetry.base_longitude : null}
-            baseSource={telemetry.base_source}
             arrivalRadius={arrivalRadius}
             stale={stale}
-            overview={missionState === 'idle'}
             flyingState={telemetry.flying_state ?? null}
           />
         </div>

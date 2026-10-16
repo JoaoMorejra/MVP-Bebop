@@ -137,6 +137,12 @@ describe('DiagnosticsScreen shell tabs', () => {
     expect(button('Fechar aba 1')).toBeNull();
   });
 
+  it('gives the whole width to the terminal: no side panel, no calibration control', async () => {
+    await render();
+    expect(container.querySelector('aside')).toBeNull();
+    expect(container.textContent ?? '').not.toMatch(/calibra/i);
+  });
+
   it('draws only the terminal: no log pane, no log source selector', async () => {
     await render();
     expect(container.textContent).not.toContain('logs:');

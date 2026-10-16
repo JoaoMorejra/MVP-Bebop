@@ -2,46 +2,27 @@ import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 
 import { Building2, Crosshair, LocateFixed, MapPin, Minus, Plus } from 'lucide-react';
 import type { TrackPoint } from '../../types/mission';
 import { useReverseGeocode } from '../../hooks/useReverseGeocode';
-import { useOperatorLocation } from '../../hooks/useOperatorLocation';
-import { fromEnu, isValidCoordinate, niceGridStep } from '../../lib/geo';
+import { fromEnu, niceGridStep } from '../../lib/geo';
 import {
   MAX_DISPLAY_ZOOM,
   MIN_DISPLAY_ZOOM,
   ZOOM_STEP,
-  accuracyIsCoarse,
   clampDisplayZoom,
-  displayZoom,
-  formatAccuracy,
+  fixedView,
   pinchZoom,
-  pixelsPerMetre,
-  tileZoom,
   wheelZoom,
-  zoomForPixelsPerMetre,
 } from '../../lib/mapView';
+import { MAP_ANCHOR } from '../../lib/siteAnchor';
 import { cn } from '../../lib/format';
 import { rotorsTurning } from '../../lib/flightState';
 
 interface TacticalMapProps {
   track: TrackPoint[];
-  /** The aircraft's own fix when `gpsFix`; otherwise the bridge's projection. */
-  latitude: number;
-  longitude: number;
   /** Degrees, compass convention: 0 is north, positive clockwise. */
   heading: number;
-  gpsFix: boolean;
-  /** The real reference the telemetry bridge placed the flight against, if any. */
-  baseLatitude?: number | null;
-  baseLongitude?: number | null;
-  baseSource?: string;
   /** Metres; `null` when the parameter document does not hold it, and no circle is drawn. */
   arrivalRadius: number | null;
   stale: boolean;
-  /**
-   * No mission yet: frame the surroundings rather than the trail. The trail is
-   * not empty before a launch (odometry accumulates until the launch resets
-   * it), so this is keyed to the mission, not to the track.
-   */
-  overview?: boolean;
   /** ARSDK flying state, null when unknown or stale; drives the rotor animation. */
   flyingState?: number | null;
 }
@@ -120,64 +101,24 @@ const TILE_SOURCES: readonly TileSource[] = (() => {
 /** Failures within one source before the next is tried. */
 const SOURCE_FAILURE_BUDGET = 6;
 /**
- * Least extent the automatic fit frames, in metres: wide enough to read the
- * site on the imagery. It holds through the mission too. A floor that fell
- * to a few tens of metres at launch zoomed the map in abruptly the instant a
- * mission started; the fit now only widens as the flight spreads, and a
- * closer look is the manual zoom's job.
- */
-const OVERVIEW_EXTENT_M = 300;
-
-/** The automatic extent that frames `track` around the aircraft, never below `floor`. */
-export function fitExtent(
-  track: readonly { x: number; y: number }[],
-  droneEast: number,
-  droneNorth: number,
-  floor: number
-): number {
-  let extent = floor;
-  for (const p of track) {
-    extent = Math.max(
-      extent,
-      Math.abs(p.x - droneEast) * 2.4,
-      Math.abs(p.y - droneNorth) * 2.4,
-      Math.abs(p.x) * 2.4,
-      Math.abs(p.y) * 2.4
-    );
-  }
-  return extent;
-}
-/**
  * Drawn size of the aircraft marker relative to its geometry. The marker is
  * what the operator's eye goes to first, across the room from the station.
  */
 const MARKER_SCALE = 1.45;
-
-/** Web Mercator, in fractional tiles. */
-function project(lat: number, lng: number, zoom: number) {
-  const n = 2 ** zoom;
-  const x = ((lng + 180) / 360) * n;
-  const latRad = (lat * Math.PI) / 180;
-  const y = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
-  return { x, y };
-}
 
 /** Without a single tile loaded in this long, the basemap is treated as offline. */
 const TILE_LOAD_TIMEOUT_MS = 8000;
 /** How often an offline map probes for the tiles coming back. */
 const TILE_PROBE_INTERVAL_MS = 45000;
 
-type GeoSource = 'gps' | 'site' | 'device' | 'host' | 'cache' | 'bridge' | 'none';
+type GeoSource = 'site';
 
 const GEO_LABEL: Record<GeoSource, string> = {
-  gps: 'GPS da aeronave',
   site: 'odometria + base fixa do local',
-  device: 'odometria + posição do operador',
-  host: 'odometria + posição aproximada pela rede',
-  cache: 'odometria + base em cache',
-  bridge: 'odometria + base real',
-  none: 'odometria (sem referência geográfica)',
 };
+
+/** The base the map is drawn around; never moves. */
+const ANCHOR = { lat: MAP_ANCHOR.latitude, lng: MAP_ANCHOR.longitude, source: 'site' as GeoSource };
 
 /**
  * Where the aircraft is, over the ground it is actually flying.
@@ -188,11 +129,11 @@ const GEO_LABEL: Record<GeoSource, string> = {
  * trail, arrival radius and the aircraft with its heading, drawn from odometry
  * alone.
  *
- * The geographic position comes from the best source available, in order: the
- * aircraft's own GPS fix; otherwise the launch point placed on the operator's
- * real position (a live fix, or the one cached while the station still had
- * internet) with the odometry offset added to it. There is no hard-coded city
- * any more: with none of those, the map says so and draws the local grid.
+ * The launch point is the fixed site anchor (`MAP_ANCHOR`), and the view is
+ * centred on it at a fixed scale: the basemap and the base never move, and the
+ * aircraft crosses them by its odometry offset. Neither the aircraft's GPS,
+ * the operator's position nor the bridge's base re-anchor it, so nothing a
+ * fix or a cache does in flight makes the map jump.
  *
  * The aircraft's Wi-Fi has no route to the internet, so the tiles are expected
  * to fail in the field. The panel does not wait on them: the tactical grid is
@@ -202,16 +143,9 @@ const GEO_LABEL: Record<GeoSource, string> = {
  */
 export const TacticalMap: React.FC<TacticalMapProps> = ({
   track,
-  latitude,
-  longitude,
   heading,
-  gpsFix,
-  baseLatitude,
-  baseLongitude,
-  baseSource,
   arrivalRadius,
   stale,
-  overview = false,
   flyingState = null,
 }) => {
   const uid = useId().replace(/:/g, '');
@@ -222,9 +156,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const failures = React.useRef(0);
   const hostRef = React.useRef<HTMLDivElement | null>(null);
   /**
-   * The operator's zoom, in display-zoom levels; null while the view fits the
-   * flight on its own. Set by the buttons, the wheel and a pinch, and cleared
-   * by the recentre control, which hands the view back to the trajectory fit.
+   * The operator's zoom, in display-zoom levels; null for the default framing.
+   * Set by the buttons, the wheel and a pinch, and cleared by the recentre
+   * control, which restores the default scale.
    */
   const [manualZoom, setManualZoom] = useState<number | null>(null);
 
@@ -277,100 +211,33 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const droneEast = last?.x ?? 0;
   const droneNorth = last?.y ?? 0;
 
-  /**
-   * Which geographic position the flight is placed at.
-   *
-   * The GPS fix, when the aircraft has one, is the truth and nothing else is
-   * consulted. Otherwise the launch point is placed on the operator's position
-   * and the odometry offset carries the aircraft away from it — which keeps
-   * the marker over the right street and the trail registered to it.
-   */
-  const operator = useOperatorLocation(!gpsFix);
-  const geo = useMemo((): { lat: number; lng: number; source: GeoSource } => {
-    if (gpsFix && isValidCoordinate(latitude, longitude)) {
-      return { lat: latitude, lng: longitude, source: 'gps' };
-    }
-    const op = operator.location;
-    if (op && isValidCoordinate(op.latitude, op.longitude)) {
-      const at = fromEnu(droneEast, droneNorth, op.latitude, op.longitude);
-      return { ...at, source: op.source };
-    }
-    if (isValidCoordinate(baseLatitude, baseLongitude)) {
-      const at = fromEnu(droneEast, droneNorth, baseLatitude as number, baseLongitude as number);
-      return { ...at, source: baseSource === 'operator-cache' ? 'cache' : 'bridge' };
-    }
-    return { lat: 0, lng: 0, source: 'none' };
-  }, [gpsFix, latitude, longitude, operator.location, baseLatitude, baseLongitude, baseSource, droneEast, droneNorth]);
-
-  const geoKnown = geo.source !== 'none';
-  /**
-   * How far the base itself may be from where it is drawn. A network-derived
-   * position is a city centroid, kilometres from the launch point, and the
-   * flight is then registered to the wrong streets however exact the odometry
-   * on top of it is; saying so is the only honest fix available without a fix.
-   */
-  const operatorBased = geo.source === 'device' || geo.source === 'host' || geo.source === 'cache';
-  const baseAccuracy = operatorBased && operator.location ? operator.location.accuracyM : null;
-  const baseCoarse = baseAccuracy !== null && accuracyIsCoarse(baseAccuracy);
-  // With nothing to centre on, there is no tile worth requesting.
-  const basemapUsable = geoKnown && tilesOk !== false;
+  const geo = ANCHOR;
+  /** Where the aircraft is on the ground: the anchor plus the odometry offset. */
+  const aircraft = useMemo(() => fromEnu(droneEast, droneNorth, ANCHOR.lat, ANCHOR.lng), [droneEast, droneNorth]);
+  const basemapUsable = tilesOk !== false;
 
   // A load that never answers — DNS hanging on a network with no route — is
   // an offline map, not one that is about to appear.
   useEffect(() => {
-    if (!geoKnown || tilesOk !== null) return;
+    if (tilesOk !== null) return;
     const id = window.setTimeout(() => {
       setTilesOk((previous) => (previous === null ? false : previous));
     }, TILE_LOAD_TIMEOUT_MS);
     return () => window.clearTimeout(id);
-  }, [geoKnown, tilesOk, sourceIndex]);
+  }, [tilesOk, sourceIndex]);
 
-  const place = useReverseGeocode(geo.lat, geo.lng, geoKnown && tilesOk === true);
+  const place = useReverseGeocode(aircraft.lat, aircraft.lng, tilesOk === true);
 
   /**
-   * Both layers are centred on the aircraft, so the basemap scrolls under a
-   * fixed marker the way a navigation map does.
-   *
-   * The scale fits the flight: the launch point and the whole trail stay in
-   * view with a margin. With tiles, that fit picks a display zoom, and the
-   * tiles are requested at the deepest zoom their source serves and scaled to
-   * it, so the overlay and the streets share one metres-per-pixel. Without
-   * tiles the overlay fits the flight directly.
+   * Both layers are centred on the base at a fixed scale: the tiles are laid
+   * out around the anchor and the overlay is drawn in metres from it, so the
+   * streets and the trail share one metres-per-pixel and neither scrolls.
+   * Without tiles the local grid is registered to the same base.
    */
-  // The extent on screen at the last moment of rest, carried into the
-  // mission as its floor: the launch resets the trail, and a view that had
-  // opened wider over the resting trail must not close at the click.
-  const restExtent = useRef(OVERVIEW_EXTENT_M);
-  const view = useMemo(() => {
-    const extent = fitExtent(track, droneEast, droneNorth, overview ? OVERVIEW_EXTENT_M : restExtent.current);
-    if (overview) restExtent.current = extent;
-
-    let pxPerMetre: number;
-    let tile = { z: 0, scale: 1 };
-    let centre = { x: 0, y: 0 };
-    let zoom: number;
-    if (basemapUsable) {
-      zoom = manualZoom ?? displayZoom(extent, size, geo.lat);
-      tile = tileZoom(zoom, source.maxZoom);
-      centre = project(geo.lat, geo.lng, tile.z);
-      pxPerMetre = pixelsPerMetre(zoom, geo.lat);
-    } else if (manualZoom !== null) {
-      zoom = manualZoom;
-      pxPerMetre = pixelsPerMetre(zoom, geo.lat);
-    } else {
-      pxPerMetre = Math.min(size.width, size.height) / extent;
-      zoom = zoomForPixelsPerMetre(pxPerMetre, geo.lat);
-    }
-
-    const cx = size.width / 2;
-    const cy = size.height / 2;
-
-    // Screen position of a point given in metres east/north of launch.
-    const sx = (east: number) => cx + (east - droneEast) * pxPerMetre;
-    const sy = (north: number) => cy - (north - droneNorth) * pxPerMetre;
-
-    return { centre, tile, tileSize: TILE_SIZE * tile.scale, pxPerMetre, cx, cy, sx, sy, zoom };
-  }, [geo.lat, geo.lng, basemapUsable, size, track, droneEast, droneNorth, source.maxZoom, overview, manualZoom]);
+  const view = useMemo(
+    () => fixedView(size, ANCHOR, manualZoom, source.maxZoom),
+    [size, manualZoom, source.maxZoom]
+  );
 
   // The zoom on screen, read by input handlers that outlive a render.
   const zoomRef = useRef(view.zoom);
@@ -393,7 +260,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     return () => host.removeEventListener('wheel', onWheel);
   }, []);
 
-  // Two pointers down pinch-zoom around the aircraft, which stays centred.
+  // Two pointers down pinch-zoom around the base, which stays centred.
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const pinch = useRef<{ distance: number; zoom: number } | null>(null);
   const spread = () => {
@@ -419,7 +286,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   // Offline, probe one tile now and then; the first that loads brings the
   // basemap back without a flicker through a half-loaded grid.
   useEffect(() => {
-    if (tilesOk !== false || !geoKnown) return;
+    if (tilesOk !== false) return;
     const id = window.setInterval(() => {
       const probe = new Image();
       const tx = Math.floor(view.centre.x);
@@ -435,9 +302,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       probe.src = `${url}${url.includes('?') ? '&' : '?'}probe=${Date.now()}`;
     }, TILE_PROBE_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [tilesOk, geoKnown, view.centre.x, view.centre.y, view.tile.z]);
+  }, [tilesOk, view.centre.x, view.centre.y, view.tile.z]);
 
-  // Tile grid covering the viewport, centred on the aircraft.
+  // Tile grid covering the viewport, centred on the base.
   const tiles = useMemo(() => {
     if (!basemapUsable) return [];
     const { centre, tile, tileSize } = view;
@@ -481,24 +348,17 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const homeX = view.sx(0);
   const homeY = view.sy(0);
   const distance = Math.hypot(droneEast, droneNorth);
-  const basemapState =
-    tilesOk === true && geoKnown ? 'mapa online' : tilesOk === null && geoKnown ? 'carregando mapa' : 'grade offline';
-  const mapStatus = [
-    `${GEO_LABEL[geo.source]}${geo.source === 'site' && operator.location?.city ? ` (${operator.location.city})` : ''}${baseAccuracy !== null ? ` ${formatAccuracy(baseAccuracy)}` : ''}`,
-    baseCoarse ? 'base aproximada: a posição sobre as ruas não é confiável' : null,
-    !geoKnown && operator.status === 'locating' ? 'localizando a estação' : null,
-    basemapState,
-    `${distance.toFixed(1)} m da base`,
-  ]
-    .filter(Boolean)
-    .join(' · ');
+  const basemapState = tilesOk === true ? 'mapa online' : tilesOk === null ? 'carregando mapa' : 'grade offline';
+  const mapStatus = [`${GEO_LABEL[geo.source]} (${MAP_ANCHOR.name})`, basemapState, `${distance.toFixed(1)} m da base`].join(
+    ' · '
+  );
 
   // A round number of metres near a fifth of the panel.
   const scaleMetres = niceGridStep((size.width / Math.max(view.pxPerMetre, 0.0001)) * 0.9);
   const scaleBarPx = scaleMetres * view.pxPerMetre;
   const scaleLabel = scaleMetres >= 1 ? `${scaleMetres} m` : `${Math.round(scaleMetres * 100)} cm`;
   const compass = ((heading % 360) + 360) % 360;
-  const showGrid = tilesOk !== true || !geoKnown;
+  const showGrid = tilesOk !== true;
 
   return (
     <div className="flex min-h-0 flex-col overflow-hidden rounded-panel border border-strut-soft bg-hull-deep">
@@ -509,32 +369,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         className="flex h-9 shrink-0 items-center gap-2 border-b border-strut-soft px-3"
         title={mapStatus}
       >
-        <Crosshair
-          size={12}
-          strokeWidth={2}
-          aria-hidden
-          className={
-            baseCoarse
-              ? 'text-amber'
-              : geo.source === 'gps'
-              ? 'text-mint'
-              : geoKnown
-              ? 'text-frost'
-              : 'text-haze-deep'
-          }
-        />
+        <Crosshair size={12} strokeWidth={2} aria-hidden className="text-frost" />
         <span className="font-cond text-2xs font-semibold tracking-wide text-frost">MAPA TÁTICO</span>
-        {/* The one status that stays on screen: a network-derived base can
-            put the flight kilometres from where it is, and the operator has to
-            be able to see that without hovering for it. */}
-        {baseCoarse ? (
-          <span
-            data-coarse-base
-            className="ml-auto flex items-center gap-1 rounded-full border border-amber/45 bg-amber/10 px-2 py-0.5 font-cond text-3xs tracking-wide text-amber"
-          >
-            posição aproximada {baseAccuracy !== null ? formatAccuracy(baseAccuracy) : ''}
-          </span>
-        ) : null}
         <span className="sr-only">{mapStatus}</span>
       </div>
 
@@ -667,23 +503,17 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             BASE · DECOLAGEM (0, 0)
           </text>
 
-          {/* The aircraft, fixed at the centre with the ground moving under it. */}
-          <g transform={`translate(${view.cx}, ${view.cy})`} opacity={stale ? 0.45 : 1}>
+          {/* The aircraft, at its odometry offset from the fixed base. */}
+          <g
+            data-aircraft
+            transform={`translate(${view.sx(droneEast)}, ${view.sy(droneNorth)})`}
+            opacity={stale ? 0.45 : 1}
+          >
             <circle r="44" fill={`url(#${uid}-halo)`} />
             <g transform={`scale(${MARKER_SCALE})`}>
               <Quadcopter heading={compass} spinning={rotorsTurning(flyingState)} />
             </g>
           </g>
-          <text
-            x={view.cx}
-            y={view.cy - 50}
-            textAnchor="middle"
-            className="fill-mint font-mono"
-            fontSize="12"
-            style={{ paintOrder: 'stroke', stroke: '#001A2F', strokeWidth: 3.5 }}
-          >
-            {`E ${droneEast.toFixed(1)} · N ${droneNorth.toFixed(1)} m`}
-          </text>
 
           {/* Tactical compass: north fixed, heading needle live. */}
           <g transform={`translate(${size.width - 46}, 46) scale(1.35)`}>
@@ -729,9 +559,9 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             type="button"
             onClick={() => setManualZoom(null)}
             disabled={manualZoom === null}
-            aria-label="Voltar ao enquadramento automático"
+            aria-label="Voltar ao enquadramento padrão"
             aria-pressed={manualZoom === null}
-            title={manualZoom === null ? 'Enquadramento automático ativo' : 'Voltar ao enquadramento automático'}
+            title={manualZoom === null ? 'Enquadramento padrão ativo' : 'Voltar ao enquadramento padrão'}
             className={cn(
               'grid h-7 w-7 place-items-center border-t border-strut-soft transition-colors hover:bg-hull-raise disabled:cursor-default',
               manualZoom === null ? 'text-mint' : 'text-amber'
@@ -742,7 +572,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         </div>
 
         {/* Attribution is a condition of using the tileset. */}
-        {tilesOk && geoKnown ? (
+        {tilesOk ? (
           <span className="pointer-events-none absolute bottom-1 right-2 font-mono text-[9px] text-frost/35">
             {source.attribution}
           </span>
@@ -752,23 +582,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       {/* The coordinates, and where that is on the ground. */}
       <div className="flex h-9 shrink-0 items-center gap-4 border-t border-strut-soft px-3">
         <span className="flex min-w-0 shrink-0 items-center gap-1.5" title={GEO_LABEL[geo.source]}>
-          <MapPin
-            size={11}
-            strokeWidth={2}
-            className={geo.source === 'gps' ? 'text-mint' : geoKnown ? 'text-frost' : 'text-haze-deep'}
-          />
-          <span className="font-cond text-3xs tracking-wide text-haze-deep">
-            {geo.source === 'gps' ? 'GPS' : 'ODOM'}
-          </span>
-          <span className={cn('tnum font-mono text-2xs', geoKnown ? 'text-frost' : 'text-haze-deep')}>
-            {geoKnown ? `${geo.lat.toFixed(6)}, ${geo.lng.toFixed(6)}` : 'sem referência'}
+          <MapPin size={11} strokeWidth={2} className="text-frost" />
+          <span className="font-cond text-3xs tracking-wide text-haze-deep">BASE FIXA</span>
+          <span className="tnum font-mono text-2xs text-frost">
+            {`${aircraft.lat.toFixed(6)}, ${aircraft.lng.toFixed(6)}`}
           </span>
         </span>
-        <GeoField
-          icon={<Building2 size={11} strokeWidth={2} />}
-          label="Cidade"
-          value={place.city ?? (geoKnown ? operator.location?.city ?? null : null)}
-        />
+        <GeoField icon={<Building2 size={11} strokeWidth={2} />} label="Cidade" value={place.city ?? MAP_ANCHOR.name} />
 
       </div>
     </div>

@@ -4,6 +4,7 @@ import type { MissionState } from '../../types/mission';
 import type { VoiceLevel } from '../../types/bmg';
 import { VoiceControl } from '../shell/StatusBar';
 import { cn } from '../../lib/format';
+import { stageLabel, type MissionMode } from '../../lib/missionMode';
 
 interface StageBarProps {
   stage: number;
@@ -30,6 +31,8 @@ interface StageBarProps {
   voice: VoiceLevel;
   onVolume: (volume: number) => void;
   onToggleMute: () => void;
+  /** Relabels the last stage; the sheet is locked during flight, so it matches the launched mode. */
+  missionMode?: MissionMode;
 }
 
 /**
@@ -93,6 +96,7 @@ export const StageBar: React.FC<StageBarProps> = ({
   voice,
   onVolume,
   onToggleMute,
+  missionMode = 'advanced',
 }) => {
   const aborted = state === 'aborting' || state === 'aborted' || state === 'faulted';
   const running = state === 'running' || state === 'arming';
@@ -132,7 +136,7 @@ export const StageBar: React.FC<StageBarProps> = ({
                   </span>
                   <span className="truncate font-cond text-sm font-semibold tracking-wide text-mint">
                     {stage > 0 ? `${stage} · ` : ''}
-                    {stageName}
+                    {stageLabel(missionMode, stage, stageName)}
                   </span>
                 </>
               ) : null}
@@ -227,7 +231,7 @@ export const StageBar: React.FC<StageBarProps> = ({
                         : 'text-haze'
                     )}
                   >
-                    {stepLabel}
+                    {stageLabel(missionMode, step, stepLabel)}
                   </span>
                 </span>
                 {active ? (

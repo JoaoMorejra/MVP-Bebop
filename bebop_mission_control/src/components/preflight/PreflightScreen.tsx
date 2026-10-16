@@ -6,10 +6,12 @@ import type { LinkProgressEvent, LinkReadiness, WifiNetwork } from '../../types/
 import type { LinkPhase } from '../../hooks/useLink';
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { getPath } from '../../lib/paths';
+import { readMissionMode, type MissionMode } from '../../lib/missionMode';
 import { preflightBlockedReason } from '../../lib/preflightGate';
 import { VideoBackdrop } from '../brand/VideoBackdrop';
 import { StatusBar } from '../shell/StatusBar';
 import { LaunchDial } from './LaunchDial';
+import { MissionModeSelector } from './MissionModeSelector';
 import { ConnectionSheet } from './ConnectionSheet';
 import { ParameterSheet } from './ParameterSheet';
 import { DiscardChangesDialog } from './DiscardChangesDialog';
@@ -42,7 +44,10 @@ interface PreflightScreenProps {
   hasPreset: boolean;
   presetActive: boolean;
   onEdit: (path: string, value: unknown) => void;
+  onModeChange: (mode: MissionMode) => void;
   onSave: () => void;
+  /** A save was refused for a conflict between parameters; the sheet marks the fields. */
+  saveAttempted?: boolean;
   onDiscard: () => void;
   onSavePreset: () => void;
   onApplyPreset: () => void;
@@ -60,6 +65,11 @@ interface PreflightScreenProps {
   launchError: string | null;
   onLaunch: () => void;
   onOpenDiagnostics: () => void;
+  /**
+   * True from the click on the launch dial until the mission ends; the
+   * profile is part of the document already sent.
+   */
+  modeLocked?: boolean;
 }
 
 /**
@@ -106,6 +116,7 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
   };
 
   const benchMode = Boolean(getPath(params, 'no_fly'));
+  const missionMode = readMissionMode(params);
   const missingTopics = readiness?.missing ?? [];
 
 
@@ -124,7 +135,6 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
         batteryPct: telemetry.battery_pct,
         batteryKnown: telemetry.battery_known,
         batteryFailsafeThreshold: props.failsafe?.thresholdPct,
-        magnetoRequired: Boolean(telemetry.magneto_calibration && telemetry.magneto_calibration.required === 1),
         bridgeReady: readiness?.ready,
       }),
     [
@@ -135,7 +145,6 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
       telemetry.flying_state,
       telemetry.battery_pct,
       telemetry.battery_known,
-      telemetry.magneto_calibration?.required,
       flightReady,
       missingTopics,
       stale,
@@ -200,6 +209,13 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
             }
             benchMode={benchMode}
             onLaunch={props.onLaunch}
+            above={
+              <MissionModeSelector
+                value={missionMode}
+                onChange={props.onModeChange}
+                disabled={props.modeLocked}
+              />
+            }
             beneath={
               <div className="flex items-center gap-2">
                 <button
@@ -306,6 +322,7 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
                 presetActive={props.presetActive}
                 onEdit={props.onEdit}
                 onSave={props.onSave}
+                saveAttempted={props.saveAttempted}
                 onDiscard={props.onDiscard}
                 onSavePreset={props.onSavePreset}
                 onApplyPreset={props.onApplyPreset}

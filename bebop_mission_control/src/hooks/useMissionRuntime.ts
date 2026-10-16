@@ -220,6 +220,20 @@ export function useMissionRuntime() {
     setStartedAt(Date.now());
   }, []);
 
+  /**
+   * The host refused the bench routine `beginBenchStage` announced.
+   *
+   * No process exists, so this is the bookkeeping of a refused `launch`: the
+   * routine reads `faulted` with `ran` cleared, which leaves the pre-flight tab
+   * and the mission mode free for the operator to correct what failed.
+   */
+  const refuseBenchStage = useCallback(() => {
+    processUp.current = false;
+    setRan(false);
+    setState('faulted');
+    cues.play('fault');
+  }, []);
+
   const clearLogs = useCallback(() => {
     setMissionLog([]);
     setDriverLog([]);
@@ -241,6 +255,7 @@ export function useMissionRuntime() {
     abort,
     reset,
     beginBenchStage,
+    refuseBenchStage,
     clearLogs,
   };
 }

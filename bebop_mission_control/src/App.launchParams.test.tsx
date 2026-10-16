@@ -21,13 +21,23 @@ const hoisted = vi.hoisted(() => {
       target_altitude_m: 1.6,
       altitude_ceiling_margin_m: 0.6,
       forward_cruise_velocity: 0.2,
+      max_horizontal_speed: 0.3,
       takeoff_stabilize_duration_sec: 2,
       hover_duration_sec: 7,
       countdown_sec: 0,
     },
     gimbal: { search_tilt_deg: -20, nadir_tilt_deg: -69 },
     timeouts: { search_timeout_sec: 30 },
-    rtl: { timeout_sec: 60, max_speed: 0.1, arrival_radius_m: 0.2 },
+    rtl: {
+      timeout_sec: 60,
+      max_speed: 0.1,
+      arrival_radius_m: 0.2,
+      reverse_cruise_velocity: -0.2,
+      target_aruco_id: 8,
+      marker_dict: 'DICT_APRILTAG_36h11',
+      tag_size: 0.2,
+      centering_timeout_sec: 25,
+    },
     vision: { confidence_threshold: 0.5, model_path: 'yolov8n.pt' },
     network: { drone_ip: '192.168.42.1' },
     battery: { land_pct: 99 },
@@ -65,6 +75,7 @@ const hoisted = vi.hoisted(() => {
       abort: async () => undefined,
       reset: () => undefined,
       beginBenchStage: () => undefined,
+      refuseBenchStage: () => undefined,
     },
     params: {
       working: doc as Record<string, any>,
@@ -152,6 +163,8 @@ beforeEach(() => {
   hoisted.stable.params.dirty = false;
   hoisted.stable.params.save = vi.fn(async (): Promise<boolean> => true);
   hoisted.stable.mission.state = 'idle';
+  hoisted.stable.mission.beginBenchStage = () => undefined;
+  hoisted.stable.mission.refuseBenchStage = () => undefined;
   for (const key of Object.keys(hoisted.props)) delete hoisted.props[key];
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -266,6 +279,69 @@ describe('the parameter document as the only source of a launch', () => {
     expect(Object.keys(options).sort()).toEqual(['countdown', 'launchAtMs', 'noFly', 'paramsJson']);
     expect(options.countdown).toBe(0);
     expect(sent(options).kinematics.countdown_sec).toBe(0);
+  });
+
+  it('couples a document stored with an independent return cruise and saves it before launching', async () => {
+    const stored = { ...hoisted.doc, rtl: { ...hoisted.doc.rtl, reverse_cruise_velocity: -0.1 } };
+    hoisted.stable.params.working = stored;
+    hoisted.stable.params.committed = stored;
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.stable.params.save).toHaveBeenCalledTimes(1);
+    expect(sent(hoisted.launch.mock.calls[0][0]).rtl.reverse_cruise_velocity).toBe(-0.2);
+  });
+
+  it('carries the advanced pad marker fields as edited', async () => {
+    const edited = {
+      ...hoisted.doc,
+      rtl: { ...hoisted.doc.rtl, target_aruco_id: 12, marker_dict: 'DICT_4X4_50', tag_size: 0.16, centering_timeout_sec: 40 },
+    };
+    expect(JSON.parse(launchParamsJson(edited, 25)).rtl).toMatchObject({
+      target_aruco_id: 12,
+      marker_dict: 'DICT_4X4_50',
+      tag_size: 0.16,
+    });
+    hoisted.stable.params.working = edited;
+    hoisted.stable.params.committed = edited;
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(sent(hoisted.launch.mock.calls[0][0]).rtl).toMatchObject({
+      target_aruco_id: 12,
+      marker_dict: 'DICT_4X4_50',
+      tag_size: 0.16,
+      centering_timeout_sec: 40,
+    });
+  });
+
+  it('blocks an inexecutable combination before saving it, naming the conflicts', async () => {
+    const doc = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, target_altitude_m: 0.1, altitude_ceiling_margin_m: 0 } };
+    hoisted.stable.params.working = doc;
+    hoisted.stable.params.dirty = true;
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).not.toHaveBeenCalled();
+    expect(hoisted.stable.params.save).not.toHaveBeenCalled();
+    const message = String(hoisted.props.preflight.launchError);
+    expect(message).toContain('Teto abaixo da altura de decolagem do firmware');
+    // E04 reads kinematics.climb_deadband_m, which this document does not hold: skipped, not invented.
+    expect(message).not.toContain('Margem do teto menor que a banda de chegada');
+  });
+
+  it('launches a combination that only warns', async () => {
+    const doc = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, countdown_sec: 4 } };
+    hoisted.stable.params.working = doc;
+    hoisted.stable.params.committed = doc;
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).toHaveBeenCalledTimes(1);
   });
 
   it('blocks a launch whose document lacks a required number, naming it', async () => {
@@ -400,3 +476,237 @@ describe('the countdown starts at the click', () => {
   });
 });
 
+
+describe('the mission mode in the launch payload', () => {
+  const simple = () => ({
+    ...hoisted.doc,
+    kinematics: { ...hoisted.doc.kinematics, target_altitude_m: 0.9 },
+    mission_mode: 'simple',
+    yaw_pattern: { scan_vyaw: 0.15 },
+  });
+
+  it('sends the mission mode with the launch document', async () => {
+    hoisted.stable.params.working = simple();
+    hoisted.stable.params.committed = simple();
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).toHaveBeenCalledTimes(1);
+    const received = hoisted.launch.mock.calls[0][0];
+    expect(JSON.parse(String(received.paramsJson)).mission_mode).toBe('simple');
+  });
+
+  it('sends the mission mode with a bench routine', async () => {
+    hoisted.stable.params.working = simple();
+    hoisted.stable.params.committed = simple();
+    window.history.replaceState(null, '', '/?screen=cockpit');
+    await mount();
+    await act(async () => {
+      await call('cockpit', 'onRunStage', 2);
+    });
+    const received = hoisted.startBenchStage.mock.calls[0][0];
+    expect(JSON.parse(String(received.paramsJson)).mission_mode).toBe('simple');
+  });
+});
+
+describe('the mission mode selector lock', () => {
+  const flush = async () => {
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  };
+
+  it('locks from the click on the dial, and sends the document of the click', async () => {
+    const clicked = { ...hoisted.doc, mission_mode: 'intermediate' };
+    hoisted.stable.params.working = clicked;
+    hoisted.stable.params.committed = hoisted.doc;
+    hoisted.stable.params.dirty = true;
+    let resolveSave: (saved: boolean) => void = () => undefined;
+    hoisted.stable.params.save = vi.fn(
+      () => new Promise<boolean>((resolve) => {
+        resolveSave = resolve;
+      })
+    );
+    let resolveLaunch: (value: { success: boolean; error?: string }) => void = () => undefined;
+    hoisted.launch.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveLaunch = resolve;
+      })
+    );
+    await mount();
+    expect(hoisted.props.preflight.modeLocked).toBe(false);
+
+    let pending: Promise<unknown> | undefined;
+    await act(async () => {
+      pending = call('preflight', 'onLaunch') as Promise<unknown>;
+      await flush();
+    });
+    expect(hoisted.props.preflight.modeLocked, 'unlocked while the document was being saved').toBe(true);
+
+    // An edit reaching the store after the click must not reach the flight.
+    hoisted.stable.params.working = { ...clicked, mission_mode: 'simple', yaw_pattern: { scan_vyaw: 0.15 } };
+    await act(async () => {
+      root.render(<App />);
+    });
+    await act(async () => {
+      resolveSave(true);
+      await flush();
+    });
+    expect(hoisted.launch).toHaveBeenCalledTimes(1);
+    expect(hoisted.props.preflight.modeLocked, 'unlocked while the process was being spawned').toBe(true);
+    expect(JSON.parse(String(hoisted.launch.mock.calls[0][0].paramsJson)).mission_mode).toBe('intermediate');
+
+    await act(async () => {
+      resolveLaunch({ success: false, error: 'spawn failed' });
+      await pending;
+    });
+    expect(hoisted.props.preflight.modeLocked, 'still locked after the launch was refused').toBe(false);
+  });
+
+  it('unlocks when the launch is blocked before the spawn', async () => {
+    hoisted.stable.params.status = 'loading';
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.launch).not.toHaveBeenCalled();
+    expect(hoisted.props.preflight.modeLocked).toBe(false);
+  });
+
+  it('unlocks when priming the launch phrases throws, and launches on the next click', async () => {
+    const original = hoisted.stable.copilot.prepare;
+    let failing = false;
+    hoisted.stable.copilot.prepare = () => {
+      if (failing) throw new Error('speech engine gone');
+    };
+    // The dial drops the launch promise (`void launch()`), so the throw
+    // surfaces as an unhandled rejection; it is the expected outcome here.
+    const runnerListeners = process.listeners('unhandledRejection');
+    const rejected: unknown[] = [];
+    process.removeAllListeners('unhandledRejection');
+    process.on('unhandledRejection', (reason) => rejected.push(reason));
+    try {
+      await mount();
+      failing = true;
+      await act(async () => {
+        call('preflight', 'onLaunch');
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(rejected.map((r) => (r as Error).message)).toEqual(['speech engine gone']);
+      expect(hoisted.launch).not.toHaveBeenCalled();
+      expect(hoisted.props.preflight.modeLocked, 'left locked by a throw before the launch').toBe(false);
+
+      failing = false;
+      await act(async () => {
+        await call('preflight', 'onLaunch');
+      });
+      expect(hoisted.launch).toHaveBeenCalledTimes(1);
+    } finally {
+      hoisted.stable.copilot.prepare = original;
+      process.removeAllListeners('unhandledRejection');
+      for (const listener of runnerListeners) process.on('unhandledRejection', listener);
+    }
+  });
+
+  it('stays locked through the countdown and unlocks when it is cancelled', async () => {
+    hoisted.stable.params.working = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, countdown_sec: 10 } };
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.props.countdown).toBeDefined();
+    expect(hoisted.props.preflight.modeLocked).toBe(true);
+    await act(async () => {
+      call('countdown', 'onCancel');
+      await flush();
+    });
+    expect(hoisted.props.preflight.modeLocked).toBe(false);
+  });
+
+  it('stays locked while the mission is arming or running, and unlocks once it is over', async () => {
+    for (const [state, locked] of [
+      ['arming', true],
+      ['running', true],
+      ['finished', false],
+      ['aborted', false],
+      ['idle', false],
+    ] as const) {
+      hoisted.stable.mission.state = state;
+      await mount();
+      expect(hoisted.props.preflight.modeLocked, state).toBe(locked);
+    }
+  });
+
+  it('locks while a bench routine is being started', async () => {
+    let resolveBench: (value: { success: boolean; error?: string }) => void = () => undefined;
+    hoisted.startBenchStage.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveBench = resolve;
+      })
+    );
+    await mount();
+    await act(async () => {
+      call('tabs', 'onNavigate', 'cockpit');
+    });
+    let pending: Promise<unknown> | undefined;
+    await act(async () => {
+      pending = call('cockpit', 'onRunStage', 2) as Promise<unknown>;
+      await flush();
+    });
+    await act(async () => {
+      call('tabs', 'onNavigate', 'preflight');
+    });
+    expect(hoisted.startBenchStage).toHaveBeenCalledTimes(1);
+    expect(hoisted.props.preflight.modeLocked).toBe(true);
+    await act(async () => {
+      resolveBench({ success: false, error: 'bench failed' });
+      await pending;
+    });
+    expect(hoisted.props.preflight.modeLocked).toBe(false);
+  });
+});
+
+describe('a refused bench routine', () => {
+  /** The runtime's bench bookkeeping, as `useMissionRuntime` keeps it. */
+  function statefulBench() {
+    const mission = hoisted.stable.mission;
+    mission.beginBenchStage = () => {
+      mission.state = 'running';
+    };
+    const refuse = vi.fn((): undefined => {
+      mission.state = 'faulted';
+      return undefined;
+    });
+    mission.refuseBenchStage = refuse;
+    return refuse;
+  }
+
+  async function runFromCockpitAndReturn(): Promise<void> {
+    await mount();
+    await act(async () => {
+      call('tabs', 'onNavigate', 'cockpit');
+    });
+    await act(async () => {
+      await call('cockpit', 'onRunStage', 2);
+    });
+    await act(async () => {
+      call('tabs', 'onNavigate', 'preflight');
+    });
+  }
+
+  it('releases the mode selector when the host refuses the routine', async () => {
+    const refuse = statefulBench();
+    hoisted.startBenchStage.mockImplementationOnce(async () => ({ success: false, error: 'bench failed' }));
+    await runFromCockpitAndReturn();
+    expect(refuse).toHaveBeenCalledTimes(1);
+    expect(hoisted.props.preflight.modeLocked).toBe(false);
+    expect(String(hoisted.props.preflight.launchError)).toContain('bench failed');
+  });
+
+  it('leaves a routine the host started running and locked', async () => {
+    const refuse = statefulBench();
+    await runFromCockpitAndReturn();
+    expect(refuse).not.toHaveBeenCalled();
+    expect(hoisted.stable.mission.state).toBe('running');
+    expect(hoisted.props.preflight.modeLocked).toBe(true);
+  });
+});

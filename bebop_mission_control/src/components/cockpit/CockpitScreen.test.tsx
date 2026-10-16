@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CockpitScreen } from './CockpitScreen';
 import type { TelemetryView } from '../../types/mission';
+import type { MissionMode } from '../../lib/missionMode';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -72,6 +73,7 @@ function renderCockpit(props: {
   missionState?: any;
   flyingState?: number | null;
   landProgress?: any;
+  missionMode?: MissionMode;
 }) {
   const onAbort = props.onAbort ?? vi.fn();
   const telemetry = {
@@ -88,6 +90,7 @@ function renderCockpit(props: {
         missionState={props.missionState ?? 'running'}
         stage={1}
         stageName="Decolagem"
+        missionMode={props.missionMode}
         streamFps={30}
         streamBridgeUp={true}
         streamLive={true}
@@ -122,6 +125,10 @@ function renderCockpit(props: {
   });
 
   return { onAbort };
+}
+
+function unmountCockpit() {
+  act(() => root.unmount());
 }
 
 describe('CockpitScreen Global Escape Shortcut (R11)', () => {
@@ -171,5 +178,69 @@ describe('CockpitScreen Global Escape Shortcut (R11)', () => {
     });
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     expect(onAbort).not.toHaveBeenCalled();
+  });
+});
+
+describe('Ctrl+C abort shortcut', () => {
+  const press = (init: KeyboardEventInit & { target?: Element }) => {
+    const event = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init });
+    (init.target ?? document.body).dispatchEvent(event);
+    return event;
+  };
+
+  it.each(['running', 'arming'] as const)('aborts with Ctrl+C while the mission is %s, exactly like the button', (state) => {
+    const { onAbort } = renderCockpit({ missionState: state });
+    const event = press({ key: 'c', code: 'KeyC', ctrlKey: true });
+    expect(onAbort).toHaveBeenCalledTimes(1);
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it('aborts with Cmd+C as well', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    press({ key: 'c', code: 'KeyC', metaKey: true });
+    expect(onAbort).toHaveBeenCalledTimes(1);
+  });
+
+  it('does nothing, and leaves copy alone, when the abort is not available', () => {
+    const { onAbort } = renderCockpit({ missionState: 'idle', flyingState: 0 });
+    const event = press({ key: 'c', code: 'KeyC', ctrlKey: true });
+    expect(onAbort).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it('leaves Ctrl+C to a text field', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    press({ key: 'c', code: 'KeyC', ctrlKey: true, target: input });
+    expect(onAbort).not.toHaveBeenCalled();
+    input.remove();
+  });
+
+  it('fires once for a held key', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    press({ key: 'c', code: 'KeyC', ctrlKey: true });
+    press({ key: 'c', code: 'KeyC', ctrlKey: true, repeat: true });
+    press({ key: 'c', code: 'KeyC', ctrlKey: true, repeat: true });
+    expect(onAbort).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not capture Ctrl+Shift+C', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    press({ key: 'C', code: 'KeyC', ctrlKey: true, shiftKey: true });
+    expect(onAbort).not.toHaveBeenCalled();
+  });
+
+  it('stops listening when the cockpit unmounts', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    unmountCockpit();
+    press({ key: 'c', code: 'KeyC', ctrlKey: true });
+    expect(onAbort).not.toHaveBeenCalled();
+  });
+
+  it.each(['simple', 'intermediate', 'advanced'] as const)('aborts the same way in the %s mode', (mode) => {
+    const { onAbort } = renderCockpit({ missionState: 'running', missionMode: mode });
+    press({ key: 'c', code: 'KeyC', ctrlKey: true });
+    expect(onAbort).toHaveBeenCalledTimes(1);
   });
 });

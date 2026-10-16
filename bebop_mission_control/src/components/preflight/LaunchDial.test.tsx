@@ -141,3 +141,22 @@ describe('LaunchDial (R4 / R8 Arming Hold & Preflight Gate)', () => {
     });
   });
 });
+
+describe('LaunchDial slot above the dial', () => {
+  it('renders the slot before the launch button in document order', () => {
+    act(() => {
+      root.render(
+        <LaunchDial
+          ready={true}
+          blockedReason={null}
+          benchMode={false}
+          onLaunch={() => undefined}
+          above={<div data-testid="mode-slot">modo</div>}
+        />
+      );
+    });
+    const slot = host.querySelector('[data-testid="mode-slot"]')!;
+    const button = host.querySelector('button')!;
+    expect(slot.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});

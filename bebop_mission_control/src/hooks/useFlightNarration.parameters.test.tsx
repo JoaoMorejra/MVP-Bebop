@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useFlightNarration, useNarrationQueue, type Copilot } from './useCopilot';
-import { PHRASE_POOLS } from '../lib/copilotPhrases';
+import { PHRASE_POOLS, renderPhrase, spokenSpeed } from '../lib/copilotPhrases';
+import { NarrationQueue } from '../lib/narrationQueue';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -135,5 +136,55 @@ describe('phrase cache warm-up (3.9)', () => {
     expect(texts.some((line) => line.startsWith('Para começar,'))).toBe(true);
     expect(texts).toContain('Missão abortada. Pouso imediato comandado.');
     expect(texts).toContain('Bateria crítica. Retornando à base para pouso.');
+  });
+});
+
+describe('copilot repertoire by mission mode', () => {
+  const scanStartRendered = PHRASE_POOLS['mission.scan_start'].map((variant) =>
+    renderPhrase(variant, { speed: spokenSpeed(0.2) ?? '' })
+  );
+
+  it('drops mission.rtl_start in a reduced mode even if it arrives', async () => {
+    emit(milestone('mission.mode', { mode: 'intermediate' }));
+    emit(milestone('mission.rtl_start', { inspected: true, marker_guided: true }));
+    await settle();
+    expect(spoken).toEqual([]);
+  });
+
+  it('speaks the yaw-scan line for the scan start in the simple mode', async () => {
+    emit(milestone('mission.mode', { mode: 'simple' }));
+    emit(milestone('mission.takeoff', { altitude_m: 1, native: true }));
+    emit(milestone('mission.scan_start', { window_sec: 30, cruise_mps: 0.2 }));
+    await settle();
+    expect(spoken.some((line) => PHRASE_POOLS['mission.scan_start_yaw'].includes(line))).toBe(true);
+    expect(spoken.some((line) => scanStartRendered.includes(line))).toBe(false);
+  });
+
+  it('falls back to the full repertoire when no mode was reported', async () => {
+    emit(milestone('mission.takeoff', { altitude_m: 1 }));
+    emit(milestone('mission.scan_start', { window_sec: 30, cruise_mps: 0.2 }));
+    await settle();
+    expect(spoken.some((line) => scanStartRendered.includes(line))).toBe(true);
+  });
+
+  it('forgets the mode at the start of the next mission', async () => {
+    emit(milestone('mission.mode', { mode: 'simple' }));
+    emit(milestone('mission.start'));
+    emit(milestone('mission.takeoff', { altitude_m: 1 }));
+    emit(milestone('mission.scan_start', { window_sec: 30, cruise_mps: 0.2 }));
+    await settle();
+    expect(spoken.some((line) => scanStartRendered.includes(line))).toBe(true);
+  });
+
+  it('assigns the approach milestone to stage 3 so earlier-stage lines are pruned', async () => {
+    const enqueue = vi.spyOn(NarrationQueue.prototype, 'enqueue');
+    try {
+      emit(milestone('mission.approaching', { ibvs: true }));
+      await settle();
+      const call = enqueue.mock.calls.find(([label]) => label === 'mission.approaching');
+      expect(call?.[2]?.stage).toBe(3);
+    } finally {
+      enqueue.mockRestore();
+    }
   });
 });

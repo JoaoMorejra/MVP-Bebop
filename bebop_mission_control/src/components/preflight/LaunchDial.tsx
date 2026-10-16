@@ -14,6 +14,11 @@ interface LaunchDialProps {
    * is the thing that would change their mind.
    */
   beneath?: React.ReactNode;
+  /**
+   * Control seated directly above the dial; the mission profile lives here
+   * because it is the last thing an operator decides before pressing it.
+   */
+  above?: React.ReactNode;
   onLaunch: () => void;
 }
 
@@ -57,6 +62,7 @@ export const LaunchDial: React.FC<LaunchDialProps> = ({
   blockedReason,
   benchMode,
   beneath,
+  above,
   onLaunch,
 }) => {
   const theme = benchMode ? THEME.bench : THEME.flight;
@@ -74,6 +80,7 @@ export const LaunchDial: React.FC<LaunchDialProps> = ({
 
   return (
     <div className="flex flex-col items-center gap-5">
+      {above ? <div className="mb-2">{above}</div> : null}
       <button
         type="button"
         onClick={handleClick}
