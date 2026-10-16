@@ -61,7 +61,7 @@ Por decisão de escopo, os itens a seguir foram **adiados** e permanecem como ri
 - [ ] **Texto do Dial:** `"VOO REAL: motores serão armados"`.
 - [ ] **Status dos Tópicos:** Todos os tópicos obrigatórios verdes (odometria, câmera, bateria, cmd_vel, land).
 - [ ] **Bateria:** Leitura conhecida e >= 35% (piso de segurança).
-- [ ] **Magnetômetro:** Calibração não requerida.
+- [ ] **Magnetômetro:** Calibração não requerida, verificada manualmente fora da estação (aplicativo da Parrot). A estação não lê nem bloqueia o lançamento por este estado.
 - [ ] **Ponte de Comando:** Status `ready`.
 - [ ] **Copiloto:** Voz pronta (online).
 
@@ -77,3 +77,76 @@ Por decisão de escopo, os itens a seguir foram **adiados** e permanecem como ri
   - Pressionar a tecla **Escape** no teclado OU
   - Clicar imediatamente no botão **ABORTAR MISSÃO** no topo do Cockpit.
 - A estação cortará a velocidade instantaneamente, emitirá rajada de comandos `land` e acompanhará o pouso até a confirmação em solo (`flying_state == 0`).
+
+## 4. Procedimento de Campo: Decolagem e Pouso no Totem de 1,0 m
+
+Referência: `docs/PROMPT_IMPLEMENTACAO_TOTEM_VOO_ALTITUDE.md`, seções 1.5 e 6. Requisito: voar a 1,8 m
+sobre o piso (0,8 m sobre o topo do totem). Os itens abaixo decidem os pontos **[A CONFIRMAR]** do
+modelo de sonar; nenhum teste sem a aeronave os prova.
+
+### 4.1 Pré-requisitos
+- [ ] Totem de 1,0 m estável; marcador ID 8 no topo, no ponto de decolagem.
+- [ ] Medir com trena `platform.edge_ahead_m`: ponto de decolagem -> borda do totem **à ESQUERDA** (eixo lateral
+  da trilha de saída; valor esperado 0,30 m para o totem de 60 x 60 cm com decolagem no centro).
+- [ ] **Posicionar a trilha de varredura na faixa de visada (D7).** O padrão de voo é estritamente lateral: a
+  aeronave não avança nem recua, de modo que o alvo deve estar à frente da câmera na faixa de detecção
+  `[h / tan(|tilt| + VFOV/2), h / tan(|tilt| - VFOV/2)]`, com `h` a altura sobre o alvo e `tilt` =
+  `gimbal.search_tilt_deg`. Medir a distância da trilha ao alvo e conferir que cai dentro da faixa; fora dela
+  o alvo não entra no quadro durante a varredura.
+- [ ] **Alcance do retorno (Estágio 3 + RTL).** O Estágio 3 voa lateralmente até ~0,7 x R (R = distância ao
+  alvo) ao longo do eixo de retorno, e o W08 (`needed = forward_cruise_velocity * search_timeout_sec /
+  |reverse_cruise_velocity|`) não conta esse trecho: `rtl.timeout_sec` deve cobrir o Estágio 2 mais o
+  deslocamento lateral do Estágio 3. Com a configuração padrão (0,15 normalizado, 30 s) o retorno cobre
+  ~4,5 m; alvos além de ~4-5 m de distância exigem `rtl.timeout_sec` maior.
+- [ ] Medir o teto do local sobre o piso e registrar em `platform.venue_ceiling_agl_m`.
+- [ ] `mission_config.json`: `platform.height_m = 1.0`, `kinematics.target_altitude_m = 1.8`.
+  O arquivo é o store local da estação e não é versionado: conferir os valores nesta máquina.
+- [ ] Sonda ativa (`calibration.altitude_probe_enabled = true`): linhas `[ALT_PROBE ...]` a 1 Hz
+  e `[PLATFORM ...]` a cada transição no log da missão.
+
+### 4.2 Ensaios
+- [ ] **F-0 Decolagem:** registrar a altura em que o firmware encerra o launch profile (esperado
+  ~1,0 m sobre o totem) e o tempo até o governor assentar em 0,8 m relativos
+  (`[PLATFORM departure_settle err=... elapsed=...]`). Confirmar que não passa de `venue_ceiling_agl_m`.
+- [ ] **F-1 Linha de base:** pairar 60 s a 0,8 m sobre o totem; `z_rel` e `fw_alt` com divergência
+  estável < 0,10 m; registrar o ruído de ambos.
+- [ ] **F-2 Saída do totem (critério de aceite):** cruzeiro lateral de 2 m para a esquerda (`vy > 0`, `vx = 0`,
+  sem guinada) e retorno parando antes do totem. 3 repetições com a guarda **desligada** (`edge_ahead_m = null`), 3 com a guarda ligada,
+  3 com `guard_vertical_shaper = false`. Registrar a perda máxima transiente de altura sobre o piso,
+  o tempo até +/-0,10 m, o `vz` mínimo, o `s` em que o degrau de `fw_alt` ocorre contra o `s_star`
+  previsto (valida `sonar_half_angle_deg`) e a velocidade horizontal real na borda. Repetir sobre
+  uma bancada. **Meta: perda transiente <= 0,25 m com a guarda ligada.** Se o firmware afundar mais
+  rápido que a autoridade de subida da guarda (0,2 normalizado), a meta não é atingível por software
+  e o relatório deve dizê-lo.
+- [ ] **F-3 Reentrada:** retorno lateral para a direita (`vy < 0`) cruzando a borda com o RTL atual; registrar o pico de `z_rel` (falso
+  climb), se `[PLATFORM state=ENTERING ...]` ocorreu antes do degrau, o erro lateral acumulado e o
+  pico contra o teto efetivo. Dimensiona `ceiling_allowance_m` e `rise_feedforward_mps`.
+  Em `ENTERING`, um estouro de teto **não** pousa a aeronave por até `reentry_breach_grace_sec` (3 s):
+  a guarda comanda a descida máxima (`[PLATFORM reentry_descent ...]`). Passado esse tempo, ou fora de
+  `ENTERING` ainda acima do teto, o pouso de emergência volta. Manter a mão no ABORTAR durante a reentrada.
+- [ ] **F-4 Feedforwards:** a partir de F-2/F-3, ajustar `sag_feedforward_mps` e
+  `rise_feedforward_mps`; repetir 3 vezes; manter só se reduzirem a perda.
+
+### 4.3 Decisões após os ensaios
+- Divergência `z_rel` x `fw_alt` estável e sem degrau de `vz`: manter `altitude_estimator = "legacy"`.
+- Degrau ou spike de `vz` na borda: promover `"vz_gated"`.
+- `fw_alt` imune ao sonar e `z_rel` com deriva: habilitar `altitude_anchor_enabled`.
+
+### 4.4 Limite da bancada `--no-fly`
+Ensaiar o padrão lateral antes do voo com `mission.py --no-fly` (nunca armar motores nesse ensaio): conferir
+no log a sequência `[STEP 2: Lateral Left Search]` com `vy > 0` e `vx = 0`, o freeze do Stage 3, o
+enquadramento por gimbal no Stage 4 e a busca do marcador com `vy < 0` no Stage 5.
+O `KinematicSimulator` não tem sonar, solo nem totem: o `PlatformMonitor` roda sobre a odometria
+sintética, mas não há degrau. A bancada valida a máquina de estados e a ausência de regressão, não a
+reação do firmware nem a manutenção de altitude na borda.
+
+### 4.5 Expectativas no Eixo Lateral
+- [ ] **Stage 2:** deslocamento somente para a esquerda a `kinematics.forward_cruise_velocity`; `vx` e `vyaw`
+  nulos; câmera em `gimbal.search_tilt_deg`. Qualquer avanço ou guinada visível é falha.
+- [ ] **Stage 3:** apenas correções laterais (`vy`); sem avanço e sem movimento do gimbal; a aeronave congela
+  (`vx = vy = 0`) ao centralizar lateralmente com velocidade abaixo de `inspection.settle_max_speed_mps`.
+- [ ] **Stage 4:** aeronave em pairado absoluto; somente o gimbal se move (lei de apontamento limitada por
+  `max_slew_limit_deg`, entre `nadir_tilt_deg` e `search_tilt_deg`); captura e JSON pericial marcados
+  `degraded`/`settled = false` se o alvo não for enquadrado.
+- [ ] **Stage 5:** busca do marcador voando para a **direita** (`vy < 0`, `|vy| = |rtl.reverse_cruise_velocity|`,
+  regra E05); se o marcador for ultrapassado, o reenquadramento é um creep para a esquerda.
