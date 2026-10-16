@@ -21,6 +21,8 @@ from support.fake_bebop.plant import (
     PictureEvent,
     PlantConfig,
     StateChange,
+    sonar_range,
+    surface_height,
 )
 
 QUIET = dict(speed_noise_mps=0.0, speed_bias_walk_mps=0.0)
@@ -274,3 +276,114 @@ def test_time_never_runs_backwards():
     run(plant, 1.0)
     with pytest.raises(ValueError):
         plant.advance(0.5)
+
+
+# ------------------------------------------------------------------ pad, sonar and sonar hold
+
+
+PAD = dict(QUIET, platform_height_m=1.0, platform_edge_ahead_m=1.0)
+HALF_ANGLE = math.radians(20.0)
+
+
+def test_the_pad_and_the_sonar_hold_are_inert_by_default():
+    cfg = PlantConfig()
+    assert (cfg.platform_height_m, cfg.sonar_hold_gain, cfg.fw_altitude_source) == (0.0, 0.0, "inertial")
+    plant = airborne()
+    assert plant.sonar_range == pytest.approx(plant.true_altitude)
+    assert plant.firmware_altitude == plant.true_altitude
+    assert plant.height_above_surface == plant.true_altitude
+
+
+@pytest.mark.parametrize(
+    "y, expected",
+    [
+        (0.0, 0.8),
+        (1.0, 0.8),
+        (1.1, math.hypot(0.8, 0.1)),
+        (1.0 + 0.8 * math.tan(HALF_ANGLE) - 1e-6, 0.8 / math.cos(HALF_ANGLE)),
+        (1.0 + 0.8 * math.tan(HALF_ANGLE) + 1e-3, 1.8),
+        (3.0, 1.8),
+    ],
+)
+def test_the_sonar_ranges_the_nearest_echo(y, expected):
+    assert sonar_range(0.0, y, 0.8, 1.0, 1.0, 20.0) == pytest.approx(expected, abs=1e-4)
+
+
+def test_without_a_pad_the_sonar_reads_the_altitude():
+    assert sonar_range(0.0, 3.0, 0.8, 0.0, 1.0, 20.0) == 0.8
+
+
+@pytest.mark.parametrize("x, y", [(2.0, 0.0), (0.0, 2.0), (-2.0, 0.0), (0.0, -2.0), (1.5, -1.5)])
+def test_the_pad_is_a_square_centred_on_the_takeoff_point(x, y):
+    assert surface_height(x, y, 1.0, 1.0) == -1.0
+    assert sonar_range(x, y, 0.8, 1.0, 1.0, 20.0) == pytest.approx(1.8)
+    assert surface_height(0.9, -0.9, 1.0, 1.0) == 0.0
+    assert sonar_range(0.9, -0.9, 0.8, 1.0, 1.0, 20.0) == pytest.approx(0.8)
+
+
+def test_drift_along_x_leaves_the_pad_as_travel_along_y_does():
+    assert sonar_range(1.1, 0.0, 0.8, 1.0, 1.0, 20.0) == pytest.approx(sonar_range(0.0, 1.1, 0.8, 1.0, 1.0, 20.0))
+
+
+def cruise_across_the_edge(gaz: float, gain: float = 2.0):
+    plant = airborne(PlantConfig(**PAD, sonar_hold_gain=gain, takeoff_altitude_m=0.8))
+    start = plant.true_altitude
+    plant.pcmd(plant.time, 0.0, 0.2, gaz, 0.0)
+    lowest = start
+    t = plant.time
+    while plant.true_position[1] < 1.0 + 0.8 * math.tan(HALF_ANGLE) + 1.0:
+        t += 0.01
+        plant.advance(t)
+        lowest = min(lowest, plant.true_altitude)
+    return plant, start, lowest
+
+
+def test_the_sonar_hold_sinks_the_airframe_a_pad_height_on_leaving_it():
+    plant, start, lowest = cruise_across_the_edge(gaz=0.0)
+    assert start - lowest == pytest.approx(1.0, abs=0.08)
+    assert plant.sonar_range == pytest.approx(0.8, abs=0.08)
+
+
+@pytest.mark.parametrize("gaz", [0.01, -0.01, 0.05])
+def test_any_nonzero_gaz_disengages_the_sonar_hold(gaz):
+    _plant, start, lowest = cruise_across_the_edge(gaz=gaz)
+    assert start - lowest < 0.15
+
+
+def test_without_a_hold_gain_the_edge_moves_nothing():
+    _plant, start, lowest = cruise_across_the_edge(gaz=0.0, gain=0.0)
+    assert start - lowest < 1e-6
+
+
+def test_off_the_pad_the_floor_is_a_pad_height_down():
+    plant, _start, _lowest = cruise_across_the_edge(gaz=0.0)
+    plant.pcmd(plant.time, 0.0, 0.0, 0.0, 0.0)
+    plant.land(plant.time)
+    run(plant, plant.time + 8.0)
+    assert plant.state is FlyingState.LANDED
+    assert plant.true_altitude == pytest.approx(-1.0)
+    assert plant.height_above_surface == pytest.approx(0.0)
+
+
+def test_the_firmware_altitude_can_follow_the_sonar():
+    plant, _start, _lowest = cruise_across_the_edge(gaz=0.0)
+    inertial = BebopPlant(PlantConfig(**PAD, fw_altitude_source="sonar"))
+    assert plant.firmware_altitude == plant.true_altitude
+    assert inertial.firmware_altitude == inertial.sonar_range
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("platform_height_m", -0.1),
+        ("platform_edge_ahead_m", 0.0),
+        ("sonar_half_angle_deg", 0.0),
+        ("sonar_half_angle_deg", 90.0),
+        ("sonar_hold_gain", -1.0),
+        ("sonar_hold_max_mps", 0.0),
+        ("fw_altitude_source", "baro"),
+    ],
+)
+def test_an_out_of_range_pad_config_is_refused(field, value):
+    with pytest.raises((TypeError, ValueError)):
+        PlantConfig(**{field: value})

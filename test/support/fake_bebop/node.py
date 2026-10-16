@@ -409,6 +409,7 @@ class FakeBebopDriver:
                 self.log.write("traj", mono=now, x=round(x, 4), y=round(y, 4), z=round(z, 4), vx=round(vx, 4),
                                vy=round(vy, 4), vz=round(vz, 4), state=int(self.plant.state),
                                odom_z=None if odom is None else round(odom.z, 4),
+                               sonar=round(self.plant.sonar_range, 4),
                                battery=round(self.plant.battery_pct, 2), tilt=self._tilt)
 
     def _handle(self, event: Any) -> None:
@@ -455,7 +456,7 @@ class FakeBebopDriver:
             now = self._clock()
             state = int(self.plant.state)
             battery = int(round(self.plant.battery_pct))
-            altitude = float(self.plant.true_altitude)
+            altitude = float(self.plant.firmware_altitude)
             sequence = self.plant.flat_trim_sequence
             if battery != self._battery_report[0]:
                 self._battery_report = (battery, now)
@@ -526,8 +527,8 @@ class FakeBebopDriver:
     def current_view(self) -> CameraView:
         """The camera's view of the plant now."""
         with self._lock:
-            x, y, z = self.plant.true_position
-            return CameraView(x, y, z, self._tilt, self._pan, int(self.plant.state))
+            x, y, _z = self.plant.true_position
+            return CameraView(x, y, self.plant.height_above_surface, self._tilt, self._pan, int(self.plant.state))
 
     def _camera_loop(self) -> None:
         next_frame = self._clock()
@@ -590,4 +591,6 @@ def _quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> Tuple[float, 
 def _plant_summary(plant: BebopPlant) -> Dict[str, Any]:
     cfg = plant.config
     return {"seed": cfg.seed, "efficiency": cfg.efficiency, "tau_sec": cfg.tau_sec, "latency_sec": cfg.latency_sec,
-            "battery_start_pct": cfg.battery_start_pct}
+            "battery_start_pct": cfg.battery_start_pct, "platform_height_m": cfg.platform_height_m,
+            "platform_edge_ahead_m": cfg.platform_edge_ahead_m, "sonar_hold_gain": cfg.sonar_hold_gain,
+            "fw_altitude_source": cfg.fw_altitude_source}

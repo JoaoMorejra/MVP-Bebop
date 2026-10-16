@@ -111,6 +111,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compressed", action="store_true", help="also publish camera/image_raw/compressed")
     parser.add_argument("--log-json", default=None, help="JSON-lines ground-truth log")
     parser.add_argument("--max-sec", type=float, default=None, help="stop by itself after this many seconds")
+    parser.add_argument("--reveal-y", dest="reveal_y", type=float, default=None,
+                        help="accident scene: target in view past y (left of the takeoff point), metres")
+    parser.add_argument("--marker-radius", type=float, default=None,
+                        help="accident scene: marker in view within this distance of the pad, metres")
+    parser.add_argument("--platform-height", type=float, default=None, help="takeoff pad height, metres")
+    parser.add_argument("--platform-edge", type=float, default=None, help="takeoff point to pad edge, metres")
+    parser.add_argument("--sonar-half-angle", type=float, default=None, help="sonar beam half-angle, degrees")
+    parser.add_argument("--sonar-hold-gain", type=float, default=None, help="firmware sonar hold gain, 1/s")
+    parser.add_argument("--fw-altitude-source", choices=("inertial", "sonar"), default=None,
+                        help="what states/altitude reports")
+    parser.add_argument("--no-odometry-drift", action="store_true",
+                        help="zero the odometric speed bias and its random walk; noise is kept")
     return parser
 
 
@@ -154,12 +166,27 @@ def main(argv: Optional[List[str]] = None) -> int:
             with open(args.faults_json, encoding="utf-8") as handle:
                 faults += list(FaultSchedule.from_json(handle.read()).faults)
         schedule = FaultSchedule(faults)
+        from dataclasses import replace
+
         config = PlantConfig.from_seed(args.seed)
         if args.battery_start is not None:
-            from dataclasses import replace
-
             config = replace(config, battery_start_pct=args.battery_start)
-        scene = build_scene(args.scenario)
+        pad = {
+            name: value
+            for name, value in (
+                ("platform_height_m", args.platform_height),
+                ("platform_edge_ahead_m", args.platform_edge),
+                ("sonar_half_angle_deg", args.sonar_half_angle),
+                ("sonar_hold_gain", args.sonar_hold_gain),
+                ("fw_altitude_source", args.fw_altitude_source),
+            )
+            if value is not None
+        }
+        if args.no_odometry_drift:
+            pad.update(speed_bias_mps=(0.0, 0.0, 0.0), speed_bias_walk_mps=0.0)
+        if pad:
+            config = replace(config, **pad)
+        scene = build_scene(args.scenario, reveal_y_m=args.reveal_y, marker_radius_m=args.marker_radius)
     except (TypeError, ValueError, OSError) as exc:
         print(f"[FAKE_BEBOP] refused: {exc}", file=sys.stderr, flush=True)
         return EXIT_REFUSED

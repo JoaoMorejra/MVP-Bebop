@@ -67,6 +67,8 @@ EMERGENCY_FALL_MPS: Final[float] = 3.0
 EMERGENCY_LANDING_MPS: Final[float] = 0.8
 #: Time ``EMERGENCY`` is held on the ground before ``LANDED``, seconds.
 EMERGENCY_SETTLE_SEC: Final[float] = 0.5
+#: Sources ``states/altitude`` can be published from.
+FW_ALTITUDE_SOURCES: Final[frozenset] = frozenset({"inertial", "sonar"})
 
 
 def _number(name: str, value: object) -> float:
@@ -85,6 +87,56 @@ def quantize(value: float) -> float:
     """
     clamped = max(-1.0, min(1.0, float(value)))
     return math.trunc(clamped * 100.0) / 100.0
+
+
+def pad_offset(x: float, y: float, edge_ahead_m: float) -> float:
+    """Distance beyond the pad edge, metres: positive off the pad, non-positive over it.
+
+    The pad is a square centred on the takeoff point with half-side
+    ``edge_ahead_m``, so drift along X leaves it as surely as travel along Y.
+    """
+    return max(abs(x), abs(y)) - edge_ahead_m
+
+
+def surface_height(x: float, y: float, platform_height_m: float, edge_ahead_m: float) -> float:
+    """Height of the surface under ``(x, y)``: the pad top (0) inside the pad, the floor outside.
+
+    The mission's platform model is one-dimensional along the outbound track
+    (``+y``); the plant is two-dimensional so that drift along X is physically
+    real in the emulated flights.
+    """
+    if platform_height_m <= 0.0 or pad_offset(x, y, edge_ahead_m) <= 0.0:
+        return 0.0
+    return -platform_height_m
+
+
+def sonar_range(
+    x: float, y: float, z: float, platform_height_m: float, edge_ahead_m: float, half_angle_deg: float
+) -> float:
+    """Nearest-echo sonar reading over the pad and the floor (section 1.5 of the scope document).
+
+    Parameters
+    ----------
+    x, y, z : float
+        Horizontal position from the takeoff point and altitude above the pad top, metres.
+    platform_height_m, edge_ahead_m : float
+        Pad height and distance from the takeoff point to its edge, metres.
+    half_angle_deg : float
+        Effective half-angle of the beam, degrees.
+
+    Returns
+    -------
+    float
+        ``z`` over the pad; the slant range to the pad edge while it is inside
+        the beam, from ``z`` to ``z / cos(a)``; ``z + platform_height_m`` once the
+        edge leaves the beam at ``edge_ahead_m + z * tan(a)``.
+    """
+    offset = pad_offset(x, y, edge_ahead_m)
+    if platform_height_m <= 0.0 or offset <= 0.0:
+        return z
+    if offset <= max(z, 0.0) * math.tan(math.radians(half_angle_deg)):
+        return math.hypot(z, offset)
+    return z + platform_height_m
 
 
 @dataclass(frozen=True)
@@ -130,6 +182,26 @@ class PlantConfig:
     photo_busy_sec, photo_taken_sec : float
         ``PictureStateChangedV2`` busy and ``PictureEventChanged`` taken delays
         after the request (taken measured 2.5 s live); ready follows taken.
+    platform_height_m : float
+        Height of the takeoff pad, metres (>= 0). ``0.0``, the default, is a
+        takeoff from the floor and leaves every other pad field inert.
+    platform_edge_ahead_m : float
+        Distance from the takeoff point to the pad edge, metres (> 0): the half-side
+        of a square pad centred on the takeoff point. Beyond it the floor is
+        ``platform_height_m`` below the pad top.
+    sonar_half_angle_deg : float
+        Effective half-angle of the nearest-echo sonar beam, degrees, in (0, 90).
+    sonar_hold_gain : float
+        Firmware sonar hold, 1/s (>= 0). With the piloting ``gaz`` exactly zero
+        in flight the vertical speed target is ``-gain * (range - range_ref)``,
+        ``range_ref`` being the sonar reading when ``gaz`` returned to zero; any
+        nonzero ``gaz`` releases it. This reproduces outcome M1 of the scope
+        document only for an exactly zero vertical command. ``0.0`` disables it.
+    sonar_hold_max_mps : float
+        Saturation of the sonar hold speed, m/s (> 0).
+    fw_altitude_source : str
+        What ``states/altitude`` reports: ``"inertial"`` (true altitude above the
+        takeoff point, the default) or ``"sonar"`` (the sonar range).
     seed : int
         Seed of the noise generator.
 
@@ -160,14 +232,21 @@ class PlantConfig:
     flat_trim_ack_sec: float = 0.3
     photo_busy_sec: float = 0.1
     photo_taken_sec: float = 2.5
+    platform_height_m: float = 0.0
+    platform_edge_ahead_m: float = 1.0
+    sonar_half_angle_deg: float = 20.0
+    sonar_hold_gain: float = 0.0
+    sonar_hold_max_mps: float = 0.5
+    fw_altitude_source: str = "inertial"
     seed: int = 0
 
     def __post_init__(self) -> None:
         positive = ("efficiency", "tau_sec", "ramp_sec", "takeoff_altitude_m", "takeoff_climb_mps",
-                    "landing_descent_mps", "odom_rate_hz")
+                    "landing_descent_mps", "odom_rate_hz", "platform_edge_ahead_m", "sonar_hold_max_mps")
         non_negative = ("latency_sec", "speed_noise_mps", "speed_bias_walk_mps", "max_tilt_rad",
                         "battery_drain_flying_pct_min", "battery_drain_ground_pct_min",
-                        "flat_trim_ack_sec", "photo_busy_sec", "photo_taken_sec")
+                        "flat_trim_ack_sec", "photo_busy_sec", "photo_taken_sec", "platform_height_m",
+                        "sonar_hold_gain")
         for item in fields(self):
             value = getattr(self, item.name)
             if item.name in ("gain_mps", "speed_bias_mps"):
@@ -180,6 +259,9 @@ class PlantConfig:
             elif item.name == "seed":
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise TypeError(f"seed must be an int, got {type(value).__name__}")
+            elif item.name == "fw_altitude_source":
+                if value not in FW_ALTITUDE_SOURCES:
+                    raise ValueError(f"fw_altitude_source must be one of {sorted(FW_ALTITUDE_SOURCES)}, got {value!r}")
             else:
                 _number(item.name, value)
                 if item.name in positive and value <= 0.0:
@@ -190,6 +272,8 @@ class PlantConfig:
             raise ValueError(f"efficiency must lie in (0, 3], got {self.efficiency!r}")
         if not 0.0 <= self.battery_start_pct <= 100.0:
             raise ValueError(f"battery_start_pct must lie in [0, 100], got {self.battery_start_pct!r}")
+        if not 0.0 < self.sonar_half_angle_deg < 90.0:
+            raise ValueError(f"sonar_half_angle_deg must lie in (0, 90), got {self.sonar_half_angle_deg!r}")
 
     @classmethod
     def from_seed(cls, seed: int) -> "PlantConfig":
@@ -365,6 +449,7 @@ class BebopPlant:
         self._odometry_pose = [0.0, 0.0, 0.0]
         self._odometry_last: Optional[float] = None
         self._events: List[PlantEvent] = []
+        self._hold_reference: Optional[float] = None
 
     # ------------------------------------------------------------- readouts
 
@@ -379,6 +464,31 @@ class BebopPlant:
     @property
     def true_altitude(self) -> float:
         return self._position[2]
+
+    @property
+    def surface(self) -> float:
+        """Height of the surface under the airframe: pad top 0, floor ``-platform_height_m``."""
+        cfg = self.config
+        return surface_height(
+            self._position[0], self._position[1], cfg.platform_height_m, cfg.platform_edge_ahead_m
+        )
+
+    @property
+    def height_above_surface(self) -> float:
+        """Altitude above whatever is directly below: what the camera sees from."""
+        return self._position[2] - self.surface
+
+    @property
+    def sonar_range(self) -> float:
+        """Nearest-echo sonar reading, metres."""
+        cfg = self.config
+        return sonar_range(self._position[0], self._position[1], self._position[2], cfg.platform_height_m,
+                           cfg.platform_edge_ahead_m, cfg.sonar_half_angle_deg)
+
+    @property
+    def firmware_altitude(self) -> float:
+        """``states/altitude``: true altitude above the takeoff point, or the sonar range."""
+        return self.sonar_range if self.config.fw_altitude_source == "sonar" else self._position[2]
 
     @property
     def latched_pcmd(self) -> Vector3:
@@ -542,10 +652,10 @@ class BebopPlant:
             self._velocity[2] = 0.0
             self._set_state(FlyingState.HOVERING)
             self._update_piloted_state()
-        elif state in (FlyingState.LANDING, FlyingState.EMERGENCY_LANDING) and z <= 0.0:
+        elif state in (FlyingState.LANDING, FlyingState.EMERGENCY_LANDING) and z <= self.surface:
             self._ground()
             self._set_state(FlyingState.LANDED)
-        elif state is FlyingState.EMERGENCY and z <= 0.0:
+        elif state is FlyingState.EMERGENCY and z <= self.surface:
             self._ground()
             if self._emergency_grounded_at is None:
                 self._emergency_grounded_at = self.time
@@ -554,7 +664,7 @@ class BebopPlant:
                 self._set_state(FlyingState.LANDED)
 
     def _ground(self) -> None:
-        self._position[2] = 0.0
+        self._position[2] = self.surface
         self._velocity = [0.0, 0.0, 0.0]
 
     def _integrate(self, dt: float) -> None:
@@ -569,14 +679,24 @@ class BebopPlant:
         if state in PILOTED_STATES:
             horizontal_target = tuple(self._pcmd[i] * cfg.gain_mps[i] * cfg.efficiency for i in (0, 1))
             vertical_target = self._pcmd[2] * cfg.gain_mps[2] * cfg.efficiency
-        elif state is FlyingState.TAKINGOFF:
+            if cfg.sonar_hold_gain > 0.0 and self._pcmd[2] == 0.0:
+                reading = self.sonar_range
+                if self._hold_reference is None:
+                    self._hold_reference = reading
+                hold = -cfg.sonar_hold_gain * (reading - self._hold_reference)
+                vertical_target = max(-cfg.sonar_hold_max_mps, min(cfg.sonar_hold_max_mps, hold))
+            else:
+                self._hold_reference = None
+        else:
+            self._hold_reference = None
+        if state is FlyingState.TAKINGOFF:
             vertical = cfg.takeoff_climb_mps
         elif state is FlyingState.LANDING:
             vertical = -cfg.landing_descent_mps
         elif state is FlyingState.EMERGENCY_LANDING:
             vertical = -EMERGENCY_LANDING_MPS
         elif state is FlyingState.EMERGENCY:
-            vertical = -EMERGENCY_FALL_MPS if self._position[2] > 0.0 else 0.0
+            vertical = -EMERGENCY_FALL_MPS if self._position[2] > self.surface else 0.0
 
         if state in (FlyingState.LANDED, FlyingState.MOTOR_RAMPING):
             self._velocity = [0.0, 0.0, 0.0]
@@ -590,8 +710,9 @@ class BebopPlant:
 
         for axis in range(3):
             self._position[axis] += self._velocity[axis] * dt
-        if self._position[2] < 0.0:
-            self._position[2] = 0.0
+        floor = self.surface
+        if self._position[2] < floor:
+            self._position[2] = floor
             if self._velocity[2] < 0.0:
                 self._velocity[2] = 0.0
 

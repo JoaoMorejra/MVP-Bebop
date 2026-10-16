@@ -144,6 +144,8 @@ class EmulatedFlight:
     scenario: str = "accident"
     battery_start: Optional[float] = None
     camera_hz: float = 15.0
+    #: Further ``scripts/fake_bebop_driver.py`` arguments (pad, sonar, scene).
+    emulator_args: Sequence[str] = ()
     _emulator: Optional[subprocess.Popen] = field(default=None, init=False)
     _mission: Optional[subprocess.Popen] = field(default=None, init=False)
     _lines: List[Line] = field(default_factory=list, init=False)
@@ -186,6 +188,7 @@ class EmulatedFlight:
             command += ["--fault", fault]
         if self.battery_start is not None:
             command += ["--battery-start", str(self.battery_start)]
+        command += list(self.emulator_args)
         self._emulator = subprocess.Popen(command, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           text=True)
         deadline = time.monotonic() + 30.0

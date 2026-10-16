@@ -25,8 +25,11 @@ class CameraView:
 
     Attributes
     ----------
-    x, y, z : float
-        True position, metres (``x`` forward, ``y`` left, ``z`` up).
+    x, y : float
+        True position, metres (``x`` forward, ``y`` left).
+    z : float
+        Height above the surface directly below, metres: the true altitude
+        unless a takeoff pad is modelled and the airframe is off it.
     tilt_deg, pan_deg : float
         Last ``move_camera`` command, degrees (negative tilt looks down).
     flying_state : int
@@ -92,8 +95,8 @@ class PhaseScene:
     target_frame : str or ndarray, optional
         Image with the target, resized to the stream geometry. The bench frame
         by default.
-    reveal_x_m : float
-        Forward distance past which the target is in view, metres (>= 0).
+    reveal_y_m : float
+        Leftward distance past which the target is in view, metres (>= 0).
     marker_radius_m : float
         Horizontal distance from the pad within which the marker is in view
         when looking down, metres (> 0).
@@ -113,23 +116,23 @@ class PhaseScene:
     def __init__(
         self,
         target_frame: Union[str, np.ndarray, None] = None,
-        reveal_x_m: float = 0.5,
+        reveal_y_m: float = 0.5,
         marker_radius_m: float = 0.8,
         marker_id: int = 8,
         marker_dict: Union[int, str] = "DICT_APRILTAG_36h11",
     ) -> None:
         import cv2
 
-        for name, value in (("reveal_x_m", reveal_x_m), ("marker_radius_m", marker_radius_m)):
+        for name, value in (("reveal_y_m", reveal_y_m), ("marker_radius_m", marker_radius_m)):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise TypeError(f"{name} must be a finite number, got {value!r}")
-        if reveal_x_m < 0.0:
-            raise ValueError(f"reveal_x_m must be non-negative, got {reveal_x_m}")
+        if reveal_y_m < 0.0:
+            raise ValueError(f"reveal_y_m must be non-negative, got {reveal_y_m}")
         if marker_radius_m <= 0.0:
             raise ValueError(f"marker_radius_m must be positive, got {marker_radius_m}")
         if isinstance(marker_id, bool) or not isinstance(marker_id, int) or marker_id < 0:
             raise ValueError(f"marker_id must be a non-negative int, got {marker_id!r}")
-        self.reveal_x_m = float(reveal_x_m)
+        self.reveal_y_m = float(reveal_y_m)
         self.marker_radius_m = float(marker_radius_m)
         self._floor = floor_texture()
         self._target = self._load_target(DEFAULT_TARGET_FRAME if target_frame is None else target_frame)
@@ -165,7 +168,7 @@ class PhaseScene:
     def render(self, view: CameraView) -> np.ndarray:
         if view.flying_state not in _AIRBORNE or view.z <= _AIRBORNE_MIN_Z_M:
             return self._floor
-        if view.x >= self.reveal_x_m:
+        if view.y >= self.reveal_y_m:
             self._target_seen = True
             return self._target
         near_pad = math.hypot(view.x, view.y) <= self.marker_radius_m
@@ -178,14 +181,35 @@ class PhaseScene:
 SCENARIOS: Dict[str, Callable[[], Scene]] = {"empty": UniformScene, "accident": PhaseScene}
 
 
-def build_scene(name: str) -> Scene:
+def build_scene(
+    name: str, reveal_y_m: Optional[float] = None, marker_radius_m: Optional[float] = None
+) -> Scene:
     """The scene registered as ``name``.
+
+    Parameters
+    ----------
+    name : str
+        Key of :data:`SCENARIOS`.
+    reveal_y_m : float, optional
+        Leftward distance at which the target comes into view, for ``accident``.
+    marker_radius_m : float, optional
+        Distance from the pad within which the marker is in view, for ``accident``.
 
     Raises
     ------
     ValueError
-        If no scene has that name.
+        If no scene has that name, or a geometry is given for a scene without
+        a target.
     """
     if name not in SCENARIOS:
         raise ValueError(f"unknown scenario {name!r}; known: {', '.join(sorted(SCENARIOS))}")
-    return SCENARIOS[name]()
+    geometry = {
+        key: value
+        for key, value in (("reveal_y_m", reveal_y_m), ("marker_radius_m", marker_radius_m))
+        if value is not None
+    }
+    if not geometry:
+        return SCENARIOS[name]()
+    if name != "accident":
+        raise ValueError(f"scene geometry applies to the accident scene only, not {name!r}")
+    return PhaseScene(**geometry)

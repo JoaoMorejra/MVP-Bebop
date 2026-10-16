@@ -8,15 +8,105 @@ Covers items 1 and 2 of section 2.6 of docs/PROMPT_VOO_REAL_ESCOPO_ATUAL.md:
 2. ``--no-fly`` in the same scenario:
    - zero takeoff command;
    - zero non-zero cmd_vel.
+3. Lateral flight pattern signs on the same ``--fly`` runs: the outbound leg flies left
+   (vy >= 0), Stage 3 never translates forward, Stage 4 only moves the gimbal (downward)
+   and the altitude, and the Stage 5 search flies right (vy <= 0). The emulator renders
+   the target from a fixed image, so Stage 3 does not converge here (it ends degraded);
+   these runs check sequence, signs and safety, not convergence.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
+from typing import Callable, Dict, Final, List, Optional, Sequence, Tuple
+
 import pytest
 
-from support.fake_bebop.harness import EmulatedFlight, SHORT_FLIGHT
+from support.fake_bebop.harness import EmulatedFlight, FlightResult, SHORT_FLIGHT
+
+#: Half-width of the band around a window boundary inside which a Twist may belong to
+#: either adjacent window. A boundary is the instant the harness read the mission's
+#: stdout line; a Twist is stamped when the emulator received it. Both are
+#: CLOCK_MONOTONIC, but each carries its own scheduling latency (pipe reader thread,
+#: DDS delivery), so a command published just after a marker can be stamped before the
+#: harness reads the marker, and one published just before it can be stamped after.
+BOUNDARY_GRACE_SEC: Final[float] = 0.3
+
+#: Stage 5 lines that end the rightward search: the 2D centering over the marker, the
+#: odometric return when the marker backend is unavailable, or the touchdown itself.
+SEARCH_END_MARKERS: Final[Tuple[str, ...]] = (
+    "Centering on marker",
+    "Odometric RTL engaged",
+    "Executing terminal landing",
+)
+
+Twist = Sequence[float]
+Rule = Callable[[Twist], bool]
+
+#: Per-window admissible Twists, ``v = (linear.x, linear.y, linear.z, angular.z)``.
+#: +y is LEFT (REP-103); vyaw is locked at zero for the whole flight.
+WINDOW_RULES: Final[Dict[str, Rule]] = {
+    "step2": lambda v: v[0] == 0.0 and v[1] >= 0.0 and v[3] == 0.0,
+    "step3": lambda v: v[0] == 0.0 and v[3] == 0.0,
+    "step4": lambda v: v[0] == 0.0 and v[1] == 0.0 and v[3] == 0.0,
+    "step5_search": lambda v: v[0] == 0.0 and v[1] <= 0.0 and v[3] == 0.0,
+    "step5_final": lambda v: v[3] == 0.0,
+}
+
+FLY_SEEDS: Final[List[Tuple[int, int]]] = [(1, 91), (2, 92), (3, 93)]
+
+
+@pytest.fixture(scope="module", params=FLY_SEEDS, ids=[f"{seed}-{domain}" for seed, domain in FLY_SEEDS])
+def fly_result(request, tmp_path_factory) -> FlightResult:
+    """One ``--fly`` run per plant seed, shared by every test that inspects it."""
+    seed, domain = request.param
+    flight = EmulatedFlight(str(tmp_path_factory.mktemp(f"fly_seed{seed}")), domain=domain, seed=seed)
+    with flight:
+        return flight.fly(SHORT_FLIGHT, fly=True, timeout=180.0)
+
+
+def _windows(result: FlightResult) -> List[Tuple[str, float, float]]:
+    """Partition the run into ``(name, start, end)`` windows from the ``[STEP N:`` markers."""
+    starts: Dict[int, float] = {}
+    for line in result.lines:
+        for step in range(2, 6):
+            if step not in starts and f"[STEP {step}:" in line.text:
+                starts[step] = line.mono
+    assert sorted(starts) == [2, 3, 4, 5], f"missing step markers: {sorted(starts)}"
+    search_end: Optional[float] = next(
+        (
+            line.mono
+            for line in result.lines
+            if line.mono > starts[5] and any(marker in line.text for marker in SEARCH_END_MARKERS)
+        ),
+        None,
+    )
+    bounds = [
+        ("step2", starts[2]),
+        ("step3", starts[3]),
+        ("step4", starts[4]),
+        ("step5_search", starts[5]),
+    ]
+    if search_end is not None:
+        bounds.append(("step5_final", search_end))
+    return [
+        (name, start, bounds[index + 1][1] if index + 1 < len(bounds) else math.inf)
+        for index, (name, start) in enumerate(bounds)
+    ]
+
+
+def _admissible(windows: List[Tuple[str, float, float]], mono: float, twist: Twist) -> bool:
+    """A Twist is admissible under its own window, or under a neighbour within the grace band."""
+    return any(
+        start - BOUNDARY_GRACE_SEC <= mono < end + BOUNDARY_GRACE_SEC and WINDOW_RULES[name](twist)
+        for name, start, end in windows
+    )
+
+
+def _window_of(windows: List[Tuple[str, float, float]], mono: float) -> Optional[str]:
+    return next((name for name, start, end in windows if start <= mono < end), None)
 
 
 def test_fly_path_no_fly_issues_zero_takeoff_and_zero_nonzero_cmd_vel(tmp_path):
@@ -32,12 +122,9 @@ def test_fly_path_no_fly_issues_zero_takeoff_and_zero_nonzero_cmd_vel(tmp_path):
     assert result.watchdog.get("violations", 0) == 0, "watchdog found publishers on domain 14"
 
 
-@pytest.mark.parametrize("seed,domain", [(1, 91), (2, 92), (3, 93)])
-def test_fly_path_fly_completes_all_stages_with_single_takeoff(tmp_path, seed, domain):
+def test_fly_path_fly_completes_all_stages_with_single_takeoff(fly_result):
     """In --fly, the mission completes 5 stages against the emulator and satisfies safety invariants."""
-    flight = EmulatedFlight(str(tmp_path), domain=domain, seed=seed)
-    with flight:
-        result = flight.fly(SHORT_FLIGHT, fly=True, timeout=180.0)
+    result = fly_result
 
     assert result.exit_code == 0, f"flight failed with exit {result.exit_code}:\n{result.tail()}"
     assert result.steps() == [1, 2, 3, 4, 5], f"steps: {result.steps()}"
@@ -108,6 +195,42 @@ def test_fly_path_fly_completes_all_stages_with_single_takeoff(tmp_path, seed, d
     td_val = float(touchdown_lines[0].text.split("mono=")[1].split()[0])
     dt_td = abs(td_val - t_touchdown)
     assert dt_td < 0.050, f"touchdown latency too high: {dt_td:.4f} s"
+
+
+def test_the_outbound_leg_flies_left_and_the_return_leg_flies_right(fly_result):
+    """Every non-zero Twist of Stages 2-5 obeys the lateral pattern of the window it falls in.
+
+    Stage 2 flies left only (vx == 0, vy >= 0, at least one vy > 0); Stage 3 never
+    translates forward (vx == 0); Stage 4 holds station and moves only the altitude and
+    the gimbal, which slews downward at least once; the Stage 5 search flies right only
+    (vx == 0, vy <= 0), and only the final 2D centering over the marker may use both
+    horizontal axes. vyaw stays zero throughout.
+    """
+    result = fly_result
+    assert result.exit_code == 0, f"flight failed with exit {result.exit_code}:\n{result.tail()}"
+    assert result.steps() == [1, 2, 3, 4, 5], f"steps: {result.steps()}"
+
+    windows = _windows(result)
+    stage2_start = windows[0][1]
+    twists = [(r["mono"], tuple(r["v"])) for r in result.nonzero_twists(after=stage2_start)]
+    violations = [
+        (_window_of(windows, mono), round(mono - stage2_start, 3), twist)
+        for mono, twist in twists
+        if not _admissible(windows, mono, twist)
+    ]
+    assert not violations, f"Twists outside the lateral pattern (window, t since STEP 2, v): {violations[:10]}"
+
+    stage2 = [twist for mono, twist in twists if _window_of(windows, mono) == "step2"]
+    assert any(twist[1] > 0.0 for twist in stage2), f"Stage 2 never flew left: {stage2[:10]}"
+
+    _, stage4_start, stage4_end = windows[2]
+    gimbal = [(r["mono"], float(r["tilt"])) for r in result.commands("move_camera")]
+    descending = [
+        (round(mono - stage4_start, 3), previous, tilt)
+        for (_, previous), (mono, tilt) in zip(gimbal, gimbal[1:])
+        if stage4_start - BOUNDARY_GRACE_SEC <= mono < stage4_end and tilt < previous
+    ]
+    assert descending, f"Stage 4 never slewed the gimbal downward; move_camera: {gimbal}"
 
 
 def test_takeoff_rejected_fails_stage1_and_never_enters_stage2(tmp_path):
