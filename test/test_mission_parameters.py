@@ -69,6 +69,14 @@ def test_values_are_the_merged_document_the_steps_fly():
     assert payload["countdown_sec"] == pytest.approx(4.0)
 
 
+def test_cruise_speeds_use_the_lateral_gain_of_the_lateral_pattern():
+    calibration = SpeedCalibration(normalized_to_mps=0.5, lateral_to_mps=2.0)
+    params = merged({"kinematics": {"forward_cruise_velocity": 0.3}, "rtl": {"max_speed": 0.1}})
+    payload = spoken_parameters(params, calibration)
+    assert payload["cruise_mps"] == pytest.approx(0.6)
+    assert payload["rtl_mps"] == pytest.approx(0.2)
+
+
 def test_every_value_is_a_finite_float():
     params = MissionParameters()
     payload = spoken_parameters(params, SpeedCalibration.from_kinematics(params.kinematics))

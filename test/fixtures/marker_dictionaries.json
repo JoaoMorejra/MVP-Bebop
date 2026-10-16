@@ -1,0 +1,78 @@
+[
+  {
+    "name": "DICT_4X4_50",
+    "markers": 50
+  },
+  {
+    "name": "DICT_4X4_100",
+    "markers": 100
+  },
+  {
+    "name": "DICT_4X4_250",
+    "markers": 250
+  },
+  {
+    "name": "DICT_4X4_1000",
+    "markers": 1000
+  },
+  {
+    "name": "DICT_5X5_50",
+    "markers": 50
+  },
+  {
+    "name": "DICT_5X5_100",
+    "markers": 100
+  },
+  {
+    "name": "DICT_5X5_250",
+    "markers": 250
+  },
+  {
+    "name": "DICT_5X5_1000",
+    "markers": 1000
+  },
+  {
+    "name": "DICT_6X6_50",
+    "markers": 50
+  },
+  {
+    "name": "DICT_6X6_100",
+    "markers": 100
+  },
+  {
+    "name": "DICT_6X6_250",
+    "markers": 250
+  },
+  {
+    "name": "DICT_6X6_1000",
+    "markers": 1000
+  },
+  {
+    "name": "DICT_7X7_50",
+    "markers": 50
+  },
+  {
+    "name": "DICT_7X7_1000",
+    "markers": 1000
+  },
+  {
+    "name": "DICT_ARUCO_ORIGINAL",
+    "markers": 1024
+  },
+  {
+    "name": "DICT_APRILTAG_16h5",
+    "markers": 30
+  },
+  {
+    "name": "DICT_APRILTAG_25h9",
+    "markers": 35
+  },
+  {
+    "name": "DICT_APRILTAG_36h10",
+    "markers": 2320
+  },
+  {
+    "name": "DICT_APRILTAG_36h11",
+    "markers": 587
+  }
+]

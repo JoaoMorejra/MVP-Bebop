@@ -1,0 +1,651 @@
+{
+  "description": "Parameter conflict cases shared by test/test_parameter_conflicts.py and bebop_mission_control/src/lib/parameterConflicts.test.ts. Each case applies base_overrides, then overrides, to test/fixtures/mission_factory_document.json (dotted paths; null removes the field) and lists the conflict ids expected, in order.",
+  "base_overrides": {
+    "rtl.reverse_cruise_velocity": -0.2
+  },
+  "cases": [
+    {
+      "name": "factory_coupled",
+      "overrides": {},
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e01_nadir_above_search",
+      "overrides": {
+        "gimbal.search_tilt_deg": -30,
+        "gimbal.nadir_tilt_deg": -10
+      },
+      "expect": {
+        "errors": [
+          "E01"
+        ],
+        "warnings": []
+      },
+      "note": "operator case s=-30, n=-10"
+    },
+    {
+      "name": "e01_boundary_nadir_just_below",
+      "overrides": {
+        "gimbal.search_tilt_deg": -30,
+        "gimbal.nadir_tilt_deg": -31.5
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e02_gap_at_tolerance",
+      "overrides": {
+        "gimbal.search_tilt_deg": -30,
+        "gimbal.nadir_tilt_deg": -31
+      },
+      "expect": {
+        "errors": [
+          "E02"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e02_boundary_gap_above_tolerance",
+      "overrides": {
+        "gimbal.search_tilt_deg": -30,
+        "gimbal.nadir_tilt_deg": -31.25
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e03_e04_operator_case",
+      "overrides": {
+        "kinematics.target_altitude_m": 0.1,
+        "kinematics.altitude_ceiling_margin_m": 0.0
+      },
+      "expect": {
+        "errors": [
+          "E03",
+          "E04"
+        ],
+        "warnings": [
+          "W03",
+          "W15"
+        ]
+      },
+      "note": "operator case h=0.1, m=0.0"
+    },
+    {
+      "name": "e03_ceiling_below_hover",
+      "overrides": {
+        "kinematics.target_altitude_m": 0.5,
+        "kinematics.altitude_ceiling_margin_m": 0.45
+      },
+      "expect": {
+        "errors": [
+          "E03"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e03_boundary_ceiling_at_hover",
+      "overrides": {
+        "kinematics.target_altitude_m": 0.5,
+        "kinematics.altitude_ceiling_margin_m": 0.5
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W01"
+        ]
+      }
+    },
+    {
+      "name": "operator_case_h01_m09",
+      "overrides": {
+        "kinematics.target_altitude_m": 0.1,
+        "kinematics.altitude_ceiling_margin_m": 0.9
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W01",
+          "W03",
+          "W15"
+        ]
+      },
+      "note": "operator case h=0.1, m=0.9: no error"
+    },
+    {
+      "name": "e04_margin_below_climb_band",
+      "overrides": {
+        "kinematics.altitude_ceiling_margin_m": 0.04
+      },
+      "expect": {
+        "errors": [
+          "E04"
+        ],
+        "warnings": [
+          "W01"
+        ]
+      }
+    },
+    {
+      "name": "e04_boundary_margin_at_climb_band",
+      "overrides": {
+        "kinematics.altitude_ceiling_margin_m": 0.05
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W01",
+          "W02"
+        ]
+      }
+    },
+    {
+      "name": "w01_w02_boundary_margin_at_noise_floor",
+      "overrides": {
+        "kinematics.altitude_ceiling_margin_m": 0.21
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e05_decoupled_factory_return",
+      "overrides": {
+        "rtl.reverse_cruise_velocity": -0.1
+      },
+      "expect": {
+        "errors": [
+          "E05"
+        ],
+        "warnings": []
+      },
+      "note": "raw MissionParameters.factory()"
+    },
+    {
+      "name": "e05_positive_return",
+      "overrides": {
+        "rtl.reverse_cruise_velocity": 0.2
+      },
+      "expect": {
+        "errors": [
+          "E05"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e06_ceiling_below_cruise",
+      "overrides": {
+        "kinematics.forward_cruise_velocity": 0.6,
+        "rtl.reverse_cruise_velocity": -0.6,
+        "kinematics.max_horizontal_speed": 0.3
+      },
+      "expect": {
+        "errors": [
+          "E06"
+        ],
+        "warnings": [
+          "W14"
+        ]
+      }
+    },
+    {
+      "name": "e06_operator_case_reconciled",
+      "overrides": {
+        "kinematics.forward_cruise_velocity": 0.6,
+        "rtl.reverse_cruise_velocity": -0.6,
+        "kinematics.max_horizontal_speed": 0.65
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W14"
+        ]
+      },
+      "note": "forward 0.6 with the ceiling lifted by reconcileCoupledPaths"
+    },
+    {
+      "name": "e06_ceiling_at_one",
+      "overrides": {
+        "kinematics.max_horizontal_speed": 1.0
+      },
+      "expect": {
+        "errors": [
+          "E06"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e06_boundary_ceiling_at_demand",
+      "overrides": {
+        "kinematics.max_horizontal_speed": 0.2
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e07_tag_zero",
+      "overrides": {
+        "rtl.tag_size": 0.0
+      },
+      "expect": {
+        "errors": [
+          "E07"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e07_tag_above_one_metre",
+      "overrides": {
+        "rtl.tag_size": 1.01
+      },
+      "expect": {
+        "errors": [
+          "E07"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e07_boundary_tag_one_metre",
+      "overrides": {
+        "rtl.tag_size": 1.0
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W13"
+        ]
+      }
+    },
+    {
+      "name": "e08_operator_case",
+      "overrides": {
+        "rtl.tag_size": 0.16,
+        "rtl.marker_dict": "DICT_4X4_50",
+        "rtl.target_aruco_id": 50
+      },
+      "expect": {
+        "errors": [
+          "E08"
+        ],
+        "warnings": []
+      },
+      "note": "operator case"
+    },
+    {
+      "name": "e08_boundary_last_id",
+      "overrides": {
+        "rtl.tag_size": 0.16,
+        "rtl.marker_dict": "DICT_4X4_50",
+        "rtl.target_aruco_id": 49
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e08_non_integer_id",
+      "overrides": {
+        "rtl.target_aruco_id": 1.5
+      },
+      "expect": {
+        "errors": [
+          "E08"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e09_unlisted_dictionary_name",
+      "overrides": {
+        "rtl.marker_dict": "tag36h11"
+      },
+      "expect": {
+        "errors": [
+          "E09"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e09_boundary_numeric_string",
+      "overrides": {
+        "rtl.marker_dict": "20"
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e09_legacy_integer_order",
+      "overrides": {
+        "rtl.marker_dict": 5,
+        "rtl.target_aruco_id": 900
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w03_altitude_at_low_floor",
+      "overrides": {
+        "kinematics.target_altitude_m": 0.35,
+        "kinematics.altitude_ceiling_margin_m": 0.9
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W03"
+        ]
+      }
+    },
+    {
+      "name": "w03_boundary_altitude_above_low_floor",
+      "overrides": {
+        "kinematics.target_altitude_m": 0.36,
+        "kinematics.altitude_ceiling_margin_m": 0.9
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w04_retired_overrun_geometry",
+      "overrides": {
+        "kinematics.forward_cruise_velocity": 0.6,
+        "rtl.reverse_cruise_velocity": -0.6,
+        "kinematics.max_horizontal_speed": 0.65,
+        "gimbal.nadir_tilt_deg": -25
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W14"
+        ]
+      },
+      "note": "W04 retired: no forward approach in the lateral pattern"
+    },
+    {
+      "name": "w05_retired_short_approach_geometry",
+      "overrides": {
+        "gimbal.nadir_tilt_deg": -21.5
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      },
+      "note": "W05 retired"
+    },
+    {
+      "name": "w06_retired_slow_approach",
+      "overrides": {
+        "kinematics.max_approach_forward_speed": 0.02,
+        "gimbal.search_tilt_deg": 0
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W11"
+        ]
+      },
+      "note": "W06 retired"
+    },
+    {
+      "name": "w08_distance_is_lateral_cruise_only",
+      "overrides": {
+        "rtl.timeout_sec": 29.5,
+        "gimbal.search_tilt_deg": 0
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W08",
+          "W11"
+        ]
+      },
+      "note": "needed = vf * search_timeout / abs(vr) = 30 s, no approach distance term even with the search at the horizon"
+    },
+    {
+      "name": "w07_ramp",
+      "overrides": {
+        "timeouts.search_timeout_sec": 1.8
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W07"
+        ]
+      }
+    },
+    {
+      "name": "w07_boundary",
+      "overrides": {
+        "timeouts.search_timeout_sec": 1.84
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w08_rtl_timeout",
+      "overrides": {
+        "rtl.timeout_sec": 29
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W08"
+        ]
+      }
+    },
+    {
+      "name": "w08_boundary",
+      "overrides": {
+        "rtl.timeout_sec": 30
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w08_float_noise_above_integer_requirement",
+      "overrides": {
+        "kinematics.forward_cruise_velocity": 0.2,
+        "timeouts.search_timeout_sec": 42,
+        "rtl.reverse_cruise_velocity": -0.3,
+        "rtl.timeout_sec": 28
+      },
+      "expect": {
+        "errors": [
+          "E05"
+        ],
+        "warnings": []
+      },
+      "note": "needed = 28.000000000000004 s; timeout 28 must not warn (EPS); fix text for 20 s is pinned to 28 s in both language tests"
+    },
+    {
+      "name": "w09_stabilize",
+      "overrides": {
+        "kinematics.takeoff_stabilize_duration_sec": 2.0
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W09"
+        ]
+      }
+    },
+    {
+      "name": "w09_boundary",
+      "overrides": {
+        "kinematics.takeoff_stabilize_duration_sec": 2.5
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w10_countdown",
+      "overrides": {
+        "kinematics.countdown_sec": 4
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W10"
+        ]
+      }
+    },
+    {
+      "name": "w10_boundary",
+      "overrides": {
+        "kinematics.countdown_sec": 5
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w11_band_above_horizon",
+      "overrides": {
+        "gimbal.search_tilt_deg": -4
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W11"
+        ]
+      }
+    },
+    {
+      "name": "w11_boundary",
+      "overrides": {
+        "gimbal.search_tilt_deg": -5
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w12_pixels",
+      "overrides": {
+        "rtl.tag_size": 0.03
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W12"
+        ]
+      }
+    },
+    {
+      "name": "w12_boundary",
+      "overrides": {
+        "rtl.tag_size": 0.064
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w13_margin",
+      "overrides": {
+        "rtl.tag_size": 0.9
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W13"
+        ]
+      }
+    },
+    {
+      "name": "w13_boundary",
+      "overrides": {
+        "rtl.tag_size": 0.85
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w14_speed",
+      "overrides": {
+        "kinematics.forward_cruise_velocity": 0.31,
+        "rtl.reverse_cruise_velocity": -0.31,
+        "kinematics.max_horizontal_speed": 0.4
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W14"
+        ]
+      }
+    },
+    {
+      "name": "w14_boundary",
+      "overrides": {
+        "kinematics.forward_cruise_velocity": 0.3,
+        "rtl.reverse_cruise_velocity": -0.3,
+        "kinematics.max_horizontal_speed": 0.35
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "w15_boundary_tag_inside_frame",
+      "overrides": {
+        "kinematics.target_altitude_m": 0.1,
+        "kinematics.altitude_ceiling_margin_m": 0.9,
+        "rtl.tag_size": 0.17
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W01",
+          "W03",
+          "W13"
+        ]
+      }
+    },
+    {
+      "name": "missing_inputs_are_skipped",
+      "overrides": {
+        "kinematics.target_altitude_m": null,
+        "vision.horizontal_fov_deg": null
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    }
+  ]
+}
