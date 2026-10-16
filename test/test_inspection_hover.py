@@ -8,15 +8,21 @@ evidence is still missing; after that it is station keeping and nothing else.
 
 from __future__ import annotations
 
+import math
 import threading
 
+import pytest
+
 from mvp_mission_bebop.blackboard import EvidenceRecord
+from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.parameters import MissionParameters
 from mvp_mission_bebop.perception.worker import SynchronousPerception
+from mvp_mission_bebop.steps import inspection as inspection_module
 from mvp_mission_bebop.steps.base import StepStatus
 from mvp_mission_bebop.steps.inspection import NadirInspectionStep
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import TelemetryHealth
+from test_stage3_integration import FakeClock, Scene
 
 HOVER_SEC = 0.3
 LOOP_HZ = 100.0
@@ -45,6 +51,10 @@ class Drone:
     def __init__(self):
         self.commands = []
         self.snapshots = 0
+        self.tilts = []
+
+    def camera_control(self, tilt, pan=0.0):
+        self.tilts.append(tilt)
 
     def move_velocity(self, vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=None):
         self.commands.append((vx, vy, vz, vyaw))
@@ -80,6 +90,8 @@ class Blackboard:
         self.evidence = EvidenceRecord()
         self.approach_finished = True
         self.target_confirmed = True
+        self.confirmed_target_px = None
+        self.confirmed_tilt_deg = None
 
 
 class Ctx:
@@ -102,6 +114,7 @@ class Ctx:
         self.emergency_event = threading.Event()
         self.stage_jump_event = threading.Event()
         self.current_tilt_deg = self.params.gimbal.nadir_tilt_deg
+        self.frame_width, self.frame_height = 856, 480
         self.detector = self
         self.targets = targets
         self.capture_succeeds = capture_succeeds
@@ -341,3 +354,194 @@ def test_no_acknowledgement_is_settled_by_the_end_of_the_stage_while_holding():
     step._settle_native_ack(ctx)
     assert ctx.updates and ctx.updates[-1][1]["native_photo"]["acknowledged"] is False
     assert len(ctx.drone.commands) > commands, "station keeping stopped while waiting"
+
+
+# ------------------------------------------------------- gimbal-only framing (D3)
+#
+# Stage 4 holds the airframe in absolute hover and frames the target with the
+# gimbal alone. The scene renders the target's pixel from the current tilt, so the
+# stage is closed against the same pinhole model the framing law inverts.
+
+SCENE_RANGE_M = 2.0
+SCENE_ALTITUDE_M = 1.2
+
+
+def _framing_ctx(*, targets=True):
+    """A Stage 4 entry as Stage 3 leaves it: locked at the search tilt."""
+    ctx = Ctx(targets=targets)
+    gimbal = ctx.params.gimbal
+    ctx.params.inspection.settle_window_sec = 0.05
+    ctx.params.inspection.settle_min_samples = 2
+    ctx.params.inspection.settle_timeout_sec = 0.2
+    ctx.current_tilt_deg = gimbal.search_tilt_deg
+    scene = Scene(SCENE_RANGE_M, altitude_m=SCENE_ALTITUDE_M)
+    ctx.blackboard.confirmed_target_px = scene.pixel(gimbal.search_tilt_deg)
+    ctx.blackboard.confirmed_tilt_deg = gimbal.search_tilt_deg
+
+    def detect(_frame, **_kwargs):
+        ctx.detections += 1
+        if not ctx.targets:
+            return Result([])
+        detection = Detection()
+        detection.center = scene.pixel(ctx.current_tilt_deg)
+        return Result([detection])
+
+    ctx.detect = detect
+    return ctx
+
+
+def _fixed_point_deg():
+    return -math.degrees(math.atan(SCENE_ALTITUDE_M / SCENE_RANGE_M))
+
+
+@pytest.fixture
+def simulated_time(monkeypatch):
+    """Deterministic loop timing for the step, as in ``test_stage3_integration``."""
+    clock = FakeClock()
+    monkeypatch.setattr(
+        inspection_module,
+        "LoopRate",
+        lambda hz, **kw: LoopRate(hz, clock=clock, sleeper=clock.sleep),
+    )
+    monkeypatch.setattr(
+        inspection_module, "Deadline", lambda seconds, **kw: Deadline(seconds, clock=clock)
+    )
+    return clock
+
+
+def _record_tilt_times(ctx, clock):
+    """Timestamp every gimbal command on the simulated clock."""
+    stamped = [(clock.now, ctx.current_tilt_deg)]
+    original = ctx.drone.camera_control
+
+    def camera_control(tilt, pan=0.0):
+        stamped.append((clock.now, tilt))
+        original(tilt, pan)
+
+    ctx.drone.camera_control = camera_control
+    return stamped
+
+
+def _assert_slew_respected(ctx, stamped):
+    rate = ctx.params.gimbal.max_slew_limit_deg
+    for (t0, tilt0), (t1, tilt1) in zip(stamped, stamped[1:]):
+        assert abs(tilt1 - tilt0) <= rate * (t1 - t0) + 1e-9, (
+            f"{tilt0:.3f} -> {tilt1:.3f} deg in {t1 - t0:.4f} s exceeds {rate} deg/s"
+        )
+
+
+def test_stage4_never_translates():
+    ctx = _framing_ctx()
+
+    assert NadirInspectionStep().execute(ctx) is StepStatus.SUCCESS
+    assert ctx.captures >= 1
+    assert ctx.drone.commands
+    assert all(
+        vx == 0.0 and vy == 0.0 and vyaw == 0.0 for vx, vy, _vz, vyaw in ctx.drone.commands
+    )
+
+
+def test_stage4_moves_only_the_gimbal(simulated_time):
+    """The target lies below the optical axis at the search tilt, so the framing
+    law can only pitch the camera down: every command is at or below the last."""
+    ctx = _framing_ctx()
+    gimbal = ctx.params.gimbal
+    stamped = _record_tilt_times(ctx, simulated_time)
+    assert ctx.blackboard.confirmed_target_px[1] > ctx.frame_height / 2.0
+
+    assert NadirInspectionStep().execute(ctx) is StepStatus.SUCCESS
+
+    tilts = ctx.drone.tilts
+    assert tilts, "the gimbal was never commanded"
+    assert all(later <= earlier + 1e-9 for earlier, later in zip(tilts, tilts[1:]))
+    assert all(gimbal.nadir_tilt_deg <= tilt <= gimbal.search_tilt_deg for tilt in tilts)
+    assert tilts[-1] < gimbal.search_tilt_deg
+    assert ctx.current_tilt_deg == tilts[-1]
+    tolerance = max(
+        ctx.params.vision.optical_center_tolerance_px,
+        ctx.params.vision.optical_center_tolerance_ratio * ctx.frame_width,
+    )
+    scene = Scene(SCENE_RANGE_M, altitude_m=SCENE_ALTITUDE_M)
+    assert abs(scene.pixel(tilts[-1])[1] - ctx.frame_height / 2.0) <= tolerance
+    _assert_slew_respected(ctx, stamped)
+
+
+def test_a_single_detection_then_loss_rests_on_its_open_loop_solution(
+    simulated_time, monkeypatch
+):
+    """Review Focus 7 with one detection: seen in the first frame, never again.
+
+    The gimbal must end on the open-loop solution of that pixel -- neither the
+    tilt reached by the one closed-loop step nor the floor -- and the capture is
+    flagged as unsettled.
+    """
+    ctx = _framing_ctx()
+    gimbal = ctx.params.gimbal
+    gimbal.max_slew_limit_deg = 450.0
+    ctx.blackboard.confirmed_target_px = None
+    ctx.blackboard.confirmed_tilt_deg = None
+    framing_detect = ctx.detect
+
+    def detect(frame, **kwargs):
+        result = framing_detect(frame, **kwargs)
+        ctx.targets = False
+        return result
+
+    ctx.detect = detect
+    stamped = _record_tilt_times(ctx, simulated_time)
+    milestones = []
+    monkeypatch.setattr(
+        inspection_module, "emit_milestone", lambda key, payload: milestones.append((key, payload))
+    )
+
+    assert NadirInspectionStep().execute(ctx) is StepStatus.SUCCESS
+
+    first_step = ctx.drone.tilts[0]
+    assert first_step > _fixed_point_deg() + 1.0, "the scenario never left an intermediate tilt"
+    assert ctx.current_tilt_deg == pytest.approx(_fixed_point_deg(), abs=0.5)
+    assert ctx.current_tilt_deg > gimbal.nadir_tilt_deg + gimbal.nadir_tilt_tolerance_deg
+    captures = [payload for key, payload in milestones if key == "mission.capture_done"]
+    assert captures and captures[0]["settled"] is False
+    _assert_slew_respected(ctx, stamped)
+
+
+def test_framing_failure_degrades_the_capture_without_aborting(monkeypatch):
+    """Review Focus 7: the target is never seen while the gimbal frames.
+
+    The stage keeps the open-loop pointing solution from Stage 3's last measured
+    pixel -- never the floor -- and still captures, flagged as unsettled.
+    """
+    ctx = _framing_ctx(targets=False)
+    gimbal = ctx.params.gimbal
+    # Shortens the derived framing window, 2 * (search - nadir) / slew, so the
+    # timeout path runs in a fraction of a second.
+    gimbal.max_slew_limit_deg = 450.0
+    milestones = []
+    monkeypatch.setattr(
+        inspection_module, "emit_milestone", lambda key, payload: milestones.append((key, payload))
+    )
+
+    assert NadirInspectionStep().execute(ctx) is StepStatus.SUCCESS
+
+    assert ctx.captures >= 1
+    assert ctx.current_tilt_deg == pytest.approx(_fixed_point_deg(), abs=1.0)
+    assert ctx.current_tilt_deg > gimbal.nadir_tilt_deg + gimbal.nadir_tilt_tolerance_deg
+    captures = [payload for key, payload in milestones if key == "mission.capture_done"]
+    assert captures and captures[0]["settled"] is False
+    assert all(vx == 0.0 and vy == 0.0 for vx, vy, _vz, _vyaw in ctx.drone.commands)
+
+
+def test_an_abort_during_framing_returns_aborted_without_capturing():
+    ctx = _framing_ctx()
+    framing_detect = ctx.detect
+
+    def detect(frame, **kwargs):
+        ctx.emergency_event.set()
+        return framing_detect(frame, **kwargs)
+
+    ctx.detect = detect
+
+    assert NadirInspectionStep().execute(ctx) is StepStatus.ABORTED
+    assert ctx.captures == 0
+    assert ctx.drone.snapshots == 0
+    assert not ctx.perception.engaged

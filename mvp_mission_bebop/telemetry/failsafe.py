@@ -10,8 +10,9 @@ import logging
 import math
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Final, Iterator, Optional, Tuple
+from typing import TYPE_CHECKING, ContextManager, Final, Iterator, Optional, Tuple
 
+from mvp_mission_bebop.actuators.yaw_authority import YawAuthority
 from mvp_mission_bebop.exceptions import KinematicConstraintViolation
 from mvp_mission_bebop.parameters import FlightKinematicsConfig, TimeoutsConfig
 from mvp_mission_bebop.telemetry.battery import BatterySupervisor
@@ -79,8 +80,10 @@ class FailsafeSupervisor:
         timeouts_cfg: TimeoutsConfig,
         kinematics_cfg: Optional[FlightKinematicsConfig] = None,
         battery_supervisor: Optional[BatterySupervisor] = None,
+        yaw_authority: Optional[YawAuthority] = None,
     ) -> None:
         self.actuator = drone_actuator
+        self.yaw_authority: YawAuthority = yaw_authority if yaw_authority is not None else YawAuthority()
         self.odom_supervisor = odom_supervisor
         self.timeouts_cfg = timeouts_cfg
         self.kinematics_cfg = kinematics_cfg or FlightKinematicsConfig()
@@ -217,6 +220,45 @@ class FailsafeSupervisor:
             if ceiling > 0.0 and previous <= 0.0:
                 logger.info("Altitude hold authority revoked; vertical authority is descent-only.")
 
+    def guard_hold_boost(self) -> float:
+        """Ascent the platform edge guard adds to an open altitude-hold window.
+
+        The guard near the pad edge lets the altitude hold climb up to
+        ``platform.guard_climb_authority`` instead of the global
+        ``governor.max_climb_speed``. It widens a window a translating stage
+        has already opened; it never opens one, so outside every window the
+        vertical axis stays descent-only whatever the platform monitor says.
+
+        Returns
+        -------
+        float
+            ``platform.guard_climb_authority`` while an altitude-hold window is
+            open and the odometry supervisor reports the guard active; ``0.0``
+            otherwise, including when the supervisor has no platform report.
+        """
+        if self._altitude_hold_ceiling <= 0.0:
+            return 0.0
+        source = getattr(self.odom_supervisor, "platform_report", None)
+        platform = getattr(self.odom_supervisor, "platform_cfg", None)
+        if not callable(source) or platform is None:
+            return 0.0
+        try:
+            report = source()
+        except Exception as exc:  # noqa: BLE001 - a broken monitor grants nothing
+            logger.debug("Platform report unavailable (%s); no guard boost.", exc)
+            return 0.0
+        if not getattr(report, "guard_active", False):
+            return 0.0
+        return max(0.0, float(platform.guard_climb_authority))
+
+    def yaw_window(self, max_vyaw: float) -> ContextManager[None]:
+        """Authorize yaw up to ``max_vyaw`` for the duration of the block.
+
+        Opened only by the Simple mission profile (stages 2 to 4). See
+        :class:`~mvp_mission_bebop.actuators.yaw_authority.YawAuthority`.
+        """
+        return self.yaw_authority.window(max_vyaw)
+
     def clamp_kinematics(
         self, vz: float, vyaw: float, *, allow_climb: bool = False
     ) -> Tuple[float, float]:
@@ -240,15 +282,16 @@ class FailsafeSupervisor:
         supervisor unless a translating stage has opened one -- ``vz`` is
         saturated non-positive exactly as it always was.
 
-        ``vyaw`` is forced to zero unconditionally in every phase: the yaw
-        invariant protects optical-flow fidelity and has no exception.
+        ``vyaw`` is forced to zero unless the yaw authority is open: the yaw
+        invariant protects optical-flow fidelity and is relaxed only by
+        :meth:`yaw_window`.
 
         Parameters
         ----------
         vz : float
             Requested vertical velocity. Positive is ascent.
         vyaw : float
-            Requested yaw rate. Always suppressed.
+            Requested yaw rate. Suppressed unless the yaw authority is open.
         allow_climb : bool
             Caller's opt-in to ascent. Default ``False``, so every existing call
             site keeps the strict descent-only behaviour without modification.
@@ -256,7 +299,8 @@ class FailsafeSupervisor:
         Returns
         -------
         Tuple[float, float]
-            ``(vz, vyaw)``. ``vyaw`` is always ``0.0``. ``vz`` is saturated to
+            ``(vz, vyaw)``. ``vyaw`` is ``0.0`` unless a yaw window is open, in which
+            case it is saturated to that window's ceiling. ``vz`` is saturated to
             ``<= 0`` unless a window is open, in which case it is saturated to
             that window's ascent ceiling.
         """
@@ -266,6 +310,10 @@ class FailsafeSupervisor:
         else:
             ceiling = self._altitude_hold_ceiling
             authority = "altitude hold" if ceiling > 0.0 else ""
+            boost = self.guard_hold_boost()
+            if boost > ceiling:
+                ceiling = boost
+                authority = "the platform edge guard"
 
         safe_vz = min(vz, ceiling)
         if vz > ceiling + KINEMATIC_TOLERANCE:
@@ -281,11 +329,15 @@ class FailsafeSupervisor:
                     "Climb command vz=%.4f suppressed; vertical authority is descent-only.", vz
                 )
 
-        if abs(vyaw) > KINEMATIC_TOLERANCE:
+        safe_vyaw = self.yaw_authority.clamp(vyaw)
+        if abs(vyaw - safe_vyaw) > KINEMATIC_TOLERANCE:
             logger.warning(
-                "Yaw command vyaw=%.4f suppressed; rotation is prohibited in flight.", vyaw
+                "Yaw command vyaw=%.4f limited to %.4f; rotation is authorized only inside "
+                "a yaw window.",
+                vyaw,
+                safe_vyaw,
             )
-        return safe_vz, 0.0
+        return safe_vz, safe_vyaw
 
     def clamp_translation(self, vx: float, vy: float) -> Tuple[float, float]:
         """Saturate the horizontal command onto the flight envelope.
@@ -343,8 +395,22 @@ class FailsafeSupervisor:
                 "Positive vertical climbing commands are strictly prohibited."
             )
 
-    def evaluate_system_health(self) -> Tuple[bool, str]:
-        """Verify telemetry health, altitude ceiling, battery charge, and optical stream continuity."""
+    def evaluate_system_health(self, *, check_video: bool = True) -> Tuple[bool, str]:
+        """Verify telemetry health, altitude ceiling, battery charge, and optical stream continuity.
+
+        Parameters
+        ----------
+        check_video : bool
+            Include the camera heartbeat. A phase that suspends vision on purpose
+            (the heading restore after the Stage 4 capture) passes False: the
+            frame age is stale there by construction, and every other item stays
+            enforced.
+
+        Returns
+        -------
+        Tuple[bool, str]
+            ``(True, "Nominal")`` or ``(False, reason)``.
+        """
         if self.failsafe_active:
             return False, "Failsafe already active."
 
@@ -364,10 +430,11 @@ class FailsafeSupervisor:
             if battery_reason is not None:
                 return False, battery_reason
 
-        frame_age = time.monotonic() - self.last_valid_frame_timestamp
-        timeout = self.timeouts_cfg.video_stream_timeout_sec
-        if frame_age > timeout:
-            return False, f"Camera stream loss: frame age {frame_age:.1f} s > {timeout:.1f} s."
+        if check_video:
+            frame_age = time.monotonic() - self.last_valid_frame_timestamp
+            timeout = self.timeouts_cfg.video_stream_timeout_sec
+            if frame_age > timeout:
+                return False, f"Camera stream loss: frame age {frame_age:.1f} s > {timeout:.1f} s."
 
         return True, "Nominal"
 

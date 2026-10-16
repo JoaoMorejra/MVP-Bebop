@@ -468,6 +468,18 @@ class PerceptionPipeline:
         """
         raise NotImplementedError
 
+    def release_nowait(self) -> None:
+        """Stop starting new cycles, without waiting for the one in flight.
+
+        For a caller that must act at once and only later needs the camera and
+        detector to itself: Stage 1 releases the warmup at the countdown's zero,
+        commands the takeoff, and only then disengages, so a hung inference
+        delays the confirmation's first frame and never the takeoff command. A
+        result the in-flight cycle produces is discarded as after
+        :meth:`disengage`.
+        """
+        raise NotImplementedError
+
     @contextmanager
     def session(
         self, conf: Optional[float] = None, imgsz: Union[int, float, str, None] = None
@@ -594,6 +606,11 @@ class PerceptionWorker(PerceptionPipeline, threading.Thread):
             self._engagement_generation += 1
             self._slot.clear()
         self._engaged_event.set()
+
+    def release_nowait(self) -> None:
+        # Only the engage flag: ``_cycle`` refuses to publish once it is clear,
+        # and the cycle lock is left to the bounded :meth:`disengage`.
+        self._engaged_event.clear()
 
     def disengage(self, timeout_sec: float = DEFAULT_DISENGAGE_TIMEOUT_SEC) -> bool:
         """Stop the worker and wait, bounded, for the in-flight cycle.
@@ -742,6 +759,9 @@ class SynchronousPerception(PerceptionPipeline):
         self._slot.clear()
         self._published_generation = self._slot.generation
         self._engaged = True
+
+    def release_nowait(self) -> None:
+        self._engaged = False
 
     def disengage(self, timeout_sec: float = DEFAULT_DISENGAGE_TIMEOUT_SEC) -> bool:
         self._engaged = False

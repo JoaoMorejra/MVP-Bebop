@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 import random
 import threading
+import time
 from typing import List, Optional, Tuple
 
 import pytest
@@ -754,25 +755,25 @@ def test_a_lost_marker_brakes_rather_than_leaving_the_last_command_latched():
     assert stopping.vx == 0.0 and stopping.vy == 0.0
 
 
-def test_a_loss_mid_approach_creeps_aft_to_reframe_the_marker():
+def test_a_loss_mid_approach_creeps_left_to_reframe_the_marker():
     """The flight failure: overshoot loses the tag, then the drone just hovers.
 
-    The narrow rear field of view at a steep camera_tilt_deg means a marker
-    lost while the airframe was still closing in -- not already parked over it
-    -- is very often a marker that has just slipped out of frame ahead or
-    below, exactly the direction a small aft creep re-frames.
+    The return leg is flown to the right, so a marker lost while the airframe
+    was still closing in -- not already parked over it -- is very often a
+    marker that has just slipped past the left edge of the frame, exactly the
+    direction a small leftward creep re-frames.
     """
     controller = law()
     moving = None
     for _ in range(40):
-        moving = controller.update(sighting(0.30, 0.0), DT)
+        moving = controller.update(sighting(0.0, -0.30), DT)
     assert moving.commanded_speed_mps > controller.rtl_cfg.settle_max_speed_mps, (
         "the approach never built up real speed; the test does not exercise the case"
     )
 
     # The profile was tracking a real cruise speed; jerk and acceleration
     # limits mean it takes several cycles to decelerate through zero into the
-    # negative creep target, not one. The window this must happen within is
+    # leftward creep target, not one. The window this must happen within is
     # reacquire_creep_sec, not the first post-loss cycle. The bound carries the
     # same 1.5-step dither margin as the speed-ceiling tests above, for the
     # same reason: the sigma-delta shaper's correction can momentarily overshot
@@ -780,20 +781,21 @@ def test_a_loss_mid_approach_creeps_aft_to_reframe_the_marker():
     creep_ceiling = abs(
         controller.calibration.to_normalized(controller.rtl_cfg.reacquire_creep_speed)
     ) + 1.5 * controller.rtl_cfg.quantization_step
-    crept_negative = False
+    crept_left = False
     command = None
     for _ in range(int(controller.rtl_cfg.reacquire_creep_sec / DT) + 1):
         command = controller.update(None, DT)
-        assert command.vx >= -creep_ceiling - 1e-6, "the creep authority must stay bounded"
-        if command.vx < 0.0:
-            crept_negative = True
-    assert crept_negative, "the recovery must actually creep aft within the creep window"
+        assert command.vy <= creep_ceiling + 1e-6, "the creep authority must stay bounded"
+        assert command.vx == 0.0, "the creep never uses the forward channel"
+        if command.vy > 0.0:
+            crept_left = True
+    assert crept_left, "the recovery must actually creep left within the creep window"
 
 
 def test_the_creep_is_bounded_in_time_and_then_holds():
     controller = law()
     for _ in range(40):
-        controller.update(sighting(0.30, 0.0), DT)
+        controller.update(sighting(0.0, -0.30), DT)
 
     cfg = MissionParameters().rtl
     elapsed = 0.0
@@ -801,12 +803,12 @@ def test_the_creep_is_bounded_in_time_and_then_holds():
     command = None
     while elapsed < cfg.reacquire_creep_sec + 1.0:
         command = controller.update(None, DT)
-        if command.vx < 0.0:
+        if command.vy > 0.0:
             creeping_seen = True
         elapsed += DT
 
     assert creeping_seen, "the creep never engaged at all"
-    assert command.vx == pytest.approx(0.0, abs=1e-6), (
+    assert command.vy == pytest.approx(0.0, abs=1e-6), (
         "the creep must end and the airframe come to rest, not creep indefinitely"
     )
 
@@ -822,27 +824,30 @@ def test_a_loss_while_already_parked_over_the_marker_does_not_creep():
 
     for _ in range(10):
         command = controller.update(None, DT)
-        assert command.vx == 0.0, "an at-rest loss must hold station, not creep"
+        assert command.vx == 0.0 and command.vy == 0.0, (
+            "an at-rest loss must hold station, not creep"
+        )
 
 
 def test_a_loss_from_far_out_does_not_creep():
     """Creep is a close-in remedy; a marker lost well outside landing range is
     not the overshoot case this recovery exists for. The airframe was cruising
-    toward the marker at speed, so the first cycles after loss are still a
-    positive-vx deceleration -- the assertion is that it decays cleanly to
-    zero rather than being railed at the (much smaller) creep authority.
+    toward the marker at speed, to the right, so the first cycles after loss
+    are still a negative-vy deceleration -- the assertion is that it decays
+    cleanly to zero rather than being railed at the (much smaller) leftward
+    creep authority.
     """
     controller = law()
     for _ in range(60):
-        controller.update(sighting(2.0, 1.5), DT)
+        controller.update(sighting(1.5, -2.0), DT)
 
-    creep_floor = -abs(
+    creep_ceiling = abs(
         controller.calibration.to_normalized(controller.rtl_cfg.reacquire_creep_speed)
-    ) - 1e-6
+    ) + 1e-6
     command = None
     for _ in range(400):
         command = controller.update(None, DT)
-        assert command.vx >= creep_floor, (
+        assert command.vy <= creep_ceiling, (
             "a far-range loss must never creep past the bounded reacquire authority"
         )
         if command.commanded_speed_mps == 0.0:
@@ -1071,36 +1076,6 @@ def test_the_gimbal_is_pitched_to_the_configured_search_attitude():
     assert ctx.drone.tilts, "the gimbal was never commanded"
     assert ctx.drone.tilts[0] == pytest.approx(ctx.params.rtl.camera_tilt_deg)
     assert ctx.current_tilt_deg == pytest.approx(ctx.params.rtl.camera_tilt_deg)
-
-
-def test_the_reverse_cruise_never_commands_forward_flight():
-    """The search leg is the mirror of Stage 2 and must stay mirrored.
-
-    Enforced at the actuator boundary rather than in the profile, so neither a
-    sign error in ``reverse_cruise_velocity`` nor a sigma-delta pulse of the
-    wrong polarity can turn the return into an outbound cruise.
-    """
-    ctx = Ctx()
-    sensor = ScriptedSensor(ctx.drone)
-    step = ClosedLoopRTLStep(sensor=sensor)
-
-    outcome = step._reverse_search(ctx, sensor, __deadline(ctx))
-
-    assert ctx.horizontal, "the search sent no commands at all"
-    assert all(vx <= 0.0 for vx, _vy in ctx.horizontal)
-    assert any(vx < 0.0 for vx, _vy in ctx.horizontal), "it never actually flew"
-    assert outcome.value == "exhausted"
-
-
-def test_the_reverse_cruise_holds_the_lateral_and_yaw_axes_at_zero():
-    """With no marker in frame there is nothing to correct *towards*, and a
-    cross-track command with no reference is just a curved search track."""
-    ctx = Ctx()
-    sensor = ScriptedSensor(ctx.drone)
-    ClosedLoopRTLStep(sensor=sensor)._reverse_search(ctx, sensor, __deadline(ctx))
-
-    assert all(vy == 0.0 for _vx, vy in ctx.horizontal)
-    assert all(vyaw == 0.0 for _vx, _vy, _vz, vyaw in ctx.drone.commands)
 
 
 def test_the_search_leg_transmits_the_corrective_climb():
@@ -1901,43 +1876,6 @@ def test_the_sensor_survives_whichever_opencv_the_interpreter_has():
     sensor.observe(render_marker(7, 428, 240, 200, (617, 597)))
 
 
-class RecordingGovernor:
-    def __init__(self):
-        self.calls = []
-
-    def compute_vz(self, altitude, dt=None, vx_commanded=0.0):
-        self.calls.append(vx_commanded)
-        return 0.0
-
-    def horizontal_scale(self):
-        return 1.0
-
-
-def test_cruise_backward_feeds_the_commanded_vx_to_the_governor():
-    from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
-    from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
-
-    ctx = Ctx()
-    ctx.governor = RecordingGovernor()
-    profile = JerkLimitedProfile(ProfileLimits(max_velocity=0.3, max_accel=0.4, max_jerk=2.0))
-    shaper = QuantizedCommandShaper(0.06, 0.01)
-
-    step = ClosedLoopRTLStep(sensor=ScriptedSensor(ctx.drone))
-
-    # Several cycles, so the jerk-limited profile leaves standstill: on the
-    # first one it still commands zero, which the default would satisfy too.
-    sent = [
-        step._cruise_backward(ctx, profile, shaper, dt=0.05, cruise_mps=0.2)
-        for _ in range(40)
-    ]
-
-    assert len(ctx.governor.calls) == len(sent)
-    assert all(fed <= 0.0 for fed in ctx.governor.calls), "the reverse cruise must feed a non-positive vx"
-    assert any(fed < 0.0 for fed in ctx.governor.calls), "the governor never saw the cruise"
-    assert ctx.governor.calls == pytest.approx(sent)
-
-
-
 class GeometrySensor(ScriptedSensor):
     """A scripted sensor that also reports marker geometry for the overlay."""
 
@@ -2002,3 +1940,261 @@ def test_no_marker_means_no_geometry():
             return None, None
 
     assert ArucoMarkerSensor(Blind(), target_id=7, backend="solvepnp").overlay_geometry(_np.zeros((4, 4, 3))) == []
+
+
+# ------------------------------------------------- P1 hooks for the takeoff pad (2.9)
+
+
+def test_p1a_the_halt_keeps_the_vertical_axis_governed_with_the_edge_guard():
+    ctx = Ctx()
+    ctx.params.platform.edge_ahead_m = 0.25
+    with ctx.failsafe.altitude_hold_window(0.10):
+        ClosedLoopRTLStep()._halt_translation(ctx)
+    assert ctx.drone.commands[-1] == (0.0, 0.0, pytest.approx(0.10), 0.0)
+
+
+def test_p1a_without_the_edge_guard_the_halt_is_unchanged():
+    ctx = Ctx()
+    with ctx.failsafe.altitude_hold_window(0.10):
+        ClosedLoopRTLStep()._halt_translation(ctx)
+    assert ctx.drone.commands[-1] == (0.0, 0.0, 0.0, 0.0)
+
+
+class OverrideOdometry(Odometry):
+    """Records the along-track positions the marker reports to the platform monitor."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.overrides: List[Tuple[float, float]] = []
+
+    def override_along_track(self, along_track_m, ttl_sec):
+        self.overrides.append((along_track_m, ttl_sec))
+
+
+@pytest.mark.parametrize("edge", [0.25, None])
+def test_p1b_the_marker_reports_the_pad_position_only_with_the_edge_guard(edge):
+    ctx = Ctx(altitude=0.30)
+    ctx.params.rtl.timeout_sec = 4.0
+    ctx.params.platform.edge_ahead_m = edge
+    ctx.odom_supervisor = OverrideOdometry(ctx.drone, 0.30, period=1.0 / 200.0)
+    ctx.failsafe.odom_supervisor = ctx.odom_supervisor
+    sensor = ScriptedSensor(ctx.drone, acquire_after=3, ex=0.35, ey=-0.25)
+
+    ClosedLoopRTLStep(sensor=sensor).execute(ctx)
+
+    if edge is None:
+        assert ctx.odom_supervisor.overrides == []
+    else:
+        overrides = ctx.odom_supervisor.overrides
+        assert overrides, "the marker never reported the pad position"
+        # The outbound track runs to the left: along-track is minus the left error.
+        assert overrides[0][0] == pytest.approx(0.25, abs=0.01)
+        assert all(ttl == pytest.approx(0.5) for _s, ttl in overrides)
+
+
+class PadOdometry(Odometry):
+    """Descends to the floor a pad height below the launch point."""
+
+    platform_state = "off"
+
+    def snapshot(self):
+        if self._drone.descending:
+            self.relative_altitude = max(
+                -1.0, self.relative_altitude - self._descent_rate * self._period
+            )
+        return self
+
+
+def declared_touchdown_altitude(monkeypatch, *, state, height, at_base):
+    ctx = Ctx(altitude=0.60)
+    ctx.params.platform.height_m = height
+    ctx.odom_supervisor = PadOdometry(ctx.drone, 0.60, period=1.0 / 200.0)
+    ctx.odom_supervisor.platform_state = state
+    ctx.failsafe.odom_supervisor = ctx.odom_supervisor
+    declared = []
+    monkeypatch.setattr(
+        "mvp_mission_bebop.steps.rtl.emit_milestone",
+        lambda key, payload=None: declared.append((key, ctx.odom_supervisor.relative_altitude)),
+    )
+    ClosedLoopRTLStep()._touchdown(ctx, None, at_base=at_base)
+    return [altitude for key, altitude in declared if key == "mission.touchdown"][0]
+
+
+def test_p1c_off_the_pad_touchdown_waits_for_the_floor(monkeypatch):
+    altitude = declared_touchdown_altitude(monkeypatch, state="off", height=1.0, at_base=False)
+    assert altitude <= 0.15 - 1.0
+
+
+@pytest.mark.parametrize(
+    "state, height, at_base",
+    [("off", 1.0, True), ("off", 0.0, False), ("on", 1.0, False), ("unknown", 1.0, False)],
+)
+def test_p1c_otherwise_the_grounded_threshold_is_unchanged(monkeypatch, state, height, at_base):
+    altitude = declared_touchdown_altitude(monkeypatch, state=state, height=height, at_base=at_base)
+    assert -0.85 < altitude <= 0.15
+
+
+# ------------------------------------------------- re-entry false climb over the pad edge
+
+
+class EdgePlant(Drone):
+    """Real-time airframe over the pad edge, publishing odometry at 100 Hz.
+
+    The last Twist is latched, as the Bebop latches it, and integrated on the
+    monotonic clock. ``firmware_climb_mps`` stands in for the firmware answering
+    the sonar step on re-entry: the reading drops by the pad height and the
+    airframe climbs on its own, on top of whatever ``gaz`` it is sent, from the
+    first command for ``firmware_climb_sec`` (``None``: for good).
+    """
+
+    PERIOD_SEC = 0.01
+
+    def __init__(self, odom, *, y, z, firmware_climb_mps=0.0, firmware_climb_sec=None):
+        super().__init__()
+        self.no_fly = False
+        self._odom = odom
+        self.x, self.y, self.z = 0.0, y, z
+        self.peak = z
+        self.firmware_climb_mps = firmware_climb_mps
+        self.firmware_climb_sec = firmware_climb_sec
+        self._latched = (0.0, 0.0, 0.0)
+        self._climb_started = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def move_velocity(self, vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=None):
+        super().move_velocity(vx=vx, vy=vy, vz=vz, vyaw=vyaw, duration=duration)
+        self._latched = (vx, vy, vz)
+        if self._climb_started is None:
+            self._climb_started = time.monotonic()
+
+    def _run(self):
+        last = time.monotonic()
+        while not self._stop.wait(self.PERIOD_SEC):
+            now = time.monotonic()
+            dt, last = min(now - last, 0.05), now
+            vx, vy, vz = self._latched
+            climb = 0.0
+            if self._climb_started is not None and (
+                self.firmware_climb_sec is None or now - self._climb_started < self.firmware_climb_sec
+            ):
+                climb = self.firmware_climb_mps
+            # Yaw is locked at zero, so the body velocity is the odometry-frame one.
+            self.x += vx * dt
+            self.y += vy * dt
+            self.z += (vz + climb) * dt
+            self.peak = max(self.peak, self.z)
+            self._odom.inject_synthetic_sample(x=self.x, y=self.y, z=self.z)
+
+
+START_Z = 1.40
+
+
+def re_entry_ctx(*, firmware_climb_mps, firmware_climb_sec=None, grace_sec=3.0, edge=0.30, search_sec=4.0):
+    """Stage 5 coming back over the measured pad, just under the venue-capped ceiling."""
+    from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
+    from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
+
+    ctx = Ctx(altitude=START_Z)
+    params = ctx.params
+    params.rtl.timeout_sec = search_sec
+    params.kinematics.target_altitude_m = 1.8
+    params.kinematics.altitude_ceiling_margin_m = 0.6
+    params.platform.height_m = 1.0
+    params.platform.edge_ahead_m = edge
+    params.platform.venue_ceiling_agl_m = 2.5
+    params.platform.ceiling_allowance_m = 0.4
+    params.platform.reentry_breach_grace_sec = grace_sec
+    params.calibration.altitude_probe_enabled = False
+
+    odom = OdometrySupervisor(params.kinematics, params.timeouts, params.calibration, params.platform)
+    for _ in range(params.calibration.min_ground_samples):
+        odom.inject_synthetic_sample(x=0.0, y=0.0, z=0.0)
+    assert odom.calibrate_ground_reference()
+    odom.inject_synthetic_sample(x=0.0, y=0.0, z=0.8)
+    odom.freeze_hover_takeoff_origin()
+    for k in range(126):
+        odom.inject_synthetic_sample(x=0.0, y=0.02 * k, z=0.8)
+    for k in range(76):
+        odom.inject_synthetic_sample(x=0.0, y=2.5 - 0.02 * k, z=0.8)
+    odom.inject_synthetic_sample(x=0.0, y=1.0, z=START_Z)
+    if edge is not None:
+        assert odom.snapshot().platform_state == "entering"
+    assert odom.ceiling_breach_streak == 0
+
+    plant = EdgePlant(
+        odom, y=1.0, z=START_Z, firmware_climb_mps=firmware_climb_mps, firmware_climb_sec=firmware_climb_sec
+    )
+    ctx.drone = plant
+    ctx.odom_supervisor = odom
+    ctx.governor = AltitudeHoldGovernor(
+        params.relative_target_altitude_m,
+        params.governor,
+        guard_source=odom.platform_report,
+        platform_cfg=params.platform,
+        descent_demand=odom.reentry_descent_demanded,
+    )
+    ctx.failsafe = FailsafeSupervisor(
+        drone_actuator=plant,
+        odom_supervisor=odom,
+        timeouts_cfg=params.timeouts,
+        kinematics_cfg=params.kinematics,
+    )
+    ctx.failsafe_reasons = []
+    trigger = ctx.failsafe.trigger_emergency_land
+
+    def recording_trigger(reason):
+        ctx.failsafe_reasons.append(reason)
+        trigger(reason)
+
+    ctx.failsafe.trigger_emergency_land = recording_trigger
+    ctx.sensor = ScriptedSensor(plant)
+    return ctx
+
+
+def fly_the_return(ctx):
+    with ctx.drone:
+        return ClosedLoopRTLStep(sensor=ctx.sensor).execute(ctx)
+
+
+#: A repique the guard can absorb: 0.4 m/s of firmware climb for one second.
+TRANSIENT = dict(firmware_climb_mps=0.40, firmware_climb_sec=1.0)
+
+
+def test_a_transient_re_entry_climb_is_driven_down_without_an_emergency_landing():
+    ctx = re_entry_ctx(**TRANSIENT)
+
+    status = fly_the_return(ctx)
+
+    assert ctx.drone.peak > 1.5, "the repique never reached the ceiling; the case proves nothing"
+    assert ctx.failsafe_reasons == []
+    assert status is StepStatus.SUCCESS
+    assert min(ctx.vertical) == pytest.approx(-ctx.params.platform.guard_descent_cap, abs=1e-6)
+    assert ctx.drone.z < 1.5
+
+
+def test_regression_without_the_pad_edge_the_same_repique_lands_the_aircraft():
+    ctx = re_entry_ctx(edge=None, **TRANSIENT)
+
+    status = fly_the_return(ctx)
+
+    assert status is StepStatus.FAILURE
+    assert ctx.failsafe_reasons == ["Altitude ceiling breached during RTL."]
+
+
+def test_a_sustained_re_entry_climb_still_lands_the_aircraft_after_the_grace():
+    ctx = re_entry_ctx(firmware_climb_mps=0.30, grace_sec=0.5)
+
+    status = fly_the_return(ctx)
+
+    assert status is StepStatus.FAILURE
+    assert ctx.failsafe_reasons == ["Altitude ceiling breached during RTL."]
+    assert min(ctx.vertical) < -0.10, "the breach never commanded the guard descent"

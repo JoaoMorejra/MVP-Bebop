@@ -42,7 +42,8 @@ def spoken_parameters(
         The merged document the steps fly.
     calibration : SpeedCalibration
         Converts the normalized cruise commands the document holds into metres
-        per second, the unit the copilot speaks.
+        per second, the unit the copilot speaks. Both cruises are flown
+        cross-track in the lateral pattern, so they use the lateral gain.
 
     Returns
     -------
@@ -53,8 +54,8 @@ def spoken_parameters(
     kinematics = params.kinematics
     return {
         "target_altitude_m": round(float(kinematics.target_altitude_m), 2),
-        "cruise_mps": round(float(calibration.to_mps(kinematics.forward_cruise_velocity)), 3),
-        "rtl_mps": round(float(calibration.to_mps(params.rtl.max_speed)), 3),
+        "cruise_mps": round(float(calibration.to_mps(kinematics.forward_cruise_velocity, axis="lateral")), 3),
+        "rtl_mps": round(float(calibration.to_mps(params.rtl.max_speed, axis="lateral")), 3),
         "search_timeout_sec": round(float(params.timeouts.search_timeout_sec), 2),
         "hover_duration_sec": round(float(kinematics.hover_duration_sec), 2),
         "confidence": round(float(params.vision.confidence_threshold), 2),

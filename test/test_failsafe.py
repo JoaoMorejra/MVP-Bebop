@@ -257,3 +257,50 @@ def test_a_frame_gap_past_two_seconds_is_a_camera_stream_loss():
 
     assert healthy is False
     assert "Camera stream loss" in reason
+
+
+# ------------------------------------------------- platform edge guard boost
+
+
+def _guarded_failsafe(guard_active):
+    from mvp_mission_bebop.estimation.platform_monitor import PlatformReport, PlatformState
+    from mvp_mission_bebop.parameters import PlatformConfig
+
+    state = PlatformState.LEAVING if guard_active else PlatformState.OFF
+    odometry = type(
+        "GuardedOdometry",
+        (),
+        {
+            "platform_cfg": PlatformConfig(height_m=1.0, edge_ahead_m=0.25),
+            "platform_report": lambda self: PlatformReport(state, guard_active, 0.5, 0.54, 1, 0.0),
+        },
+    )()
+    return FailsafeSupervisor(DummyActuator(), odometry, TimeoutsConfig())
+
+
+def test_the_guard_boost_is_zero_outside_the_guard():
+    failsafe = _guarded_failsafe(guard_active=False)
+    with failsafe.altitude_hold_window(0.10):
+        assert failsafe.guard_hold_boost() == 0.0
+        assert failsafe.clamp_kinematics(0.30, 0.0)[0] == pytest.approx(0.10)
+
+
+def test_the_guard_boost_is_zero_without_a_hold_window():
+    failsafe = _guarded_failsafe(guard_active=True)
+    assert failsafe.guard_hold_boost() == 0.0
+    assert failsafe.clamp_kinematics(0.30, 0.0)[0] == 0.0
+
+
+def test_the_guard_boost_raises_the_hold_ceiling_only_with_both():
+    failsafe = _guarded_failsafe(guard_active=True)
+    with failsafe.altitude_hold_window(0.10):
+        assert failsafe.guard_hold_boost() == pytest.approx(0.20)
+        assert failsafe.clamp_kinematics(0.30, 0.0) == (pytest.approx(0.20), 0.0)
+    assert failsafe.clamp_kinematics(0.30, 0.0)[0] == 0.0
+
+
+def test_an_odometry_without_a_platform_report_grants_no_boost():
+    failsafe, _ = _failsafe_with_fresh_odometry()
+    with failsafe.altitude_hold_window(0.10):
+        assert failsafe.guard_hold_boost() == 0.0
+        assert failsafe.clamp_kinematics(0.30, 0.0)[0] == pytest.approx(0.10)

@@ -103,7 +103,7 @@ def test_startup_and_failure_calls_keep_their_sentences(action, details, sentenc
 
 class Ends(BaseStep):
     def __init__(self, status):
-        super().__init__("STEP 2: Linear Forward Search")
+        super().__init__("STEP 2: Lateral Left Search")
         self.status = status
 
     def execute(self, ctx):
@@ -890,7 +890,11 @@ def test_every_played_line_logs_the_length_of_its_audio(cached_announcer):
     finally:
         target.removeHandler(handler)
         target.setLevel(previous)
-    done = [r.getMessage() for r in records if r.getMessage().startswith("[SPEECH_DONE]")]
+    done = [
+        r.getMessage()
+        for r in records
+        if r.getMessage().startswith("[SPEECH_DONE]") and "Linha medida." in r.getMessage()
+    ]
     assert len(done) == 1
     assert "audio_ms=" in done[0] and "priority=NORMAL" in done[0]
     assert int(done[0].split("audio_ms=")[1].split()[0]) > 0

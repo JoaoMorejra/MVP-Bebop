@@ -66,6 +66,10 @@ def test_the_shipped_defaults_are_inside_every_envelope():
         ("gimbal", "nadir_tilt_deg", -20.0),
         ("gimbal", "nadir_tilt_deg", -10.0),
         ("kinematics", "target_altitude_m", 0.30),
+        ("kinematics", "target_altitude_m", 0.10),
+        ("kinematics", "altitude_ceiling_margin_m", 0.0),
+        ("kinematics", "altitude_ceiling_margin_m", 0.20),
+        ("kinematics", "altitude_ceiling_margin_m", float("nan")),
         ("kinematics", "target_altitude_m", "high"),
         ("kinematics", "max_horizontal_speed", 0.15),
         ("kinematics", "max_horizontal_speed", 1.0),
@@ -77,6 +81,9 @@ def test_the_shipped_defaults_are_inside_every_envelope():
         ("rtl", "camera_tilt_deg", 5.0),
         ("rtl", "reverse_cruise_velocity", 0.10),
         ("rtl", "landing_radius_m", 0.02),
+        ("rtl", "centering_timeout_sec", 0.0),
+        ("rtl", "centering_timeout_sec", -5.0),
+        ("rtl", "centering_timeout_sec", float("nan")),
         ("timeouts", "video_stream_timeout_sec", 8.0),
         ("timeouts", "video_stream_timeout_sec", 1.0),
         ("timeouts", "video_stream_timeout_sec", float("nan")),
@@ -87,6 +94,43 @@ def test_a_value_outside_its_documented_envelope_is_reported(section, field, val
     setattr(getattr(params, section), field, value)
 
     assert paths(audit_safe_envelopes(params, accepting)) == [f"{section}.{field}"]
+
+
+def test_the_ceiling_margin_floor_is_the_climb_band_plus_twice_the_settle_sigma():
+    """climb_deadband_m 0.05 + 2 * climb_settle_max_position_sigma_m 0.08 = 0.21 m."""
+    params = MissionParameters()
+    params.kinematics.altitude_ceiling_margin_m = 0.21
+    assert audit_safe_envelopes(params, accepting) == []
+
+    params.kinematics.altitude_ceiling_margin_m = 0.209
+    assert paths(audit_safe_envelopes(params, accepting)) == ["kinematics.altitude_ceiling_margin_m"]
+
+
+def test_a_horizontal_ceiling_below_the_cruise_is_still_reported():
+    params = MissionParameters()
+    params.kinematics.forward_cruise_velocity = 0.60
+    params.rtl.reverse_cruise_velocity = -0.60
+    params.kinematics.max_horizontal_speed = 0.30
+    assert paths(audit_safe_envelopes(params, accepting)) == ["kinematics.max_horizontal_speed"]
+
+
+def test_a_lifted_ceiling_clears_the_fastest_coupled_cruise():
+    params = MissionParameters()
+    params.kinematics.forward_cruise_velocity = 0.60
+    params.rtl.reverse_cruise_velocity = -0.60
+    params.kinematics.max_horizontal_speed = 0.65
+    assert audit_safe_envelopes(params, accepting) == []
+
+
+@pytest.mark.parametrize("search, nadir", [(0.0, -80.0), (-45.0, -80.0), (0.0, -1.0)])
+def test_the_widened_gimbal_ranges_diverge_only_when_nadir_is_not_below_search(search, nadir):
+    params = MissionParameters()
+    params.gimbal.search_tilt_deg = search
+    params.gimbal.nadir_tilt_deg = nadir
+    assert audit_safe_envelopes(params, accepting) == []
+
+    params.gimbal.nadir_tilt_deg = search
+    assert paths(audit_safe_envelopes(params, accepting)) == ["gimbal.nadir_tilt_deg"]
 
 
 def test_an_unresolvable_marker_dictionary_is_reported():
@@ -118,7 +162,9 @@ def test_divergences_are_logged_as_structured_warnings_and_never_raise(records):
 
     found = log_envelope_divergences(params, accepting)
 
-    warnings = [r for r in records.records if r.levelno == logging.WARNING]
+    warnings = [
+        r for r in records.records if r.levelno == logging.WARNING and r.getMessage().startswith(f"[{ENVELOPE_TAG}] ")
+    ]
     assert len(warnings) == len(found) == 2
     payloads = [json.loads(ENVELOPE_LINE.search(r.getMessage()).group(1)) for r in warnings]
     assert {p["path"] for p in payloads} == {
@@ -132,7 +178,10 @@ def test_divergences_are_logged_as_structured_warnings_and_never_raise(records):
 
 
 def test_a_nominal_configuration_logs_no_warning(records):
-    assert log_envelope_divergences(MissionParameters(), accepting) == []
+    """Nominal as the station sends it: the return cruise coupled to the forward one."""
+    params = MissionParameters()
+    params.rtl.reverse_cruise_velocity = -params.kinematics.forward_cruise_velocity
+    assert log_envelope_divergences(params, accepting) == []
     assert not [r for r in records.records if r.levelno >= logging.WARNING]
 
 

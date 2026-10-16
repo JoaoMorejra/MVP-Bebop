@@ -3,11 +3,10 @@
 Two flight-observed defects, both of which ended with the airframe doing nothing
 useful for a long time:
 
-*The approach abandoned a target it was directly on top of.* Near the inspection
-attitude the ground footprint is small, the object is foreshortened into an
-aspect ratio the detector never trained on, and the airframe's own shadow falls
-on it. Losing the detection there is the expected case, and the step treated it
-as the end of the approach.
+*Stage 3 abandoned a target on the first sustained loss.* The step treated a
+lost detection as the end of the stage. Reacquisition now holds the tilt and, in
+the lateral flight pattern, creeps sideways toward the edge the target left
+through -- never along-track -- before giving up on a bounded window.
 
 *RTL returned to the takeoff point and never landed.* A braking profile plus
 odometry lag leaves the drone slightly past the origin; forward flight was
@@ -44,7 +43,7 @@ SEARCH_TILT_DEG = -20.0
 NADIR_TILT_DEG = GimbalConstraintsConfig().nadir_tilt_deg
 
 
-# ═══════════════════════════════════════════════ target loss near nadir
+# ═══════════════════════════════════════════════ target loss in Stage 3
 
 
 def build_controller():
@@ -60,140 +59,111 @@ def build_controller():
     )
 
 
-def at_nadir(controller, tilt=NADIR_TILT_DEG, cycles=6):
-    """Drive the controller into the nadir phase with a centred target."""
-    controller._phase = TrackingPhase.NADIR
+def tracking(controller, px_x=CENTER_X, cycles=6):
+    """Servo on a target at ``px_x`` without letting the freeze latch."""
     command = None
     for _ in range(cycles):
-        command = controller.compute((CENTER_X, CENTER_Y), FRAME, tilt, 1.20, DT)
-        tilt = command.tilt_deg
-    return command, tilt
+        command = controller.compute(
+            (px_x, CENTER_Y), FRAME, SEARCH_TILT_DEG, 1.20, DT, airframe_at_rest=False
+        )
+    return command
 
 
-def test_losing_the_target_at_nadir_does_not_end_the_approach():
+def test_losing_the_target_does_not_end_the_stage():
     controller = build_controller()
-    _, tilt = at_nadir(controller)
+    tracking(controller)
 
-    command = controller.note_target_lost(tilt, DT)
+    command = controller.note_target_lost(SEARCH_TILT_DEG, DT)
 
     assert controller.phase is TrackingPhase.REACQUIRING
     assert not command.recovery_exhausted, "recovery must not give up on the first lost frame"
 
 
-def test_recovery_holds_position_rather_than_drifting():
-    """The cross-track axis is silent without a bearing to act on."""
+def test_a_loss_at_the_centreline_holds_position():
+    """No side to creep toward, so no motion on either axis and no tilt change."""
     controller = build_controller()
-    _, tilt = at_nadir(controller)
+    tracking(controller)
 
     for _ in range(int(3.0 / DT)):
-        command = controller.note_target_lost(tilt, DT)
-        tilt = command.tilt_deg
-        assert command.vy == 0.0, "no lateral command without a measurement"
-        assert command.vx <= 0.0, "recovery may back off, never press forward"
+        command = controller.note_target_lost(SEARCH_TILT_DEG, DT)
+        assert command.vy == 0.0, "no lateral command without a side to creep toward"
+        assert command.vx == 0.0, "recovery never translates along-track"
+        assert command.tilt_deg == SEARCH_TILT_DEG
 
 
-def test_recovery_sweeps_the_gimbal_back_up_from_the_last_sighting():
-    """Pitching up is the recovery; pitching down only stares harder at the miss.
-
-    A shallower ray lands the footprint further ahead and covers far more ground
-    per degree of pitch, so it re-frames a target that fell out of the near
-    field. The sweep starts from the anchor -- the tilt at which the target was
-    last actually seen -- not from wherever the gimbal happens to be.
-    """
+def test_recovery_creeps_toward_the_exit_side_then_holds():
+    """The target left through the right edge: creep right, bounded, then stop."""
     controller = build_controller()
-    _, tilt = at_nadir(controller)
-    start = tilt
-
-    tilts = []
-    for _ in range(int(4.0 / DT)):
-        command = controller.note_target_lost(tilt, DT)
-        tilt = command.tilt_deg
-        tilts.append(tilt)
-
-    assert tilts[-1] > start, "the gimbal must pitch up, toward a wider footprint"
-    assert tilts[-1] <= SEARCH_TILT_DEG + 1e-6, "never above the search attitude"
-    assert tilts == sorted(tilts), "the sweep must be monotone, not a dither"
-
-
-def test_recovery_backs_off_then_holds():
-    """A target directly beneath the airframe is outside the frustum at any tilt."""
-    controller = build_controller()
-    _, tilt = at_nadir(controller)
+    tracking(controller, px_x=820.0)
     cfg = VisionConfig()
 
-    reverse = []
+    creep = []
     elapsed = 0.0
     while elapsed < cfg.reacquire_reverse_sec + 1.5:
-        command = controller.note_target_lost(tilt, DT)
-        tilt = command.tilt_deg
-        reverse.append((elapsed, command.vx))
+        command = controller.note_target_lost(SEARCH_TILT_DEG, DT)
         elapsed += DT
+        creep.append((elapsed, command.vy))
+        assert command.vx == 0.0
 
-    early = [vx for t, vx in reverse if t < cfg.reacquire_reverse_sec - DT]
-    late = [vx for t, vx in reverse if t > cfg.reacquire_reverse_sec + DT]
+    early = [vy for t, vy in creep if t < cfg.reacquire_reverse_sec - DT]
+    late = [vy for t, vy in creep if t > cfg.reacquire_reverse_sec + DT]
 
-    assert all(vx < 0.0 for vx in early), "the creep must actually run"
-    assert min(early) >= -cfg.reacquire_reverse_speed - 1e-9, "and stay bounded"
-    assert all(vx == 0.0 for vx in late), "then stop, rather than reversing indefinitely"
+    assert any(vy < 0.0 for vy in early), "the creep must actually run"
+    assert all(vy <= 0.0 for vy in early), "and only toward the exit side"
+    assert sum(early) / len(early) >= -cfg.reacquire_reverse_speed - 0.015, "and stay bounded"
+    assert all(vy == 0.0 for vy in late), "then stop, rather than creeping indefinitely"
 
 
-def test_regaining_the_target_resumes_the_phase_it_was_lost_from():
-    """The anchor exists so the approach continues rather than restarting."""
+def test_regaining_the_target_resumes_centering():
     controller = build_controller()
-    _, tilt = at_nadir(controller)
+    tracking(controller, px_x=820.0)
 
     for _ in range(int(2.0 / DT)):
-        command = controller.note_target_lost(tilt, DT)
-        tilt = command.tilt_deg
+        controller.note_target_lost(SEARCH_TILT_DEG, DT)
     assert controller.phase is TrackingPhase.REACQUIRING
 
     for _ in range(VisionConfig().reacquire_confirm_frames):
-        command = controller.compute((CENTER_X, CENTER_Y), FRAME, tilt, 1.20, DT)
-        tilt = command.tilt_deg
+        tracking(controller, px_x=700.0, cycles=1)
 
-    assert controller.phase is TrackingPhase.NADIR, "must resume nadir, not restart the approach"
+    assert controller.phase is TrackingPhase.CENTERING
 
 
 def test_a_single_frame_does_not_end_recovery():
     """One detection is what sent the tracker chasing phantoms before."""
     controller = build_controller()
-    _, tilt = at_nadir(controller)
+    tracking(controller)
     for _ in range(int(1.0 / DT)):
-        tilt = controller.note_target_lost(tilt, DT).tilt_deg
+        controller.note_target_lost(SEARCH_TILT_DEG, DT)
 
-    controller.compute((CENTER_X, CENTER_Y), FRAME, tilt, 1.20, DT)
+    tracking(controller, cycles=1)
     assert controller.phase is TrackingPhase.REACQUIRING, "one frame is not a reacquisition"
+
+
+def test_a_predicted_frame_does_not_confirm_a_reacquisition():
+    controller = build_controller()
+    tracking(controller)
+    controller.note_target_lost(SEARCH_TILT_DEG, DT)
+
+    for _ in range(VisionConfig().reacquire_confirm_frames * 3):
+        controller.compute(
+            (CENTER_X, CENTER_Y), FRAME, SEARCH_TILT_DEG, 1.20, DT, measured=False
+        )
+    assert controller.phase is TrackingPhase.REACQUIRING
 
 
 def test_recovery_is_bounded_and_reports_exhaustion():
     controller = build_controller()
-    _, tilt = at_nadir(controller)
+    tracking(controller, px_x=820.0)
     cfg = VisionConfig()
 
     elapsed = 0.0
     command = None
     while elapsed < cfg.reacquire_timeout_sec + 1.0:
-        command = controller.note_target_lost(tilt, DT)
-        tilt = command.tilt_deg
+        command = controller.note_target_lost(SEARCH_TILT_DEG, DT)
         elapsed += DT
 
     assert command.recovery_exhausted, "recovery must terminate rather than hold forever"
-    assert command.vx == 0.0, "an exhausted recovery must not still be translating"
-
-
-def test_recovery_from_the_approach_phase_resumes_the_approach():
-    controller = build_controller()
-    controller._phase = TrackingPhase.APPROACHING
-    tilt = -45.0
-    for _ in range(4):
-        tilt = controller.compute((CENTER_X, CENTER_Y), FRAME, tilt, 1.20, DT).tilt_deg
-
-    for _ in range(int(1.5 / DT)):
-        tilt = controller.note_target_lost(tilt, DT).tilt_deg
-    for _ in range(VisionConfig().reacquire_confirm_frames):
-        tilt = controller.compute((CENTER_X, CENTER_Y), FRAME, tilt, 1.20, DT).tilt_deg
-
-    assert controller.phase is TrackingPhase.APPROACHING
+    assert command.vx == 0.0 and command.vy == 0.0, "an exhausted recovery must not translate"
 
 
 # ═══════════════════════════════════════════════════ RTL touchdown
@@ -220,34 +190,36 @@ def guidance(cfg=None):
 
 
 def test_a_terminal_overshoot_is_nulled_instead_of_deadlocking():
-    """The flight failure: past the origin, forward prohibited, distance frozen.
+    """The flight failure: past the origin, outbound prohibited, distance frozen.
 
-    Holding the along-track axis meant the distance never changed, so arrival
-    could never confirm and the drone hovered over the takeoff point until the
-    whole return window expired.
+    Holding the return axis meant the distance never changed, so arrival could
+    never confirm and the drone hovered over the takeoff point until the whole
+    return window expired. The return is flown to the right, so the overshoot
+    leaves the origin to the left of the airframe.
     """
     cfg = ReturnToLaunchConfig()
     law = guidance(cfg)
 
-    ex = 0.35  # origin this far ahead of the nose: outside the arrival radius
+    ey = 0.35  # origin this far to the left: outside the arrival radius
     committed_at = None
     for cycle in range(int(30.0 / DT)):
-        command = law.compute(Snapshot(ex), 0.0, DT, phase=RTLPhase.NAVIGATING)
-        ex -= command.vx * DT
+        command = law.compute(Snapshot(0.0, ey), 0.0, DT, phase=RTLPhase.NAVIGATING)
+        ey -= command.vy * DT
         if command.ready_to_land:
             committed_at = cycle * DT
             break
 
     assert committed_at is not None, "never committed to landing"
     assert committed_at < 15.0, f"took {committed_at:.1f} s to commit"
-    assert ex <= cfg.arrival_radius_m
+    assert ey <= cfg.arrival_radius_m
 
 
-def test_forward_recovery_never_becomes_forward_flight():
+def test_leftward_recovery_never_becomes_leftward_flight():
     cfg = ReturnToLaunchConfig()
     law = guidance(cfg)
     peak = max(
-        law.compute(Snapshot(1.0), 0.0, DT, phase=RTLPhase.NAVIGATING).vx for _ in range(200)
+        law.compute(Snapshot(0.0, 1.0), 0.0, DT, phase=RTLPhase.NAVIGATING).vy
+        for _ in range(200)
     )
     assert 0.0 < peak <= cfg.overshoot_recovery_speed
 

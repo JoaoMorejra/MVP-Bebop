@@ -72,6 +72,10 @@ MILESTONE_KEYS: Final[Tuple[str, ...]] = (
     "mission.landing",
     "mission.battery_warning",
     "mission.touchdown",
+    #: Profile the mission resolved, ``{"mode": "simple|intermediate|advanced"}``,
+    #: raised once before ``mission.parameters``. The station compares it with
+    #: the profile requested and aborts on the ground on a divergence.
+    "mission.mode",
     "mission.parameters",
     #: Outcome of the Stage 1 flat trim, ``{"acknowledged": bool}``: the
     #: countdown overlay's IMU item follows it. Not narrated.

@@ -1,25 +1,31 @@
-"""Step-level integration test for Stage 3 against the flight's own scenario.
+"""Step-level integration test for Stage 3 in the lateral flight pattern.
 
-``test_centering_recovery`` proves the *control law* escapes the centering
-deadlock. This proves the *step* does -- the loop that owns perception, the
-gimbal, the governor and the actuator boundary -- because that is the layer the
-drone actually flew, and a control law that converges in isolation is worth
-nothing if the step around it never transmits its output.
+The control law is pinned in ``test_lateral_servoing``. This proves the *step*
+-- the loop that owns perception, the governor and the actuator boundary --
+centres the target with lateral corrections alone and freezes, because that is
+the layer the drone actually flies.
 
 The scene is closed-loop. The stub camera renders the target's pixel position
-from the current range and gimbal tilt, and the range shortens by whatever the
-step transmits as ``vx``. So the only way this test reaches nadir is if the step
-really does drive the airframe over the target.
+from the current lateral offset and gimbal tilt, and the offset changes by
+whatever the step transmits as ``vy``. The ground range is constant: the step
+must never transmit along-track motion, and the scene ignores it so that a
+regression shows up as a failed assertion on the command stream rather than as
+a silently easier geometry.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import math
+import os
 import threading
 
 import pytest
 
+import mvp_mission_bebop
 from mvp_mission_bebop.controllers.visual_servoing import (
+    ServoCommand,
     TrackingPhase,
     VisualServoingController,
 )
@@ -34,10 +40,11 @@ from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 FRAME = (856, 480)
 WIDTH, HEIGHT = FRAME
 ALTITUDE_M = 1.23
+SHIPPED_CONFIG = os.path.join(os.path.dirname(mvp_mission_bebop.__file__), "mission_config.json")
 
 
 class FakeClock:
-    """Simulated time, so a sixty-second flight stage runs in milliseconds.
+    """Simulated time, so a long flight stage runs in milliseconds.
 
     ``LoopRate`` and ``Deadline`` both accept an injected clock precisely for
     this, but the step constructs them itself, so the classes are substituted in
@@ -88,18 +95,17 @@ class DetectionResult:
 
 
 class Scene:
-    """A stationary ground target, observed through a steerable gimbal."""
+    """A stationary ground target at a constant range, observed through the gimbal."""
 
     def __init__(self, ground_range_m, altitude_m=ALTITUDE_M, lateral_m=0.0):
         self.ground_range_m = ground_range_m
         self.altitude_m = altitude_m
         self.lateral_m = lateral_m
 
-    def advance(self, vx_normalized, vy_normalized, dt):
-        self.ground_range_m = max(0.0, self.ground_range_m - vx_normalized * dt)
+    def advance(self, _vx_normalized, vy_normalized, dt):
         # ``lateral_m`` follows GroundProjection: positive is to the *left*. The
         # body frame is FLU, so +vy is also to the left, and flying left reduces
-        # a leftward offset.
+        # a leftward offset. ``vx`` is ignored on purpose: the range is constant.
         self.lateral_m -= vy_normalized * dt
 
     def pixel(self, tilt_deg):
@@ -128,11 +134,12 @@ class Drone:
 
 
 class Odometry:
-    """Healthy telemetry at a held altitude. The vertical axis is not on trial here."""
+    """Healthy telemetry at a held altitude, airframe at rest unless told otherwise."""
 
     def __init__(self, altitude_m):
         self.relative_altitude = altitude_m
         self.speed = 0.0
+        self.horizontal_speed = 0.0
         self.x = self.y = 0.0
 
     def snapshot(self):
@@ -162,6 +169,8 @@ class Governor:
 class Blackboard:
     target_confirmed = True
     approach_finished = False
+    confirmed_tilt_deg = None
+    confirmed_target_px = None
 
 
 class Ctx:
@@ -195,6 +204,8 @@ class Ctx:
         self.current_tilt_deg = params.gimbal.search_tilt_deg
         self.detector = self
         self.overlays = []
+        #: Every pixel the stub detector reported, in order.
+        self.detected_px = []
         self._dt = 1.0 / params.kinematics.control_loop_hz
         # Inline perception: one frame, one inference, one overlay per control
         # cycle, so the stage's frame-counting logic is exercised exactly.
@@ -209,8 +220,7 @@ class Ctx:
             self.scene.advance(vx, vy, self._dt)
         return object()
 
-    #: Cycles over which the detector returns nothing, simulating the dropout
-    #: that happens near nadir. Set by the loss test.
+    #: Cycles over which the detector returns nothing. Set by the loss tests.
     blackout = range(0, 0)
 
     def interrupted(self) -> bool:
@@ -221,11 +231,19 @@ class Ctx:
         self._cycle = getattr(self, "_cycle", -1) + 1
         if self._cycle in self.blackout:
             return DetectionResult([])
-        return DetectionResult([Detection(self.scene.pixel(self.current_tilt_deg), 0.79)])
+        pixel = self.scene.pixel(self.current_tilt_deg)
+        self.detected_px.append(pixel)
+        return DetectionResult([Detection(pixel, 0.79)])
 
     def publish_annotated_stream(self, _frame, _result, text):
         self.overlays.append(text)
         return None
+
+    # -- assertions ------------------------------------------------------
+    def phases(self):
+        return [
+            line.split("STEP 3: ")[1].split()[0] for line in self.overlays if "STEP 3: " in line
+        ]
 
 
 def flight_params():
@@ -235,149 +253,207 @@ def flight_params():
     return params
 
 
+def in_view_range(params, altitude_m=ALTITUDE_M):
+    """Ground range that the search tilt centres vertically: ``h / tan(|tilt|)``.
+
+    Stage 2 confirms the target with the camera at the search tilt, and Stage 3
+    neither advances nor moves the gimbal, so this is the range the whole stage
+    runs at.
+    """
+    return altitude_m / math.tan(math.radians(abs(params.gimbal.search_tilt_deg)))
+
+
+def tolerance_px(params):
+    return max(
+        params.vision.optical_center_tolerance_px,
+        params.vision.optical_center_tolerance_ratio * WIDTH,
+    )
+
+
+def offset_ctx(lateral_m=0.6, params=None):
+    params = params or flight_params()
+    return Ctx(params, Scene(ground_range_m=in_view_range(params), lateral_m=lateral_m))
+
+
 # ---------------------------------------------------------------------------
 
 
-def inspection_standoff(params, altitude_m=ALTITUDE_M):
-    """Ground range the gimbal frames when it reaches the inspection attitude.
-
-    The stage no longer flies the drone onto the target. It closes the range
-    until the camera has pitched to ``nadir_tilt_deg``, which by construction is
-    the moment the optical axis lands on the subject -- ``h / tan(|tilt|)``
-    ahead -- and freezes there. So the arrival criterion is this distance, not
-    the old 0.25 m "almost on top of it" threshold.
-    """
-    return altitude_m / math.tan(math.radians(abs(params.gimbal.nadir_tilt_deg)))
-
-
-def test_stage3_drives_the_airframe_to_the_inspection_standoff(simulated_time):
-    """The whole stage, from where the real flight stalled, to the freeze.
-
-    Eight metres out at 1.23 m -- the geometry that produced a sixty-second
-    hover at ``vx = 0``.
-    """
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
+@pytest.mark.parametrize("lateral_m", [0.6, -0.6], ids=["target-left", "target-right"])
+def test_stage3_converges_with_lateral_corrections_only(simulated_time, lateral_m):
+    ctx = offset_ctx(lateral_m)
+    start_range = ctx.scene.ground_range_m
 
     status = VisualServoingStep().execute(ctx)
 
-    standoff = inspection_standoff(ctx.params)
     assert status.name == "SUCCESS"
-    assert ctx.blackboard.approach_finished, "the stage never confirmed the inspection attitude"
-    assert ctx.scene.ground_range_m <= standoff + 0.10, (
-        f"stopped {ctx.scene.ground_range_m:.2f} m out against a {standoff:.2f} m standoff"
-    )
-    assert ctx.scene.ground_range_m >= standoff - 0.15, (
-        f"overflew the scene to {ctx.scene.ground_range_m:.2f} m; the gimbal cannot follow "
-        f"a subject closer than the {standoff:.2f} m its stop frames"
-    )
-
-
-def test_the_airframe_is_stationary_once_the_stage_reports_complete(simulated_time):
-    """Requirement: reaching the inspection tilt freezes the drone where it is.
-
-    Stage 4 verifies motionlessness statistically before it triggers the 14 MP
-    capture, and every command still in flight when Stage 3 hands over is
-    something that verification has to wait out. Asserted on the command stream
-    rather than on a controller flag, because the command stream is what the
-    airframe sees.
-    """
-    ctx = Ctx(flight_params(), Scene(ground_range_m=6.0))
-    VisualServoingStep().execute(ctx)
-
-    assert ctx.blackboard.approach_finished
-    tail = ctx.drone.commands[-4:]
-    assert tail, "the stage transmitted nothing"
-    assert all(vx == 0.0 and vy == 0.0 for vx, vy, _vz, _vyaw in tail), (
-        f"the airframe was still translating when the stage finished: {tail}"
-    )
-
-
-def test_the_gimbal_never_goes_past_the_inspection_attitude(simulated_time):
-    """It must not go all the way down to -80: -69 is a hard mechanical stop."""
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
-    VisualServoingStep().execute(ctx)
-
-    assert min(ctx.drone.tilts) >= ctx.params.gimbal.nadir_tilt_deg - 1e-6
-    assert min(ctx.drone.tilts) > -80.0
-
-
-def test_forward_cruise_is_transmitted_not_merely_computed(simulated_time):
-    """The failure was a step that never sent a non-zero vx to the actuator."""
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
-    VisualServoingStep().execute(ctx)
-
-    forward = [vx for vx, _vy, _vz, _vyaw in ctx.drone.commands]
-    assert max(forward) > 0.0, "no forward velocity ever reached the drone"
-    assert max(forward) <= ctx.params.kinematics.max_horizontal_speed
-
-
-def test_the_gimbal_walks_from_search_attitude_to_nadir(simulated_time):
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
-    VisualServoingStep().execute(ctx)
-
-    assert ctx.drone.tilts, "the gimbal was never commanded"
-    assert ctx.drone.tilts[-1] == pytest.approx(ctx.params.gimbal.nadir_tilt_deg, abs=2.5)
-    assert min(ctx.drone.tilts) >= ctx.params.gimbal.nadir_tilt_deg - 1e-6, (
-        "the gimbal exceeded its mechanical nadir limit"
-    )
-
-
-def test_the_vertical_invariant_holds_for_every_transmitted_command(simulated_time):
-    """Requirement 1: vz <= 0 across the whole of Stage 3, without exception."""
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
-    VisualServoingStep().execute(ctx)
-
+    assert ctx.blackboard.approach_finished is True
     assert ctx.drone.commands
-    assert all(vz <= 0.0 for _vx, _vy, vz, _vyaw in ctx.drone.commands)
+    assert all(vx == 0.0 for vx, _vy, _vz, _vyaw in ctx.drone.commands), "vx was transmitted"
     assert all(vyaw == 0.0 for _vx, _vy, _vz, vyaw in ctx.drone.commands)
+    assert any(vy != 0.0 for _vx, vy, _vz, _vyaw in ctx.drone.commands), "never moved laterally"
+    assert ctx.scene.ground_range_m == start_range
+    assert abs(ctx.scene.lateral_m) < abs(lateral_m)
 
 
-def test_a_laterally_offset_target_is_still_reached(simulated_time):
-    """The cross-track loop has to actually move the airframe, not just demand it."""
-    ctx = Ctx(flight_params(), Scene(ground_range_m=6.0, lateral_m=1.2))
+def test_the_airframe_is_frozen_on_the_cycle_the_stage_completes(simulated_time):
+    """The freeze is transmitted in the lock cycle itself, not a cycle later."""
+    ctx = offset_ctx()
     VisualServoingStep().execute(ctx)
 
-    assert abs(ctx.scene.lateral_m) < abs(1.2), "the lateral offset was never reduced"
     assert ctx.blackboard.approach_finished
+    vx, vy, _vz, _vyaw = ctx.drone.commands[-1]
+    assert vx == 0.0 and vy == 0.0
+    assert ctx.phases()[-1] == TrackingPhase.LOCKED.value.upper()
+    lock_cycle = ctx.drone.commands[-2]
+    assert lock_cycle[0] == 0.0 and lock_cycle[1] == 0.0, f"lock cycle transmitted {lock_cycle}"
+
+
+def test_the_gimbal_is_not_commanded_in_stage_3(simulated_time):
+    """D2: the gimbal belongs to Stage 4."""
+    ctx = offset_ctx()
+    ctx.blackout = range(10, 110)
+    VisualServoingStep().execute(ctx)
+
+    assert ctx.drone.tilts == []
+    assert ctx.current_tilt_deg == ctx.params.gimbal.search_tilt_deg
+
+
+@pytest.mark.parametrize("lateral_m", [0.6, -0.6], ids=["target-left", "target-right"])
+def test_a_laterally_offset_target_is_centred_on_either_side(simulated_time, lateral_m):
+    ctx = offset_ctx(lateral_m)
+    first_px = ctx.scene.pixel(ctx.current_tilt_deg)[0]
+    assert abs(first_px - WIDTH / 2.0) > tolerance_px(ctx.params), "premise: starts off-centre"
+
+    VisualServoingStep().execute(ctx)
+
+    assert ctx.blackboard.approach_finished
+    last_x = ctx.detected_px[-1][0]
+    assert abs(last_x - WIDTH / 2.0) <= tolerance_px(ctx.params)
 
 
 def test_the_stage_completes_well_inside_its_deadline(simulated_time):
-    """A stage that only finishes at the timeout has not really converged."""
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
-    VisualServoingStep().execute(ctx)
-
-    cycles = len(ctx.drone.commands)
-    elapsed = cycles / ctx.params.kinematics.control_loop_hz
-    assert ctx.blackboard.approach_finished
-    assert elapsed < ctx.params.timeouts.tracking_timeout_sec * 0.75, (
-        f"took {elapsed:.1f} s of a {ctx.params.timeouts.tracking_timeout_sec:.0f} s window"
-    )
-
-
-def test_the_window_covers_the_range_the_search_stage_can_hand_over(simulated_time):
-    """The stage deadline has to be sized from the geometry it must cover.
-
-    Stage 2 confirms a target as soon as three frames clear the confidence
-    threshold, which for a bicycle at 1.2 m AGL is routinely eight metres out
-    and can be considerably more. At the 0.15 approach cap the old 60 s window
-    bought 9.0 m of travel, so a target confirmed past roughly 8.5 m could not
-    be reached inside it no matter how well the control law performed -- the
-    stage would have ended in a timeout that looked exactly like the centering
-    deadlock it had just been fixed for.
-    """
+    """With the shipped lateral gains (output limit +/-0.04) a 0.6 m offset converges."""
     params = flight_params()
-    reachable = params.timeouts.tracking_timeout_sec * params.kinematics.max_approach_forward_speed
-    assert reachable >= 15.0, (
-        f"the window covers only {reachable:.1f} m of approach; Stage 2 hands over from further"
+    params.lateral_pid = MissionParameters.load_from_file(SHIPPED_CONFIG).lateral_pid
+    assert params.lateral_pid.output_limits[1] == pytest.approx(0.04), "premise: shipped gains"
+    ctx = offset_ctx(0.6, params)
+
+    VisualServoingStep().execute(ctx)
+
+    assert ctx.blackboard.approach_finished
+    assert simulated_time.now < 0.5 * params.timeouts.tracking_timeout_sec, (
+        f"took {simulated_time.now:.1f} s of a {params.timeouts.tracking_timeout_sec:.0f} s window"
     )
 
-    ctx = Ctx(params, Scene(ground_range_m=14.0))
-    VisualServoingStep().execute(ctx)
-    assert ctx.blackboard.approach_finished, "a 14 m standoff was not reachable in the window"
+
+def test_a_brief_occlusion_does_not_trigger_reacquisition(simulated_time):
+    """The alpha-beta coast absorbs a ten-frame dropout on its own, silently."""
+    ctx = offset_ctx()
+    ctx.blackout = range(10, 20)
+
+    status = VisualServoingStep().execute(ctx)
+
+    assert status.name == "SUCCESS"
+    assert ctx.blackboard.approach_finished
+    assert "REACQUIRING" not in ctx.phases()
+    assert any("[PREDICTED]" in line for line in ctx.overlays), "premise: the coast ran"
+    assert all(vx == 0.0 for vx, _vy, _vz, _vyaw in ctx.drone.commands)
+
+
+def test_the_step_recovers_from_a_dropout_instead_of_ending(simulated_time):
+    """A loss that outlasts the coast escalates to REACQUIRING and comes back."""
+    ctx = offset_ctx()
+    ctx.blackout = range(10, 110)
+
+    status = VisualServoingStep().execute(ctx)
+
+    phases = ctx.phases()
+    assert status.name == "SUCCESS"
+    assert "REACQUIRING" in phases, "recovery never engaged"
+    resumed = phases.index("REACQUIRING")
+    assert "CENTERING" in phases[resumed:], "never resumed centering"
+    assert ctx.blackboard.approach_finished, "the stage did not survive the dropout"
+    assert all(vx == 0.0 for vx, _vy, _vz, _vyaw in ctx.drone.commands)
+
+
+def test_a_permanent_loss_terminates_with_approach_unfinished(simulated_time):
+    """Recovery is bounded: a retry, not a new way to hang."""
+    ctx = offset_ctx()
+    ctx.blackout = range(10, 100_000)
+
+    status = VisualServoingStep().execute(ctx)
+
+    assert status.name == "SUCCESS"
+    assert ctx.blackboard.approach_finished is False
+    assert simulated_time.now < ctx.params.timeouts.tracking_timeout_sec, (
+        "recovery must end on its own window, not on the stage deadline"
+    )
+    assert all(vx == 0.0 for vx, _vy, _vz, _vyaw in ctx.drone.commands)
+
+
+class ExhaustingController:
+    """Real controller whose observation path reports an exhausted reacquisition.
+
+    ``VisualServoingController._reacquired`` reports exhaustion on frames that
+    carry an unconfirmed observation; reproducing that through the tracker's
+    coast in a closed-loop scene depends on fragile timing, so the report is
+    injected at the step boundary instead, from the ``exhaust_at``-th call on.
+    """
+
+    def __init__(self, inner, exhaust_at):
+        self._inner = inner
+        self._exhaust_at = exhaust_at
+        self.calls = 0
+
+    def reset(self):
+        self._inner.reset()
+
+    def note_target_lost(self, current_tilt_deg, dt):
+        return self._inner.note_target_lost(current_tilt_deg, dt)
+
+    def compute(self, **kwargs):
+        self.calls += 1
+        command = self._inner.compute(**kwargs)
+        if self.calls < self._exhaust_at:
+            return command
+        return dataclasses.replace(
+            command,
+            vy=0.0,
+            phase=TrackingPhase.REACQUIRING,
+            locked=False,
+            recovery_exhausted=True,
+        )
+
+
+def test_an_exhaustion_reported_with_an_observation_ends_the_stage_unfinished(
+    simulated_time, caplog
+):
+    """The stage stops on the report instead of running on to its deadline."""
+    ctx = offset_ctx()
+    controller = ExhaustingController(ctx.visual_controller, exhaust_at=5)
+    ctx.visual_controller = controller
+
+    # Attached directly: the mission's logging setup may stop this logger from
+    # propagating to the root handler caplog normally listens on.
+    step_logger = logging.getLogger("Step3Tracking")
+    step_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="Step3Tracking"):
+            status = VisualServoingStep().execute(ctx)
+    finally:
+        step_logger.removeHandler(caplog.handler)
+
+    assert status.name == "SUCCESS"
+    assert ctx.blackboard.approach_finished is False
+    assert controller.calls == 5, "the loop kept servoing after the exhaustion report"
+    assert simulated_time.now < 0.1 * ctx.params.timeouts.tracking_timeout_sec
+    assert "without a lateral lock" in caplog.text
+    vx, vy, _vz, _vyaw = ctx.drone.commands[-1]
+    assert vx == 0.0 and vy == 0.0
 
 
 def test_an_emergency_aborts_the_stage_without_commanding_motion(simulated_time):
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
+    ctx = offset_ctx()
     ctx.emergency_event.set()
 
     status = VisualServoingStep().execute(ctx)
@@ -386,86 +462,13 @@ def test_an_emergency_aborts_the_stage_without_commanding_motion(simulated_time)
     assert all(vx == 0.0 and vy == 0.0 for vx, vy, _vz, _vyaw in ctx.drone.commands)
 
 
-def test_phase_progression_is_monotone_through_the_approach(simulated_time):
-    """Centering, then approaching, then nadir -- and the phases are reached."""
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
+def test_the_vertical_invariant_holds_for_every_transmitted_command(simulated_time):
+    """vz <= 0 across the whole of Stage 3, through a dropout and its recovery."""
+    ctx = offset_ctx()
+    ctx.blackout = range(10, 110)
     VisualServoingStep().execute(ctx)
 
-    reached = [line.split("STEP 3: ")[1].split()[0] for line in ctx.overlays if "STEP 3: " in line]
-    assert TrackingPhase.CENTERING.value.upper() in reached
-    assert TrackingPhase.APPROACHING.value.upper() in reached
-    assert TrackingPhase.NADIR.value.upper() in reached
-    assert reached.index(TrackingPhase.APPROACHING.value.upper()) < reached.index(
-        TrackingPhase.NADIR.value.upper()
-    )
-
-
-def test_the_step_recovers_from_a_nadir_dropout_instead_of_ending(simulated_time):
-    """The flight defect: a dropout near nadir ended the approach outright.
-
-    Near the inspection attitude the footprint is small and the object is
-    foreshortened into an aspect ratio the detector never trained on, so losing
-    it there is expected. The step used to break out of its loop and
-    report an unfinished approach, discarding a target it was directly above.
-    """
-    ctx = Ctx(flight_params(), Scene(ground_range_m=3.0))
-    # The blackout has to outlast the tracker's coast horizon before recovery is
-    # even reached: an alpha-beta extrapolation covers short dropouts on its own,
-    # and that layer is working as intended. Eight seconds of nothing is what it
-    # takes to get past it.
-    ctx.blackout = range(60, 200)
-
-    VisualServoingStep().execute(ctx)
-
-    assert any("REACQUIRING" in line for line in ctx.overlays), "recovery never engaged"
-    assert ctx.blackboard.approach_finished, "the approach did not survive the dropout"
-    assert ctx.scene.ground_range_m <= inspection_standoff(ctx.params) + 0.10
-
-
-def test_a_brief_occlusion_does_not_trigger_reacquisition_or_lose_progress(simulated_time):
-    """The alpha-beta coast is supposed to absorb this on its own, silently.
-
-    Ten frames at 16 Hz is well inside ConstantVelocityTracker's 1.5 s coast
-    horizon -- a glint, the airframe's own shadow, or a single bad detection,
-    not a real loss. The approach must finish exactly as if the dropout had
-    never happened: no REACQUIRING phase, no discarded progress.
-    """
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
-    ctx.blackout = range(60, 70)
-
-    status = VisualServoingStep().execute(ctx)
-
-    standoff = inspection_standoff(ctx.params)
-    assert status.name == "SUCCESS"
-    assert ctx.blackboard.approach_finished
-    assert not any("REACQUIRING" in line for line in ctx.overlays), (
-        "a ten-frame dropout escalated to active reacquisition; the coast layer "
-        "did not absorb it"
-    )
-    assert ctx.scene.ground_range_m <= standoff + 0.10
-
-
-def test_a_permanent_loss_still_terminates(simulated_time):
-    """Recovery must be bounded: it is a retry, not a new way to hang."""
-    ctx = Ctx(flight_params(), Scene(ground_range_m=3.0))
-    ctx.blackout = range(60, 10_000)
-
-    status = VisualServoingStep().execute(ctx)
-
-    assert status.name == "SUCCESS"
-    assert not ctx.blackboard.approach_finished
-    cycles = len(ctx.drone.commands)
-    elapsed = cycles / ctx.params.kinematics.control_loop_hz
-    assert elapsed < ctx.params.timeouts.tracking_timeout_sec, (
-        "recovery must end on its own window, not on the stage deadline"
-    )
-
-
-def test_recovery_never_violates_the_vertical_invariant(simulated_time):
-    ctx = Ctx(flight_params(), Scene(ground_range_m=3.0))
-    ctx.blackout = range(60, 120)
-    VisualServoingStep().execute(ctx)
-
+    assert ctx.drone.commands
     assert all(vz <= 0.0 for _vx, _vy, vz, _vyaw in ctx.drone.commands)
     assert all(vyaw == 0.0 for _vx, _vy, _vz, vyaw in ctx.drone.commands)
 
@@ -493,26 +496,19 @@ class DecimatedPerception(SynchronousPerception):
         return super().get_latest(max_age_sec)
 
 
-def test_the_approach_converges_when_inference_lags_the_control_loop(simulated_time):
-    """Inference at a third of the loop rate: the ground-station CPU case.
-
-    The servoing law, the tracker and the controller's frame counters run once
-    per new observation; the cycles between re-transmit the latched command.
-    The stage must reach the same standoff it reaches when every cycle carries
-    a fresh detection, and must never re-run the law on a repeated frame.
-    """
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
+def test_the_servo_converges_when_inference_lags_the_control_loop(simulated_time):
+    """Inference at a third of the loop rate: the law runs once per new frame."""
+    ctx = offset_ctx()
     ctx.perception = DecimatedPerception(ctx, stride=3)
 
     status = VisualServoingStep().execute(ctx)
 
-    standoff = inspection_standoff(ctx.params)
     assert status.name == "SUCCESS"
     assert ctx.blackboard.approach_finished
-    assert standoff - 0.15 <= ctx.scene.ground_range_m <= standoff + 0.10
     assert len(ctx.overlays) * 3 <= len(ctx.drone.commands) + 3, (
         "the control law ran on repeated observations"
     )
+    assert all(vx == 0.0 for vx, _vy, _vz, _vyaw in ctx.drone.commands)
     assert all(vz <= 0.0 for _vx, _vy, vz, _vyaw in ctx.drone.commands)
 
 
@@ -528,24 +524,76 @@ class RecordingGovernor:
         return 1.0
 
 
-def test_tracking_apply_feeds_the_commanded_vx_to_the_governor():
-    """Task 6 wiring: the governor sees what the step is about to command."""
-    from mvp_mission_bebop.controllers.visual_servoing import ServoCommand, TrackingPhase
-
-    ctx = Ctx(flight_params(), Scene(ground_range_m=8.0))
+def test_tracking_apply_feeds_the_horizontal_demand_to_the_governor():
+    """D5: the governor's feedforward is the norm of the horizontal demand, here |vy|."""
+    ctx = offset_ctx()
     ctx.governor = RecordingGovernor()
     command = ServoCommand(
-        vx=0.35,
-        vy=0.0,
-        tilt_deg=0.0,
-        pixel_error=0.0,
+        vx=0.0,
+        vy=-0.035,
+        tilt_deg=ctx.current_tilt_deg,
+        pixel_error=60.0,
         ground_range_m=None,
         depression_deg=None,
-        phase=TrackingPhase.APPROACHING,
-        nadir_aligned=False,
+        phase=TrackingPhase.CENTERING,
+        laterally_centered=False,
+        locked=False,
         note="",
     )
 
     VisualServoingStep()._apply(ctx, command, dt=0.05)
 
-    assert ctx.governor.calls == [0.35]
+    assert ctx.governor.calls == [pytest.approx(0.035)]
+    vx, vy, _vz, _vyaw = ctx.drone.commands[-1]
+    assert vx == 0.0
+    assert vy == pytest.approx(-0.035), "the servo must be able to correct to the right"
+
+
+def test_the_lock_publishes_the_last_pixel_and_tilt_for_stage_4(simulated_time):
+    """Review Focus 7: Stage 4's open-loop pointing solution starts from here."""
+    ctx = offset_ctx()
+    ctx.blackboard.confirmed_target_px = (1.0, 1.0)
+    ctx.blackboard.confirmed_tilt_deg = 0.0
+
+    VisualServoingStep().execute(ctx)
+
+    assert ctx.blackboard.approach_finished
+    assert ctx.blackboard.confirmed_target_px == pytest.approx(ctx.detected_px[-1])
+    assert ctx.blackboard.confirmed_tilt_deg == pytest.approx(ctx.params.gimbal.search_tilt_deg)
+
+
+class SettlingOdometry(Odometry):
+    """Ground speed above the stillness threshold until ``settle_at`` simulated seconds."""
+
+    def __init__(self, altitude_m, clock, settle_at, moving_mps):
+        super().__init__(altitude_m)
+        self._clock = clock
+        self._settle_at = settle_at
+        self._moving_mps = moving_mps
+
+    @property
+    def horizontal_speed(self):
+        return self._moving_mps if self._clock.now < self._settle_at else 0.0
+
+    @horizontal_speed.setter
+    def horizontal_speed(self, _value):
+        pass
+
+
+def test_a_stationary_check_gates_the_lock(simulated_time):
+    params = flight_params()
+    settle_at = 3.0
+    ctx = Ctx(params, Scene(ground_range_m=in_view_range(params), lateral_m=0.0))
+    ctx.odom_supervisor = SettlingOdometry(
+        ALTITUDE_M, simulated_time, settle_at, 2.0 * params.inspection.settle_max_speed_mps
+    )
+    ctx.failsafe.odom_supervisor = ctx.odom_supervisor
+
+    VisualServoingStep().execute(ctx)
+
+    assert ctx.blackboard.approach_finished
+    assert simulated_time.now >= settle_at, (
+        f"locked at {simulated_time.now:.2f} s while the airframe was still moving"
+    )
+    waiting = [line for line in ctx.overlays if "CENTERING" in line]
+    assert len(waiting) > params.vision.alignment_dwell_cycles, "premise: credit was full early"

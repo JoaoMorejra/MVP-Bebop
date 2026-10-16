@@ -291,6 +291,35 @@ class GatedCtx(PerceptionCtx):
         return result
 
 
+def test_release_nowait_stops_new_cycles_without_waiting_for_the_one_in_flight(worker_factory):
+    """The takeoff is commanded between the release and the bounded disengage."""
+    ctx = GatedCtx()
+    worker = worker_factory(ctx)
+    worker.engage(conf=0.5)
+    assert ctx.first_call.wait(timeout=2.0)
+
+    started = time.monotonic()
+    worker.release_nowait()
+    assert time.monotonic() - started < 0.05
+    assert worker.engaged is False
+
+    ctx.release.set()
+    assert worker.disengage(timeout_sec=1.0) is True
+    assert worker.slot.latest() is None
+    assert worker.discarded == 1
+    calls = len(ctx.detect_calls)
+    time.sleep(0.1)
+    assert len(ctx.detect_calls) == calls
+
+
+def test_the_inline_pipeline_releases_too():
+    pipeline = SynchronousPerception(PerceptionCtx())
+    pipeline.engage(conf=0.5)
+    pipeline.release_nowait()
+    assert pipeline.engaged is False
+    assert pipeline.get_latest(1.0) is None
+
+
 def test_every_engage_advances_the_engagement_generation(worker_factory):
     worker = worker_factory(PerceptionCtx())
     assert worker.engagement_generation == 0
@@ -592,7 +621,7 @@ def test_a_stale_pipeline_keeps_the_cruise_alive():
 
     ctx.perception = Silent(ctx)
     ForwardSearchStep().execute(ctx)
-    assert max(vx for vx, *_ in ctx.drone.commands) > 0.0
+    assert max(vy for _vx, vy, *_ in ctx.drone.commands) > 0.0
     assert ctx.blackboard.target_confirmed is False
 
 

@@ -151,13 +151,9 @@ def test_a_header_stamp_is_read_in_seconds(bridge):
     assert bridge.stamp_seconds(zero) is None
 
 
-def test_the_magnetometer_calibration_is_forwarded_as_reported(bridge):
+def test_the_payload_carries_no_compass_calibration(bridge):
     state = linked(bridge)
-    assert state.to_payload(None)["magneto_calibration"] is None
-    state.set_magneto_calibration(
-        '{"sequence":2,"kind":"state","x":1,"y":0,"z":0,"failed":0,"required":1,"axis":"y","started":1,"stamp":1.0}'
-    )
-    magneto = state.to_payload(None)["magneto_calibration"]
-    assert magneto["x"] == 1 and magneto["axis"] == "y" and magneto["started"] == 1
-    state.set_magneto_calibration("not json")
-    assert state.to_payload(None)["magneto_calibration"]["sequence"] == 2
+    payload = state.to_payload(None)
+    assert not any("magneto" in key for key in payload)
+    assert not hasattr(bridge, "TOPIC_MAGNETO")
+    assert not hasattr(state, "set_magneto_calibration")
