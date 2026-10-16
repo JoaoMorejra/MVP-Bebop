@@ -20,18 +20,20 @@ drift-free observation: its error is a property of the camera calibration, not
 of how long the drone has been flying. Four phases run in order.
 
 1. **Camera transition.** The gimbal drops to ``rtl.camera_tilt_deg`` (-80 deg by
-   default), near-nadir but leaning far enough forward that the reverse cruise
-   has ground ahead of it to search rather than only ground it has already
-   overflown. The altitude-hold governor is engaged for everything that follows
+   default), near-nadir with a small forward lean, so the frame covers the ground
+   below and slightly ahead of the airframe. The rightward return sweeps that
+   footprint along the track and the pad enters through the right side of the
+   frame. The altitude-hold governor is engaged for everything that follows
    that is not the touchdown itself.
 2. **Reverse cruise search.** The mirror of Stage 2: a straight, yaw-locked line
-   flown *backward* at ``rtl.reverse_cruise_velocity`` while every frame is put
-   through ``nectar.vision.Aruco``. The along-track command is saturated
-   non-positive at the actuator boundary, so the search leg cannot become an
-   outbound one; ``vyaw`` is pinned at zero, as everywhere else in this mission,
-   because rotation is what corrupts the optical-flow estimate the altitude and
-   failsafe logic still ride on. Confirmation is hysteretic: one frame carrying
-   the target ID is not enough to commit the aircraft to a landing site.
+   flown *to the right* at ``abs(rtl.reverse_cruise_velocity)`` while every
+   frame is put through ``nectar.vision.Aruco``. ``vx`` is the literal zero and
+   ``vy`` is saturated non-positive at the actuator boundary, so the search leg
+   cannot become an outbound one; ``vyaw`` is pinned at zero, as everywhere
+   else in this mission, because rotation is what corrupts the optical-flow
+   estimate the altitude and failsafe logic still ride on. Confirmation is
+   hysteretic: one frame carrying the target ID is not enough to commit the
+   aircraft to a landing site.
 3. **Closed-loop centering.** On confirmation the cruise brakes and a per-axis
    filtered PD closes on the marker's body-frame position, jerk-limited,
    saturated onto a centering speed ceiling, and rendered through the sigma-delta
@@ -86,6 +88,7 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
 )
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
+from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.perception.intrinsics import (
     DRIVER_PACKAGE,
     CalibrationMismatch,
@@ -96,6 +99,12 @@ from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, TelemetryHealth
 
 logger = logging.getLogger("Step5RTL")
+
+_STEP_NAMES: Final[Dict[MissionMode, str]] = {
+    MissionMode.ADVANCED: "STEP 5: ArUco RTL & Precision Landing",
+    MissionMode.INTERMEDIATE: "STEP 5: Landing at Inspection Point",
+    MissionMode.SIMPLE: "STEP 5: ArUco Centering & Base Landing",
+}
 
 #: Publish an annotated telemetry frame every Nth cycle. Grabbing a frame blocks,
 #: and the return leg needs its cadence more than it needs every frame.
@@ -147,10 +156,13 @@ _PRINCIPAL_POINT_TOLERANCE_RATIO: Final[float] = 0.10
 #: The tilt is not a cosmetic setting here: it is a term in the camera-to-body
 #: projection, and the law has no way to measure it. If the single ``camera_control``
 #: publish at engagement is dropped, the gimbal stays where Stage 4 left it --
-#: ``gimbal.nadir_tilt_deg``, 11 degrees away -- and the centering law converges
-#: on a point ``altitude * tan(11 deg)`` off the pad. At the 1.55 m cruise
-#: altitude that is 0.30 m, seven times the centering tolerance, and the step
-#: would report a confirmed centring and land there.
+#: the framing tilt, somewhere in ``[gimbal.nadir_tilt_deg, gimbal.search_tilt_deg]``
+#: and never steeper than ``gimbal.nadir_tilt_deg`` -- and the centering law
+#: converges on a point ``altitude * (cot(actual) - cot(assumed))`` off the pad.
+#: Even the steepest framing tilt (-69 deg by default, 11 degrees from -80) leaves
+#: it 0.32 m off at the 1.55 m cruise altitude, eight times the centering
+#: tolerance; the shallower end of the band leaves it metres off. Either way the
+#: step would report a confirmed centring and land there.
 #:
 #: Nothing on this airframe acknowledges a gimbal command, exactly as nothing
 #: acknowledges ``land()`` -- and the landing is burst-asserted for that reason.
@@ -163,6 +175,10 @@ _TILT_REASSERT_SEC: Final[float] = 1.0
 #: term and the sigma-delta accumulator both have to absorb, over a marker, at
 #: low altitude. Better to treat the frame as missing and hold station.
 _CENTERING_FRAME_TIMEOUT_SEC: Final[float] = 0.4
+
+#: Validity of an along-track position reported by the pad marker to the
+#: platform monitor, seconds. Covers the gap to the next centering frame.
+_MARKER_POSITION_TTL_SEC: Final[float] = 0.5
 
 
 class _PhaseOutcome(Enum):
@@ -440,6 +456,9 @@ class ClosedLoopRTLStep(BaseStep):
         Marker sensor. Injecting one bypasses SDK construction entirely, which
         is what lets the whole return leg be flown against a synthetic marker in
         a unit test with no camera, no calibration files and no ROS.
+    mode : MissionMode
+        Mission profile, keyword-only. Selects the stage name; ``ADVANCED`` (the
+        default) is the historical return leg.
     """
 
     def __init__(
@@ -447,12 +466,20 @@ class ClosedLoopRTLStep(BaseStep):
         guidance: Optional[RTLGuidanceController] = None,
         centering: Optional[ArucoCenteringController] = None,
         sensor: Optional[ArucoMarkerSensor] = None,
+        *,
+        mode: MissionMode = MissionMode.ADVANCED,
     ) -> None:
-        super().__init__("STEP 5: ArUco RTL & Precision Landing")
+        super().__init__(_STEP_NAMES[mode])
+        self._mode = mode
         self._guidance = guidance
         self._centering = centering
         self._sensor = sensor
         self._stream_failed = False
+
+    @property
+    def mode(self) -> MissionMode:
+        """Mission profile this stage was built for."""
+        return self._mode
 
     # ------------------------------------------------------------------ entry
 
@@ -481,6 +508,9 @@ class ClosedLoopRTLStep(BaseStep):
         guidance.reset()
         ctx.speed_calibration.warn_if_uncalibrated("RTL guidance")
 
+        if self._mode is MissionMode.INTERMEDIATE:
+            return self._land_in_place(ctx, guidance)
+
         # The centering law is constructed here, before anything flies, and not
         # at the point it is first needed. Its constructor validates the
         # configuration -- a zero speed ceiling, a quantization floor below one
@@ -500,6 +530,9 @@ class ClosedLoopRTLStep(BaseStep):
         # calibration only, not on the gimbal attitude.
         sensor = None if centering is None else (self._sensor or self._build_sensor(ctx))
         self._active_sensor = sensor
+        if self._mode is MissionMode.SIMPLE:
+            return self._land_over_base(ctx, guidance, centering, sensor)
+
         evidence = getattr(ctx.blackboard, "evidence", None)
         emit_milestone(
             "mission.rtl_start",
@@ -531,20 +564,20 @@ class ClosedLoopRTLStep(BaseStep):
 
         logger.info(
             "RTL/ArUco engaged. Marker ID %d, dictionary %s, tag %.3f m, "
-            "gimbal %.1f deg, reverse cruise %.3f normalized (%.3f m/s), search window "
+            "gimbal %.1f deg, rightward cruise %.3f normalized (%.3f m/s), search window "
             "%.1f s, centering window %.1f s.",
             rtl_cfg.target_aruco_id,
             rtl_cfg.marker_dict,
             rtl_cfg.tag_size,
             rtl_cfg.camera_tilt_deg,
-            rtl_cfg.reverse_cruise_velocity,
-            ctx.speed_calibration.to_mps(rtl_cfg.reverse_cruise_velocity),
+            -abs(rtl_cfg.reverse_cruise_velocity),
+            -abs(ctx.speed_calibration.to_mps(rtl_cfg.reverse_cruise_velocity, axis="lateral")),
             rtl_cfg.timeout_sec,
             rtl_cfg.centering_timeout_sec,
         )
         logger.info(
-            "Invariants: vyaw == 0.0 (locked everywhere), vx <= 0.0 (search leg is "
-            "backward-only), centering bounded at %.3f normalized.",
+            "Invariants: vyaw == 0.0 (locked everywhere), vx == 0.0 and vy <= 0.0 (search "
+            "leg is a rightward return), centering bounded at %.3f normalized.",
             rtl_cfg.max_centering_speed,
         )
 
@@ -615,6 +648,90 @@ class ClosedLoopRTLStep(BaseStep):
         )
         self._assert_tilt(ctx)
 
+    def _land_in_place(self, ctx: MissionContext, guidance: RTLGuidanceController) -> StepStatus:
+        """Intermediate profile: land vertically where the inspection ended.
+
+        No return leg, no marker sensor and no ``mission.rtl_start`` milestone:
+        that milestone is narrated as "iniciando retorno à base" and nothing here
+        returns. ``mission.landing`` and ``mission.touchdown`` carry
+        ``at_base: False``, which selects the in-place phrasing.
+        """
+        logger.info("Intermediate profile: no return leg; landing at the inspection point.")
+        self._announce("Pouso no local", "inspeção concluída, executando pouso no local da inspeção")
+        self._halt_translation(ctx)
+        return self._touchdown(ctx, guidance, at_base=False)
+
+    def _land_over_base(
+        self,
+        ctx: MissionContext,
+        guidance: RTLGuidanceController,
+        centering: Optional[ArucoCenteringController],
+        sensor: Optional[ArucoMarkerSensor],
+    ) -> StepStatus:
+        """Simple profile: centre on the pad marker and land; the airframe never left it.
+
+        The reverse search and the odometric return are skipped. Position by
+        optical flow is not trusted after the yaw manoeuvres of Stages 2 to 4,
+        and it is not needed: the airframe has not translated. Without a marker
+        sensor the aircraft lands where it hovers, flagged ``at_base`` for the
+        same reason. A marker that never appears is handled by the centering
+        window of ``rtl.centering_timeout_sec``, after which it lands as well.
+
+        Returns
+        -------
+        StepStatus
+            ``ABORTED`` / ``FAILURE`` on an interrupt or a health fault, else the
+            result of the verified touchdown.
+        """
+        rtl_cfg = ctx.params.rtl
+        self._engage_return_attitude(ctx)
+        pad_height = float(getattr(ctx.params, "launch_pad_height_m_original", 0.0))
+        if pad_height > 0.0:
+            logger.info(
+                "Landing on a pad of %.2f m: acknowledged, no effect on the centering or the touchdown.",
+                pad_height,
+            )
+
+        if sensor is None or centering is None:
+            logger.warning(
+                "Marker-guided centering unavailable; landing in place (the airframe has not "
+                "left the launch pad)."
+            )
+            self._halt_translation(ctx)
+            return self._touchdown(ctx, guidance, at_base=True)
+
+        logger.info(
+            "Simple profile: centring on marker %d (dictionary %s, tag %.3f m, gimbal %.1f deg), "
+            "window %.1f s; no reverse search.",
+            rtl_cfg.target_aruco_id,
+            rtl_cfg.marker_dict,
+            rtl_cfg.tag_size,
+            rtl_cfg.camera_tilt_deg,
+            rtl_cfg.centering_timeout_sec,
+        )
+        self._announce(
+            "Centralizando sobre a base",
+            "centralizando sobre o marcador da base para o pouso de precisão",
+        )
+        with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
+            outcome = self._center_over_marker(ctx, centering, sensor)
+
+        if outcome is _PhaseOutcome.ABORTED:
+            return StepStatus.ABORTED
+        if outcome is _PhaseOutcome.FAILED:
+            return StepStatus.FAILURE
+        if outcome is _PhaseOutcome.EXHAUSTED:
+            logger.warning(
+                "Centering window of %.1f s expired; landing from the position held.",
+                rtl_cfg.centering_timeout_sec,
+            )
+        else:
+            self._announce(
+                "Centralizado sobre a base",
+                "aeronave centralizada sobre o marcador, iniciando pouso de precisão",
+            )
+        return self._touchdown(ctx, guidance, at_base=True)
+
     @staticmethod
     def _assert_tilt(ctx: MissionContext) -> None:
         """Command the return-leg gimbal angle, absorbing any fault.
@@ -622,10 +739,11 @@ class ClosedLoopRTLStep(BaseStep):
         Called repeatedly, on purpose. See :data:`_TILT_REASSERT_SEC`: the tilt
         is a term in the camera-to-body projection that the control law cannot
         measure, nothing on this airframe acknowledges a gimbal command, and
-        Stage 4 leaves the mount eleven degrees away from where this stage needs
-        it. A single dropped publish therefore produces a centering solution that
-        converges confidently onto a point 0.30 m from the pad, and reports it as
-        centred.
+        Stage 4 leaves the mount at the framing tilt, in
+        [gimbal.nadir_tilt_deg, gimbal.search_tilt_deg] and tens of degrees from
+        rtl.camera_tilt_deg. A single dropped publish therefore produces a
+        centering solution that converges confidently onto a point 0.30 m from
+        the pad, and reports it as centred.
 
         A gimbal fault is still not a reason to abandon a return leg, so the
         exception is absorbed -- but it is logged at warning level, because a
@@ -835,18 +953,21 @@ class ClosedLoopRTLStep(BaseStep):
     def _reverse_search(
         self, ctx: MissionContext, sensor: ArucoMarkerSensor, deadline: Deadline
     ) -> _PhaseOutcome:
-        """Cruise backward along the outbound track until the marker confirms.
+        """Cruise to the right along the outbound track until the marker confirms.
 
-        The kinematic invariants of this phase are the mirror of Stage 2's and
-        are enforced structurally rather than asserted:
+        The outbound search flew to the left, so the return is flown on body Y
+        at ``abs(reverse_cruise_velocity)`` converted on the lateral gain. The
+        kinematic invariants of this phase are the mirror of Stage 2's and are
+        enforced structurally rather than asserted:
 
-        * ``vx <= 0`` -- the shaped command is passed through ``min(0.0, vx)``
+        * ``vy <= 0`` -- the shaped command is passed through ``min(0.0, vy)``
           before it reaches the envelope clamp, so neither a sign error in
           ``reverse_cruise_velocity`` nor a sigma-delta pulse of the wrong
           polarity can turn the return into an outbound cruise.
-        * ``vy == 0`` -- the search leg does not correct laterally. It has
-          nothing to correct *towards* until the marker is in frame, and a
-          cross-track command with no reference is just a curved search track.
+        * ``vx == 0`` -- the literal zero. The search leg does not correct off
+          the track: it has nothing to correct *towards* until the marker is in
+          frame, and an off-track command with no reference is just a curved
+          search track.
         * ``vyaw == 0`` -- as everywhere in this mission.
         * ``vz`` belongs to the altitude governor, inside the hold window the
           caller opened.
@@ -859,7 +980,9 @@ class ClosedLoopRTLStep(BaseStep):
         kinematics_cfg = ctx.params.kinematics
 
         rate = LoopRate(kinematics_cfg.control_loop_hz)
-        cruise_mps = abs(ctx.speed_calibration.to_mps(rtl_cfg.reverse_cruise_velocity))
+        cruise_mps = abs(
+            ctx.speed_calibration.to_mps(rtl_cfg.reverse_cruise_velocity, axis="lateral")
+        )
         profile = JerkLimitedProfile(
             ProfileLimits(
                 max_velocity=max(cruise_mps, 1e-3),
@@ -875,7 +998,7 @@ class ClosedLoopRTLStep(BaseStep):
         ctx.failsafe.notify_frame_received()
 
         logger.info(
-            "Reverse cruise search engaged: %.3f m/s backward, confirmation over %d frames, "
+            "Reverse cruise search engaged: %.3f m/s to the right, confirmation over %d frames, "
             "window %.1f s.",
             cruise_mps,
             max(1, int(rtl_cfg.confirmation_frames)),
@@ -948,7 +1071,7 @@ class ClosedLoopRTLStep(BaseStep):
             # latches its last Twist, so a cycle that transmits nothing is a
             # cycle that keeps the previous command -- there is no "do nothing"
             # branch available here.
-            vx = self._cruise_backward(ctx, profile, shaper, dt, cruise_mps)
+            vy = self._cruise_rightward(ctx, profile, shaper, dt, cruise_mps)
 
             if cycle % _STREAM_DECIMATION == 0:
                 snapshot = ctx.odom_supervisor.snapshot()
@@ -965,8 +1088,8 @@ class ClosedLoopRTLStep(BaseStep):
                         ctx,
                         marker_id=observation.marker_id if observation else None,
                         distance_m=observation.slant_range_m if observation else None,
-                        vx=vx,
-                        vy=0.0,
+                        vx=0.0,
+                        vy=vy,
                         suffix=(
                             f"{progress} | T: {deadline.elapsed_sec:.1f}/"
                             f"{deadline.duration_sec:.1f}s"
@@ -974,9 +1097,9 @@ class ClosedLoopRTLStep(BaseStep):
                     ),
                 )
                 logger.info(
-                    "Reverse search: %s | cmd vx=%.3f | alt=%.2f m | %.1f/%.1f s",
+                    "Reverse search: %s | cmd vy=%.3f | alt=%.2f m | %.1f/%.1f s",
                     progress.lstrip(" |"),
-                    vx,
+                    vy,
                     snapshot.relative_altitude,
                     deadline.elapsed_sec,
                     deadline.duration_sec,
@@ -992,7 +1115,7 @@ class ClosedLoopRTLStep(BaseStep):
             )
         return _PhaseOutcome.EXHAUSTED
 
-    def _cruise_backward(
+    def _cruise_rightward(
         self,
         ctx: MissionContext,
         profile: JerkLimitedProfile,
@@ -1000,7 +1123,7 @@ class ClosedLoopRTLStep(BaseStep):
         dt: float,
         cruise_mps: float,
     ) -> float:
-        """Transmit one cycle of the reverse cruise, and return what was sent.
+        """Transmit one cycle of the rightward cruise, and return what was sent.
 
         The demand is scaled by the altitude loop's horizontal allowance *before*
         it is profiled, exactly as Stage 2 does and for the same reason: scaling
@@ -1008,20 +1131,41 @@ class ClosedLoopRTLStep(BaseStep):
         the airframe never received, so the jerk limit would be measured against
         a fiction, and a demand scaled below the driver's quantization floor
         would truncate to a standstill instead of duty-cycling down to it.
+
+        Parameters
+        ----------
+        ctx : MissionContext
+        profile : JerkLimitedProfile
+            Return-channel profile, in m/s.
+        shaper : QuantizedCommandShaper
+            Sigma-delta shaper of the ``vy`` channel.
+        dt : float
+            Interval since the previous cycle, seconds.
+        cruise_mps : float
+            Magnitude of the rightward demand, m/s. Its sign is ignored.
+
+        Returns
+        -------
+        float
+            The ``vy`` transmitted, normalized; never positive. ``vx`` is sent as
+            the literal ``0.0``.
         """
         scale = getattr(ctx.governor, "horizontal_scale", None)
-        permitted = cruise_mps * (float(scale()) if callable(scale) else 1.0)
+        permitted = abs(cruise_mps) * (float(scale()) if callable(scale) else 1.0)
 
         profiled = profile.step(-permitted, dt)
-        vx = shaper.shape(ctx.speed_calibration.to_normalized(profiled), dt)
+        # The rightward-only invariant, enforced where it cannot be argued with.
+        vy = min(
+            0.0,
+            shaper.shape(ctx.speed_calibration.to_normalized(profiled, axis="lateral"), dt),
+        )
 
         snapshot = ctx.odom_supervisor.snapshot()
-        vz = ctx.governor.compute_vz(snapshot.relative_altitude, dt, vx_commanded=vx)
+        vz = ctx.governor.compute_vz(snapshot.relative_altitude, dt, vx_commanded=abs(vy))
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
-        # The backward-only invariant, enforced where it cannot be argued with.
-        safe_vx, safe_vy = ctx.failsafe.clamp_translation(min(0.0, vx), 0.0)
+        safe_vx, safe_vy = ctx.failsafe.clamp_translation(0.0, vy)
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
-        return safe_vx
+        return safe_vy
 
     def _brake(
         self,
@@ -1030,7 +1174,7 @@ class ClosedLoopRTLStep(BaseStep):
         shaper: QuantizedCommandShaper,
         rate: LoopRate,
     ) -> None:
-        """Ramp the reverse cruise down to rest, paced by the control loop.
+        """Ramp the rightward cruise down to rest, paced by the control loop.
 
         Pacing is the whole of it. Stepping the profile in a tight loop publishes
         the entire deceleration in under a millisecond onto a depth-1 queue, of
@@ -1044,7 +1188,7 @@ class ClosedLoopRTLStep(BaseStep):
         limits = profile.limits
         horizon = limits.max_velocity / limits.max_accel + limits.max_accel / limits.max_jerk
         for _ in range(max(1, int(horizon / max(dt, 1e-3)) + 2)):
-            self._cruise_backward(ctx, profile, shaper, dt, 0.0)
+            self._cruise_rightward(ctx, profile, shaper, dt, 0.0)
             if abs(profile.velocity) <= 1e-6:
                 break
             rate.tick()
@@ -1120,6 +1264,8 @@ class ClosedLoopRTLStep(BaseStep):
 
             observation = sensor.observe(frame)
             command = centering.update(observation, dt)
+            if observation is not None:
+                self._report_pad_position(ctx, command.ey_body_m)
             self._transmit_centering(ctx, command, dt)
 
             if cycle % _STREAM_DECIMATION == 0:
@@ -1171,9 +1317,11 @@ class ClosedLoopRTLStep(BaseStep):
         redundant on purpose -- the yaw invariant is the one that protects the
         odometry every other subsystem reads.
         """
+        # The governor's feedforward argument is the norm of the horizontal
+        # demand: the centering closes in 2D and the return approach is lateral.
         snapshot = ctx.odom_supervisor.snapshot()
         vz = ctx.governor.compute_vz(
-            snapshot.relative_altitude, dt, vx_commanded=command.vx
+            snapshot.relative_altitude, dt, vx_commanded=math.hypot(command.vx, command.vy)
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(command.vx, command.vy)
@@ -1186,9 +1334,43 @@ class ClosedLoopRTLStep(BaseStep):
         phase without a zero translation hands the touchdown sequence an
         aircraft still drifting under the last correction it was given.
         """
-        safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(0.0, 0.0)
+        vz = 0.0
+        if self._edge_guard_configured(ctx):
+            # Near the pad edge an exactly zero gaz hands the vertical axis to
+            # the firmware's sonar hover, which is what the edge guard exists
+            # to avoid. The governor keeps it, as in every other phase.
+            vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude)
+        safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(0.0, 0.0)
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
+
+    @staticmethod
+    def _edge_guard_configured(ctx: MissionContext) -> bool:
+        """True when a pad edge is configured (``platform.edge_ahead_m``)."""
+        platform = getattr(ctx.params, "platform", None)
+        return getattr(platform, "edge_ahead_m", None) is not None
+
+    def _report_pad_position(self, ctx: MissionContext, ey_body_m: float) -> None:
+        """Hand the platform monitor the along-track position the marker implies.
+
+        The marker sits on the takeoff point and the outbound track runs to the
+        left (``outbound_track_m``), so the airframe's along-track position is
+        ``-ey_body_m``: a marker to the right (``ey < 0``) puts the airframe out
+        on the track. It is measured independently of the odometry, whose drift
+        over a mission can move the predicted pad edge by a metre. Only with a
+        pad edge configured; otherwise the monitor is not in use.
+
+        Parameters
+        ----------
+        ctx : MissionContext
+        ey_body_m : float
+            Marker offset along body Y, metres, positive to the left.
+        """
+        if not self._edge_guard_configured(ctx):
+            return
+        override = getattr(ctx.odom_supervisor, "override_along_track", None)
+        if callable(override):
+            override(-ey_body_m, ttl_sec=_MARKER_POSITION_TTL_SEC)
 
     # ------------------------------------------------------- degraded return
 
@@ -1202,9 +1384,9 @@ class ClosedLoopRTLStep(BaseStep):
         only difference is that arriving here is now an explicitly logged
         degradation rather than the nominal design.
         """
-        # The operator is about to watch a return leg flown blind, so point the
-        # camera where the aircraft is going rather than at the ground it is
-        # passing over.
+        # The operator is about to watch a return leg flown blind, so keep the
+        # camera facing forward at the search tilt while the aircraft flies right,
+        # rather than at the ground it is passing over.
         try:
             ctx.drone.camera_control(tilt=ctx.params.gimbal.search_tilt_deg, pan=0.0)
             ctx.current_tilt_deg = ctx.params.gimbal.search_tilt_deg
@@ -1241,7 +1423,10 @@ class ClosedLoopRTLStep(BaseStep):
             logger.info(
                 "Return vector from odometry: no aggregated motion sequence is available."
             )
-        logger.info("Invariants: vyaw == 0.0 (locked), vx <= 0.0 (backward only).")
+        logger.info(
+            "Invariants: vyaw == 0.0 (locked), vx limited to the off-track trim "
+            "(|vx| <= rtl.max_lateral_speed), vy <= 0.0 except bounded overshoot recovery."
+        )
 
         status = self._navigate(ctx, guidance)
         if status is not StepStatus.SUCCESS:
@@ -1446,6 +1631,23 @@ class ClosedLoopRTLStep(BaseStep):
 
     # --------------------------------------------------------------- terminal
 
+    @staticmethod
+    def _grounded_altitude(ctx: MissionContext, snapshot: Any, at_base: bool) -> float:
+        """Relative altitude at or below which the airframe counts as grounded.
+
+        ``relative_altitude`` is measured from the launch point. Away from the
+        base, with a pad configured and the platform monitor placing the
+        airframe off it, the floor is ``platform.height_m`` below that point,
+        and ``touchdown_altitude_m`` would be crossed a pad height above the
+        floor. Over the base, or without a pad, the threshold is unchanged.
+        """
+        threshold = ctx.params.rtl.touchdown_altitude_m
+        platform = getattr(ctx.params, "platform", None)
+        height = float(getattr(platform, "height_m", 0.0) or 0.0)
+        if not at_base and height > 0.0 and getattr(snapshot, "platform_state", "unknown") == "off":
+            return threshold - height
+        return threshold
+
     def _touchdown(
         self, ctx: MissionContext, guidance: RTLGuidanceController, *, at_base: bool
     ) -> StepStatus:
@@ -1476,7 +1678,8 @@ class ClosedLoopRTLStep(BaseStep):
         deadline = Deadline(rtl_cfg.touchdown_timeout_sec)
 
         logger.info(
-            "Executing terminal landing at the launch origin (window %.1f s)...",
+            "Executing terminal landing at the %s (window %.1f s)...",
+            "launch origin" if at_base else "present position",
             rtl_cfg.touchdown_timeout_sec,
         )
         # Raised before the first land command, not on confirmed contact: the
@@ -1516,7 +1719,7 @@ class ClosedLoopRTLStep(BaseStep):
             altitude = snapshot.relative_altitude
 
             # --- primary: the airframe is low and still -----------------
-            grounded = altitude <= rtl_cfg.touchdown_altitude_m
+            grounded = altitude <= self._grounded_altitude(ctx, snapshot, at_base)
             still = snapshot.speed <= rtl_cfg.settle_max_speed_mps
             settled_cycles = settled_cycles + 1 if (grounded and still) else 0
             if settled_cycles >= required_cycles:
@@ -1698,7 +1901,8 @@ class ClosedLoopRTLStep(BaseStep):
                 getattr(ctx, "frame_width", 856),
                 getattr(ctx, "frame_height", 480),
                 f"{prefix}STEP 5: RTL ({elapsed_sec:.1f}s) | DIST: {command.distance_m:.2f}m "
-                f"| VX: {command.vx:.3f} | ALT: {ctx.odom_supervisor.relative_altitude:.2f}m",
+                f"| VX: {command.vx:.3f} | VY: {command.vy:.3f} "
+                f"| ALT: {ctx.odom_supervisor.relative_altitude:.2f}m",
             )
         except Exception as exc:  # noqa: BLE001 - telemetry must never break flight
             self._note_stream_failure(exc)

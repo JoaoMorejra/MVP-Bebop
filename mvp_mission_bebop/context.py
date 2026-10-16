@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
 import cv2
 import numpy as np
@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     # Annotation only: importing it loads torch (~2 s), which mission.py now
     # does on a background thread (_prepare_inference).
     from nectar.ai.detection import Detector
+
+    from mvp_mission_bebop.controllers.yaw_pattern import YawServoingController
 
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.blackboard import EvidenceRecord, MissionBlackboard
@@ -57,7 +59,7 @@ class MissionContext:
         odom_supervisor: OdometrySupervisor,
         governor: AltitudeAntiClimbGovernor,
         failsafe: FailsafeSupervisor,
-        visual_controller: VisualServoingController,
+        visual_controller: Union[VisualServoingController, "YawServoingController"],
         parameters: MissionParameters,
         frame_width: int,
         frame_height: int,
@@ -563,6 +565,9 @@ class MissionContext:
                 "x_m": snapshot.x,
                 "y_m": snapshot.y,
                 "relative_altitude_m": snapshot.relative_altitude,
+                "height_above_floor_m": getattr(
+                    snapshot, "height_above_floor_m", snapshot.relative_altitude
+                ),
                 "raw_altitude_m": snapshot.raw_altitude,
                 "yaw_rad": snapshot.yaw,
                 "speed_mps": snapshot.speed,

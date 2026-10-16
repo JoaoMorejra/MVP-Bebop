@@ -38,8 +38,11 @@ class GimbalConstraintsConfig:
     """Mechanical and operational angular limits for the camera gimbal (degrees)."""
 
     search_tilt_deg: float = -20.0
-    #: Inspection attitude, in degrees. The gimbal is never asked to go below
-    #: this, and reaching it is what ends the approach.
+    #: Steepest gimbal tilt allowed in the Stage 4 framing, in degrees. The
+    #: gimbal is never asked to go below this. The drone holds position in
+    #: Stage 4, so the closed-loop framing law points the optical axis at the
+    #: target within ``[nadir_tilt_deg, search_tilt_deg]``; reaching this floor
+    #: without centring the target ends the framing at the best view available.
     #:
     #: Previously -80. The airframe does not need to stare straight down to
     #: photograph a scene, and driving the last eleven degrees was expensive in
@@ -76,6 +79,8 @@ class GimbalConstraintsConfig:
     #: Kept small: a shallower ray meets the ground at a range whose sensitivity
     #: to the angle is h / sin^2(depression), so range estimates degrade sharply
     #: toward the horizon and there is nothing to gain by staring at it.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     centering_tilt_band_up_deg: float = 5.0
     #: How far below the search attitude the gimbal may look while centering.
     #: Wider than the upward margin because the downward direction is where the
@@ -83,6 +88,8 @@ class GimbalConstraintsConfig:
     #: railed the pointing solution against its lower stop for any target closer
     #: than h / tan(search_tilt + 5 deg) -- about 2.1 m at a 1.2 m altitude --
     #: and a railed gimbal cannot null the vertical pixel error.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     centering_tilt_band_down_deg: float = 15.0
 
 
@@ -140,11 +147,14 @@ class VisionConfig:
     #: detection on a small distant object; the gate was therefore tighter than
     #: the measurement it gates on.
     optical_center_tolerance_ratio: float = 0.05
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     approach_centering_tolerance_px: float = 30.0
     #: Vertical centering tolerance as a multiple of the horizontal one.
     #:
     #: Retained for the approach and nadir phases. It is deliberately *not* a
     #: convergence gate during centering: see ``centering_vertical_guard_ratio``.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     centering_vertical_ratio: float = 1.5
     #: Vertical in-frame guard during centering, as a fraction of the frame
     #: half-height.
@@ -158,6 +168,8 @@ class VisionConfig:
     #: reduce it, by shortening the range -- is exactly what the gate withholds.
     #: The vertical precondition for advancing is therefore that the target is
     #: still comfortably inside the frame, not that it is centred in it.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     centering_vertical_guard_ratio: float = 0.72
     #: Acquisition dwell before the approach engages, in seconds.
     #:
@@ -169,12 +181,18 @@ class VisionConfig:
     #: what closes the range that the vertical error depends on. Cross-track
     #: centring is now continuous across every phase instead of being a gate on
     #: one of them.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     acquisition_dwell_sec: float = 1.0
     #: Hard ceiling on the acquisition dwell. Reaching it is not a fault.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     acquisition_timeout_sec: float = 3.0
     #: Lateral corridor half-width during approach, as a multiple of the
     #: horizontal tolerance. Forward speed tapers to zero across this band
     #: rather than switching off at its edge -- see ``alignment_gain``.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     approach_corridor_ratio: float = 1.6
     #: Floor on the cross-track alignment gain while the target is inside the
     #: corridor but not yet centred.
@@ -186,17 +204,27 @@ class VisionConfig:
     #: continuously by how well aligned the drone is, so it centres *while*
     #: advancing, which is what the manoeuvre actually calls for. This floor
     #: keeps a partially aligned approach moving instead of creeping.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     min_alignment_gain: float = 0.25
     #: Per-axis deadband at nadir, as a multiple of the horizontal tolerance.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     nadir_deadband_ratio: float = 0.50
     #: Radial alignment threshold at nadir, as a multiple of the tolerance.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     nadir_alignment_ratio: float = 1.5
     #: Consecutive out-of-corridor frames before the approach concludes that the
     #: cross-track loop is not winning and hands over to reacquisition, which
     #: widens the field of view rather than continuing to creep at a target the
     #: drone is not aimed at.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     decentered_frames_to_revert: int = 10
     #: Consecutive out-of-window frames before leaving the nadir phase.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     nadir_exit_frames: int = 8
     #: Consecutive lost frames tolerated before entering recovery.
     lost_frames_tolerance: int = 3
@@ -210,6 +238,8 @@ class VisionConfig:
     #: centroid walks with the airframe's own attitude jitter, and holding it to
     #: the tracking tolerance is what kept the aircraft station-keeping over a
     #: target it had already reached.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     nadir_arrival_tolerance_factor: float = 2.0
     #: How long reacquisition may run before the approach is abandoned.
     #:
@@ -225,15 +255,18 @@ class VisionConfig:
     #: footprint further ahead and covers far more ground per degree, so it
     #: re-frames a target that fell out of the near field. Sweeping down would
     #: only stare harder at the patch that already failed.
-    reacquire_sweep_deg: float = 30.0
-    #: Bounded reverse creep during reacquisition, in normalized units.
     #:
-    #: A target lost directly beneath the airframe cannot be recovered by
-    #: pitching up alone, because the gimbal's own travel limit stops short of
-    #: straight down plus the field of view. Backing off a few centimetres puts
-    #: it back inside the frustum.
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
+    reacquire_sweep_deg: float = 30.0
+    #: Bounded lateral creep of Stage 3 reacquisition, in normalized units.
+    #:
+    #: A target that left the frame sideways did so because the airframe
+    #: translated past it. The creep moves cross-track toward the side the
+    #: target was last seen on, which puts it back inside the frustum. A target
+    #: last seen inside the centering tolerance authorises no motion. The name
+    #: is kept from the forward pattern for the GCS contract.
     reacquire_reverse_speed: float = 0.05
-    #: How long the reverse creep may run before reacquisition holds station.
+    #: How long the lateral creep may run before reacquisition holds station.
     reacquire_reverse_sec: float = 2.0
     #: Consecutive re-detections required to leave reacquisition.
     reacquire_confirm_frames: int = 2
@@ -249,14 +282,23 @@ class VisionConfig:
     #: the controller falls back to the open-loop ramp.
     min_altitude_for_ibvs_m: float = 0.35
     #: Ground range at which the approach is considered to be over the target.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     nadir_range_threshold_m: float = 0.25
     #: Per-cycle gimbal step used by the open-loop fallback, in degrees.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     legacy_gimbal_ramp_deg: float = 2.0
 
 
 @dataclass
 class GimbalPIDConfig:
-    """High-bandwidth PID gains for vertical optical centering."""
+    """High-bandwidth PID gains for vertical optical centering.
+
+    Inert in the lateral flight pattern; retained for the GCS contract.
+    Stage 4 frames the target with the closed-form gimbal law
+    (``controllers/gimbal_framing``), which reads none of these gains.
+    """
 
     kp: float = 18.0
     ki: float = 0.0
@@ -425,11 +467,28 @@ class FlightKinematicsConfig:
     target_altitude_m: float = 1.00
     #: Safety headroom allowed above target_altitude_m before failsafe triggers, in metres.
     #: 0.60 m absorbs climb momentum, sonar dispersion, and pitch-induced tilt reading spikes.
+    #:
+    #: Safe envelope: at or above :attr:`climb_deadband_m` plus twice
+    #: :attr:`climb_settle_max_position_sigma_m` (0.21 m). The hover the climb
+    #: accepts reaches ``target + climb_deadband_m``, and the sonar/baro scatter
+    #: a settled hover still shows is bounded by the settle sigma; a ceiling
+    #: inside that band trips ``OdometrySupervisor.is_ceiling_breached`` in nominal flight.
+    #: Below :attr:`climb_deadband_m` itself it trips on arrival (station rule
+    #: E04), and ``target_altitude_m + altitude_ceiling_margin_m`` must clear
+    #: the firmware takeoff height, about one metre, or the ceiling trips right
+    #: after liftoff (E03, ``parameter_conflicts.FIRMWARE_HOVER_HEIGHT_M``).
     altitude_ceiling_margin_m: float = 0.60
     #: Consecutive odometry samples above the ceiling required to declare a breach.
     #: 3 samples at 15 Hz = ~200 ms debounce, rejecting instantaneous ultrasonic/baro spikes.
     ceiling_breach_streak: int = 3
+    #: Search cruise setpoint, normalized. Stage 2 flies it as a leftward
+    #: lateral velocity (``vy > 0``, FLU) along the outbound track; the name is
+    #: kept for the GCS contract and rule E05.
     forward_cruise_velocity: float = 0.20
+    #: Forward approach speed ceiling, normalized. No forward motion is
+    #: commanded after the target is confirmed.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     max_approach_forward_speed: float = 0.15
     #: Safety ceiling on the post-takeoff stabilization gate, in seconds.
     #:
@@ -501,6 +560,8 @@ class FlightKinematicsConfig:
     #: already slow is worth more than arriving quickly and stopping hard. At
     #: 0.08 the approach begins easing roughly 0.14 m out and settles onto the
     #: standoff instead of braking onto it.
+    #:
+    #: Inert in the lateral flight pattern; retained for the GCS contract.
     max_approach_decel_mps2: float = 0.08
     #: Peak commanded ascent speed for the Stage 1 climb, in m/s.
     #:
@@ -583,14 +644,22 @@ class ReturnToLaunchConfig:
     it is better than having no return leg.
     """
 
+    #: Speed ceiling of the odometric return along the return track (body Y,
+    #: to the right in the lateral flight pattern), in normalized units.
     max_speed: float = 0.10
-    #: Longitudinal PD trim applied on top of the feedforward braking profile.
-    #: Both gains were declared and never read by the previous implementation,
-    #: which had no control law at all -- only a piecewise ramp in displacement.
+    #: PD gains of the odometric return. In the lateral flight pattern ``kp``
+    #: and ``kd`` act on the off-track trim (body X) and ``lateral_kp`` and
+    #: ``lateral_kd`` on the return channel (body Y), under the feedforward
+    #: braking profile. The names predate the pattern and are kept for the GCS
+    #: contract. The gains were declared and never read by the previous
+    #: implementation, which had no control law at all -- only a piecewise ramp
+    #: in displacement.
     kp: float = 0.15
     kd: float = 0.01
     lateral_kp: float = 0.18
     lateral_kd: float = 0.02
+    #: Ceiling of the off-track trim in the odometric return, applied on the
+    #: body X axis in the lateral flight pattern.
     max_lateral_speed: float = 0.05
     braking_distance_m: float = 0.45
     deadband_m: float = 0.03
@@ -602,25 +671,26 @@ class ReturnToLaunchConfig:
     quantization_step: float = 0.01
     settle_cycles: int = 3
     arrival_radius_m: float = 0.20
-    #: Bounded forward authority for nulling a terminal overshoot, normalized.
+    #: Bounded leftward authority (``vy > 0``) for nulling a terminal overshoot,
+    #: normalized.
     #:
-    #: RTL flies strictly backward, and that rule used to be absolute: when the
-    #: origin ended up ahead of the nose the along-track axis was simply held at
-    #: zero. A braking profile plus odometry lag makes overshoot close to
+    #: RTL flies strictly to the right, and that rule used to be absolute: when
+    #: the origin ended up on the outbound side the return axis was simply held
+    #: at zero. A braking profile plus odometry lag makes overshoot close to
     #: certain, so the drone would arrive a little past the origin, freeze that
     #: axis, and hover there -- distance never changing, arrival never
     #: confirming -- until the whole return window expired. Observed in flight as
     #: "returns to the takeoff point and never lands".
     #:
     #: The invariant exists to keep the return a straight reverse line with no
-    #: yaw, which protects optical-flow fidelity. A centimetre-scale forward trim
+    #: yaw, which protects optical-flow fidelity. A centimetre-scale leftward trim
     #: in the terminal regime does not threaten that; hovering off-target until a
     #: timeout does. Bounded well below the cruise cap, and only applied inside
     #: ``overshoot_recovery_radius_m``.
     overshoot_recovery_speed: float = 0.04
-    #: Range within which forward overshoot recovery is permitted, in metres.
-    #: Beyond it the origin being ahead means something worse than overshoot has
-    #: happened, and creeping forward is not the answer.
+    #: Range within which leftward overshoot recovery is permitted, in metres.
+    #: Beyond it the origin being that far to the left means something worse
+    #: than overshoot has happened, and creeping back out is not the answer.
     overshoot_recovery_radius_m: float = 1.50
     #: Dwell inside the arrival radius at low speed that commits to landing.
     #:
@@ -740,32 +810,34 @@ class ReturnToLaunchConfig:
     #: centering law converges onto a point 33% off. Measure the printed
     #: marker's black border, edge to edge.
     #:
-    #: Safe envelope: a positive, finite length.
+    #: Safe envelope: a positive, finite length; the station also caps it at
+    #: 1.0 m (rule E07).
     tag_size: float = 0.20
     #: Gimbal depression for the return leg, in degrees (negative is down).
     #:
-    #: Near-nadir, and deliberately not fully nadir. At exactly -90 the marker's
-    #: image position is a pure function of horizontal offset, which is ideal for
-    #: centering and useless for *finding*: the footprint ahead of the airframe
-    #: is zero, so a reverse cruise would only ever see the pad at the instant it
-    #: was already over it, with no range in which to brake. Ten degrees of
-    #: forward lean puts the optical axis on the ground roughly
-    #: ``altitude / tan(80 deg)`` ahead -- 0.18 m at 1.0 m AGL -- and, more to the
-    #: point, keeps the whole forward half of the frame looking at ground the
-    #: drone has not yet flown over.
+    #: Near-nadir, and deliberately not fully nadir. The return leg is flown to
+    #: the right, so the pad enters the frame through its right side and the
+    #: search range is set by the horizontal field of view, not by this angle.
+    #: Ten degrees of forward lean puts the optical axis on the ground roughly
+    #: ``altitude / tan(80 deg)`` ahead -- 0.18 m at 1.0 m AGL -- so the frame
+    #: keeps ground below and slightly ahead of the airframe in view, which
+    #: tolerates an off-track offset of the pad along the nose while centering.
     #:
     #: Safe envelope: ``(-90, 0)``, down but never exactly nadir.
     camera_tilt_deg: float = -80.0
     #: Reverse cruise command for the marker search, normalized.
     #:
-    #: Signed, and the sign is load-bearing: the search leg is the mirror of
-    #: Stage 2, flown backward along the track the mission came out on, and the
-    #: along-track command is saturated non-positive at the actuator boundary so
-    #: a sign error in configuration cannot turn the return into an outbound
-    #: cruise. Slower than the Stage 2 cruise because the payoff is detection
+    #: Signed, and the sign is load-bearing (rule E05): the search leg is the
+    #: mirror of Stage 2, flown to the right along the track the mission came
+    #: out on as ``vy = -abs(reverse_cruise_velocity)``, and the return command
+    #: is saturated at the actuator boundary so a sign error in configuration
+    #: cannot turn the return into an outbound cruise. Slower than the Stage 2 cruise because the payoff is detection
     #: probability per metre travelled, not metres travelled.
     #:
-    #: Safe envelope: strictly negative.
+    #: Safe envelope: strictly negative. The station writes it as minus
+    #: ``kinematics.forward_cruise_velocity`` and refuses any other value
+    #: (rule E05), so a station launch flies the search speed back; this
+    #: default is what a run without the station flies.
     reverse_cruise_velocity: float = -0.10
     #: Longitudinal (body-x) centering gains, m/s per metre of error and per
     #: metre-per-second of error rate.
@@ -819,18 +891,20 @@ class ReturnToLaunchConfig:
     #: because a settlement claim built on stale observations is exactly the
     #: claim that puts the aircraft down somewhere it was not looking.
     lost_frames_tolerance: int = 5
-    #: Bounded reverse creep commanded while the marker is lost, normalized.
+    #: Bounded leftward creep (``vy > 0``, never ``vx``) commanded while the
+    #: marker is lost, normalized. The return is flown to the right, so an
+    #: overshot marker leaves the frame on its left side.
     #:
-    #: The camera_tilt_deg rear field of view is narrow by construction (see
-    #: that field's docstring), so a marker lost while the airframe was still
-    #: actively closing on it -- not already at rest over it -- is very often a
-    #: marker that has just slipped out of frame ahead or below. Holding
-    #: station and waiting out lost_frames_tolerance treats that the same as
-    #: any other dropout; creeping aft treats it as what it almost always is.
+    #: A marker lost while the airframe was still actively closing on it -- not
+    #: already at rest over it -- is very often a marker that has just slipped
+    #: past the left edge of the frame. Holding station and waiting out
+    #: lost_frames_tolerance treats that the same as any other dropout;
+    #: creeping left treats it as what it almost always is.
     #: Bounded well below reverse_cruise_velocity: this is a re-framing nudge,
     #: not a second search leg.
     reacquire_creep_speed: float = 0.03
-    #: Duration the aft creep runs before yielding to a plain hold, in seconds.
+    #: Duration the leftward creep runs before yielding to a plain hold, in
+    #: seconds.
     reacquire_creep_sec: float = 1.0
     #: Radial error, at the last valid sighting, below which a subsequent loss
     #: is treated as a close-in overshoot rather than a general dropout. Losses
@@ -843,6 +917,11 @@ class ReturnToLaunchConfig:
     #: window would let a long search consume the budget for the convergence it
     #: exists to enable, and the failure mode of that is an aircraft landing
     #: half-centred because the clock ran out on a phase that was converging.
+    #: Edited in the station's advanced settings, inside ``[1, 120]`` s.
+    #:
+    #: Safe envelope: a positive, finite duration. Zero ends the centering
+    #: before its first cycle, and a negative value makes the phase's
+    #: ``Deadline`` raise in flight.
     centering_timeout_sec: float = 25.0
 
 
@@ -880,6 +959,41 @@ class CalibrationConfig:
     #: Consecutive out-of-envelope samples required before a new regime is
     #: accepted rather than held.
     plausibility_reject_streak: int = 3
+
+    # ------------------------------------------------------- altitude probe
+
+    #: Log ``[ALT_PROBE ...]`` once a second: along-track position, platform
+    #: state, odometric altitude, the firmware's own ``states/altitude`` and
+    #: the vertical speed. Log only; nothing reads it back.
+    altitude_probe_enabled: bool = True
+
+    # ------------------------------------------------ vertical state estimator
+
+    #: Altitude source for live odometry: ``"legacy"`` keeps ``pose.z`` behind
+    #: the position plausibility gate above; ``"vz_gated"`` integrates the
+    #: gated vertical speed instead (``estimation.vertical_estimator``). Stays
+    #: ``"legacy"`` until field test F-2 shows a ``vz`` step at the pad edge.
+    #:
+    #: Safe envelope: one of ``"legacy"``, ``"vz_gated"``; anything else is
+    #: refused with ``ValueError`` when the odometry supervisor is built.
+    altitude_estimator: str = "legacy"
+    #: Ceiling on a trusted vertical speed sample, in metres per second.
+    #:
+    #: Describes the firmware's reaction, not the governor's commanded profile:
+    #: the 0.40 m/s^2 of ``plausibility_max_accel_mps2`` would reject the real
+    #: response to a sonar step.
+    vz_max_speed_mps: float = 1.5
+    #: Ceiling on a trusted change of vertical speed, in metres per second squared.
+    vz_max_accel_mps2: float = 5.0
+    #: Consecutive out-of-envelope samples after which a new regime is accepted.
+    vz_reject_streak: int = 3
+    #: Pull the estimate toward ``/bebop/states/altitude`` (``"vz_gated"`` only).
+    altitude_anchor_enabled: bool = False
+    #: Time constant of that pull, in seconds.
+    altitude_anchor_tau_sec: float = 6.0
+    #: Innovation beyond which the anchor does not correct, in metres; 3 s of
+    #: persistent disagreement is logged.
+    altitude_anchor_gate_m: float = 0.25
 
 
 @dataclass
@@ -1027,8 +1141,200 @@ class BatteryConfig:
 
 
 @dataclass
+class PlatformConfig:
+    """Takeoff pad the mission launches from, lands on and flies above.
+
+    The ground reference ``z0`` is calibrated on whatever the airframe rests on
+    before takeoff, so on a pad ``relative_altitude`` is the height above the
+    *top of the pad*. The governor, the ceiling and the touchdown live in that
+    frame and need nothing from this section. The operating height is stated
+    over the floor instead (``kinematics.target_altitude_m``), and two things
+    therefore have to know the pad exists: the control target, which is
+    ``target_altitude_m - height_m``, and the ground projection of the visual
+    approach, which needs the height over the plane the target lies on.
+
+    The rest of the section is the edge guard. The Bebop holds height with a
+    downward sonar, and crossing the pad edge moves its echo from the pad top
+    to the floor: a ``height_m`` step in the reading that the firmware answers
+    by moving the airframe, not by correcting the reading. Every field below
+    ``edge_ahead_m`` is inert while it is ``None``.
+
+    With every field at its default the mission is identical to a flight from
+    the floor.
+    """
+
+    #: Height of the pad top above the floor, in metres.
+    #:
+    #: Safe envelope: ``>= 0``. ``0.0`` is a launch from the floor.
+    height_m: float = 0.0
+    #: Venue ceiling above the floor, in metres; ``None`` when unknown.
+    #:
+    #: Clamps the effective altitude ceiling to ``venue_ceiling_agl_m -
+    #: height_m`` in the control frame, whatever the margin and the allowance
+    #: would otherwise permit.
+    #:
+    #: Safe envelope: ``> kinematics.target_altitude_m``.
+    venue_ceiling_agl_m: Optional[float] = None
+    #: Distance from the takeoff point to the pad edge along the outbound track
+    #: (lateral, to the left), in metres, measured with a tape. ``None`` disables the platform monitor
+    #: and the edge guard.
+    #:
+    #: Safe envelope: ``> 0``.
+    edge_ahead_m: Optional[float] = None
+    #: Uncertainty of the odometric along-track position over the 1-3 m the
+    #: mission flies near the pad, in metres.
+    #:
+    #: Safe envelope: ``>= 0``.
+    edge_uncertainty_m: float = 0.15
+    #: Effective half-angle of the sonar beam, in degrees. Sets ``s*``, the
+    #: along-track position at which the pad leaves the beam:
+    #: ``edge_ahead_m + h * tan(sonar_half_angle_deg)``. Unconfirmed; measured
+    #: in field test F-2.
+    #:
+    #: Safe envelope: ``(5, 45)``.
+    sonar_half_angle_deg: float = 20.0
+    #: How far before ``s* - edge_uncertainty_m`` the guard opens, in metres.
+    #:
+    #: Safe envelope: ``>= 0``.
+    guard_lead_m: float = 0.40
+    #: How far beyond ``s* + edge_uncertainty_m`` the guard stays open, in
+    #: metres. Covers the recovery of a sink that starts at the edge.
+    #:
+    #: Safe envelope: ``> 0``.
+    guard_extent_m: float = 1.0
+    #: Climb ceiling of the altitude hold inside the guard, normalized. The
+    #: global one is ``governor.max_climb_speed``.
+    #:
+    #: Safe envelope: ``<= 0.30``.
+    guard_climb_authority: float = 0.20
+    #: Descent ceiling of the altitude hold inside the guard, normalized. The
+    #: global one is ``governor.max_descent_speed``.
+    #:
+    #: Safe envelope: ``<= 0.30``.
+    guard_descent_cap: float = 0.16
+    #: Multiplier on ``governor.kp`` inside the guard.
+    #:
+    #: Safe envelope: ``[1, 3]``.
+    guard_kp_scale: float = 1.5
+    #: Deadband of the altitude hold inside the guard, both sides, in metres.
+    #:
+    #: Safe envelope: ``>= 0``.
+    guard_deadband_m: float = 0.01
+    #: Vertical error above which translation stops inside the guard, in metres.
+    #:
+    #: Safe envelope: ``> guard_resume_error_m``.
+    guard_stop_error_m: float = 0.15
+    #: Vertical error below which translation resumes, in metres.
+    #:
+    #: Safe envelope: ``< guard_stop_error_m``.
+    guard_resume_error_m: float = 0.08
+    #: Render a sub-quantum vertical demand as +/-0.01 pulses inside the guard.
+    #:
+    #: The firmware engages its own sonar hover only on an exactly zero
+    #: ``gaz``; a demand under the driver's ``int8(v * 100)`` quantum is
+    #: transmitted as that zero.
+    guard_vertical_shaper: bool = True
+    #: Extra ceiling headroom granted only while the guard is open, in metres.
+    #: Suggested 0.4; unconfirmed until field test F-3.
+    #:
+    #: Safe envelope: ``>= 0``. Always bounded by the venue ceiling.
+    ceiling_allowance_m: float = 0.0
+    #: How long a ceiling breach is tolerated while re-entering the pad
+    #: (``PlatformState.ENTERING``), in seconds.
+    #:
+    #: Coming back over the edge, the sonar reading drops by the pad height and
+    #: the firmware may climb on its own. An emergency landing there puts the
+    #: airframe down on the pad edge. Inside this window the breach commands the
+    #: full guard descent instead; past it, or once the airframe leaves
+    #: ``ENTERING`` still above the ceiling, the emergency landing applies as
+    #: everywhere else. Inert while ``edge_ahead_m`` is ``None``.
+    #:
+    #: Safe envelope: ``> 0``.
+    reentry_breach_grace_sec: float = 3.0
+    #: Anticipatory climb on leaving the pad, in metres per second. Inert until
+    #: field test F-2 measures the sink.
+    #:
+    #: Safe envelope: ``>= 0``.
+    sag_feedforward_mps: float = 0.0
+    #: Anticipatory descent on entering the pad, in metres per second. Inert
+    #: until field test F-3 measures the false climb.
+    #:
+    #: Safe envelope: ``>= 0``.
+    rise_feedforward_mps: float = 0.0
+    #: Duration of either feedforward after the transition, in seconds.
+    #:
+    #: Safe envelope: ``> 0``.
+    feedforward_sec: float = 1.5
+    #: Continuous time inside the governor deadband that releases Stage 2 to
+    #: translate, in seconds.
+    #:
+    #: Safe envelope: ``> 0``.
+    departure_settle_window_sec: float = 1.0
+    #: Ceiling on that wait, in seconds. Reaching it is not a fault.
+    #:
+    #: Safe envelope: ``> 0``.
+    departure_settle_timeout_sec: float = 8.0
+
+
+@dataclass
+class YawPatternConfig:
+    """Yaw laws of the Simple mission profile (``mission_mode == "simple"``).
+
+    Yaw rate is a normalized command in [-1, 1]; a positive value turns left
+    (counter-clockwise seen from above). One unit is about
+    ``DeadReckoningConfig.yaw_rate_per_unit_rad_s`` rad/s on this airframe.
+    The values below are conservative starting points to be tuned on the bench;
+    none of them is an operator parameter.
+    """
+
+    #: Yaw command of the Stage 2 scan, normalized. 0.15 is roughly 15 deg/s:
+    #: slow enough that the detector, which runs near 10 Hz, sees every
+    #: bearing for several frames, and one full turn takes about 24 s, inside
+    #: the default ``timeouts.search_timeout_sec`` of 30 s.
+    scan_vyaw: float = 0.15
+    #: Slew limit of the scan command, normalized units per second. Bounds the
+    #: angular acceleration so the camera does not smear on the start and stop.
+    scan_ramp_per_sec: float = 0.30
+    #: Ceiling of the yaw authority window, normalized. Must be at least every
+    #: other yaw magnitude in this section.
+    max_vyaw: float = 0.30
+    #: Stage 3 yaw PID on the normalized horizontal pixel error.
+    kp: float = 0.45
+    ki: float = 0.0
+    kd: float = 0.03
+    #: Output saturation of the Stage 3 PID, normalized.
+    pid_output_limit: float = 0.25
+    #: Output deadband of the Stage 3 PID, normalized.
+    deadband: float = 0.01
+    #: Smallest yaw command the airframe reproduces; sub-floor demands are
+    #: duty-cycled by ``QuantizedCommandShaper`` rather than raised to the floor.
+    min_effective_vyaw: float = 0.05
+    #: Driver quantization step (``int8(v * 100)``).
+    quantization_step: float = 0.01
+    #: Rate at which Stage 3 searches toward the side the target left from.
+    reacquire_vyaw: float = 0.08
+    #: Heading restore (end of Stage 4): proportional and derivative gains on
+    #: the wrapped heading error in radians.
+    return_kp: float = 0.50
+    return_kd: float = 0.02
+    #: Output saturation of the heading restore, normalized.
+    return_max_vyaw: float = 0.25
+    #: Heading error inside which the restore counts as settled, degrees.
+    return_tolerance_deg: float = 4.0
+    #: Consecutive in-tolerance cycles required to end the restore.
+    return_settle_cycles: int = 4
+    #: Window of the heading restore, seconds. On expiry the mission continues
+    #: with the heading reached.
+    return_timeout_sec: float = 12.0
+
+
+@dataclass
 class MissionParameters:
-    """Root container consolidating all configurable mission subsystems."""
+    """Root container consolidating all configurable mission subsystems.
+
+    ``mission_mode`` selects the mission profile: ``simple``, ``intermediate``
+    or ``advanced``. Resolved once by ``mission_mode.apply_mission_mode``.
+    """
 
     network: NetworkConfig = field(default_factory=NetworkConfig)
     gimbal: GimbalConstraintsConfig = field(default_factory=GimbalConstraintsConfig)
@@ -1043,8 +1349,48 @@ class MissionParameters:
     inspection: InspectionConfig = field(default_factory=InspectionConfig)
     timeouts: TimeoutsConfig = field(default_factory=TimeoutsConfig)
     battery: BatteryConfig = field(default_factory=BatteryConfig)
+    platform: PlatformConfig = field(default_factory=PlatformConfig)
+    mission_mode: str = "advanced"
+    yaw_pattern: YawPatternConfig = field(default_factory=YawPatternConfig)
     no_fly: bool = False
     output_dir: str = "."
+
+    @property
+    def relative_target_altitude_m(self) -> float:
+        """Operating height in the control frame, above the launch point, in metres.
+
+        ``kinematics.target_altitude_m`` is stated over the floor;
+        ``relative_altitude`` is measured from the ground reference calibrated
+        where the airframe rested before takeoff, which on a pad is its top.
+        Not a dataclass field, so the on-disk layout is unchanged.
+
+        Returns
+        -------
+        float
+            ``target_altitude_m - platform.height_m``; exactly
+            ``target_altitude_m`` when no pad is configured.
+
+        Raises
+        ------
+        ValueError
+            With a pad configured, if the height left above it is under
+            ``kinematics.takeoff_settle_min_altitude_m``: no hover sample there
+            counts as airborne. Without a pad the configured target is returned
+            unchecked, low targets included, exactly as before this section
+            existed.
+        """
+        target = float(self.kinematics.target_altitude_m)
+        height = float(self.platform.height_m)
+        if height <= 0.0:
+            return target
+        relative = target - height
+        floor = float(self.kinematics.takeoff_settle_min_altitude_m)
+        if relative < floor:
+            raise ValueError(
+                f"target_altitude_m={target:g} leaves {relative:g} m above a {height:g} m pad, "
+                f"under takeoff_settle_min_altitude_m={floor:g}"
+            )
+        return relative
 
     @property
     def battery_land_pct(self) -> float:

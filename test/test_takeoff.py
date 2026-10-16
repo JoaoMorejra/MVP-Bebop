@@ -6,9 +6,12 @@ fly its whole profile a metre low. These tests exercise the closed-loop climb
 that closes the gap, and the invariant that it is the only phase allowed to.
 """
 
+import contextlib
+import logging
 import threading
 import types
 import time
+from typing import List
 
 import pytest
 
@@ -21,6 +24,35 @@ from mvp_mission_bebop.steps.base import StepStatus
 from mvp_mission_bebop.steps.takeoff import TakeoffStep
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
+
+
+class _StepLog(logging.Handler):
+    """Stage 1 log lines; the mission's logging setup does not propagate them to pytest."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.lines: List[str] = []
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def captured_step_log():
+    handler = _StepLog()
+    target = logging.getLogger("Step1Takeoff")
+    previous = target.level
+    target.addHandler(handler)
+    target.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous)
 
 
 class StubDrone:
@@ -610,18 +642,25 @@ class RecordingPerception:
         self.statuses = []
         self.disengaged = 0
 
+    on_engage = on_release = on_disengage = staticmethod(lambda: None)
+
     def session(self, conf=None, imgsz=None):
         import contextlib
 
         @contextlib.contextmanager
         def scope():
             self.engaged_with.append(imgsz)
+            self.on_engage()
             try:
                 yield self
             finally:
                 self.disengaged += 1
+                self.on_disengage()
 
         return scope()
+
+    def release_nowait(self):
+        self.on_release()
 
     def set_status(self, text):
         self.statuses.append(text)
@@ -630,7 +669,8 @@ class RecordingPerception:
         return types.SimpleNamespace(frame=object(), result=None)
 
 
-def test_the_countdown_warms_yolo_on_the_worker_not_on_the_control_thread(milestones):
+def test_the_countdown_feeds_on_the_session_the_ground_sequence_opened(milestones):
+    """The warmup session opens at the go (Stage 1 entry), not in the countdown."""
     ctx = countdown_ctx(2.0)
     ctx.perception = RecordingPerception()
     ctx.params.vision.inference_imgsz = 480
@@ -640,6 +680,78 @@ def test_the_countdown_warms_yolo_on_the_worker_not_on_the_control_thread(milest
 
     assert TakeoffStep()._countdown(ctx) is StepStatus.SUCCESS
     assert calls == []
-    assert ctx.perception.engaged_with == [480]
-    assert ctx.perception.disengaged == 1
+    assert ctx.perception.engaged_with == []
     assert any("CONTAGEM REGRESSIVA" in text for text in ctx.perception.statuses)
+
+
+def test_stage1_engages_the_warmup_before_the_flat_trim_and_releases_it_before_the_takeoff(milestones, monkeypatch):
+    params = stabilize_params()
+    params.kinematics.countdown_sec = 0.0
+    params.vision.inference_imgsz = 480
+    order = []
+    perception = RecordingPerception()
+    perception.on_engage = lambda: order.append("engage")
+    perception.on_release = lambda: order.append("release")
+    perception.on_disengage = lambda: order.append("disengage")
+    drone = StubDrone()
+    drone.no_fly = True
+    drone.flat_trim = lambda: order.append("flat_trim")
+    drone.takeoff = lambda altitude: order.append("takeoff") or True
+    ctx = scripted_context(params, lambda n: (0.0, 0.0, True))
+    ctx.drone = drone
+    ctx.perception = perception
+    ctx.failsafe = types.SimpleNamespace(notify_frame_received=lambda: None)
+    monkeypatch.setattr(TakeoffStep, "_calibrate", lambda self, c: True)
+    monkeypatch.setattr(TakeoffStep, "_stabilize", lambda self, c: order.append("stabilize") or StepStatus.ABORTED)
+    monkeypatch.setattr("mvp_mission_bebop.steps.takeoff._FLAT_TRIM_SETTLE_SEC", 0.0)
+
+    assert TakeoffStep().execute(ctx) is StepStatus.ABORTED
+    assert order == ["engage", "flat_trim", "release", "takeoff", "disengage", "stabilize"]
+    assert perception.engaged_with == [480]
+
+
+def test_a_refused_ground_sequence_hands_the_detector_back(milestones, monkeypatch):
+    params = stabilize_params()
+    perception = RecordingPerception()
+    ctx = scripted_context(params, lambda n: (0.0, 0.0, True))
+    ctx.drone.no_fly = False
+    ctx.perception = perception
+    monkeypatch.setattr(TakeoffStep, "_flat_trim", lambda self, c: False)
+
+    assert TakeoffStep().execute(ctx) is StepStatus.FAILURE
+    assert perception.disengaged == 1
+
+
+# ------------------------------------------------ low target settle floor (4.4)
+
+
+def test_a_low_target_settles_on_a_floor_it_can_reach():
+    """Below the 0.30 m settle floor, the floor follows half the target."""
+    params = stabilize_params(ceiling=3.0)
+    params.kinematics.target_altitude_m = 0.20
+    params.kinematics.control_loop_hz = 50.0
+    ctx = scripted_context(params, lambda n: (0.20, 0.0, True))
+
+    with captured_step_log() as caplog:
+        status, elapsed = timed_stabilize(ctx)
+
+    assert status is StepStatus.SUCCESS
+    assert elapsed < 1.5, f"a hover at a 0.20 m target waited {elapsed:.2f} s of a 3.0 s ceiling"
+    assert "settle floor 0.10 m" in caplog.text
+
+
+def test_a_low_target_still_rejects_an_airframe_on_the_ground():
+    params = stabilize_params(ceiling=0.5)
+    params.kinematics.target_altitude_m = 0.20
+    ctx = scripted_context(params, lambda n: (0.05, 0.0, True))
+
+    _status, elapsed = timed_stabilize(ctx)
+
+    assert elapsed >= 0.5, "an airframe below half the target was declared settled"
+
+
+def test_a_nominal_target_keeps_the_configured_settle_floor():
+    params = stabilize_params(ceiling=0.3)
+    with captured_step_log() as caplog:
+        timed_stabilize(scripted_context(params, lambda n: (1.0, 0.0, True)))
+    assert "settle floor 0.30 m" in caplog.text

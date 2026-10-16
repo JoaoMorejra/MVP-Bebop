@@ -34,12 +34,14 @@ from mvp_mission_bebop.actuators.driver_discovery import (
     restart_ros2_daemon,
 )
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
+from mvp_mission_bebop.actuators.yaw_authority import YawAuthority
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
 from mvp_mission_bebop.config_audit import log_envelope_divergences
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
+from mvp_mission_bebop.controllers.yaw_pattern import YawServoingController, validate_yaw_pattern
 from mvp_mission_bebop.engine.exit_codes import EXIT_ABORTED_LANDED
 from mvp_mission_bebop.engine.launch import (
     EXIT_STANDBY_MISMATCH,
@@ -56,6 +58,7 @@ from mvp_mission_bebop.engine.startup_timing import StartupTimer, process_age_ms
 from mvp_mission_bebop.engine.stage_gate import StageRequestHandler
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
+from mvp_mission_bebop.mission_mode import MissionMode, apply_mission_mode, neutralize_launch_pad
 from mvp_mission_bebop.parameters import (
     COUNTDOWN_MIN_SEC,
     BatteryConfig,
@@ -73,13 +76,7 @@ from mvp_mission_bebop.perception.inference_device import (
     select_detector,
 )
 from mvp_mission_bebop.perception.worker import PerceptionWorker, detector_kwargs, normalize_imgsz
-from mvp_mission_bebop.steps import (
-    ClosedLoopRTLStep,
-    ForwardSearchStep,
-    NadirInspectionStep,
-    TakeoffStep,
-    VisualServoingStep,
-)
+from mvp_mission_bebop.steps.pipeline import build_steps
 from mvp_mission_bebop.telemetry.battery import (
     BATTERY_WARNING_PCT,
     BatterySupervisor,
@@ -122,7 +119,7 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         "--velocity",
         type=float,
         default=None,
-        help="Cruise velocity for forward search (default: %(default)s).",
+        help="Cruise velocity for lateral search (default: %(default)s).",
     )
     parser.add_argument(
         "--search-timeout",
@@ -232,6 +229,17 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
             "Comma-separated subset of the five stages to execute, in the order "
             "given (e.g. --stages 2 or --stages 1,4). Intended for benchtop "
             "rehearsal of a single routine; omitting it flies the whole sequence."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=[mode.value for mode in MissionMode],
+        default=None,
+        help=(
+            "Mission profile: simple (yaw-only search, no translation), intermediate "
+            "(full mission, lands where the inspection ends) or advanced (full mission "
+            "with the ArUco return). Overrides mission_mode in the parameter store and "
+            "in --params-json (default: advanced)."
         ),
     )
     parser.add_argument(
@@ -449,6 +457,10 @@ def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
         params.no_fly = False
     if args.countdown is not None:
         params.kinematics.countdown_sec = args.countdown
+    try:
+        apply_mission_mode(params, getattr(args, "mode", None))
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"mission_mode: {error}") from error
     _validate_countdown(params)
     _persist_parameters(params, config_file)
     return params
@@ -461,7 +473,7 @@ def _log_active_parameters(params: MissionParameters) -> None:
         "search_timeout=%.1fs, confidence=%.2f, confirmation_frames=%d, "
         "classes=%s, rtl_radius=%.2fm, countdown=%.1fs, no_fly=%s, "
         "aruco_id=%d, aruco_dict=%s, aruco_size=%.3fm, stabilize=%.1fs, "
-        "search_tilt=%.0fdeg, nadir_freeze_tilt=%.0fdeg (tol %.1fdeg), rtl_timeout=%.0fs",
+        "search_tilt=%.0fdeg, stage4_tilt_floor=%.0fdeg (tol %.1fdeg), rtl_timeout=%.0fs",
         params.kinematics.target_altitude_m,
         params.kinematics.forward_cruise_velocity,
         params.kinematics.hover_duration_sec,
@@ -707,6 +719,7 @@ def main() -> None:
         kinematics_cfg=params.kinematics,
         timeouts_cfg=params.timeouts,
         calibration_cfg=params.calibration,
+        platform_cfg=params.platform,
     )
     calibration = SpeedCalibration.from_kinematics(params.kinematics)
 
@@ -742,11 +755,13 @@ def main() -> None:
     # the drone is genuinely displaced by the cruise rather than by a constant
     # injected for the occasion.
     simulator = KinematicSimulator(odom_supervisor, calibration) if params.no_fly else None
+    yaw_authority = YawAuthority()
     actuator = BenchtopDroneProxy(
         raw_drone,
         no_fly=params.no_fly,
         simulator=simulator,
         motion_tracker=motion_tracker,
+        yaw_authority=yaw_authority,
     )
 
 
@@ -862,6 +877,15 @@ def main() -> None:
             params.network.odometry_topic,
             odom_supervisor.odometry_callback,
             qos_profile_sensor_data,
+        )
+        # Firmware altitude above the takeoff point (ARSDK AltitudeChanged),
+        # recorded by the altitude probe beside the odometric one. Reliable,
+        # transient-local, depth 1, as the driver publishes it.
+        telemetry_node.create_subscription(
+            Float32,
+            f"/{params.network.namespace.strip('/')}/states/altitude",
+            odom_supervisor.altitude_state_callback,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
     else:
         # The simulator is the only writer of the supervisor on the bench. With
@@ -994,6 +1018,10 @@ def main() -> None:
             nectar.shutdown()
             sys.exit(EXIT_STANDBY_MISMATCH)
         params.update_from_dict(command["params"])
+        try:
+            apply_mission_mode(params, getattr(args, "mode", None))
+        except (TypeError, ValueError) as error:
+            raise SystemExit(f"mission_mode: {error}") from error
         _validate_countdown(params)
         _persist_parameters(params, _config_file(args))
         try:
@@ -1025,19 +1053,41 @@ def main() -> None:
     # D2: the station speaks the numbers of this document and of no other.
     # Emitted after every normalization above (and, from standby, after the
     # go), so it is exactly what the steps will fly.
+    emit_milestone("mission.mode", {"mode": MissionMode(params.mission_mode).value})
     emit_milestone("mission.parameters", spoken_parameters(params, calibration))
+
+    if MissionMode(params.mission_mode) is MissionMode.SIMPLE:
+        neutralize_launch_pad(params)
+        logger.info(
+            "Simple profile: launch pad height %.2f m is ignored for the flight (no translation); "
+            "ceiling anchored on the native takeoff height.",
+            getattr(params, "launch_pad_height_m_original", 0.0),
+        )
 
     governor_class = (
         AltitudeHoldGovernor if params.governor.hold_enabled else AltitudeAntiClimbGovernor
     )
-    governor = governor_class(
-        target_altitude=params.kinematics.target_altitude_m,
-        config=params.governor,
-    )
+    if governor_class is AltitudeHoldGovernor:
+        # The platform edge guard rides on the two-sided law only; it is inert
+        # while platform.edge_ahead_m is null.
+        governor = AltitudeHoldGovernor(
+            target_altitude=params.relative_target_altitude_m,
+            config=params.governor,
+            guard_source=odom_supervisor.platform_report,
+            platform_cfg=params.platform,
+            calibration=calibration,
+            descent_demand=odom_supervisor.reentry_descent_demanded,
+        )
+    else:
+        governor = governor_class(
+            target_altitude=params.relative_target_altitude_m,
+            config=params.governor,
+        )
     logger.info(
-        "Vertical axis: %s at %.2f m (descent <= %.3f, ascent <= %.3f normalized).",
+        "Vertical axis: %s at %.2f m above the launch point "
+        "(descent <= %.3f, ascent <= %.3f normalized).",
         governor_class.__name__,
-        params.kinematics.target_altitude_m,
+        params.relative_target_altitude_m,
         params.governor.max_descent_speed,
         params.governor.climb_authority,
     )
@@ -1047,15 +1097,25 @@ def main() -> None:
         timeouts_cfg=params.timeouts,
         kinematics_cfg=params.kinematics,
         battery_supervisor=battery_supervisor,
+        yaw_authority=yaw_authority,
     )
-    visual_controller = VisualServoingController(
-        gimbal_config=params.gimbal,
-        gimbal_pid_cfg=params.gimbal_pid,
-        lateral_pid_cfg=params.lateral_pid,
-        vision_cfg=params.vision,
-        kinematics_cfg=params.kinematics,
-        calibration=calibration,
-    )
+    mission_mode = MissionMode(params.mission_mode)
+    logger.info("Mission mode: %s.", mission_mode.value)
+    if mission_mode is MissionMode.SIMPLE:
+        try:
+            validate_yaw_pattern(params.yaw_pattern)
+        except (TypeError, ValueError) as error:
+            raise SystemExit(f"yaw_pattern: {error}") from error
+        visual_controller = YawServoingController(params.yaw_pattern, params.vision)
+    else:
+        visual_controller = VisualServoingController(
+            gimbal_config=params.gimbal,
+            gimbal_pid_cfg=params.gimbal_pid,
+            lateral_pid_cfg=params.lateral_pid,
+            vision_cfg=params.vision,
+            kinematics_cfg=params.kinematics,
+            calibration=calibration,
+        )
 
     ctx = MissionContext(
         drone=actuator,
@@ -1144,13 +1204,7 @@ def main() -> None:
             logger.info("[NO-FLY] Simulated landing completed at the end of the run.")
         telemetry_node.destroy_node()
 
-    all_steps = {
-        1: TakeoffStep,
-        2: ForwardSearchStep,
-        3: VisualServoingStep,
-        4: NadirInspectionStep,
-        5: ClosedLoopRTLStep,
-    }
+    all_steps = build_steps(mission_mode)
 
     selection = parse_stage_selection(getattr(args, "stages", None))
     if selection is None:

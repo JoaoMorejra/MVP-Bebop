@@ -1,4 +1,18 @@
-"""Stage 4: motionless nadir hover and forensic evidence capture.
+"""Stage 4: absolute hover, gimbal-only framing, and forensic evidence capture.
+
+The airframe holds an absolute hover for the whole stage: every Twist it
+transmits carries ``vx = vy = vyaw = 0.0`` and only the altitude governor's
+``vz``. The gimbal is the only actuator that moves. In the lateral flight pattern
+the drone never advances on the target, so no fixed nadir attitude frames it;
+the stage first points the optical axis at the target with the closed-loop
+framing law of :mod:`mvp_mission_bebop.controllers.gimbal_framing`, bounded to
+``[gimbal.nadir_tilt_deg, gimbal.search_tilt_deg]``, and only then verifies
+stillness and captures.
+
+The framing starts from the open-loop pointing solution of the last pixel Stage
+3 measured at its lock. If no detection arrives while the gimbal frames, that
+solution is kept -- never the floor -- and the capture proceeds flagged as
+unsettled.
 
 The capture is only worth as much as the hover beneath it. A 14-megapixel frame
 taken while the airframe is still translating is motion-blurred at exactly the
@@ -22,63 +36,103 @@ later.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Final, Optional, Tuple
 
 from mvp_mission_bebop.context import MissionContext
-from mvp_mission_bebop.engine.rate import Deadline, LoopRate
+from mvp_mission_bebop.controllers.gimbal_framing import FramingCommand, GimbalFramingController
+from mvp_mission_bebop.controllers.yaw_pattern import YawHeadingController
+from mvp_mission_bebop.engine.rate import MAX_INTERVAL_SEC, Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
+from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.perception.worker import detector_kwargs
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 logger = logging.getLogger("Step4Inspection")
 
+_STEP_NAMES: Final[Dict[MissionMode, str]] = {
+    MissionMode.ADVANCED: "STEP 4: Motionless Nadir Hover & Evidence Capture",
+    MissionMode.INTERMEDIATE: "STEP 4: Motionless Nadir Hover & Evidence Capture",
+    MissionMode.SIMPLE: "STEP 4: Motionless Nadir Hover & Evidence Capture",
+}
+
+#: Smallest tilt change worth transmitting, in degrees. Below it the gimbal
+#: command is not re-sent, so a converged law does not flood the gimbal topic.
+_TILT_DEADBAND_DEG: Final[float] = 1e-3
+
+
+class _StageInterrupted(Exception):
+    """Ends the framing phase with an abort or a health failure.
+
+    Raised rather than returned so the altitude-hold window and the perception
+    session both close on the way out, as in Stage 3.
+    """
+
+    def __init__(self, status: StepStatus) -> None:
+        super().__init__(status.name)
+        self.status = status
+
 
 class NadirInspectionStep(BaseStep):
-    """Holds a motionless nadir hover and records forensic evidence."""
+    """Holds an absolute hover, frames the target with the gimbal, records evidence.
 
-    def __init__(self) -> None:
+    Parameters
+    ----------
+    mode : MissionMode
+        Mission profile, keyword-only. Selects the stage name; ``ADVANCED`` (the
+        default) is the historical behaviour.
+    """
+
+    def __init__(self, *, mode: MissionMode = MissionMode.ADVANCED) -> None:
         #: Native photo still awaiting the aircraft's PictureEventChanged.
         self._pending_ack: Optional[Dict[str, Any]] = None
-        super().__init__("STEP 4: Motionless Nadir Hover & Evidence Capture")
+        self._mode = mode
+        super().__init__(_STEP_NAMES[mode])
+
+    @property
+    def mode(self) -> MissionMode:
+        """Mission profile this stage was built for."""
+        return self._mode
 
     def execute(self, ctx: MissionContext) -> StepStatus:
         logger.info("--- [%s] ---", self.name)
 
         # A degraded approach is the case where evidence is most valuable, not
         # least. The stage used to return immediately when the approach had not
-        # confirmed nadir alignment -- which is precisely the outcome Stage 3
-        # reports on any timeout or lost target -- so the common failure
-        # produced no imagery at all, never moved the gimbal to nadir, and still
-        # logged success. Capture anyway, from wherever the airframe got to, and
-        # record in the evidence metadata that the alignment was unconfirmed so
-        # nothing downstream mistakes it for a centred inspection.
-        degraded = not ctx.blackboard.approach_finished
-        if degraded:
+        # confirmed its lock -- which is precisely the outcome Stage 3 reports
+        # on any timeout or lost target -- so the common failure produced no
+        # imagery at all and still logged success. Capture anyway, from wherever
+        # the airframe got to, and record in the evidence metadata that the
+        # alignment was unconfirmed so nothing downstream mistakes it for a
+        # centred inspection.
+        approach_finished = bool(ctx.blackboard.approach_finished)
+        if not approach_finished:
             logger.warning(
-                "Approach never confirmed nadir alignment. Inspecting in degraded mode: "
+                "Approach never confirmed the lateral lock. Inspecting in degraded mode: "
                 "evidence will be captured and flagged as unaligned."
             )
 
-        # Lock the gimbal at the inspection attitude for the whole stage. Stage 3
-        # has already brought it here and frozen the airframe at the standoff
-        # this angle frames; re-asserting it costs nothing and means a degraded
-        # approach that never reached the attitude still photographs the ground
-        # rather than the horizon.
-        ctx.current_tilt_deg = ctx.params.gimbal.nadir_tilt_deg
-        ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
-        self._announce("Inspecionando acidente", "drone pairado sobre o acidente em visada nadir")
+        self._announce(
+            "Inspecionando acidente", "drone pairado, apontando a câmera para o acidente"
+        )
 
-        with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
-            return self._inspect(ctx, degraded)
+        try:
+            with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
+                return self._inspect(ctx, approach_finished)
+        except _StageInterrupted as interrupt:
+            return interrupt.status
 
     # ------------------------------------------------------------- inspection
 
-    def _inspect(self, ctx: MissionContext, degraded: bool) -> StepStatus:
-        """Settle, capture, and hold. Called inside the altitude-hold window."""
+    def _inspect(self, ctx: MissionContext, approach_finished: bool) -> StepStatus:
+        """Frame, settle, capture, and hold. Called inside the altitude-hold window."""
+        framed = self._frame_with_gimbal(ctx)
+        degraded = not approach_finished or not framed
+
         settled = self._await_stillness(ctx)
         if ctx.interrupted():
             # ``_await_stillness`` returns False both on timeout and on an
@@ -115,7 +169,206 @@ class NadirInspectionStep(BaseStep):
         else:
             logger.error("Stage 4 finished without recording any evidence.")
 
+        if self._mode is MissionMode.SIMPLE:
+            status = self._restore_heading(ctx)
+            if status is not StepStatus.SUCCESS:
+                return status
+            self._point_gimbal(ctx, float(ctx.params.rtl.camera_tilt_deg))
+
         return StepStatus.SUCCESS
+
+    # --------------------------------------------------------------- framing
+
+    def _frame_with_gimbal(self, ctx: MissionContext) -> bool:
+        """Point the gimbal at the target while the airframe holds still.
+
+        Every cycle transmits station keeping (``vx = vy = vyaw = 0.0``), checks
+        for an abort and, outside ``no_fly``, for system health, as Stage 3 does.
+        The gimbal is first carried toward the open-loop pointing solution of
+        the last pixel Stage 3 measured. Each new frame that carries the target
+        runs the closed-loop law and replaces that setpoint with the open-loop
+        solution of the new pixel; every other cycle, including frames without
+        the target, keeps slewing toward the newest setpoint. Each cycle moves
+        the tilt by at most ``max_slew_limit_deg * dt``.
+
+        The phase ends when the law reports the target framed, or when the
+        window ``max(inspection.settle_timeout_sec, 2 * (search_tilt_deg -
+        nadir_tilt_deg) / max_slew_limit_deg)`` expires: twice the time to slew
+        across the whole band, and never shorter than the stillness wait. On
+        timeout the gimbal rests on the open-loop solution of the newest pixel
+        (the Stage 3 one if no detection arrived), never blindly on the floor.
+
+        The perception session is closed before returning: ``ROSCam`` serves new
+        frames to one consumer only, and the capture that follows grabs its own.
+
+        Parameters
+        ----------
+        ctx : MissionContext
+            Mission context; ``ctx.current_tilt_deg`` is updated with every tilt
+            transmitted.
+
+        Returns
+        -------
+        bool
+            True when the target was framed inside the window.
+
+        Raises
+        ------
+        _StageInterrupted
+            On an abort (``ABORTED``) or a failed health check (``FAILURE``).
+        """
+        gimbal_cfg = ctx.params.gimbal
+        vision_cfg = ctx.params.vision
+        frame_dims = (int(ctx.frame_width), int(ctx.frame_height))
+        try:
+            controller = GimbalFramingController(gimbal_cfg, vision_cfg)
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "Gimbal framing unavailable (%s); capturing at the current tilt %.1f deg.",
+                exc,
+                ctx.current_tilt_deg,
+            )
+            return False
+        controller.reset()
+
+        goal = self._open_loop_goal(ctx, controller, frame_dims)
+        window_sec = max(
+            float(ctx.params.inspection.settle_timeout_sec),
+            2.0
+            * (float(gimbal_cfg.search_tilt_deg) - float(gimbal_cfg.nadir_tilt_deg))
+            / float(gimbal_cfg.max_slew_limit_deg),
+        )
+        deadline = Deadline(window_sec)
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        max_age = vision_cfg.perception_max_age_sec
+        last_generation = 0
+        target_seen = False
+
+        logger.info(
+            "Framing with the gimbal alone: open-loop setpoint %.1f deg, band [%.1f, %.1f] deg, "
+            "window %.1f s.",
+            goal,
+            gimbal_cfg.nadir_tilt_deg,
+            gimbal_cfg.search_tilt_deg,
+            window_sec,
+        )
+
+        try:
+            with ctx.perception.session(
+                conf=vision_cfg.confidence_threshold, imgsz=vision_cfg.inference_imgsz
+            ):
+                while deadline.active:
+                    self._hold(ctx)
+                    if ctx.interrupted():
+                        raise _StageInterrupted(StepStatus.ABORTED)
+                    if not ctx.drone.no_fly:
+                        healthy, reason = ctx.failsafe.evaluate_system_health()
+                        if not healthy:
+                            ctx.failsafe.trigger_emergency_land(reason)
+                            raise _StageInterrupted(StepStatus.FAILURE)
+
+                    # One slew budget per cycle: exactly one of the two tilt
+                    # updates below runs, each limited to max_slew_limit_deg * dt.
+                    dt = min(rate.tick(), MAX_INTERVAL_SEC)
+                    sample = ctx.perception.get_latest(max_age)
+                    if sample is None or sample.generation == last_generation:
+                        self._point_gimbal(
+                            ctx, controller.slew_toward(ctx.current_tilt_deg, goal, dt)
+                        )
+                        continue
+                    last_generation = sample.generation
+                    ctx.failsafe.notify_frame_received()
+
+                    targets = sample.result.filter_by_class(vision_cfg.target_classes)
+                    center: Optional[Tuple[float, float]] = None
+                    if targets:
+                        best = max(targets, key=lambda detection: detection.confidence)
+                        center = (float(best.center[0]), float(best.center[1]))
+                        target_seen = True
+
+                    command = controller.compute(center, frame_dims, ctx.current_tilt_deg, dt)
+                    if center is not None:
+                        # The airframe is frozen and the target static, so the
+                        # pointing solution of the newest pixel stays valid after
+                        # the target is lost; it replaces the Stage 3 setpoint.
+                        goal = controller.open_loop_tilt(center, ctx.current_tilt_deg, frame_dims)
+                        self._point_gimbal(ctx, command.tilt_deg)
+                    else:
+                        self._point_gimbal(
+                            ctx, controller.slew_toward(ctx.current_tilt_deg, goal, dt)
+                        )
+                    self._publish_framing(ctx, command, deadline)
+                    if command.framed:
+                        logger.info(
+                            "Target framed after %.1f s at tilt %.1f deg (%s).",
+                            deadline.elapsed_sec,
+                            ctx.current_tilt_deg,
+                            command.note,
+                        )
+                        return True
+        finally:
+            logger.info("Framing loop cadence: %s.", rate.cadence_report())
+
+        logger.warning(
+            "Target not framed within %.1f s; keeping tilt %.1f deg (%s). The capture is "
+            "flagged as unsettled.",
+            window_sec,
+            ctx.current_tilt_deg,
+            "open-loop solution of the last detection"
+            if target_seen
+            else "open-loop solution of the Stage 3 pixel",
+        )
+        return False
+
+    @staticmethod
+    def _open_loop_goal(
+        ctx: MissionContext, controller: GimbalFramingController, frame_dims: Tuple[int, int]
+    ) -> float:
+        """Starting setpoint: the pointing solution of Stage 3's last measured pixel.
+
+        Falls back to the current tilt when Stage 3 recorded no pixel or a
+        corrupt one; the gimbal is then left where it is rather than driven
+        toward a guess.
+        """
+        pixel = ctx.blackboard.confirmed_target_px
+        tilt = ctx.blackboard.confirmed_tilt_deg
+        if pixel is None or tilt is None:
+            logger.warning(
+                "No confirmed target pixel from Stage 3; framing starts from the current tilt "
+                "%.1f deg.",
+                ctx.current_tilt_deg,
+            )
+            return float(ctx.current_tilt_deg)
+        try:
+            return controller.open_loop_tilt(pixel, tilt, frame_dims)
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "Confirmed target pixel %r unusable (%s); framing starts from the current tilt.",
+                pixel,
+                exc,
+            )
+            return float(ctx.current_tilt_deg)
+
+    @staticmethod
+    def _point_gimbal(ctx: MissionContext, tilt_deg: float) -> None:
+        """Transmit a tilt when it differs from the one last commanded."""
+        if abs(tilt_deg - ctx.current_tilt_deg) > _TILT_DEADBAND_DEG:
+            ctx.drone.camera_control(tilt=tilt_deg, pan=0.0)
+            ctx.current_tilt_deg = tilt_deg
+
+    @staticmethod
+    def _publish_framing(ctx: MissionContext, command: FramingCommand, deadline: Deadline) -> None:
+        """Caption the annotated stream with the framing state."""
+        err_text = (
+            f"{command.vertical_error_px:+.0f}px"
+            if math.isfinite(command.vertical_error_px)
+            else "n/a"
+        )
+        ctx.perception.set_status(
+            f"{'[NO-FLY] ' if ctx.drone.no_fly else ''}STEP 4: GIMBAL FRAMING "
+            f"({deadline.elapsed_sec:.1f}s) | TILT: {command.tilt_deg:.1f}deg "
+            f"| ERR_Y: {err_text}{' | FLOOR' if command.at_floor else ''}",
+        )
 
     # -------------------------------------------------------------- stillness
 
@@ -343,6 +596,116 @@ class NadirInspectionStep(BaseStep):
             logger.info("Hover loop cadence: %s.", rate.cadence_report())
 
         return StepStatus.SUCCESS
+
+    def _restore_heading(self, ctx: MissionContext) -> StepStatus:
+        """Turn back to the heading recorded at the end of Stage 1 (Simple profile).
+
+        Runs after the evidence is recorded, so a heading fault can never cost
+        the photograph. The yaw window is open only for this loop and the last
+        command sent is an explicit zero, because the Bebop latches its last
+        Twist.
+
+        Battery, odometry and the ceiling are evaluated every cycle, as in the
+        other loops of the mission. The camera heartbeat is not: vision is
+        suspended after the capture, so the frame age is stale by construction
+        (the hover loop above has the same property and Stage 5 re-arms the
+        heartbeat on entry). The loop is also bounded by
+        ``yaw_pattern.return_timeout_sec``.
+
+        A reference that is absent, not a number or not finite skips the
+        restore. A cycle whose heading reading is not finite carries no
+        measurement: it transmits zero yaw and the window keeps bounding the
+        loop.
+
+        Parameters
+        ----------
+        ctx : MissionContext
+            Mission context; reads ``blackboard.initial_yaw_rad`` and the
+            odometry heading, transmits through ``failsafe``.
+
+        Returns
+        -------
+        StepStatus
+            ``ABORTED`` on an interrupt; ``SUCCESS`` otherwise, including when
+            no usable reference heading was recorded or the window expired.
+            Stage 5 centres on the marker from whatever heading was reached.
+        """
+        raw_reference = getattr(ctx.blackboard, "initial_yaw_rad", None)
+        try:
+            reference = float(raw_reference) if raw_reference is not None else math.nan
+        except (TypeError, ValueError):
+            reference = math.nan
+        if not math.isfinite(reference):
+            logger.warning(
+                "No usable takeoff heading was recorded (%r); the heading restore is skipped.",
+                raw_reference,
+            )
+            return StepStatus.SUCCESS
+
+        yaw_cfg = ctx.params.yaw_pattern
+        controller = YawHeadingController(yaw_cfg)
+        controller.reset()
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        deadline = Deadline(yaw_cfg.return_timeout_sec)
+        blind_cycles = 0
+        logger.info(
+            "Restoring the takeoff heading %.1f deg: tolerance %.1f deg, window %.1f s.",
+            math.degrees(reference),
+            yaw_cfg.return_tolerance_deg,
+            yaw_cfg.return_timeout_sec,
+        )
+        try:
+            with ctx.failsafe.yaw_window(yaw_cfg.max_vyaw):
+                while deadline.active:
+                    if ctx.interrupted():
+                        return StepStatus.ABORTED
+                    if not ctx.drone.no_fly:
+                        healthy, reason = ctx.failsafe.evaluate_system_health(check_video=False)
+                        if not healthy:
+                            ctx.failsafe.trigger_emergency_land(reason)
+                            return StepStatus.FAILURE
+                    dt = min(rate.tick(), MAX_INTERVAL_SEC)
+                    yaw = float(ctx.odom_supervisor.snapshot().yaw)
+                    if not math.isfinite(yaw):
+                        if blind_cycles == 0:
+                            logger.warning(
+                                "Heading reading not finite (%r); holding zero yaw until it recovers.",
+                                yaw,
+                            )
+                        blind_cycles += 1
+                        self._transmit_yaw(ctx, 0.0, dt)
+                        continue
+                    command = controller.update(yaw, reference, dt)
+                    self._transmit_yaw(ctx, command.vyaw, dt)
+                    if command.settled:
+                        logger.info(
+                            "Heading restored after %.1f s (residual %.1f deg, %d blind cycles).",
+                            deadline.elapsed_sec,
+                            math.degrees(command.error_rad),
+                            blind_cycles,
+                        )
+                        return StepStatus.SUCCESS
+            logger.warning(
+                "Heading not restored within %.1f s (%d blind cycles); continuing from the "
+                "heading reached.",
+                yaw_cfg.return_timeout_sec,
+                blind_cycles,
+            )
+            return StepStatus.SUCCESS
+        finally:
+            self._hold(ctx)
+            # Pace the exit so the closing zero Twist reaches the consumer before Stage 5 starts.
+            rate.tick()
+            logger.info("Heading loop cadence: %s.", rate.cadence_report())
+
+    @staticmethod
+    def _transmit_yaw(ctx: MissionContext, vyaw: float, dt: float) -> None:
+        """Send a yaw command through the failsafe with every translation channel at zero."""
+        vz = ctx.governor.compute_vz(
+            ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=0.0
+        )
+        safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, vyaw)
+        ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
 
     # ----------------------------------------------------------- native ACK
 

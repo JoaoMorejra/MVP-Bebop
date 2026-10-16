@@ -36,11 +36,14 @@ class MissionBlackboard:
     #: Set by the search stage once a target clears the confirmation filter.
     #: Gates the visual servoing stage.
     target_confirmed: bool = False
-    #: Gimbal tilt at the moment of confirmation, in degrees.
+    #: Gimbal tilt at the moment of confirmation, in degrees. Overwritten by the
+    #: visual servoing stage at the instant of its lateral lock.
     confirmed_tilt_deg: Optional[float] = None
-    #: Target centre in image coordinates at confirmation.
+    #: Target centre in image coordinates at confirmation. Overwritten by the
+    #: visual servoing stage at the instant of its lateral lock with the last
+    #: measured centroid; the inspection stage points the gimbal from it.
     confirmed_target_px: Optional[Tuple[float, float]] = None
-    #: Set by the visual servoing stage once nadir alignment is achieved.
+    #: Set by the visual servoing stage once the lateral freeze has latched.
     #: Gates the inspection stage.
     approach_finished: bool = False
     #: Forensic artefacts from the inspection stage.
@@ -60,6 +63,10 @@ class MissionBlackboard:
     #: Set once the takeoff stage has climbed and stabilised. Stages 2-4
     #: presuppose it when the run includes Stage 1.
     takeoff_complete: bool = False
+    #: Heading at the end of Stage 1, radians (``OdometrySnapshot.yaw``). The
+    #: Simple profile restores it at the end of Stage 4. ``None`` until Stage 1
+    #: completes (a partial run that skips Stage 1 records it on first use).
+    initial_yaw_rad: Optional[float] = None
     #: Outcome of the return leg's touchdown: ``True`` confirmed from odometry,
     #: ``False`` commanded but unconfirmed, ``None`` when no touchdown ran. Drives
     #: the exit status (``engine.exit_codes``).

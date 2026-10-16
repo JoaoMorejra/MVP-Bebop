@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import time
-from typing import Any, Dict, Final, FrozenSet, Optional
+from typing import Any, ContextManager, Dict, Final, FrozenSet, Optional
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.profiling import (
@@ -13,8 +14,10 @@ from mvp_mission_bebop.controllers.profiling import (
     ProfileLimits,
     braking_velocity,
 )
+from mvp_mission_bebop.engine.launch import CountdownTicker
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
+from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
@@ -24,8 +27,26 @@ logger = logging.getLogger("Step1Takeoff")
 _CLEARANCE_ANNOUNCE_SEC: float = 3.2
 
 #: Settling time after flat trim, in seconds. The IMU needs a moment on a level
-#: surface before the calibration it just performed is trustworthy.
+#: surface before the calibration it just performed is trustworthy. Not a
+#: blocking wait any more: the ground reference and the detector warmup run
+#: inside it, and the takeoff waits only for what is left of it at the zero.
 _FLAT_TRIM_SETTLE_SEC: float = 2.0
+
+#: Margin above ``takeoff_settle_min_altitude_m`` within which a target is
+#: treated as low for the stabilization floor, metres.
+_LOW_TARGET_MARGIN_M: Final[float] = 0.05
+
+#: Poll period of the remaining IMU settle before the takeoff, seconds.
+_SETTLE_POLL_SEC: Final[float] = 0.01
+
+
+class _NoPerception:
+    """Stand-in for a context without a perception pipeline."""
+
+    engaged = False
+
+    def release_nowait(self) -> None:
+        return None
 
 
 #: ARSDK flying states that confirm the airframe has left the ground: takingoff
@@ -60,9 +81,23 @@ def takeoff_confirmed(flying_state: Optional[int], relative_altitude: float, min
 class TakeoffStep(BaseStep):
     """Calibrates, launches, and establishes a drift-free airborne origin."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, mode: MissionMode = MissionMode.ADVANCED) -> None:
         super().__init__("STEP 1: Calibration, Takeoff & Stabilization")
+        self._mode = mode
         self._takeoff_called = False
+        #: Monotonic instant the IMU settle after the flat trim ends; ``None``
+        #: before a flat trim has been requested.
+        self._imu_settled_at: Optional[float] = None
+        #: Countdown deadline of a launch without a pinned one, anchored at the
+        #: Stage 1 entry, and the ticker counting towards it.
+        self._cold_deadline: Optional[float] = None
+        self._cold_ticker: Optional[CountdownTicker] = None
+        #: Monotonic instant of the last takeoff command.
+        self._t_takeoff_cmd: float = 0.0
+
+    @property
+    def mode(self) -> MissionMode:
+        return self._mode
 
     def _call_takeoff_once_confirmed(self, ctx: MissionContext, relative_altitude: float) -> None:
         """Raise ``mission.takeoff`` the first time the takeoff is confirmed.
@@ -85,24 +120,78 @@ class TakeoffStep(BaseStep):
                 val = getattr(bb, attr, None)
                 if val is not None:
                     payload[attr] = round(val, 3) if isinstance(val, float) else val
+        if self._mode is MissionMode.SIMPLE:
+            payload["native"] = True
         emit_milestone("mission.takeoff", payload)
 
     def execute(self, ctx: MissionContext) -> StepStatus:
+        """Run Stage 1: the ground sequence inside the countdown, then the flight.
+
+        The countdown is the warmup window. The perception session opens at the
+        go, so the detector warms up while the flat trim and the ground
+        reference run; a launch without a pinned deadline counts from here, not
+        after them; and at the zero the detector is released and the takeoff
+        commanded at once, the session closing (bounded) only after it.
+        """
         logger.info("--- [%s] ---", self.name)
         self._takeoff_called = False
-        status = self._ground_sequence(ctx)
+        self._imu_settled_at = None
+        started = time.monotonic()
+        self._arm_cold_countdown(ctx, started)
+
+        with self._perception_session(ctx) as perception:
+            status = self._ground_sequence(ctx)
+            if status is not StepStatus.SUCCESS:
+                # The countdown ticks must not keep running towards a takeoff
+                # that is not going to happen.
+                self._stop_ticker(ctx)
+                return status
+            bb = getattr(ctx, "blackboard", None)
+            if bb is not None:
+                bb.takeoff_committed = True
+            # The takeoff does not need the camera; the confirmation after it
+            # does. Releasing first keeps a hung inference out of the gap
+            # between the zero and the command.
+            perception.release_nowait()
+            status = self._command_takeoff(ctx)
         if status is not StepStatus.SUCCESS:
-            # The countdown ticks must not keep running towards a takeoff
-            # that is not going to happen.
-            self._stop_ticker(ctx)
             return status
         return self._flight_sequence(ctx)
 
-    @staticmethod
-    def _stop_ticker(ctx: MissionContext) -> None:
+    def _stop_ticker(self, ctx: MissionContext) -> None:
         ticker = getattr(ctx, "countdown_ticker", None)
         if ticker is not None:
             ticker.stop()
+        if self._cold_ticker is not None:
+            self._cold_ticker.stop()
+
+    def _arm_cold_countdown(self, ctx: MissionContext, started: float) -> None:
+        """Anchor a countdown with no pinned deadline at the Stage 1 entry.
+
+        A launch from standby carries ``launch_deadline`` and its own ticker.
+        Without one the countdown used to start after the flat trim and the
+        ground reference, so the operator waited for both and then for the
+        whole countdown. It now runs from the go, in full, and the ground
+        sequence happens inside it.
+        """
+        self._cold_deadline = None
+        self._cold_ticker = None
+        countdown = ctx.params.kinematics.countdown_sec
+        if getattr(ctx, "launch_deadline", None) is not None or not countdown > 0.0:
+            return
+        self._cold_deadline = started + float(countdown)
+        self._cold_ticker = CountdownTicker(
+            self._cold_deadline,
+            lambda whole: emit_milestone("mission.countdown", {"remaining_sec": whole}),
+        )
+        self._cold_ticker.start()
+
+    @staticmethod
+    def _perception_session(ctx: MissionContext) -> ContextManager[Any]:
+        perception = getattr(ctx, "perception", None)
+        if perception is None:
+            return contextlib.nullcontext(_NoPerception())
+        return perception.session(imgsz=ctx.params.vision.inference_imgsz)
 
     def _ground_sequence(self, ctx: MissionContext) -> StepStatus:
         """Pre-arm checks, gimbal, flat trim, ground reference and the countdown."""
@@ -112,20 +201,20 @@ class TakeoffStep(BaseStep):
         ctx.current_tilt_deg = ctx.params.gimbal.search_tilt_deg
         ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
 
+        started = time.monotonic()
         if not self._flat_trim(ctx):
             return StepStatus.FAILURE
 
         if not self._calibrate(ctx):
             return StepStatus.FAILURE
+        logger.info("[TIMING] ground_sequence_sec=%.3f", time.monotonic() - started)
 
         return self._countdown(ctx)
 
     def _flight_sequence(self, ctx: MissionContext) -> StepStatus:
-        """Takeoff, stabilization, ascent and the airborne origin."""
+        """Takeoff confirmation, stabilization, ascent and the airborne origin."""
         bb = getattr(ctx, "blackboard", None)
-        if bb is not None:
-            bb.takeoff_committed = True
-        status = self._launch(ctx)
+        status = self._confirm_takeoff(ctx)
         if status is not StepStatus.SUCCESS:
             return status
 
@@ -133,9 +222,15 @@ class TakeoffStep(BaseStep):
         if status is not StepStatus.SUCCESS:
             return status
 
-        status = self._ascend(ctx)
-        if status is not StepStatus.SUCCESS:
-            return status
+        if self._mode is MissionMode.SIMPLE:
+            logger.info(
+                "Simple profile: native firmware takeoff; the corrective ascent is skipped and "
+                "the airframe flies at the height the firmware reached."
+            )
+        else:
+            status = self._ascend(ctx)
+            if status is not StepStatus.SUCCESS:
+                return status
 
         status = self._finalize(ctx)
         if status is StepStatus.SUCCESS:
@@ -180,7 +275,10 @@ class TakeoffStep(BaseStep):
                 priority="CRITICAL",
             )
             return False
-        ctx.drone.delay(_FLAT_TRIM_SETTLE_SEC)
+        # The settle is the airframe's IMU; on the bench there is none, and the
+        # proxy's ``delay`` that used to spend it was already a no-op there.
+        settle = 0.0 if ctx.drone.no_fly else _FLAT_TRIM_SETTLE_SEC
+        self._imu_settled_at = time.monotonic() + settle
         return True
 
     # ---------------------------------------------------------------- pre-arm
@@ -265,9 +363,13 @@ class TakeoffStep(BaseStep):
         duration = floor
         # A launch from standby counts towards the click plus the countdown,
         # the instant the station's overlay counts to as well; the flat trim
-        # and the ground reference ran inside that window.
+        # and the ground reference ran inside that window. A launch without
+        # one counts from the Stage 1 entry (:meth:`_arm_cold_countdown`).
         launch_deadline = getattr(ctx, "launch_deadline", None)
         ticker = getattr(ctx, "countdown_ticker", None)
+        if launch_deadline is None and self._cold_deadline is not None:
+            launch_deadline = self._cold_deadline
+            ticker = self._cold_ticker
         if launch_deadline is not None:
             duration = max(0.0, launch_deadline - time.monotonic())
             # A passed deadline authorizes the takeoff only if its window was
@@ -284,7 +386,7 @@ class TakeoffStep(BaseStep):
             self._stop_ticker(ctx)
             emit_milestone("mission.countdown_3", {"remaining_sec": 0})
             emit_milestone("mission.countdown", {"remaining_sec": 0})
-            return StepStatus.SUCCESS
+            return self._await_ground_interlocks(ctx, launch_deadline)
 
         logger.info("Pre-flight countdown and sensor warmup (%.1f s)...", duration)
         deadline = Deadline(duration)
@@ -302,51 +404,96 @@ class TakeoffStep(BaseStep):
         # publishes a detection summary rather than an annotated frame: drawn
         # on this thread it held the countdown loop to the inference rate and
         # gated the cockpit video on the annotated frame (5 FPS in Stage 1).
-        with ctx.perception.session(imgsz=ctx.params.vision.inference_imgsz):
-            while deadline.active:
-                if ctx.interrupted():
-                    return StepStatus.ABORTED
+        # The session is the one :meth:`execute` opened at the go.
+        while deadline.active:
+            if ctx.interrupted():
+                return StepStatus.ABORTED
 
-                remaining = deadline.remaining_sec
-                whole = int(math.ceil(max(0.0, remaining)))
-                if ticker is None and whole != last_whole and whole > 0:
-                    last_whole = whole
-                    emit_milestone("mission.countdown", {"remaining_sec": whole})
-                ctx.perception.set_status(f"CONTAGEM REGRESSIVA: {remaining:.1f}s | YOLO PRONTO")
+            remaining = deadline.remaining_sec
+            whole = int(math.ceil(max(0.0, remaining)))
+            if ticker is None and whole != last_whole and whole > 0:
+                last_whole = whole
+                emit_milestone("mission.countdown", {"remaining_sec": whole})
+            ctx.perception.set_status(f"CONTAGEM REGRESSIVA: {remaining:.1f}s | YOLO PRONTO")
 
-                sample = ctx.perception.get_latest(max_age_sec=1.0)
-                if sample is not None and sample is not seen:
-                    seen = sample
-                    warmup_frames += 1
-                    ctx.failsafe.notify_frame_received()
+            sample = ctx.perception.get_latest(max_age_sec=1.0)
+            if sample is not None and sample is not seen:
+                seen = sample
+                warmup_frames += 1
+                ctx.failsafe.notify_frame_received()
 
-                if remaining <= _CLEARANCE_ANNOUNCE_SEC and not announced:
-                    announced = True
-                    logger.info("Takeoff synchronization window reached. Announcing clearance.")
-                    emit_milestone("mission.countdown_3", {"remaining_sec": round(remaining, 1)})
-                    self._announce("Decolagem autorizada", "decolagem autorizada, iniciando voo")
+            if remaining <= _CLEARANCE_ANNOUNCE_SEC and not announced:
+                announced = True
+                logger.info("Takeoff synchronization window reached. Announcing clearance.")
+                emit_milestone("mission.countdown_3", {"remaining_sec": round(remaining, 1)})
+                self._announce("Decolagem autorizada", "decolagem autorizada, iniciando voo")
 
-                rate.tick()
+            rate.tick()
 
         self._stop_ticker(ctx)
         if not announced:
             emit_milestone("mission.countdown_3", {"remaining_sec": 0})
         emit_milestone("mission.countdown", {"remaining_sec": 0})
         logger.info("Perception pipeline warmed up over %d frames.", warmup_frames)
+        return self._await_ground_interlocks(ctx, None)
+
+    def _await_ground_interlocks(self, ctx: MissionContext, deadline: Optional[float]) -> StepStatus:
+        """Stamp the countdown's zero and wait out what is left of the IMU settle.
+
+        The settle after the flat trim is an interlock, not a delay to remove:
+        a countdown shorter than the ground sequence waits for it, and the
+        excess over the zero is logged rather than skipped.
+
+        Parameters
+        ----------
+        deadline : Optional[float]
+            Monotonic instant the countdown reached zero when that lies in the
+            past (a passed deadline); ``None`` when the zero is now.
+        """
+        now = time.monotonic()
+        zero = now if deadline is None else min(now, deadline)
+        bb = getattr(ctx, "blackboard", None)
+        if bb is not None:
+            bb.t_countdown_zero = zero
+        logger.info("[TIMING] t_countdown_zero mono=%.3f", zero)
+
+        settled_at = self._imu_settled_at
+        if settled_at is not None:
+            while time.monotonic() < settled_at:
+                if ctx.interrupted():
+                    return StepStatus.ABORTED
+                time.sleep(min(_SETTLE_POLL_SEC, max(0.0, settled_at - time.monotonic())))
+
+        overrun = time.monotonic() - zero
+        if overrun > _SETTLE_POLL_SEC:
+            logger.warning(
+                "[TIMING] ground_sequence_overrun_sec=%.3f: the countdown was exceeded by a ground "
+                "interlock (flat trim settle); the takeoff waited for it.",
+                overrun,
+            )
         return StepStatus.SUCCESS
 
     # ----------------------------------------------------------------- launch
 
     def _launch(self, ctx: MissionContext) -> StepStatus:
+        """Command the takeoff and wait for the airframe to confirm it."""
+        status = self._command_takeoff(ctx)
+        if status is not StepStatus.SUCCESS:
+            return status
+        return self._confirm_takeoff(ctx)
+
+    def _command_takeoff(self, ctx: MissionContext) -> StepStatus:
         """Command takeoff.
 
         The altitude argument is accepted by the SDK and ignored by the Bebop
         firmware, which runs its own launch profile. It is passed through for
         API fidelity and used here only for logging and the ceiling.
+        ``t_takeoff_cmd`` is stamped before the call: ``BebopDrone.takeoff``
+        sleeps 3 s after publishing.
         """
-        target_altitude = ctx.params.kinematics.target_altitude_m
+        target_altitude = ctx.params.relative_target_altitude_m
         logger.info(
-            "Issuing takeoff (nominal altitude %.2f m, ceiling %.2f m). "
+            "Issuing takeoff (nominal altitude %.2f m above the launch point, ceiling %.2f m). "
             "Note: the Bebop firmware selects its own launch altitude.",
             target_altitude,
             ctx.odom_supervisor.altitude_ceiling,
@@ -378,10 +525,15 @@ class TakeoffStep(BaseStep):
             if bb is not None:
                 bb.takeoff_committed = False
             return StepStatus.FAILURE
+        self._t_takeoff_cmd = t_cmd_mono
+        return StepStatus.SUCCESS
 
+    def _confirm_takeoff(self, ctx: MissionContext) -> StepStatus:
+        """Require the airframe to confirm the takeoff on a real flight (R1)."""
+        bb = getattr(ctx, "blackboard", None)
         no_fly = getattr(ctx.drone, "no_fly", getattr(ctx.params, "no_fly", True))
         if not no_fly:
-            confirmed = self._wait_for_takeoff_confirmation(ctx, t_cmd_mono)
+            confirmed = self._wait_for_takeoff_confirmation(ctx, self._t_takeoff_cmd)
             if not confirmed:
                 logger.critical("Takeoff confirmation timed out (R1). Landing aircraft.")
                 ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
@@ -480,7 +632,9 @@ class TakeoffStep(BaseStep):
         """
         kinematics = ctx.params.kinematics
         ceiling_sec = kinematics.takeoff_stabilize_duration_sec
-        min_altitude = kinematics.takeoff_settle_min_altitude_m
+        min_altitude = self._settle_floor(
+            kinematics.takeoff_settle_min_altitude_m, ctx.params.relative_target_altitude_m
+        )
         settlement = SettlementDetector(
             SettlementCriteria(
                 window_sec=kinematics.takeoff_settle_window_sec,
@@ -492,7 +646,7 @@ class TakeoffStep(BaseStep):
 
         logger.info(
             "Stabilizing in hover: mean |vz| <= %.3f m/s and altitude sigma <= %.3f m "
-            "sustained for %.1f s above %.2f m (ceiling %.1f s)...",
+            "sustained for %.1f s above settle floor %.2f m (ceiling %.1f s)...",
             kinematics.takeoff_settle_max_vz_mps,
             kinematics.takeoff_settle_max_altitude_sigma_m,
             kinematics.takeoff_settle_window_sec,
@@ -547,6 +701,20 @@ class TakeoffStep(BaseStep):
         )
         return StepStatus.SUCCESS
 
+    @staticmethod
+    def _settle_floor(configured: float, target: float) -> float:
+        """Altitude below which a hover sample is not counted as settled.
+
+        A sample under the floor only proves the airframe is still on the
+        ground. With the target within ``_LOW_TARGET_MARGIN_M`` of the
+        configured floor, a hover at the target sits under it and the gate
+        could only time out; the floor then follows half the target, still
+        well clear of the ground and of the sonar's resting reading.
+        """
+        if target <= configured + _LOW_TARGET_MARGIN_M:
+            return min(configured, 0.5 * target)
+        return configured
+
     # ------------------------------------------------------------------ ascent
 
     def _ascend(self, ctx: MissionContext) -> StepStatus:
@@ -570,7 +738,7 @@ class TakeoffStep(BaseStep):
         the manoeuvre entirely, which is the default configuration.
         """
         kinematics = ctx.params.kinematics
-        target = kinematics.target_altitude_m
+        target = ctx.params.relative_target_altitude_m
         deadband = kinematics.climb_deadband_m
         ceiling = ctx.odom_supervisor.altitude_ceiling
 
@@ -806,8 +974,10 @@ class TakeoffStep(BaseStep):
         ctx.odom_supervisor.freeze_hover_takeoff_origin()
         self._arm_dead_reckoning(ctx)
         snapshot = ctx.odom_supervisor.snapshot()
-        t_hover = time.monotonic()
         bb = getattr(ctx, "blackboard", None)
+        if bb is not None:
+            bb.initial_yaw_rad = float(snapshot.yaw)
+        t_hover = time.monotonic()
         if bb is not None:
             bb.t_hover = t_hover
         logger.info("[TIMING] t_hover mono=%.3f", t_hover)

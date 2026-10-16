@@ -8,7 +8,10 @@ divergence, on the mission's stdout, and the operator decides.
 
 Each check below restates one "Safe envelope" note from
 :mod:`mvp_mission_bebop.parameters`; a check without such a note does not
-belong here.
+belong here. Conflicts *between* fields are the station's rules
+(:mod:`mvp_mission_bebop.parameter_conflicts`), logged here as
+``[CONFIG CONFLICT]`` with their severity, equally without aborting: the
+station is the gate, the mission keeps the record.
 """
 
 from __future__ import annotations
@@ -19,12 +22,16 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Final, List, Optional, Tuple, Union
 
+from mvp_mission_bebop.parameter_conflicts import evaluate_parameter_conflicts
 from mvp_mission_bebop.parameters import MissionParameters
 
 logger = logging.getLogger("ConfigAudit")
 
 #: Structured-log prefix of a divergence line.
 ENVELOPE_TAG: Final[str] = "CONFIG ENVELOPE"
+
+#: Structured-log prefix of a conflict between parameters.
+CONFLICT_TAG: Final[str] = "CONFIG CONFLICT"
 
 #: Documented bounds of ``timeouts.video_stream_timeout_sec``, in seconds.
 VIDEO_TIMEOUT_ENVELOPE_SEC: Final[Tuple[float, float]] = (1.5, 2.0)
@@ -124,20 +131,39 @@ def audit_safe_envelopes(
             "gimbal.nadir_tilt_deg",
             gimbal.nadir_tilt_deg,
             f"[-90, search_tilt_deg={gimbal.search_tilt_deg})",
-            "the approach cannot reach its inspection attitude",
+            "the Stage 4 gimbal framing cannot reach its steepest tilt",
         )
 
-    altitude = _real(kinematics.target_altitude_m)
+    target = _real(kinematics.target_altitude_m)
+    pad = max(0.0, _real(params.platform.height_m) or 0.0)
+    altitude = None if target is None else target - pad
     floor = max(
         _real(vision.min_altitude_for_ibvs_m) or 0.0,
         _real(kinematics.takeoff_settle_min_altitude_m) or 0.0,
     )
     if altitude is None or altitude <= floor:
+        sources = "min_altitude_for_ibvs_m, takeoff_settle_min_altitude_m"
         diverge(
             "kinematics.target_altitude_m",
             kinematics.target_altitude_m,
-            f"> {floor:g} (min_altitude_for_ibvs_m, takeoff_settle_min_altitude_m)",
-            "the approach flies the open-loop ramp and the takeoff gate cannot settle",
+            f"> {floor:g} ({sources})"
+            if pad == 0.0
+            else f"> {floor + pad:g} ({floor:g} above platform.height_m={pad:g}: {sources})",
+            "the ground projection falls back to its open-loop path and the takeoff gate cannot settle",
+        )
+
+    margin = _real(kinematics.altitude_ceiling_margin_m)
+    margin_floor = (_real(kinematics.climb_deadband_m) or 0.0) + 2.0 * (
+        _real(kinematics.climb_settle_max_position_sigma_m) or 0.0
+    )
+    # The floor is a sum of two decimal constants: compare with a tolerance so
+    # a margin set exactly at it is not reported for binary rounding alone.
+    if margin is None or margin < margin_floor - 1e-9:
+        diverge(
+            "kinematics.altitude_ceiling_margin_m",
+            kinematics.altitude_ceiling_margin_m,
+            f">= {margin_floor:g} (climb_deadband_m + 2 * climb_settle_max_position_sigma_m)",
+            "the altitude ceiling sits inside the climb arrival band and sensor scatter",
         )
 
     demands = [
@@ -193,7 +219,7 @@ def audit_safe_envelopes(
             "rtl.camera_tilt_deg",
             rtl.camera_tilt_deg,
             "(-90, 0)",
-            "the reverse cruise has no forward footprint in which to find the pad",
+            "the marker search has no ground footprint in which to find the pad",
         )
 
     reverse = _real(rtl.reverse_cruise_velocity)
@@ -215,6 +241,15 @@ def audit_safe_envelopes(
             "landing waits on a tolerance tighter than the centering law converges to",
         )
 
+    centering_window = _real(rtl.centering_timeout_sec)
+    if centering_window is None or centering_window <= 0.0:
+        diverge(
+            "rtl.centering_timeout_sec",
+            rtl.centering_timeout_sec,
+            "> 0",
+            "the marker centering ends before its first cycle, or its deadline raises in flight",
+        )
+
     video = _real(timeouts.video_stream_timeout_sec)
     low, high = VIDEO_TIMEOUT_ENVELOPE_SEC
     if video is None or not low <= video <= high:
@@ -225,7 +260,108 @@ def audit_safe_envelopes(
             "a camera stream loss is acted on too early or too late",
         )
 
+    _audit_platform(params, diverge)
     return found
+
+
+#: Distance under the venue ceiling inside which the safety ceiling is
+#: reported, in metres.
+VENUE_CEILING_CLEARANCE_M: Final[float] = 0.2
+
+
+def _audit_platform(
+    params: MissionParameters, diverge: Callable[[str, Any, str, str], None]
+) -> None:
+    """The ``platform`` section against the envelopes of ``PlatformConfig``."""
+    platform, kinematics = params.platform, params.kinematics
+
+    def bounded(name: str, accept: Callable[[float], bool], envelope: str, consequence: str) -> None:
+        raw = getattr(platform, name)
+        value = _real(raw)
+        if value is None or not accept(value):
+            diverge(f"platform.{name}", raw, envelope, consequence)
+
+    def optional(name: str, accept: Callable[[float], bool], envelope: str, consequence: str) -> None:
+        if getattr(platform, name) is not None:
+            bounded(name, accept, envelope, consequence)
+
+    bounded("height_m", lambda v: v >= 0.0, ">= 0", "the control target and the floor reference are wrong")
+
+    target = _real(kinematics.target_altitude_m)
+    venue = platform.venue_ceiling_agl_m
+    venue_value = _real(venue)
+    if venue is not None:
+        if venue_value is None or (target is not None and venue_value <= target):
+            diverge(
+                "platform.venue_ceiling_agl_m",
+                venue,
+                f"> target_altitude_m={kinematics.target_altitude_m}",
+                "the operating height is at or above the venue ceiling",
+            )
+        else:
+            margin = _real(kinematics.altitude_ceiling_margin_m) or 0.0
+            if target is not None and target + margin >= venue_value - VENUE_CEILING_CLEARANCE_M:
+                diverge(
+                    "platform.venue_ceiling_agl_m",
+                    venue,
+                    f"> {target + margin + VENUE_CEILING_CLEARANCE_M:g} "
+                    "(target_altitude_m + altitude_ceiling_margin_m + 0.2)",
+                    "the venue clamps the safety ceiling to within 0.2 m of it",
+                )
+
+    optional(
+        "edge_ahead_m", lambda v: v > 0.0, "> 0", "the pad edge guard is placed to the left of the takeoff point"
+    )
+    bounded("edge_uncertainty_m", lambda v: v >= 0.0, ">= 0", "the guard window is narrower than the edge")
+    bounded(
+        "sonar_half_angle_deg",
+        lambda v: 5.0 < v < 45.0,
+        "(5, 45)",
+        "the predicted sonar step position is not physical",
+    )
+    bounded("guard_lead_m", lambda v: v >= 0.0, ">= 0", "the guard opens after the edge")
+    bounded("guard_extent_m", lambda v: v > 0.0, "> 0", "the guard closes before the sink is recovered")
+    for name in ("guard_climb_authority", "guard_descent_cap"):
+        bounded(
+            name, lambda v: 0.0 <= v <= 0.30, "[0, 0.30]", "the guard commands outside its vertical authority"
+        )
+    bounded(
+        "guard_kp_scale",
+        lambda v: 1.0 <= v <= 3.0,
+        "[1, 3]",
+        "the guard gain softens or destabilizes the hold",
+    )
+    bounded("guard_deadband_m", lambda v: v >= 0.0, ">= 0", "the guard deadband is not a band")
+
+    stop = _real(platform.guard_stop_error_m)
+    resume = _real(platform.guard_resume_error_m)
+    if stop is None or resume is None or resume < 0.0 or resume >= stop:
+        diverge(
+            "platform.guard_stop_error_m",
+            platform.guard_stop_error_m,
+            f"> guard_resume_error_m={platform.guard_resume_error_m} >= 0",
+            "translation near the pad edge chatters between stop and resume",
+        )
+
+    if not isinstance(platform.guard_vertical_shaper, bool):
+        diverge(
+            "platform.guard_vertical_shaper",
+            platform.guard_vertical_shaper,
+            "bool",
+            "the vertical shaper switch is not a switch",
+        )
+
+    bounded("ceiling_allowance_m", lambda v: v >= 0.0, ">= 0", "the guard lowers the safety ceiling")
+    for name in ("sag_feedforward_mps", "rise_feedforward_mps"):
+        bounded(name, lambda v: v >= 0.0, ">= 0", "the edge feedforward pushes the wrong way")
+    for name in ("feedforward_sec", "departure_settle_window_sec", "departure_settle_timeout_sec"):
+        bounded(name, lambda v: v > 0.0, "> 0", "the window can never elapse or never start")
+    bounded(
+        "reentry_breach_grace_sec",
+        lambda v: v > 0.0,
+        "> 0",
+        "a re-entry false climb over the pad edge lands the aircraft on the edge",
+    )
 
 
 def log_envelope_divergences(
@@ -251,4 +387,11 @@ def log_envelope_divergences(
         logger.warning("%s", divergence.as_log_line())
     if not found:
         logger.info("Configuration inside every documented safe envelope.")
+    try:
+        conflicts = evaluate_parameter_conflicts(params.to_dict())
+    except Exception as exc:  # noqa: BLE001 - the audit is advisory
+        logger.warning("Parameter conflict evaluation failed: %s", exc)
+        conflicts = []
+    for conflict in conflicts:
+        logger.warning("%s", conflict.as_log_line(CONFLICT_TAG))
     return found

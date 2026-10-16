@@ -4,6 +4,10 @@ Replaces the previous ``test_rtl.py``, which exercised two module-level helpers
 that implemented a piecewise ramp in displacement. The properties asserted here
 are the ones that ramp could not provide: bounded kinematics, convergence
 without overshoot, and a command stream the driver can actually reproduce.
+
+The lateral flight pattern flies the return cruise on body Y, to the right:
+positions below start to the left of the origin (``y > 0``), ``vy`` is the
+return channel and ``vx`` the off-track trim.
 """
 
 import math
@@ -101,33 +105,34 @@ def fly(controller, start, *, noise=0.0, seed=0, cycles=1500, phase=RTLPhase.NAV
 # ------------------------------------------------------------------ invariants
 
 
-@pytest.mark.parametrize("start", [(2.0, 0.3), (0.5, -0.4), (4.0, 0.0), (0.1, 0.05)])
-def test_never_commands_forward_flight(controller, start):
-    """'De re' is a hard invariant, enforced structurally rather than asserted."""
+@pytest.mark.parametrize("start", [(0.3, 2.0), (-0.4, 0.5), (0.0, 4.0), (0.05, 0.1)])
+def test_never_commands_leftward_flight(controller, start):
+    """The rightward return is a hard invariant, enforced structurally."""
     x, y = start
     for _ in range(400):
         command = controller.compute(snapshot(x, y), vz_command=0.0, dt=DT)
-        assert command.vx <= 0.0
+        assert command.vy <= 0.0
+        assert abs(command.vx) <= controller.rtl_cfg.max_lateral_speed
         x += command.vx * DT
         y += command.vy * DT
 
 
 def test_never_commands_yaw_or_climb(controller):
     for _ in range(200):
-        command = controller.compute(snapshot(1.5, 0.4), vz_command=0.05, dt=DT)
+        command = controller.compute(snapshot(0.4, 1.5), vz_command=0.05, dt=DT)
         assert command.vyaw == 0.0
         assert command.vz <= 0.0
 
 
 def test_governor_descent_is_passed_through(controller):
-    command = controller.compute(snapshot(1.0, 0.0), vz_command=-0.06, dt=DT)
+    command = controller.compute(snapshot(0.0, 1.0), vz_command=-0.06, dt=DT)
     assert command.vz == pytest.approx(-0.06)
 
 
 # ----------------------------------------------------------------- convergence
 
 
-@pytest.mark.parametrize("start", [(1.0, 0.0), (2.0, 0.3), (4.0, -1.0), (0.4, 0.25)])
+@pytest.mark.parametrize("start", [(0.0, 1.0), (0.3, 2.0), (-1.0, 4.0), (0.25, 0.4)])
 def test_converges_inside_the_arrival_radius(controller, rtl_config, start):
     x, y, arrival, _, _ = fly(controller, start)
     assert arrival is not None, "guidance must reach a settled state"
@@ -137,18 +142,18 @@ def test_converges_inside_the_arrival_radius(controller, rtl_config, start):
 
 @pytest.mark.parametrize("noise", [0.0, 0.02, 0.05])
 def test_kinematic_limits_hold_under_odometry_noise(controller, rtl_config, noise):
-    _, _, _, peak_accel, peak_jerk = fly(controller, (2.0, 0.3), noise=noise, seed=3)
+    _, _, _, peak_accel, peak_jerk = fly(controller, (0.3, 2.0), noise=noise, seed=3)
     assert peak_accel <= rtl_config.max_accel_mps2 + 1e-6
     assert peak_jerk <= rtl_config.max_jerk_mps3 + 1e-6
 
 
 def test_does_not_overshoot_the_origin(controller):
-    x, y = 2.0, 0.0
+    x, y = 0.0, 2.0
     furthest_past = 0.0
     for _ in range(1500):
         command = controller.compute(snapshot(x, y), vz_command=0.0, dt=DT)
-        x += command.vx * DT
-        furthest_past = min(furthest_past, x)
+        y += command.vy * DT
+        furthest_past = min(furthest_past, y)
         if command.arrived:
             break
     assert furthest_past >= -0.05, "braking profile must not carry the drone past the origin"
@@ -159,7 +164,7 @@ def test_does_not_overshoot_the_origin(controller):
 
 def test_emitted_commands_survive_driver_quantization(controller):
     """Every non-zero command must clear the driver's int8(v * 100) truncation."""
-    x, y = 1.0, 0.2
+    x, y = 0.2, 1.0
     for _ in range(900):
         command = controller.compute(snapshot(x, y), vz_command=0.0, dt=DT)
         for value in (command.vx, command.vy):
@@ -171,10 +176,11 @@ def test_emitted_commands_survive_driver_quantization(controller):
             break
 
 
-def test_lateral_authority_clears_the_historical_threshold(controller):
-    """The original suite pinned int(vy * 100) >= 3 for a lateral correction."""
+def test_off_track_authority_clears_the_historical_threshold(controller):
+    """The original suite pinned int(v * 100) >= 3 for the cross-track correction,
+    which in the lateral pattern is the off-track trim on ``vx``."""
     commands = [
-        controller.compute(snapshot(1.0, 0.5), vz_command=0.0, dt=DT).vy for _ in range(200)
+        controller.compute(snapshot(0.5, 1.0), vz_command=0.0, dt=DT).vx for _ in range(200)
     ]
     non_zero = [value for value in commands if value != 0.0]
     assert non_zero
@@ -190,8 +196,8 @@ def test_deadband_suppresses_commands_at_the_origin(controller):
 # ------------------------------------------------------------------- behaviour
 
 
-def test_overshoot_is_recovered_under_a_bounded_forward_trim(rtl_config, controller):
-    """Superseded contract: an overshoot used to pin the along-track axis at zero.
+def test_overshoot_is_recovered_under_a_bounded_leftward_trim(rtl_config, controller):
+    """Superseded contract: an overshoot used to pin the return axis at zero.
 
     Holding the axis meant the distance never changed, so arrival could never
     confirm and the drone hovered past the origin until the whole return window
@@ -201,39 +207,39 @@ def test_overshoot_is_recovered_under_a_bounded_forward_trim(rtl_config, control
     and applies only in the terminal regime.
     """
     for _ in range(120):
-        command = controller.compute(snapshot(-0.6, 0.2), vz_command=0.0, dt=DT)
+        command = controller.compute(snapshot(0.2, -0.6), vz_command=0.0, dt=DT)
 
-    assert 0.0 < command.vx <= rtl_config.overshoot_recovery_speed
+    assert 0.0 < command.vy <= rtl_config.overshoot_recovery_speed
     assert "overshoot recovery" in command.note
 
 
-def test_an_origin_far_ahead_still_holds_the_axis(rtl_config, controller):
+def test_an_origin_far_to_the_left_still_holds_the_axis(rtl_config, controller):
     """Beyond the recovery range, something worse than overshoot has happened."""
     far = rtl_config.overshoot_recovery_radius_m + 1.0
     for _ in range(120):
-        command = controller.compute(snapshot(-far, 0.0), vz_command=0.0, dt=DT)
-    assert command.vx == 0.0
+        command = controller.compute(snapshot(0.0, -far), vz_command=0.0, dt=DT)
+    assert command.vy == 0.0
     assert "beyond recovery range" in command.note
     assert "overshoot" in command.note
 
 
-def test_lateral_correction_still_runs_during_an_overshoot(controller):
+def test_off_track_trim_still_runs_during_an_overshoot(controller):
     commands = [
-        controller.compute(snapshot(-0.6, 0.5), vz_command=0.0, dt=DT).vy for _ in range(120)
+        controller.compute(snapshot(0.5, -0.6), vz_command=0.0, dt=DT).vx for _ in range(120)
     ]
-    assert any(value != 0.0 for value in commands), "cross-track axis must stay live"
+    assert any(value != 0.0 for value in commands), "off-track axis must stay live"
 
 
 def test_station_keeping_caps_speed_below_cruise(controller):
-    navigating = controller.compute(snapshot(3.0, 0.0), vz_command=0.0, dt=DT)
+    navigating = controller.compute(snapshot(0.0, 3.0), vz_command=0.0, dt=DT)
     for _ in range(200):
-        navigating = controller.compute(snapshot(3.0, 0.0), vz_command=0.0, dt=DT)
+        navigating = controller.compute(snapshot(0.0, 3.0), vz_command=0.0, dt=DT)
 
     controller.reset()
-    holding = controller.compute(snapshot(3.0, 0.0), vz_command=0.0, dt=DT,
+    holding = controller.compute(snapshot(0.0, 3.0), vz_command=0.0, dt=DT,
                                  phase=RTLPhase.STATION_KEEPING)
     for _ in range(200):
-        holding = controller.compute(snapshot(3.0, 0.0), vz_command=0.0, dt=DT,
+        holding = controller.compute(snapshot(0.0, 3.0), vz_command=0.0, dt=DT,
                                      phase=RTLPhase.STATION_KEEPING)
 
     assert abs(holding.target_speed_mps) < abs(navigating.target_speed_mps)
@@ -254,13 +260,13 @@ def test_guidance_is_clock_free(controller):
     couples its behaviour to how fast the loop happens to run.
     """
     for _ in range(30):
-        controller.compute(snapshot(1.0, 0.0), vz_command=0.0, dt=DT)
+        controller.compute(snapshot(0.0, 1.0), vz_command=0.0, dt=DT)
     assert controller.elapsed_sec == pytest.approx(30 * DT)
 
 
 def test_reset_clears_controller_state(controller):
     for _ in range(50):
-        controller.compute(snapshot(2.0, 0.5), vz_command=0.0, dt=DT)
+        controller.compute(snapshot(0.5, 2.0), vz_command=0.0, dt=DT)
     controller.reset()
     assert controller.elapsed_sec == 0.0
     assert controller.settlement is None
@@ -324,13 +330,13 @@ def test_a_dead_reckoned_return_converges_to_the_origin(controller, rtl_config):
     makes it navigation rather than bookkeeping -- so this integrates the emitted
     velocity into the reference and requires the range to null.
     """
-    ex, ey = -4.0, -1.0  # the origin lies four metres astern and a metre to port
-    speed = 0.0
+    ex, ey = -1.0, -4.0  # the origin lies four metres to starboard and a metre astern
+    speed = (0.0, 0.0)
     arrival = None
 
     for cycle in range(1500):
         command = controller.compute(
-            snapshot(0.0, 0.0, vx=speed),
+            snapshot(0.0, 0.0, vx=speed[0], vy=speed[1]),
             vz_command=0.0,
             dt=DT,
             reference=reference(ex, ey),
@@ -339,7 +345,7 @@ def test_a_dead_reckoned_return_converges_to_the_origin(controller, rtl_config):
         # which is the property that makes the return leg self-closing.
         ex -= command.vx * DT
         ey -= command.vy * DT
-        speed = command.vx
+        speed = (command.vx, command.vy)
         if command.ready_to_land or command.arrived:
             arrival = cycle * DT
             break
@@ -348,13 +354,13 @@ def test_a_dead_reckoned_return_converges_to_the_origin(controller, rtl_config):
     assert math.hypot(ex, ey) <= rtl_config.arrival_radius_m
 
 
-def test_the_backward_only_invariant_holds_on_a_dead_reckoned_reference(controller):
-    ex, ey = -3.0, 0.6
+def test_the_rightward_only_invariant_holds_on_a_dead_reckoned_reference(controller):
+    ex, ey = 0.6, -3.0
     for _ in range(600):
         command = controller.compute(
             snapshot(0.0, 0.0), vz_command=0.0, dt=DT, reference=reference(ex, ey)
         )
-        assert command.vx <= 0.0
+        assert command.vy <= 0.0
         assert command.vyaw == 0.0
         ex -= command.vx * DT
         ey -= command.vy * DT
@@ -389,7 +395,7 @@ def test_the_climb_ceiling_is_zero_unless_a_governor_is_configured(
 
     law = RTLGuidanceController(rtl_config, kinematics_config, SpeedCalibration(1.0))
     assert law.climb_ceiling == 0.0
-    assert law.compute(snapshot(1.0, 0.0), vz_command=0.30, dt=DT).vz == 0.0
+    assert law.compute(snapshot(0.0, 1.0), vz_command=0.30, dt=DT).vz == 0.0
 
 
 def test_a_configured_governor_lets_the_altitude_trim_through(rtl_config, kinematics_config):
@@ -408,8 +414,8 @@ def test_a_configured_governor_lets_the_altitude_trim_through(rtl_config, kinema
     )
 
     assert law.climb_ceiling == pytest.approx(governor_cfg.climb_authority)
-    assert law.compute(snapshot(1.0, 0.0), vz_command=0.04, dt=DT).vz == pytest.approx(0.04)
-    assert law.compute(snapshot(1.0, 0.0), vz_command=5.0, dt=DT).vz == pytest.approx(
+    assert law.compute(snapshot(0.0, 1.0), vz_command=0.04, dt=DT).vz == pytest.approx(0.04)
+    assert law.compute(snapshot(0.0, 1.0), vz_command=5.0, dt=DT).vz == pytest.approx(
         governor_cfg.climb_authority
     )
-    assert law.compute(snapshot(1.0, 0.0), vz_command=-0.06, dt=DT).vz == pytest.approx(-0.06)
+    assert law.compute(snapshot(0.0, 1.0), vz_command=-0.06, dt=DT).vz == pytest.approx(-0.06)
