@@ -26,7 +26,6 @@ describe('evaluateLaunchReadiness', () => {
     batteryKnown: true,
     batteryPct: 85,
     batteryFailsafeThreshold: 20,
-    magnetoRequired: false,
     commandBridgeReady: true,
     ros2CliAvailable: true,
     voiceReady: true,
@@ -152,12 +151,6 @@ describe('evaluateLaunchReadiness', () => {
       });
       expect(low2.ready).toBe(false);
       expect(low2.blockedReason).toBe('Bateria insuficiente para voo real (34% < 35%)');
-    });
-
-    it('blocks if magnetometer calibration is required', () => {
-      const verdict = evaluateLaunchReadiness({ ...healthyRealFlightInput, magnetoRequired: true });
-      expect(verdict.ready).toBe(false);
-      expect(verdict.blockedReason).toBe('Calibração do magnetômetro necessária');
     });
 
     it('blocks if resident command bridge is not ready', () => {

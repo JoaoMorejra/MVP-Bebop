@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { BATTERY_CALLS, runCriticalBatteryReturn } from './batteryReturn';
+import { BATTERY_CALLS, batteryCalls, runCriticalBatteryReturn } from './batteryReturn';
 
 function harness(jump: { success: boolean } | Error) {
   const order: string[] = [];
@@ -48,5 +48,30 @@ describe('runCriticalBatteryReturn', () => {
     const { order, hooks } = harness({ success: true });
     await runCriticalBatteryReturn('none', hooks);
     expect(order).toEqual([`say:${BATTERY_CALLS.alreadyReturning}`]);
+  });
+});
+
+describe('battery calls by mode', () => {
+  it('keeps the advanced wording', () => {
+    expect(batteryCalls('advanced')).toEqual(BATTERY_CALLS);
+    expect(BATTERY_CALLS.returning).toBe('Bateria crítica. Retornando à base para pouso.');
+  });
+
+  it('speaks a landing in place for the intermediate mode and never a return', () => {
+    const calls = batteryCalls('intermediate');
+    for (const text of Object.values(calls)) expect(text).not.toMatch(/retorn|base/i);
+    expect(calls.returning).toBe('Bateria crítica. Pouso no local iniciado.');
+  });
+
+  it('speaks a landing on the base for the simple mode and never a return', () => {
+    const calls = batteryCalls('simple');
+    for (const text of Object.values(calls)) expect(text).not.toMatch(/retorn/i);
+    expect(calls.returning).toBe('Bateria crítica. Pouso na base iniciado.');
+  });
+
+  it('says the call of the mode when the jump to stage 5 is acknowledged', async () => {
+    const say = vi.fn();
+    await runCriticalBatteryReturn('rtl', { say, gotoStage: async () => ({ success: true }), land: async () => undefined }, 'intermediate');
+    expect(say).toHaveBeenCalledWith('battery.critical', 'Bateria crítica. Pouso no local iniciado.');
   });
 });

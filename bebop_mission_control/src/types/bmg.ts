@@ -36,24 +36,6 @@ export interface TopicHealth {
 }
 
 /** Shape emitted by `streamer/telemetry_bridge.py` on `BMG_TELEM:` lines. */
-/**
- * Magnetometer calibration as the aircraft reports it (`ros2_bebop_driver`
- * `magnetoCalibrationJson`). Axis flags are 1 calibrated, 0 not yet, -1 not
- * reported; `axis` is the one the operator must rotate about now.
- */
-export interface MagnetoCalibration {
-  sequence: number;
-  kind: 'state' | 'required' | 'axis' | 'started';
-  x: number;
-  y: number;
-  z: number;
-  failed: number;
-  required: number;
-  axis: 'x' | 'y' | 'z' | 'none' | null;
-  started: number;
-  stamp: number;
-}
-
 export interface BmgTelemetry {
   connected: boolean;
   driver_running: boolean;
@@ -128,8 +110,6 @@ export interface BmgTelemetry {
   /** Attitude from the odometry quaternion, degrees; null without fresh aircraft data. */
   roll_deg?: number | null;
   pitch_deg?: number | null;
-  /** Latest `states/magneto_calibration` report, or null before the aircraft sent one. */
-  magneto_calibration?: MagnetoCalibration | null;
   /** ARSDK FlyingStateChanged, or null while the aircraft has not reported. */
   flying_state?: number | null;
   flying_state_label?: string;
@@ -431,8 +411,6 @@ export interface BmgAPI {
   getParameters: () => Promise<{ success: boolean; params?: Record<string, unknown>; error?: string }>;
   saveParameters: (params: unknown) => Promise<{ success: boolean; error?: string }>;
   getParameterDefaults: () => Promise<{ success: boolean; params?: Record<string, unknown>; error?: string }>;
-  /** Start (true) or abort (false) the magnetometer calibration; refused while a mission runs. */
-  calibrateMagneto: (start: boolean) => Promise<{ success: boolean; start?: boolean; error?: string }>;
 
   /** Speak one line. Resolves when it is queued; `onAnnounceDone` says when it was heard. */
   announce: (text: string | AnnounceRequest, priority?: AnnouncePriority) => Promise<AnnounceResult>;

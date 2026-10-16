@@ -25,7 +25,12 @@ import {
   spokenMeters,
   spokenSpeed,
   placeholdersOf,
+  allMissionPhrases,
+  isMilestoneAllowed,
+  poolForMilestone,
+  poolsForMode,
 } from './copilotPhrases';
+import type { MissionMode } from './missionMode';
 
 /** Deterministic PRNG, so a failure is reproducible rather than flaky. */
 function seeded(seed: number): () => number {
@@ -454,5 +459,92 @@ describe('battery warning (3.7)', () => {
     const line = phraseForMilestone('mission.battery_warning', { battery_pct: 13.4 }, {}, { storage: null, random: () => 0 });
     expect(line).not.toMatch(/\d/);
     expect(line).toMatch(/[Bb]ateria/);
+  });
+});
+
+/** Sentences no mode may speak, by what each mode does NOT do. */
+const FORBIDDEN: Record<MissionMode, RegExp | null> = {
+  simple: /velocidade|cruzeiro|retilíne|linear|por segundo|deslocamento|deslocando|avanço|retorno|retornando|regress/i,
+  intermediate: /retorn|regress|rota de volta|marcador|na base|à base|base de lançamento/i,
+  advanced: null,
+};
+
+describe('copilot repertoire by mission mode', () => {
+  it.each(['simple', 'intermediate'] as const)('never says what the %s mode does not do', (mode) => {
+    for (const key of poolsForMode(mode)) {
+      for (const sentence of PHRASE_POOLS[key]) {
+        expect(sentence, `${mode} / ${key}`).not.toMatch(FORBIDDEN[mode]!);
+      }
+    }
+  });
+
+  it('keeps the full repertoire for the advanced mode', () => {
+    expect(poolsForMode('advanced')).toEqual(expect.arrayContaining(['mission.rtl_start', 'mission.rtl_start_no_target', 'mission.scan_start', 'mission.approaching']));
+  });
+
+  it('never reaches the return pools from the reduced modes', () => {
+    for (const mode of ['simple', 'intermediate'] as const) {
+      const reachable = poolsForMode(mode);
+      for (const key of ['mission.rtl_start', 'mission.rtl_start_jump', 'mission.rtl_start_no_target'] as const) {
+        expect(reachable).not.toContain(key);
+      }
+      expect(isMilestoneAllowed('mission.rtl_start', mode)).toBe(false);
+    }
+    expect(isMilestoneAllowed('mission.rtl_start', 'advanced')).toBe(true);
+  });
+
+  it('allows every other milestone in every mode', () => {
+    const keys: MilestoneKey[] = ['mission.takeoff', 'mission.scan_start', 'mission.target_found', 'mission.approaching', 'mission.capture_done', 'mission.landing', 'mission.touchdown'];
+    for (const mode of ['simple', 'intermediate', 'advanced'] as const) {
+      for (const key of keys) expect(isMilestoneAllowed(key, mode)).toBe(true);
+    }
+  });
+
+  it('speaks a yaw-scan line for the scan start in the simple mode', () => {
+    for (let i = 0; i < 12; i += 1) {
+      const text = phraseForMilestone('mission.scan_start', { cruise_mps: 0.2 }, { cruise_mps: 0.2 }, { storage: null, random: () => i / 12 }, 'simple');
+      expect(PHRASE_POOLS['mission.scan_start_yaw']).toContain(text);
+    }
+  });
+
+  it('speaks an angular-centring line for the approach in the simple mode, whatever the payload says', () => {
+    for (const payload of [{ ibvs: true }, { ibvs: false }, {}]) {
+      expect(poolForMilestone('mission.approaching', payload, 'simple')).toBe('mission.approaching_yaw');
+    }
+    expect(poolForMilestone('mission.approaching', { ibvs: true }, 'intermediate')).toBe('mission.approaching');
+    expect(poolForMilestone('mission.approaching', { ibvs: true })).toBe('mission.approaching');
+  });
+
+  it('says the takeoff is the native one only in the simple mode', () => {
+    expect(poolForMilestone('mission.takeoff', { native: true }, 'simple')).toBe('mission.takeoff_native');
+    expect(poolForMilestone('mission.takeoff', { native: true }, 'advanced')).toBe('mission.takeoff');
+    expect(poolForMilestone('mission.takeoff', {}, 'simple')).toBe('mission.takeoff_native');
+  });
+
+  it('announces the landing in place, not a return, in the intermediate mode', () => {
+    expect(poolForMilestone('mission.landing', { at_base: false }, 'intermediate')).toBe('mission.landing_in_place');
+    expect(poolForMilestone('mission.touchdown', { confirmed: true, at_base: false }, 'intermediate')).toBe('mission.touchdown_in_place');
+  });
+
+  it('announces the landing on the base in the simple mode', () => {
+    expect(poolForMilestone('mission.landing', { at_base: true }, 'simple')).toBe('mission.landing');
+    expect(poolForMilestone('mission.touchdown', { confirmed: true, at_base: true }, 'simple')).toBe('mission.touchdown');
+  });
+
+  it('keeps every new pool larger than the cross-flight history window', () => {
+    for (const key of ['mission.takeoff_native', 'mission.scan_start_yaw', 'mission.approaching_yaw'] as const) {
+      expect(PHRASE_POOLS[key].length).toBeGreaterThan(HISTORY_WINDOW);
+    }
+  });
+
+  it('caches only the sentences the mode can speak', () => {
+    const parameters = { target_altitude_m: 1, cruise_mps: 0.2 };
+    const simple = allMissionPhrases(parameters, 'simple');
+    const intermediate = allMissionPhrases(parameters, 'intermediate');
+    const advanced = allMissionPhrases(parameters);
+    expect(simple.some((s) => PHRASE_POOLS['mission.rtl_start'].includes(s))).toBe(false);
+    expect(intermediate.some((s) => PHRASE_POOLS['mission.rtl_start'].includes(s))).toBe(false);
+    expect(advanced.some((s) => PHRASE_POOLS['mission.rtl_start'].includes(s))).toBe(true);
+    expect(simple.some((s) => PHRASE_POOLS['mission.scan_start_yaw'].includes(s))).toBe(true);
   });
 });

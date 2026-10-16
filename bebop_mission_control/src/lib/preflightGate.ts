@@ -20,7 +20,6 @@ export interface PreflightGateInput {
   batteryPct?: number | null;
   batteryKnown?: boolean;
   batteryFailsafeThreshold?: number;
-  magnetoRequired?: boolean;
   bridgeReady?: boolean;
 }
 
@@ -50,9 +49,6 @@ export function preflightBlockedReason(input: PreflightGateInput): string | null
   }
   if (typeof input.batteryPct === 'number' && input.batteryPct < minBattery) {
     return `Bateria insuficiente para voo real (${input.batteryPct}% < ${minBattery}%)`;
-  }
-  if (input.magnetoRequired === true) {
-    return 'Calibração do magnetômetro necessária';
   }
   if (input.bridgeReady === false) {
     return 'Ponte de comando não está pronta';

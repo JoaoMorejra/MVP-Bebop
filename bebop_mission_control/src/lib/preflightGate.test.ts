@@ -54,11 +54,6 @@ describe('preflightBlockedReason', () => {
     expect(preflightBlockedReason({ ...ready, batteryKnown: true, batteryPct: 40, batteryFailsafeThreshold: 20 })).toBeNull();
   });
 
-  it('blocks real flight when magnetometer calibration is required', () => {
-    expect(preflightBlockedReason({ ...ready, magnetoRequired: true })).toBe('Calibração do magnetômetro necessária');
-    expect(preflightBlockedReason({ ...ready, magnetoRequired: false })).toBeNull();
-  });
-
   it('blocks real flight when command bridge is not ready', () => {
     expect(preflightBlockedReason({ ...ready, bridgeReady: false })).toBe('Ponte de comando não está pronta');
     expect(preflightBlockedReason({ ...ready, bridgeReady: true })).toBeNull();

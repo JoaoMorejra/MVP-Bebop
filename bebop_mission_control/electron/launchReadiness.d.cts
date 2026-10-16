@@ -13,7 +13,6 @@ export interface LaunchReadinessInput {
   batteryKnown?: boolean;
   batteryPct?: number | null;
   batteryFailsafeThreshold?: number;
-  magnetoRequired?: boolean;
   commandBridgeReady?: boolean;
   ros2CliAvailable?: boolean;
   voiceReady?: boolean;

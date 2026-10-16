@@ -1,11 +1,9 @@
 /**
  * Scale decisions for the tactical map.
  *
- * The map used a fixed tile zoom of 18, about 0.55 m per pixel at the latitudes
- * the station flies at. A bench flight of a few metres was a dozen pixels,
- * entirely under the aircraft marker. The display zoom is now chosen from the
- * extent of the flight, the same way the offline grid already fitted itself,
- * and the tiles are overzoomed past what their source serves.
+ * The map is anchored at the fixed site base and drawn at a fixed default
+ * scale ({@link fixedView}); the tiles are overzoomed past what their source
+ * serves when the operator zooms in.
  */
 
 /** Web Mercator ground resolution at zoom 0 on the equator, metres per pixel. */
@@ -41,6 +39,70 @@ export function displayZoom(
   if (!Number.isFinite(wanted)) return MIN_DISPLAY_ZOOM;
   const stepped = Math.floor(wanted * 2) / 2;
   return Math.min(MAX_DISPLAY_ZOOM, Math.max(MIN_DISPLAY_ZOOM, stepped));
+}
+
+/**
+ * Extent the default view frames in the panel's short side, in metres: wide
+ * enough to read the site on the imagery. The view no longer widens with the
+ * trail; a closer or wider look is the operator's explicit zoom.
+ */
+export const OVERVIEW_EXTENT_M = 300;
+
+/** Web Mercator, in fractional tiles. */
+export function project(lat: number, lng: number, zoom: number): { x: number; y: number } {
+  const n = 2 ** zoom;
+  const x = ((lng + 180) / 360) * n;
+  const latRad = (lat * Math.PI) / 180;
+  const y = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
+  return { x, y };
+}
+
+export interface FixedView {
+  /** Display zoom on screen. */
+  zoom: number;
+  /** Tile zoom requested and the scale it is drawn at. */
+  tile: { z: number; scale: number };
+  /** The anchor, in fractional tiles at `tile.z`: the tile grid is laid out around it. */
+  centre: { x: number; y: number };
+  tileSize: number;
+  pxPerMetre: number;
+  cx: number;
+  cy: number;
+  /** Screen x of a point `east` metres from the base. */
+  sx: (east: number) => number;
+  /** Screen y of a point `north` metres from the base. */
+  sy: (north: number) => number;
+}
+
+/**
+ * The tactical map's view: centred on the base, at a fixed scale.
+ *
+ * Nothing about the flight enters it. The basemap and the base stay where
+ * they are and the aircraft moves across them; only the operator's own zoom
+ * (`manualZoom`, null for the default framing) changes the scale.
+ */
+export function fixedView(
+  size: { width: number; height: number },
+  anchor: { lat: number; lng: number },
+  manualZoom: number | null,
+  maxTileZoom: number
+): FixedView {
+  const zoom = manualZoom ?? displayZoom(OVERVIEW_EXTENT_M, size, anchor.lat);
+  const tile = tileZoom(zoom, maxTileZoom);
+  const pxPerMetre = pixelsPerMetre(zoom, anchor.lat);
+  const cx = size.width / 2;
+  const cy = size.height / 2;
+  return {
+    zoom,
+    tile,
+    centre: project(anchor.lat, anchor.lng, tile.z),
+    tileSize: 256 * tile.scale,
+    pxPerMetre,
+    cx,
+    cy,
+    sx: (east: number) => cx + east * pxPerMetre,
+    sy: (north: number) => cy - north * pxPerMetre,
+  };
 }
 
 /** One press of a zoom button, in display-zoom levels. */

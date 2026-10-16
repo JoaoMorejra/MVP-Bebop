@@ -42,7 +42,7 @@ from rclpy.qos import (
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import BatteryState, NavSatFix
-from std_msgs.msg import Bool, Float32, Int16, String, UInt8
+from std_msgs.msg import Bool, Float32, Int16, UInt8
 
 # -----------------------------------------------------------------------------
 # Contract
@@ -65,7 +65,6 @@ TOPIC_GPS = f"{NAMESPACE}/states/gps"
 #: ARSDK link as the driver sees it (``states/link``): false the moment the
 #: device controller stops or the aircraft goes silent.
 TOPIC_LINK = f"{NAMESPACE}/states/link"
-TOPIC_MAGNETO = f"{NAMESPACE}/states/magneto_calibration"
 #: z0 of the running mission (``mission.py``), for the relative altitude and
 #: the per-mission home.
 TOPIC_GROUND_REFERENCE = f"{NAMESPACE}/mission/ground_reference"
@@ -178,7 +177,7 @@ def decode_attitude(msg: Odometry) -> Tuple[float, float]:
 # ``ros2_bebop_driver`` (``BebopDriverNode::publishOdometry``) takes the ARSDK
 # speed, which is NED -- speedX towards north, speedY towards east, speedZ
 # down -- negates Y and Z, and integrates it; it takes the ARSDK yaw, which is
-# the magnetic heading clockwise from north, and negates it. Its variables are
+# the compass heading clockwise from north, and negates it. Its variables are
 # named ``*_enu``, but what it publishes on ``/bebop/odom`` is x north, y west,
 # z up, with yaw counter-clockwise from north. Reading x as east and y as north
 # rotated every flight 90 degrees clockwise on the tactical map, and passing
@@ -264,8 +263,6 @@ class TelemetryState:
         self.ground_reference: Optional[float] = None
         #: The driver's ``states/link``; ``None`` from a driver that predates it.
         self.driver_link: Optional[bool] = None
-        #: Latest ``states/magneto_calibration`` report, parsed.
-        self.magneto: Optional[Dict[str, Any]] = None
 
         self.flying_state: Optional[int] = None
         self.flying_state_at: Optional[float] = None
@@ -346,17 +343,6 @@ class TelemetryState:
     def set_driver_link(self, up: bool) -> None:
         with self._lock:
             self.driver_link = bool(up)
-
-    def set_magneto_calibration(self, text: str) -> None:
-        """Accept one ``states/magneto_calibration`` JSON; malformed ones are ignored."""
-        try:
-            parsed = json.loads(text)
-        except (TypeError, ValueError):
-            return
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("sequence"), int):
-            return
-        with self._lock:
-            self.magneto = parsed
 
     def set_bench(
         self,
@@ -719,7 +705,6 @@ class TelemetryState:
                 "pitch_deg": (
                     round(self.pitch_deg, 1) if data_fresh and not simulated and self.pitch_deg is not None else None
                 ),
-                "magneto_calibration": dict(self.magneto) if self.magneto is not None else None,
                 # Navigation fields above come from `nav_source`; `simulated`
                 # marks a benchtop run so the station can say so.
                 "nav_fresh": bool(nav_fresh),
@@ -781,7 +766,6 @@ class TelemetryNode(Node):
         )
         self.create_subscription(NavSatFix, TOPIC_GPS, self._on_gps, state_qos)
         self.create_subscription(Bool, TOPIC_LINK, self._on_link, state_qos)
-        self.create_subscription(String, TOPIC_MAGNETO, self._on_magneto, state_qos)
         self.create_subscription(Float32, TOPIC_GROUND_REFERENCE, self._on_ground_reference, state_qos)
         self.create_subscription(
             Odometry, TOPIC_BENCH_ODOM, self._on_bench_odom, BENCH_QOS
@@ -826,9 +810,6 @@ class TelemetryNode(Node):
 
     def _on_link(self, msg: Bool) -> None:
         STATE.set_driver_link(bool(msg.data))
-
-    def _on_magneto(self, msg: String) -> None:
-        STATE.set_magneto_calibration(msg.data)
 
     def _on_ground_reference(self, msg: Float32) -> None:
         if math.isfinite(float(msg.data)):

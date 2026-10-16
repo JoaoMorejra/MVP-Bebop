@@ -16,7 +16,6 @@
  * - Odometry and video stream fresh
  * - Flying state === 0 (on ground)
  * - Battery known and >= max(failsafeThreshold + 10, 30)%
- * - Magnetometer calibration not required
  * - Resident command bridge ready
  * - Backup ROS 2 CLI available
  * - Voice copilot ready (daemon alive, audio device open, online)
@@ -41,7 +40,6 @@
  * @property {boolean} [batteryKnown]
  * @property {number | null} [batteryPct]
  * @property {number} [batteryFailsafeThreshold]
- * @property {boolean} [magnetoRequired]
  * @property {boolean} [commandBridgeReady]
  * @property {boolean} [ros2CliAvailable]
  * @property {boolean} [voiceReady]
@@ -153,22 +151,17 @@ function evaluateLaunchReadiness(input) {
     };
   }
 
-  // 12. Magnetometer calibration
-  if (input.magnetoRequired === true) {
-    return { ready: false, blockedReason: 'Calibração do magnetômetro necessária', warning: null };
-  }
-
-  // 13. Resident command bridge ready
+  // 12. Resident command bridge ready
   if (input.commandBridgeReady === false) {
     return { ready: false, blockedReason: 'Ponte de comando não está pronta', warning: null };
   }
 
-  // 14. Emergency ros2 CLI backup
+  // 13. Emergency ros2 CLI backup
   if (input.ros2CliAvailable === false) {
     return { ready: false, blockedReason: 'ROS 2 CLI de backup indisponível', warning: null };
   }
 
-  // 15. Voice copilot ready (daemon alive, audio open, backend online)
+  // 14. Voice copilot ready (daemon alive, audio open, backend online)
   if (input.voiceReady === false) {
     return { ready: false, blockedReason: 'Voz do copiloto indisponível ou offline', warning: null };
   }

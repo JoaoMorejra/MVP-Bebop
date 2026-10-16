@@ -19,6 +19,8 @@
  * variants of the last five flights always leaves at least one candidate.
  */
 
+import type { MissionMode } from './missionMode';
+
 export type MilestoneKey =
   | 'mission.start'
   | 'mission.countdown_3'
@@ -48,7 +50,10 @@ export type PoolKey =
   | 'mission.rtl_start_jump'
   | 'mission.rtl_start_no_target'
   | 'mission.landing_in_place'
-  | 'mission.approaching_direct';
+  | 'mission.approaching_direct'
+  | 'mission.takeoff_native'
+  | 'mission.scan_start_yaw'
+  | 'mission.approaching_yaw';
 
 /** Pools holding one dictated sentence rather than variants. */
 export const FIXED_POOLS: readonly PoolKey[] = ['mission.touchdown_unconfirmed'];
@@ -197,6 +202,30 @@ export const PHRASE_POOLS: Readonly<Record<PoolKey, readonly string[]>> = {
     'Aproximação iniciada. Aeronave a caminho do alvo.',
     'Aproximando do local da ocorrência.',
   ],
+  'mission.takeoff_native': [
+    'Decolagem pela rotina nativa do Bebop. Estabilizando na altura padrão.',
+    'Decolagem nativa em curso. Aguardando a estabilização.',
+    'Aeronave no ar pela decolagem nativa. Estabilizando.',
+    'Decolagem confirmada. Estabilizando na altura nativa da aeronave.',
+    'Voo autônomo iniciado. Decolagem nativa concluída, estabilizando.',
+    'Decolagem executada pelo firmware. Estabilizando a aeronave.',
+  ],
+  'mission.scan_start_yaw': [
+    'Varredura por rotação iniciada. Buscando ocorrências ao redor da aeronave.',
+    'Girando sobre o próprio eixo. Visão computacional ativa.',
+    'Busca angular iniciada. Detector de objetos em operação.',
+    'Varredura em andamento. Procurando sinistro em torno da aeronave.',
+    'Busca por giro iniciada. Câmera ativa.',
+    'Rotação de busca iniciada. Monitorando a área.',
+  ],
+  'mission.approaching_yaw': [
+    'Alvo na imagem. Centralizando por rotação.',
+    'Centralização angular do alvo iniciada.',
+    'Alinhando a aeronave ao sinistro por giro.',
+    'Guiagem visual ativa. Alinhando o alvo ao centro da câmera.',
+    'Centralizando o sinistro no quadro apenas por giro.',
+    'Ajuste de rotação em curso. Alvo sendo centralizado.',
+  ],
   'mission.rtl_start_jump': [
     'Retorno à base comandado pela estação.',
     'Retorno comandado. Navegando para o ponto de lançamento.',
@@ -302,15 +331,77 @@ export const MILESTONE_KEYS: readonly MilestoneKey[] = [
 /** Every phrase pool. */
 export const POOL_KEYS = Object.keys(PHRASE_POOLS) as readonly PoolKey[];
 
+/** Pools of the return to base, which only the advanced mode flies. */
+const RETURN_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>([
+  'mission.rtl_start',
+  'mission.rtl_start_jump',
+  'mission.rtl_start_no_target',
+]);
+
+/** Pools whose wording assumes translation, a speed or the corrective climb: the simple mode never flies it. */
+const TRANSLATION_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>([
+  'mission.takeoff',
+  'mission.scan_start',
+  'mission.approaching',
+  'mission.approaching_direct',
+]);
+
+/** Pools written for the simple mode alone. */
+const SIMPLE_ONLY_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>([
+  'mission.takeoff_native',
+  'mission.scan_start_yaw',
+  'mission.approaching_yaw',
+]);
+
+/** Landing pools that name the base: the intermediate mode lands where it stands. */
+const BASE_LANDING_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>(['mission.landing', 'mission.touchdown']);
+
+/** Landing pools that name the spot: the simple mode returns to the base, so it never lands elsewhere. */
+const IN_PLACE_LANDING_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>([
+  'mission.landing_in_place',
+  'mission.touchdown_in_place',
+]);
+
+/** Pools a mission mode can reach. */
+export function poolsForMode(mode: MissionMode): readonly PoolKey[] {
+  return POOL_KEYS.filter((key) => {
+    if (mode !== 'advanced' && RETURN_POOLS.has(key)) return false;
+    if (mode === 'simple' && (TRANSLATION_POOLS.has(key) || IN_PLACE_LANDING_POOLS.has(key))) return false;
+    if (mode === 'intermediate' && BASE_LANDING_POOLS.has(key)) return false;
+    if (mode !== 'simple' && SIMPLE_ONLY_POOLS.has(key)) return false;
+    return true;
+  });
+}
+
 /**
- * The pool a milestone speaks from, given what its payload says happened.
+ * Whether the station may speak `key` in `mode`. The mission already withholds
+ * the return milestone outside the advanced mode; this is the station's own guard.
+ */
+export function isMilestoneAllowed(key: MilestoneKey, mode: MissionMode): boolean {
+  return !(key === 'mission.rtl_start' && mode !== 'advanced');
+}
+
+/**
+ * The pool a milestone speaks from, given what its payload says happened and
+ * the mode the mission flies.
  *
  * `mission.touchdown` (`steps/rtl.py:_touchdown`): "na base" only for a
  * confirmed touchdown with `at_base`; a touchdown away from it has its own
  * wording; anything not explicitly `confirmed: true` is the dictated
- * unconfirmed sentence.
+ * unconfirmed sentence. In the simple mode the takeoff, scan and approach are
+ * the native climb, the yaw sweep and the angular centring whatever the
+ * payload says: the mode decides, not the payload.
  */
-export function poolForMilestone(key: MilestoneKey, payload: Readonly<Record<string, unknown>>): PoolKey {
+export function poolForMilestone(
+  key: MilestoneKey,
+  payload: Readonly<Record<string, unknown>>,
+  mode: MissionMode = 'advanced'
+): PoolKey {
+  if (mode === 'simple') {
+    if (key === 'mission.takeoff') return 'mission.takeoff_native';
+    if (key === 'mission.scan_start') return 'mission.scan_start_yaw';
+    if (key === 'mission.approaching') return 'mission.approaching_yaw';
+  }
   // Every flag is read as "did not happen" unless the mission says it did:
   // a wording that claims an event the payload does not confirm is the defect
   // these pools exist to prevent.
@@ -613,9 +704,10 @@ export function phraseForMilestone(
   key: MilestoneKey,
   payload: Readonly<Record<string, unknown>>,
   parameters: MissionParametersPayload,
-  options: { storage?: StorageLike | null; random?: () => number } = {}
+  options: { storage?: StorageLike | null; random?: () => number } = {},
+  mode: MissionMode = 'advanced'
 ): string {
-  return nextPhrase(poolForMilestone(key, payload), phraseValues(payload, parameters), {
+  return nextPhrase(poolForMilestone(key, payload, mode), phraseValues(payload, parameters), {
     ...options,
     veto: vetoFor(key, payload),
   });
@@ -627,14 +719,14 @@ const FLIGHT_ESTIMATE_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>(['mission.t
 /**
  * Every sentence the flight narration can say for a mission launched with
  * `parameters` (D2: the numbers are known before takeoff), for the copilot's
- * on-disk phrase cache. Variants whose placeholder has no value are left out;
+ * on-disk phrase cache, limited to the pools `mode` can reach. Variants whose placeholder has no value are left out;
  * `mission.target_found` is left out because its range is estimated in flight.
  */
-export function allMissionPhrases(parameters: MissionParametersPayload): string[] {
+export function allMissionPhrases(parameters: MissionParametersPayload, mode: MissionMode = 'advanced'): string[] {
   const values = phraseValues({}, parameters);
   delete values.location;
   const out = new Set<string>();
-  for (const key of POOL_KEYS) {
+  for (const key of poolsForMode(mode)) {
     if (FLIGHT_ESTIMATE_POOLS.has(key)) continue;
     for (const variant of PHRASE_POOLS[key]) {
       const rendered = renderPhrase(variant, values);

@@ -61,7 +61,7 @@ describe('bmg:start-mission', () => {
     ]) {
       expect(args).not.toContain(flag);
     }
-    expect(JSON.parse(args[args.indexOf('--params-json') + 1])).toEqual(doc);
+    expect(JSON.parse(args[args.indexOf('--params-json') + 1])).toEqual({ ...doc, mission_mode: 'advanced' });
     expect(args).toContain('--no-fly');
     await endMission(missionSpawn());
   });
@@ -69,6 +69,44 @@ describe('bmg:start-mission', () => {
   it('states the arming mode explicitly for a real flight', async () => {
     await main.handlers['bmg:start-mission']({}, { noFly: false, paramsJson: JSON.stringify(completeDocument()) });
     expect(missionSpawn()!.args).toContain('--fly');
+    await endMission(missionSpawn());
+  });
+
+  it.each(['simple', 'intermediate', 'advanced'] as const)(
+    'carries the %s mission mode in --params-json, canonical and untouched by the CLI flags',
+    async (mode) => {
+      const doc = completeDocument({ mission_mode: mode === 'simple' ? 'Simple' : mode });
+      const result = (await main.handlers['bmg:start-mission']({}, {
+        noFly: true,
+        countdown: 0,
+        paramsJson: JSON.stringify(doc),
+      })) as { success: boolean };
+      expect(result.success).toBe(true);
+      const args = missionSpawn()!.args;
+      const payload = JSON.parse(args[args.indexOf('--params-json') + 1]);
+      expect(payload.mission_mode).toBe(mode);
+      expect(args).not.toContain('--mode');
+      await endMission(missionSpawn());
+    }
+  );
+
+  it('refuses a launch whose document names an unknown mission mode, spawning nothing', async () => {
+    const result = (await main.handlers['bmg:start-mission']({}, {
+      noFly: true,
+      countdown: 0,
+      paramsJson: JSON.stringify(completeDocument({ mission_mode: 'expert' })),
+    })) as { success: boolean; error?: string };
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('mission_mode');
+    expect(missionSpawn()).toBeUndefined();
+  });
+
+  it('makes an absent mode explicit in the document it sends', async () => {
+    const doc = completeDocument();
+    delete (doc as Record<string, unknown>).mission_mode;
+    await main.handlers['bmg:start-mission']({}, { noFly: true, countdown: 0, paramsJson: JSON.stringify(doc) });
+    const args = missionSpawn()!.args;
+    expect(JSON.parse(args[args.indexOf('--params-json') + 1]).mission_mode).toBe('advanced');
     await endMission(missionSpawn());
   });
 
@@ -99,6 +137,18 @@ describe('bmg:start-bench-stage', () => {
     expect(sent.kinematics.target_altitude_m).toBe(doc.kinematics && (doc.kinematics as Record<string, unknown>).target_altitude_m);
     expect(args).toContain('--no-fly');
     expect(args).not.toContain('--launch-at-ms');
+    await endMission(missionSpawn());
+  });
+
+  it('carries the mission mode of the document into the bench routine', async () => {
+    const result = (await main.handlers['bmg:start-bench-stage']({}, {
+      stage: 3,
+      countdown: 0,
+      paramsJson: JSON.stringify(completeDocument({ mission_mode: 'simple' })),
+    })) as { success: boolean };
+    expect(result.success).toBe(true);
+    const args = missionSpawn()!.args;
+    expect(JSON.parse(args[args.indexOf('--params-json') + 1]).mission_mode).toBe('simple');
     await endMission(missionSpawn());
   });
 

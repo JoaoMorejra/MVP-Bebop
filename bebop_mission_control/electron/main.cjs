@@ -26,6 +26,7 @@ const { createStandbyManager } = require('./missionStandby.cjs');
 const { createOrphanReaper, parseOrphanCandidates } = require('./orphanMissions.cjs');
 const { createLandSupervisor } = require('./landSupervisor.cjs');
 const { evaluateLaunchReadiness } = require('./launchReadiness.cjs');
+const { normalizeLaunchMode } = require('./missionMode.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 // The monorepo is checked out as <ws>/src/mvp_mission_bebop on every
@@ -2074,26 +2075,6 @@ ipcMain.handle('bmg:camera-tilt', async (_event, payload = {}) => {
 ipcMain.handle('bmg:get-camera-tilt', async () => ({ tilt: lastCameraTilt }));
 
 /**
- * Start (`start: true`) or abort the magnetometer calibration (6.4).
- *
- * Manual procedure, motors off: the operator turns the aircraft by hand while
- * it reports each axis. Refused while a mission process exists, since the
- * aircraft may then be airborne. The result is whatever the aircraft reports on
- * `states/magneto_calibration`, read back through the telemetry bridge.
- */
-ipcMain.handle('bmg:magneto-calibration', async (_event, payload = {}) => {
-  const start = payload && payload.start;
-  if (typeof start !== 'boolean') return { success: false, error: 'pedido inválido' };
-  if (start && missionProcess) {
-    return { success: false, error: 'Calibração bloqueada com a missão em execução.' };
-  }
-  if (!sendCommand({ op: 'magneto', start })) {
-    return { success: false, error: 'ponte de comando indisponível' };
-  }
-  return { success: true, start };
-});
-
-/**
  * Ask the running mission to continue at a different stage.
  *
  * Published on the aircraft's namespace as an Int32; `mission.py` subscribes,
@@ -2535,10 +2516,20 @@ async function startMissionProcess(options = {}) {
     // `--params-json` is the only source of the flight parameters (5.1). The
     // per-field flags it used to be followed by won over it, so a field that was
     // not a finite number on the station side flew as a hardcoded fallback.
-    const doc = parseLaunchDocument(options.paramsJson);
-    if (!doc) {
+    const parsedDoc = parseLaunchDocument(options.paramsJson);
+    if (!parsedDoc) {
       return { success: false, error: 'Documento de parâmetros ausente ou inválido; lançamento bloqueado.' };
     }
+    const resolvedMode = normalizeLaunchMode(parsedDoc);
+    if (!resolvedMode.ok) {
+      recordLog('mission', { type: 'stderr', text: `[BMG] ${resolvedMode.error}\n` });
+      return { success: false, error: resolvedMode.error, message: resolvedMode.error };
+    }
+    const doc = resolvedMode.doc;
+    recordLog('mission', {
+      type: 'stdout',
+      text: `[BMG] Modo de missão: ${resolvedMode.mode}${resolvedMode.defaulted ? ' (o documento não trazia o modo: missão completa)' : ''}\n`,
+    });
     args.push('--params-json', JSON.stringify(doc));
 
     const push = (flag, value) => {
@@ -2594,7 +2585,6 @@ async function startMissionProcess(options = {}) {
         batteryKnown: Boolean(latestTelemetry.battery_known),
         batteryPct: latestTelemetry.battery_pct,
         batteryFailsafeThreshold: failsafeThreshold,
-        magnetoRequired: Boolean(latestTelemetry.calibration_required),
         commandBridgeReady: commandBridgeGate.isReady(commandProcess),
         ros2CliAvailable,
         voiceReady: speechProcess !== null && latestSpeechState.ready,
@@ -2785,7 +2775,6 @@ ipcMain.handle('bmg:get-launch-readiness', async (_event, options = {}) => {
     batteryKnown: Boolean(latestTelemetry.battery_known),
     batteryPct: latestTelemetry.battery_pct,
     batteryFailsafeThreshold: failsafeThreshold,
-    magnetoRequired: Boolean(latestTelemetry.calibration_required),
     commandBridgeReady: commandBridgeGate.isReady(commandProcess),
     ros2CliAvailable,
     voiceReady: speechProcess !== null && latestSpeechState.ready,

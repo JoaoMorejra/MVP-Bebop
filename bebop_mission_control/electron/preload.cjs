@@ -68,7 +68,6 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   // Parameters
   getParameters: () => ipcRenderer.invoke('bmg:get-parameters'),
   getParameterDefaults: () => ipcRenderer.invoke('bmg:get-parameter-defaults'),
-  calibrateMagneto: (start) => ipcRenderer.invoke('bmg:magneto-calibration', { start }),
   saveParameters: (params) => ipcRenderer.invoke('bmg:save-parameters', params),
 
   // System state

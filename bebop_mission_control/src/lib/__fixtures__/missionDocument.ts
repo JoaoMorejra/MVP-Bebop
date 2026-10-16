@@ -1,5 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { REQUIRED_LAUNCH_NUMBERS } from '../launchDocument';
-import { ALL_PARAMETERS } from '../parameterSchema';
 import { setPath, type Doc } from '../paths';
 
 /** A parameter document with every number a launch requires, plus fields the schema does not list. */
@@ -19,18 +20,25 @@ export function completeDocument(overrides: Record<string, unknown> = {}): Doc {
 }
 
 /**
- * A document a launch accepts: every sheet field at the bottom of its range
- * and the other required numbers at plausible values. `completeDocument` is
- * for telling fields apart, not for launching (its values are 1, 2, 3...).
+ * `MissionParameters.factory()` as `mission.py --dump-defaults` serves it.
+ *
+ * Read from `test/fixtures/mission_factory_document.json`, which
+ * `test/test_shared_fixtures.py` holds equal to the dataclass defaults.
+ */
+export function factoryDocument(overrides: Record<string, unknown> = {}): Doc {
+  let doc = JSON.parse(
+    readFileSync(resolve(__dirname, '../../../../test/fixtures/mission_factory_document.json'), 'utf-8')
+  ) as Doc;
+  for (const [path, value] of Object.entries(overrides)) doc = setPath(doc, path, value);
+  return doc;
+}
+
+/**
+ * A document a launch accepts: the factory document with the return cruise
+ * coupled to the forward cruise, as the station always sends it.
  */
 export function validDocument(overrides: Record<string, unknown> = {}): Doc {
-  let doc = completeDocument({
-    'kinematics.hover_duration_sec': 7,
-    'rtl.max_speed': 0.1,
-    'rtl.arrival_radius_m': 0.2,
-    'vision.confidence_threshold': 0.5,
-  });
-  for (const spec of ALL_PARAMETERS) doc = setPath(doc, spec.path, spec.min);
+  let doc = factoryDocument({ 'rtl.reverse_cruise_velocity': -0.2 });
   for (const [path, value] of Object.entries(overrides)) doc = setPath(doc, path, value);
   return doc;
 }

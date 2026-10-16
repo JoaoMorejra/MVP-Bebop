@@ -39,7 +39,6 @@ async function setHealthyTelemetry() {
     flying_state: 0,
     battery_known: true,
     battery_pct: 90,
-    calibration_required: false,
     topics: {
       '/bebop/odom': { receiving: true, age_sec: 0.1 },
       '/bebop/camera/image_raw': { present: true, receiving: true },
@@ -145,18 +144,16 @@ describe('R4 / R8 Launch Readiness in main.cjs', () => {
       expect(missionSpawn()).toBeUndefined();
     });
 
-    it('blocks if magnetometer calibration is required', async () => {
+    it('does not block on a calibration flag in telemetry', async () => {
       await setHealthyTelemetry();
       await main.handlers['bmg:test-set-telemetry']({}, { calibration_required: true });
 
       const res = (await main.handlers['bmg:start-mission']({}, {
         noFly: false,
         paramsJson: JSON.stringify(completeDocument()),
-      })) as { success: boolean; error: string };
+      })) as { success: boolean; error?: string };
 
-      expect(res.success).toBe(false);
-      expect(res.error).toBe('Calibração do magnetômetro necessária');
-      expect(missionSpawn()).toBeUndefined();
+      expect(res.error ?? '').not.toMatch(/calibra/i);
     });
 
     it('blocks if command bridge is not ready', async () => {

@@ -12,7 +12,11 @@ import {
   tileZoom,
   formatAccuracy,
   accuracyIsCoarse,
+  OVERVIEW_EXTENT_M,
+  fixedView,
+  project,
 } from './mapView';
+import { MAP_ANCHOR } from './siteAnchor';
 
 const LAT = -22.412;
 
@@ -106,5 +110,44 @@ describe('manual zoom', () => {
     for (const zoom of [15, 17.5, 21]) {
       expect(zoomForPixelsPerMetre(pixelsPerMetre(zoom, -23.65), -23.65)).toBeCloseTo(zoom, 9);
     }
+  });
+});
+
+describe('fixedView', () => {
+  const size = { width: 880, height: 360 };
+  const anchor = { lat: MAP_ANCHOR.latitude, lng: MAP_ANCHOR.longitude };
+
+  it('centres the panel on the base and projects the tiles from the anchor', () => {
+    const view = fixedView(size, anchor, null, 20);
+    expect(view.cx).toBe(440);
+    expect(view.cy).toBe(180);
+    expect(view.sx(0)).toBe(440);
+    expect(view.sy(0)).toBe(180);
+    expect(view.centre).toEqual(project(anchor.lat, anchor.lng, view.tile.z));
+  });
+
+  it('frames the overview extent in the short side by default', () => {
+    const view = fixedView(size, anchor, null, 20);
+    expect(view.zoom).toBe(displayZoom(OVERVIEW_EXTENT_M, size, anchor.lat));
+    expect(view.pxPerMetre).toBeCloseTo(pixelsPerMetre(view.zoom, anchor.lat), 12);
+    expect(view.pxPerMetre * OVERVIEW_EXTENT_M).toBeLessThanOrEqual(size.height);
+  });
+
+  it('places east to the right and north up, in metres from the base', () => {
+    const view = fixedView(size, anchor, null, 20);
+    expect(view.sx(10) - view.sx(0)).toBeCloseTo(10 * view.pxPerMetre, 9);
+    expect(view.sy(10) - view.sy(0)).toBeCloseTo(-10 * view.pxPerMetre, 9);
+  });
+
+  it('takes the manual zoom when the operator set one', () => {
+    expect(fixedView(size, anchor, 19.5, 20).zoom).toBe(19.5);
+  });
+
+  it('does not depend on where the aircraft is', () => {
+    expect(fixedView.length).toBe(4);
+    const a = fixedView(size, anchor, null, 20);
+    const b = fixedView(size, anchor, null, 20);
+    expect(b.centre).toEqual(a.centre);
+    expect(b.zoom).toBe(a.zoom);
   });
 });

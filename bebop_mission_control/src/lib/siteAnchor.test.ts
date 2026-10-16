@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { readSiteAnchorFile } from '../../electron/siteAnchor.cjs';
+import { MAP_ANCHOR } from './siteAnchor';
 
 const dir = mkdtempSync(join(tmpdir(), 'bmg-site-'));
 const write = (name: string, body: unknown) => {
@@ -46,5 +47,14 @@ describe('readSiteAnchorFile', () => {
       accuracyM: 25,
       name: 'local configurado',
     });
+  });
+});
+
+describe('MAP_ANCHOR', () => {
+  it('is the shipped site file, to the digit', () => {
+    const shipped = JSON.parse(readFileSync(resolve(__dirname, '../../config/site-anchor.json'), 'utf-8'));
+    expect(MAP_ANCHOR).toEqual({ latitude: shipped.latitude, longitude: shipped.longitude, name: shipped.name });
+    expect(MAP_ANCHOR.latitude).toBe(-23.6488913);
+    expect(MAP_ANCHOR.longitude).toBe(-46.7187124);
   });
 });
