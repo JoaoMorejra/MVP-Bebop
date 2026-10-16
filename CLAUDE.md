@@ -8,12 +8,13 @@ Este documento estabelece as regras mandatorias de engenharia de software, sincr
 
 O projeto consiste no sistema autonomo completo para o drone **Parrot Bebop 2**, desenvolvido sobre **ROS 2 Jazzy** e **Nectar SDK**, integrado a uma estacao de controle de solo desktop (**BMG - Bebop Mission GUI**).
 
-### Arquitetura de Voo (5 Estagios Deterministicos)
-1. **Decolagem e Estabilizacao:** calibracao de sensores em solo, subida e verificacao de teto com protecao anti-climb.
-2. **Varredura Retilinea:** cruzeiro com controle cinematico jerk-limited, histerese e deteccao via YOLOv8n.
-3. **Aproximacao IBVS:** guiagem visual em malha fechada via projecao geometrica pinhole e controle proporcional com frenagem acoplada.
-4. **Inspecao Nadir e Registro Pericial:** inclinacao de camera a 90 deg, verificacao estatistica de imobilidade, captura atomica de evidencias em alta fidelidade e emissao de metadados forenses JSON.
-5. **RTL em Malha Fechada e Pouso de Precisao:** cruzeiro reverso, busca de marcador visual (ArUco / AprilTag 36h11), centralizacao fina em coordenadas de camera e touchdown com confirmacao odometrica multivariada.
+### Arquitetura de Voo (5 Estagios Deterministicos, Padrao Lateral)
+O padrao de voo e estritamente lateral: `vx == 0` e `vyaw == 0` em todo o voo; convencao `vy > 0` = esquerda (FLU, REP-103).
+1. **Decolagem e Estabilizacao:** calibracao de sensores em solo, subida sobre o totem de 1 m e verificacao de teto com protecao anti-climb.
+2. **Varredura Lateral a Esquerda:** cruzeiro com `vy > 0` em `kinematics.forward_cruise_velocity` (jerk-limited), camera em `gimbal.search_tilt_deg`, assentamento de partida antes de cruzar a borda do totem e deteccao via YOLOv8n com histerese. A trilha deve ser posicionada de modo que o alvo fique a frente, na faixa de visada `[h / tan(|tilt| + VFOV/2), h / tan(|tilt| - VFOV/2)]`; `platform.edge_ahead_m` e a distancia do ponto de decolagem a borda do totem a esquerda.
+3. **Servoing Lateral (CENTERING, LOCKED, REACQUIRING):** guiagem visual em malha fechada somente em `vy`, sem avanco e sem mover o gimbal, com creep lateral de reaquisicao; congela (`vx = vy = 0`) ao centralizar lateralmente com a aeronave em repouso (`inspection.settle_max_speed_mps`).
+4. **Enquadramento por Gimbal e Registro Pericial:** pairado absoluto com movimento exclusivo do gimbal (lei de apontamento em malha fechada `tilt = atual - theta_y` em `[nadir_tilt_deg, search_tilt_deg]`, limitada por `max_slew_limit_deg`, com solucao em malha aberta a partir do ultimo pixel do Stage 3 como partida e fallback), verificacao estatistica de imobilidade, captura atomica de evidencias em alta fidelidade e emissao de metadados forenses JSON (marcados degradados se o alvo nao for enquadrado).
+5. **RTL Lateral a Direita e Pouso de Precisao:** busca do marcador visual (ArUco / AprilTag 36h11) voando para a direita (`vy < 0`, `|vy| = |rtl.reverse_cruise_velocity|`, regra E05), centralizacao 2D, creep de reenquadramento a esquerda se o marcador for ultrapassado e touchdown com confirmacao odometrica multivariada; a guarda de borda (LEAVING/ENTERING) e medida ao longo da trilha lateral.
 
 ---
 

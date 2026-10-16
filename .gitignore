@@ -20,8 +20,10 @@ bebop_mission_control/.gstack/
 # IDE & Editor files
 .vscode/
 .idea/
+.superpowers/
 *.swp
 *.swo
+*.tmp
 
 # OS files
 .DS_Store
