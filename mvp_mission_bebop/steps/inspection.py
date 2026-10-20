@@ -42,12 +42,14 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Final, Optional, Tuple
 
+from mvp_mission_bebop.blackboard import EvidenceRecord
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.gimbal_framing import FramingCommand, GimbalFramingController
 from mvp_mission_bebop.controllers.yaw_pattern import YawHeadingController
 from mvp_mission_bebop.engine.rate import MAX_INTERVAL_SEC, Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
 from mvp_mission_bebop.mission_mode import MissionMode
+from mvp_mission_bebop.perception.inspection_worker import InspectionJob
 from mvp_mission_bebop.perception.worker import detector_kwargs
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
@@ -463,6 +465,9 @@ class NadirInspectionStep(BaseStep):
         }
         ctx.drone.snapshot()
 
+        # Still synchronous: this inference draws the annotated evidence JPEG
+        # and decides target_confirmed for capture_done. The victim assessment
+        # of the same frame runs later, off this thread (_submit_assessment).
         nadir_conf = ctx.params.inspection.nadir_confidence_threshold
         result = ctx.detector.detect(
             frame, **detector_kwargs(nadir_conf, ctx.params.vision.inference_imgsz)
@@ -517,7 +522,32 @@ class NadirInspectionStep(BaseStep):
                     "target_confirmed": bool(ctx.blackboard.target_confirmed),
                 },
             )
+        # Submitted after capture_done, so the station always sees
+        # mission.inspection_ready follow it.
+        if record.captured and record.raw_path:
+            self._submit_assessment(ctx, frame, record)
         return record.captured
+
+    @staticmethod
+    def _submit_assessment(ctx: MissionContext, frame: Any, record: EvidenceRecord) -> None:
+        """Hand the captured frame to the background victim inference.
+
+        A frame copy and a non-blocking enqueue: the capture never waits for
+        the result, which is settled during the remaining hover, the return
+        and the landing (``perception/inspection_worker.py``). A failure here
+        loses the assessment, never the capture; the report then states
+        nothing about the victim.
+        """
+        worker = getattr(ctx, "inspection_worker", None)
+        if worker is None:
+            return
+        if not record.timestamp:
+            logger.warning("Capture without timestamp; victim assessment skipped.")
+            return
+        try:
+            worker.submit(InspectionJob.create(record.timestamp, frame, record.metadata_path))
+        except Exception as exc:  # noqa: BLE001 - the assessment is never flight-critical
+            logger.error("Victim assessment not submitted: %s", exc)
 
     def _hover(self, ctx: MissionContext, already_captured: bool) -> StepStatus:
         """Hold the nadir hover for the configured duration.

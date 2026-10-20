@@ -545,3 +545,133 @@ def test_an_abort_during_framing_returns_aborted_without_capturing():
     assert ctx.captures == 0
     assert ctx.drone.snapshots == 0
     assert not ctx.perception.engaged
+
+
+# --------------------------------------------- background victim assessment
+
+
+class _BlockingDetector:
+    """The inspection worker's dedicated detector, 300 ms per inference."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def load(self):
+        return True
+
+    def detect(self, _frame, **_kwargs):
+        import time
+
+        time.sleep(0.3)
+        self.calls += 1
+        return Result([])
+
+
+def _assessment_ctx():
+    import numpy as np
+
+    ctx = Ctx()
+    frame = np.zeros((480, 856, 3), dtype=np.uint8)
+    ctx.grab_frame = lambda timeout_sec=1.0: frame
+    ctx.record_photographic_evidence = lambda **kw: EvidenceRecord(
+        raw_path="accident_raw_20261020_101500.png",
+        metadata_path="accident_metadata_20261020_101500.json",
+        timestamp="20261020_101500",
+    )
+    return ctx
+
+
+def _timed_capture(ctx, repeats=5):
+    import time
+
+    best = float("inf")
+    for _ in range(repeats):
+        started = time.perf_counter()
+        assert NadirInspectionStep()._capture(ctx, settled=True) is True
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+def test_the_capture_submits_to_the_worker_without_waiting_for_it():
+    import statistics
+    import time
+
+    from mvp_mission_bebop.perception.inspection_worker import InspectionInferenceWorker
+
+    baseline = _timed_capture(_assessment_ctx())
+
+    ctx = _assessment_ctx()
+    detector = _BlockingDetector()
+    worker = InspectionInferenceWorker(lambda: detector, ())
+    submit_ms = []
+    original_submit = worker.submit
+
+    def timed_submit(job):
+        started = time.perf_counter()
+        try:
+            return original_submit(job)
+        finally:
+            submit_ms.append((time.perf_counter() - started) * 1000.0)
+
+    worker.submit = timed_submit
+    ctx.inspection_worker = worker
+    worker.start()
+    try:
+        with_worker = _timed_capture(ctx)
+        # Median, not maximum: one sample can absorb a GIL hand-off to another
+        # runnable thread (sys.getswitchinterval() is 5 ms), which is not the
+        # capture waiting for the detector.
+        assert submit_ms and statistics.median(submit_ms) < 5.0, f"submit took {submit_ms} ms"
+        assert with_worker - baseline < 0.02, (
+            f"capture went from {baseline * 1000:.1f} to {with_worker * 1000:.1f} ms with the worker"
+        )
+        assessment = worker.slot.wait("20261020_101500", 3.0)
+        assert assessment is not None and assessment.victim_status.value == "not_detected"
+    finally:
+        worker.stop(1.0)
+
+
+def test_capture_done_is_emitted_before_the_job_is_submitted(monkeypatch):
+    order = []
+    ctx = _assessment_ctx()
+
+    class Worker:
+        def submit(self, job):
+            order.append(("submit", job.capture_stamp, job.metadata_path))
+            return True
+
+    ctx.inspection_worker = Worker()
+    monkeypatch.setattr(inspection_module, "emit_milestone", lambda key, payload=None: order.append(key))
+
+    NadirInspectionStep()._capture(ctx, settled=True)
+
+    assert order == [
+        "mission.capture_done",
+        ("submit", "20261020_101500", "accident_metadata_20261020_101500.json"),
+    ]
+
+
+def test_a_capture_that_recorded_nothing_submits_nothing():
+    ctx = _assessment_ctx()
+    ctx.record_photographic_evidence = lambda **kw: EvidenceRecord()
+    submitted = []
+
+    class Worker:
+        def submit(self, job):
+            submitted.append(job)
+            return True
+
+    ctx.inspection_worker = Worker()
+    assert NadirInspectionStep()._capture(ctx, settled=True) is False
+    assert submitted == []
+
+
+def test_a_failing_submission_never_fails_the_capture():
+    ctx = _assessment_ctx()
+
+    class Worker:
+        def submit(self, job):
+            raise RuntimeError("queue gone")
+
+    ctx.inspection_worker = Worker()
+    assert NadirInspectionStep()._capture(ctx, settled=True) is True
