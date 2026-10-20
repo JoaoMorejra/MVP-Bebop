@@ -90,14 +90,25 @@ export const HISTORY_STORAGE_KEY = 'bmg.copilot-history.v1';
 
 /**
  * Choices the forensic report remembers across flights: the wording used for
- * each topic, and the topic order (an index into the 24 permutations).
+ * each fixed topic and for the victim line of each victim status, the opening
+ * topic (`finding.lead`: vehicle or victim) and the order of the dispatch
+ * topics (`finding.dispatch_order`), and the connectors.
+ *
+ * `finding.victim` and `finding.order` of earlier builds are retired: the
+ * victim pools and the order rules changed, so their indices no longer mean
+ * anything. The document keeps its storage key because its shape is
+ * unchanged and {@link loadHistory} drops keys this build does not know; the
+ * fixed topics keep their pools, so their recorded indices stay valid.
  */
 export type FindingHistoryKey =
   | 'finding.police'
   | 'finding.samu'
-  | 'finding.victim'
   | 'finding.vehicle'
-  | 'finding.order'
+  | 'finding.victim.detected'
+  | 'finding.victim.not_detected'
+  | 'finding.victim.unknown'
+  | 'finding.lead'
+  | 'finding.dispatch_order'
   | 'finding.opener'
   | 'finding.linker'
   | 'finding.closer';
@@ -108,9 +119,12 @@ export type HistoryKey = PoolKey | FindingHistoryKey;
 const FINDING_HISTORY_KEYS: readonly FindingHistoryKey[] = [
   'finding.police',
   'finding.samu',
-  'finding.victim',
   'finding.vehicle',
-  'finding.order',
+  'finding.victim.detected',
+  'finding.victim.not_detected',
+  'finding.victim.unknown',
+  'finding.lead',
+  'finding.dispatch_order',
   'finding.opener',
   'finding.linker',
   'finding.closer',

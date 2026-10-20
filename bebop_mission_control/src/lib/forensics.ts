@@ -3,21 +3,25 @@
  *
  * Four findings, one per question an adjuster has to clear before a claim can
  * be closed without sending anyone to the scene: police, ambulance, the
- * casualty, the vehicle. Each exists in several wordings and the order is drawn
- * per flight with the copilot's cross-flight memory (`copilotPhrases`): no
- * topic is read with the wording it had on the previous flight, and the topic
- * order does not repeat any of the last five — what the operator is watching
- * is an assessment being presented, not a slide being replayed.
+ * casualty, the vehicle. Police, SAMU and the vehicle are fixed clearances; the
+ * casualty line follows the victim assessment of the inspection frame
+ * (`mission.inspection_ready`) and is neutral when no inference concluded.
+ * Each exists in several wordings and the report is drawn per flight with the
+ * copilot's cross-flight memory (`copilotPhrases`): no topic is read with the
+ * wording it had on the previous flight, the report opens with the vehicle or
+ * the casualty, alternating, and never with a dispatch topic.
  *
- * The same table exists in `mvp_mission_bebop/telemetry/announcer.py` for the
- * mission process to narrate on its own. This copy is the authority whenever
+ * The same tables exist in `mvp_mission_bebop/telemetry/inspection_report.py`
+ * for the mission process to narrate on its own. This copy is the authority whenever
  * the station is driving: it decides the order, shows the card and hands the
  * copilot the exact sentence to read, so the line in the operator's ear and the
  * line on screen are the same string rather than two renderings of one idea.
  */
 
+import type { InspectionAssessment, VictimStatus } from '../types/bmg';
+import { victimStatusOf } from '../types/bmg';
 import type { FindingHistoryKey, StorageLike } from './copilotPhrases';
-import { loadHistory, pickVariant, recordVariant, saveHistory } from './copilotPhrases';
+import { loadHistory, nextPhrase, pickVariant, recordVariant, saveHistory } from './copilotPhrases';
 
 export type FindingTopic = 'police' | 'samu' | 'victim' | 'vehicle';
 
@@ -29,7 +33,12 @@ export interface Finding {
   speech: string;
 }
 
-const WORDINGS: Record<FindingTopic, readonly string[]> = {
+/**
+ * The fixed clearances. Not to be edited: the operator's ruling keeps police,
+ * SAMU and the vehicle as they were before the victim line became
+ * evidence-driven. Mirrored by `FIXED_FINDINGS` in `telemetry/inspection_report.py`.
+ */
+export const FIXED_WORDINGS: Readonly<Record<'police' | 'samu' | 'vehicle', readonly string[]>> = {
   police: [
     'Sem necessidade de polícia',
     'Acionamento policial dispensado',
@@ -42,12 +51,6 @@ const WORDINGS: Record<FindingTopic, readonly string[]> = {
     'Atendimento emergencial não necessário',
     'SAMU dispensado para a ocorrência',
   ],
-  victim: [
-    'Estado do acidentado não é grave',
-    'Vítima consciente e sem gravidade',
-    'Acidentado sem ferimentos críticos',
-    'Condição da vítima considerada leve',
-  ],
   vehicle: [
     'Veículo não danificado',
     'Sem danos estruturais aparentes no veículo',
@@ -55,6 +58,43 @@ const WORDINGS: Record<FindingTopic, readonly string[]> = {
     'Veículo sem avarias mecânicas',
   ],
 };
+
+/**
+ * The victim line per victim status. `unknown` is neutral: without a completed
+ * inference nothing is said about presence, absence, consciousness or injuries.
+ * Mirrored by `VICTIM_FINDINGS` in `telemetry/inspection_report.py`.
+ */
+export const VICTIM_WORDINGS: Readonly<Record<VictimStatus, readonly string[]>> = {
+  detected: [
+    'Vítima consciente e sem ferimentos aparentes',
+    'Acidentado consciente, sem ferimentos aparentes',
+    'Vítima identificada, consciente e sem lesões aparentes',
+    'Estado do acidentado não é grave, sem ferimentos aparentes',
+    'Acidentado consciente e sem ferimentos críticos aparentes',
+  ],
+  not_detected: [
+    'Nenhuma vítima visível na cena',
+    'Sem vítimas visíveis no local',
+    'Nenhum acidentado identificado na imagem',
+    'Cena sem vítimas aparentes',
+    'Ausência de vítimas visíveis na imagem',
+  ],
+  unknown: [
+    'Avaliação da vítima não incluída neste laudo preliminar',
+    'Condição da vítima a confirmar em verificação presencial',
+    'Sem dados para avaliar a vítima neste registro',
+    'Avaliação da vítima pendente de conferência no local',
+  ],
+};
+
+/** Topics that may open the report, as indexed by `finding.lead`. */
+export const LEAD_TOPICS: readonly ['vehicle', 'victim'] = ['vehicle', 'victim'];
+
+/** Orders of the dispatch topics, as indexed by `finding.dispatch_order`. */
+export const DISPATCH_ORDERS: readonly (readonly ['samu', 'police'] | readonly ['police', 'samu'])[] = [
+  ['samu', 'police'],
+  ['police', 'samu'],
+];
 
 const TOPICS: readonly FindingTopic[] = ['police', 'samu', 'victim', 'vehicle'];
 
@@ -65,7 +105,7 @@ const TOPICS: readonly FindingTopic[] = ['police', 'samu', 'victim', 'vehicle'];
  * contrasts. Each pool is longer than the history window, so no connector
  * repeats the previous flight's in the same position.
  */
-const OPENERS = [
+export const OPENERS = [
   'Para começar,',
   'De início,',
   'Logo de cara,',
@@ -73,7 +113,7 @@ const OPENERS = [
   'De saída,',
   'Abrindo a análise,',
 ] as const;
-const LINKERS = [
+export const LINKERS = [
   'Além disso,',
   'Na sequência,',
   'Somado a isso,',
@@ -82,7 +122,7 @@ const LINKERS = [
   'Também observamos:',
   'E mais:',
 ] as const;
-const CLOSERS = [
+export const CLOSERS = [
   'Por fim,',
   'Para fechar,',
   'Para arrematar,',
@@ -90,24 +130,6 @@ const CLOSERS = [
   'Encerrando,',
   'Por último,',
 ] as const;
-
-/** Every order the four topics can be read in, in a fixed enumeration. */
-const ORDERS: readonly (readonly FindingTopic[])[] = (() => {
-  const out: FindingTopic[][] = [];
-  const permute = (rest: FindingTopic[], prefix: FindingTopic[]) => {
-    if (rest.length === 0) {
-      out.push(prefix);
-      return;
-    }
-    rest.forEach((topic, index) =>
-      permute([...rest.slice(0, index), ...rest.slice(index + 1)], [...prefix, topic])
-    );
-  };
-  permute([...TOPICS], []);
-  return out;
-})();
-
-const ORDER_LABELS: readonly string[] = ORDERS.map((order) => order.join(','));
 
 /** The label under each card, so the topic is legible without reading the wording. */
 export const TOPIC_LABEL: Record<FindingTopic, string> = {
@@ -130,30 +152,69 @@ function decapitalise(line: string): string {
 }
 
 /**
+ * Enforce the order invariants: the four topics exactly once each, opening
+ * with the vehicle or the victim, never with a dispatch topic.
+ *
+ * @throws RangeError when `topics` breaks either.
+ */
+export function checkTopicOrder(topics: readonly FindingTopic[]): void {
+  if (topics.length !== TOPICS.length || new Set(topics).size !== TOPICS.length) {
+    throw new RangeError(`a report covers ${TOPICS.join(', ')} exactly once each, got ${topics.join(', ')}`);
+  }
+  if (!(LEAD_TOPICS as readonly string[]).includes(topics[0])) {
+    throw new RangeError(`a report opens with ${LEAD_TOPICS.join(' or ')}, never ${topics[0]}`);
+  }
+}
+
+/**
  * Draw one report and remember it.
  *
- * The order is one of the 24 permutations, excluding those of the last five
- * flights; each topic's wording excludes its recent ones, which with four
- * wordings means never the one it had on the previous flight. The choices are
- * recorded when drawn, once per flight, in the same history document as the
- * copilot's milestone calls. With no storage it still draws a report, only
- * without the memory.
+ * The report opens with the vehicle or the victim, the opposite of the
+ * previous flight (the first flight draws), then the other of the two, then
+ * SAMU and police in the order the previous flight did not use. Police, SAMU
+ * and the vehicle draw from their fixed pools; the victim line from the pool
+ * of the assessment's victim status, `unknown` without one. Every wording and
+ * connector avoids its recent variants (`pickVariant`). The choices are
+ * recorded when drawn, once per flight, in the copilot history document. With
+ * no storage it still draws a report, only without the memory. Same algorithm
+ * as `build_inspection_report` in `telemetry/inspection_report.py`.
  */
 export function buildForensicReport(
-  options: { storage?: StorageLike | null; random?: () => number } = {}
+  options: {
+    assessment?: InspectionAssessment | null;
+    storage?: StorageLike | null;
+    random?: () => number;
+  } = {}
 ): Finding[] {
   const storage = options.storage;
+  const status = victimStatusOf(options.assessment ?? null);
   let history = storage === undefined ? loadHistory() : loadHistory(storage);
 
-  const order = pickVariant('finding.order', ORDER_LABELS, history, options.random);
-  history = recordVariant(history, 'finding.order', order.index);
+  const lead = pickVariant('finding.lead', LEAD_TOPICS, history, options.random);
+  history = recordVariant(history, 'finding.lead', lead.index);
+  const dispatch = pickVariant(
+    'finding.dispatch_order',
+    DISPATCH_ORDERS.map((order) => order.join(',')),
+    history,
+    options.random
+  );
+  history = recordVariant(history, 'finding.dispatch_order', dispatch.index);
+  const topics: FindingTopic[] = [LEAD_TOPICS[lead.index], LEAD_TOPICS[1 - lead.index], ...DISPATCH_ORDERS[dispatch.index]];
+  checkTopicOrder(topics);
 
-  const topics = ORDERS[order.index];
-  const report = topics.map((topic, index) => {
-    const key = `finding.${topic}` as FindingHistoryKey;
-    const wording = pickVariant(key, WORDINGS[topic], history, options.random);
+  const cards: Partial<Record<FindingTopic, string>> = {};
+  for (const topic of ['police', 'samu', 'vehicle'] as const) {
+    const key = `finding.${topic}` as const;
+    const wording = pickVariant(key, FIXED_WORDINGS[topic], history, options.random);
     history = recordVariant(history, key, wording.index);
+    cards[topic] = wording.text;
+  }
+  const victimKey: FindingHistoryKey = `finding.victim.${status}`;
+  const victim = pickVariant(victimKey, VICTIM_WORDINGS[status], history, options.random);
+  history = recordVariant(history, victimKey, victim.index);
+  cards.victim = victim.text;
 
+  const report = topics.map((topic, index) => {
     // Two linkers in one report are drawn one after the other, each recorded
     // before the next, so they never repeat within the report either.
     const [connectorKey, pool]: [FindingHistoryKey, readonly string[]] =
@@ -164,17 +225,62 @@ export function buildForensicReport(
         : ['finding.linker', LINKERS];
     const connector = pickVariant(connectorKey, pool, history, options.random);
     history = recordVariant(history, connectorKey, connector.index);
-
-    return {
-      topic,
-      card: wording.text,
-      speech: `${connector.text} ${decapitalise(wording.text)}.`,
-    };
+    const card = cards[topic] as string;
+    return { topic, card, speech: `${connector.text} ${decapitalise(card)}.` };
   });
 
   if (storage === undefined) saveHistory(history);
   else saveHistory(history, storage);
   return report;
+}
+
+/**
+ * Everything the copilot says for one capture: the intro, the four findings
+ * and the outro, drawn together so all six lines can be synthesized ahead.
+ */
+export interface ForensicScript {
+  /** Stamp of the capture the script belongs to, or null when unknown. */
+  captureStamp: string | null;
+  victimStatus: VictimStatus;
+  /** Why the victim line is neutral (`timeout`, the assessment's reason), or null. */
+  reason: string | null;
+  intro: string;
+  findings: Finding[];
+  outro: string;
+}
+
+/**
+ * Draw the report of one capture with its intro and outro.
+ *
+ * `assessment` null means no inference concluded (the station's own wait ran
+ * out, `reason` says why): the victim line is then the neutral one. Nothing is
+ * ever filled in for a missing result.
+ */
+export function drawForensicScript(
+  options: {
+    assessment: InspectionAssessment | null;
+    captureStamp?: string | null;
+    reason?: string | null;
+    storage?: StorageLike | null;
+    random?: () => number;
+  }
+): ForensicScript {
+  const { assessment, storage, random } = options;
+  const phraseOptions = storage === undefined ? { random } : { storage, random };
+  const findings = buildForensicReport({ assessment, storage, random });
+  return {
+    captureStamp: options.captureStamp ?? assessment?.capture_stamp ?? null,
+    victimStatus: victimStatusOf(assessment),
+    reason: assessment ? assessment.reason : options.reason ?? null,
+    intro: nextPhrase('inspection.intro', {}, phraseOptions),
+    findings,
+    outro: nextPhrase('inspection.outro', {}, phraseOptions),
+  };
+}
+
+/** The six lines of a script in reading order: intro, findings, outro. */
+export function scriptLines(script: ForensicScript): string[] {
+  return [script.intro, ...script.findings.map((finding) => finding.speech), script.outro];
 }
 
 /**
@@ -185,10 +291,16 @@ export function buildForensicReport(
 export function allFindingSentences(): string[] {
   const connectors = [...OPENERS, ...LINKERS, ...CLOSERS];
   const out: string[] = [];
-  for (const topic of TOPICS) {
-    for (const wording of WORDINGS[topic]) {
-      for (const connector of connectors) out.push(`${connector} ${decapitalise(wording)}.`);
-    }
+  const wordings = [
+    ...FIXED_WORDINGS.police,
+    ...FIXED_WORDINGS.samu,
+    ...FIXED_WORDINGS.vehicle,
+    ...VICTIM_WORDINGS.detected,
+    ...VICTIM_WORDINGS.not_detected,
+    ...VICTIM_WORDINGS.unknown,
+  ];
+  for (const wording of wordings) {
+    for (const connector of connectors) out.push(`${connector} ${decapitalise(wording)}.`);
   }
   return out;
 }

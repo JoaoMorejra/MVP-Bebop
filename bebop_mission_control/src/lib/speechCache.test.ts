@@ -1,6 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import { allMissionPhrases } from './copilotPhrases';
 import { allFindingSentences, buildForensicReport } from './forensics';
+import type { InspectionAssessment } from '../types/bmg';
+
+const DETECTED: InspectionAssessment = {
+  schema: 'bmg.inspection.v1',
+  capture_stamp: '20261020_101500',
+  status: 'complete',
+  reason: null,
+  victim_detected: true,
+  victim_count: 1,
+  victim_confidence: 0.62,
+  victim_boxes: [[100, 100, 160, 220]],
+  frame: [856, 480],
+  inference_ms: 212.3,
+  model: 'yolov8n.pt',
+  imgsz: 640,
+  conf: 0.35,
+  completed_at_utc: '2026-10-20T13:15:01+00:00',
+};
 
 describe('sentences known before the flight (3.9)', () => {
   it('renders every pool with the mission parameters, leaving no placeholder', () => {
@@ -19,8 +37,12 @@ describe('sentences known before the flight (3.9)', () => {
 
   it('enumerates every sentence the forensic report can say (D1)', () => {
     const sentences = allFindingSentences();
-    expect(sentences.length).toBe(304);
-    const report = buildForensicReport({ storage: null, random: () => 0.3 });
-    for (const finding of report) expect(sentences).toContain(finding.speech);
+    // 12 fixed wordings and 14 victim wordings (three branches), each after any
+    // of the 19 connectors.
+    expect(sentences.length).toBe(494);
+    for (const assessment of [null, DETECTED, { ...DETECTED, victim_count: 0, victim_boxes: [] }]) {
+      const report = buildForensicReport({ assessment, storage: null, random: () => 0.3 });
+      for (const finding of report) expect(sentences).toContain(finding.speech);
+    }
   });
 });
