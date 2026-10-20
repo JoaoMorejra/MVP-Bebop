@@ -842,6 +842,15 @@ def test_a_full_bench_run_crosses_every_milestone_in_flight_order(tmp_path):
             payloads[milestone.group(1)] = json.loads(milestone.group(2))
             sequence.append(milestone.group(1))
 
+    # The victim assessment is raised by a worker thread, so its position is
+    # bounded rather than fixed: after the capture, before touchdown.
+    assert sequence.count("mission.inspection_ready") == 1, sequence
+    inspection_at = sequence.index("mission.inspection_ready")
+    assert sequence.index("mission.capture_done") < inspection_at < sequence.index("mission.touchdown")
+    sequence.remove("mission.inspection_ready")
+    assert payloads["mission.inspection_ready"]["schema"] == "bmg.inspection.v1"
+    assert payloads["mission.inspection_ready"]["capture_stamp"] in payloads["mission.capture_done"]["raw_image"]
+
     assert sequence == [
         "mission.mode",
         "mission.parameters",

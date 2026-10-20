@@ -68,12 +68,20 @@ from mvp_mission_bebop.parameters import (
 from mvp_mission_bebop.perception.inference_device import (
     CUDA_WARMUP_SAMPLES,
     DetectorPreloader,
+    FallbackDetector,
     preload_plan,
     available_devices,
     build_device_detector,
     model_cache_key,
     normalize_inference_device,
     select_detector,
+)
+from mvp_mission_bebop.perception.inspection_worker import (
+    InspectionInferenceWorker,
+    MilestoneSink,
+    RosTopicSink,
+    SidecarSink,
+    assessment_topic,
 )
 from mvp_mission_bebop.perception.worker import PerceptionWorker, detector_kwargs, normalize_imgsz
 from mvp_mission_bebop.steps.pipeline import build_steps
@@ -1164,6 +1172,35 @@ def main() -> None:
     perception = PerceptionWorker(ctx, min_period_sec=params.vision.inference_min_period_sec)
     ctx.perception = perception
     perception.start()
+
+    # Victim inference on the Stage 4 frame, settled between the capture and
+    # touchdown. A second detector from the mission's own factory, starting at
+    # the device the selection chose: the Ultralytics predictor is not
+    # re-entrant and the mission detector stays exclusive to the flight.
+    inspection_chain = detector.chain[detector.chain.index(detector.device):]
+
+    def _build_inspection_detector() -> FallbackDetector:
+        return FallbackDetector(
+            inspection_chain,
+            lambda device: build_device_detector(
+                device, params.vision.model_path, params.vision.confidence_threshold, inference_backends
+            ),
+        )
+
+    inspection_sinks: List[Any] = [SidecarSink(ctx.update_evidence_metadata)]
+    try:
+        inspection_sinks.append(
+            RosTopicSink(telemetry_node, assessment_topic(params.network.namespace))
+        )
+    except Exception as exc:  # noqa: BLE001 - the topic is a convenience; sidecar and milestone remain
+        logger.warning("Inspection assessment topic unavailable: %s", exc)
+    inspection_sinks.append(MilestoneSink())
+    ctx.inspection_worker = InspectionInferenceWorker(
+        _build_inspection_detector,
+        inspection_sinks,
+        model=os.path.basename(params.vision.model_path),
+    )
+    ctx.inspection_worker.start()
 
     # Native photo acknowledgements (RecordPictureV2), JSON from the driver;
     # reliable, volatile, depth 10 on the driver side.
