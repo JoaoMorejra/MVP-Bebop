@@ -115,6 +115,7 @@ function renderCockpit(props: {
         onCameraTilt={vi.fn()}
         report={null}
         reportRevealed={0}
+        reportAnalyzing={false}
         reportClosing={null}
         onAbort={onAbort}
         onFinish={vi.fn()}

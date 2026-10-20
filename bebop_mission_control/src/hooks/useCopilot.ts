@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AnnouncePriority } from '../types/bmg';
-import type { Finding } from '../lib/forensics';
+import type { ForensicScript } from '../lib/forensics';
 import { allFindingSentences, findingGapMs } from '../lib/forensics';
 import {
   alertSentence,
   isMilestoneKey,
-  nextPhrase,
   allMissionPhrases,
   phraseForMilestone,
   takeLaunchPhrase,
@@ -327,20 +326,24 @@ export function useFlightNarration(
  * instead of dumping all four findings in a single frame, and a spoken one is
  * never padded beyond its own sentence.
  *
+ * The script carries its intro and outro, drawn with the findings when the
+ * victim assessment arrived, so all six lines were synthesized ahead and the
+ * victim line is never read before there is a result or the wait has run out.
+ *
  * Returns how many cards have been revealed, which is what the panel renders,
  * and the closing line as spoken, so the screen shows the same sentence.
  */
 export function useForensicNarration(
   queue: NarrationQueue,
   active: boolean,
-  report: Finding[] | null
+  script: ForensicScript | null
 ): { revealed: number; closing: string | null } {
   const [revealed, setRevealed] = useState(0);
   const [closing, setClosing] = useState<string | null>(null);
   const runRef = useRef(0);
 
   useEffect(() => {
-    if (!active || !report || report.length === 0) {
+    if (!active || !script || script.findings.length === 0) {
       setRevealed(0);
       setClosing(null);
       return;
@@ -353,14 +356,14 @@ export function useForensicNarration(
     const live = () => runRef.current === token;
 
     setRevealed(0);
-    const outro = nextPhrase('inspection.outro');
+    const { intro, findings, outro } = script;
     setClosing(outro);
 
-    queue.enqueue('inspection.intro', () => nextPhrase('inspection.intro'), {
+    queue.enqueue('inspection.intro', () => intro, {
       group: REPORT_GROUP,
       fallbackMs: findingGapMs(),
     });
-    report.forEach((finding, index) => {
+    findings.forEach((finding, index) => {
       queue.enqueue(`inspection.point_${index + 1}`, () => finding.speech, {
         group: REPORT_GROUP,
         fallbackMs: findingGapMs(),
@@ -375,7 +378,7 @@ export function useForensicNarration(
       runRef.current = token + 1;
       queue.resetGroup(REPORT_GROUP);
     };
-  }, [active, report, queue]);
+  }, [active, script, queue]);
 
   return { revealed, closing };
 }

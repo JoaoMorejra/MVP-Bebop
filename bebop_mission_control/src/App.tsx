@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Screen } from './types/mission';
-import type { Finding } from './lib/forensics';
 import type { BatteryFailsafe } from './types/bmg';
 import {
   RTL_ACK_TIMEOUT_MS,
@@ -31,7 +30,8 @@ import {
   useNarrationQueue,
 } from './hooks/useCopilot';
 import { useVoiceLevel } from './hooks/useVoiceLevel';
-import { buildForensicReport } from './lib/forensics';
+import { useInspectionAssessment } from './hooks/useInspectionAssessment';
+import { useForensicReport } from './hooks/useForensicReport';
 import { LAUNCH_KEYS, reserveLaunchPhrase } from './lib/copilotPhrases';
 import { deepEqual, getPath } from './lib/paths';
 import { readMissionMode, type MissionMode } from './lib/missionMode';
@@ -124,7 +124,6 @@ export const App: React.FC = () => {
   const [launchedMode, setLaunchedMode] = useState<MissionMode | null>(null);
   const [benchStage, setBenchStage] = useState<number | null>(null);
   const [pendingStage, setPendingStage] = useState<number | null>(null);
-  const [report, setReport] = useState<Finding[] | null>(null);
   const [reportDismissed, setReportDismissed] = useState(false);
   const [failsafe, setFailsafe] = useState<BatteryFailsafe>(loadFailsafe);
   const [failsafeTriggered, setFailsafeTriggered] = useState(false);
@@ -170,12 +169,8 @@ export const App: React.FC = () => {
 
   useFlightNarration(narration, true, mission.startedAt);
 
-  // The report is drawn when the capture lands, not when it is read out: the
-  // wording and the order are settled before the aircraft is back on the ground.
   useEffect(() => {
-    if (!mission.latestCapture) return;
-    setReport(buildForensicReport());
-    setReportDismissed(false);
+    if (mission.latestCapture) setReportDismissed(false);
   }, [mission.latestCapture]);
 
 
@@ -278,7 +273,6 @@ export const App: React.FC = () => {
 
       resetTrack();
       setLaunchError(null);
-      setReport(null);
       setReportDismissed(false);
       failsafeFiredRef.current = false;
       setFailsafeTriggered(false);
@@ -562,7 +556,6 @@ export const App: React.FC = () => {
     camera.reset();
     setBenchStage(null);
     setPendingStage(null);
-    setReport(null);
     setReportDismissed(false);
     setLaunchError(null);
     setLaunchedMode(null);
@@ -588,11 +581,25 @@ export const App: React.FC = () => {
     finishing,
   });
 
+  // The report is drawn when the victim assessment of the capture arrives,
+  // normally during the return leg, so the wording and the order are settled
+  // before the aircraft is back on the ground. The capture leaving (a new
+  // launch, the end of the cycle) drops it.
+  const grounded = reportMayStart(finishLock);
+  const inspection = useInspectionAssessment(mission.latestCapture);
+  const forensic = useForensicReport({
+    capture: mission.latestCapture,
+    assessment: inspection,
+    grounded,
+    prepare: prepareSpeech,
+  });
+  const report = forensic.script?.findings ?? null;
+
   // The report opens with "Aeronave em solo": it waits for confirmed ground.
   const { revealed: reportRevealed, closing: reportClosing } = useForensicNarration(
     narration,
-    reportMayStart(finishLock) && !reportDismissed && Boolean(mission.latestCapture),
-    report
+    grounded && !reportDismissed && Boolean(mission.latestCapture),
+    forensic.script
   );
 
   // The host tearing a mission down out from under the interface clears the
@@ -644,6 +651,7 @@ export const App: React.FC = () => {
           cameraAvailable={camera.available}
           onCameraTilt={camera.set}
           report={landed || over ? report : null}
+          reportAnalyzing={(landed || over) && forensic.analyzing}
           reportRevealed={reportRevealed}
           reportClosing={reportClosing}
           onAbort={() => void land()}
@@ -713,6 +721,7 @@ export const App: React.FC = () => {
     abort,
     finishMission,
     report,
+    forensic.analyzing,
     landed,
     reportRevealed,
     reportClosing,

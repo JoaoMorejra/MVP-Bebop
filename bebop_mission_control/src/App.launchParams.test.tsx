@@ -119,6 +119,7 @@ vi.mock('./hooks/useCopilot', () => ({
   useNarrationQueue: () => hoisted.stable.narration,
 }));
 vi.mock('./hooks/useVoiceLevel', () => ({ useVoiceLevel: () => hoisted.stable.voice }));
+vi.mock('./hooks/useInspectionAssessment', () => ({ useInspectionAssessment: () => null }));
 vi.mock('./hooks/useMissionCountdown', () => ({
   useMissionCountdown: () => ({ remaining: null, clearance: false }),
 }));
