@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from nectar.ai.detection import Detector
 
     from mvp_mission_bebop.controllers.yaw_pattern import YawServoingController
+    from mvp_mission_bebop.perception.inspection_worker import InspectionInferenceWorker
 
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.blackboard import EvidenceRecord, MissionBlackboard
@@ -50,6 +51,11 @@ logger = logging.getLogger("MissionContext")
 
 class MissionContext:
     """Container for drone interfaces, perception pipelines, supervisors, and state."""
+
+    #: Serializes sidecar merges. The hover loop (native photo ACK) and the
+    #: inspection worker (victim assessment) both read-modify-write the same
+    #: ``accident_metadata_<ts>.json`` through one temporary name.
+    _metadata_lock: threading.Lock = threading.Lock()
 
     def __init__(
         self,
@@ -154,6 +160,10 @@ class MissionContext:
         #: for the one-off calls that need exclusive use of it: the countdown
         #: warmup and the Stage 4 evidence capture.
         self.perception: PerceptionPipeline = SynchronousPerception(self)
+        #: Background victim inference on the Stage 4 inspection frame, with
+        #: its own detector. Started by ``mission.py``; ``None`` in unit
+        #: doubles, where the capture then submits nothing.
+        self.inspection_worker: Optional["InspectionInferenceWorker"] = None
 
     # -------------------------------------------------------------- estimation
 
@@ -482,22 +492,25 @@ class MissionContext:
         """Merge ``fields`` into an evidence sidecar, atomically.
 
         Used for what arrives after the capture: the aircraft's acknowledgement
-        of the native photo (``steps/inspection.py:_resolve_native_ack``).
+        of the native photo (``steps/inspection.py:_resolve_native_ack``) and
+        the victim assessment (``perception/inspection_worker.py``), from two
+        threads; merges are serialized.
 
         Raises
         ------
         OSError, ValueError
             When the sidecar cannot be read or written.
         """
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        payload.update(fields)
-        directory = os.path.dirname(path) or "."
-        base, extension = os.path.splitext(os.path.basename(path))
-        temporary = os.path.join(directory, f".{base}.tmp{extension}")
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, ensure_ascii=False)
-        os.replace(temporary, path)
+        with MissionContext._metadata_lock:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            payload.update(fields)
+            directory = os.path.dirname(path) or "."
+            base, extension = os.path.splitext(os.path.basename(path))
+            temporary = os.path.join(directory, f".{base}.tmp{extension}")
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+            os.replace(temporary, path)
 
     def _write_atomic(self, path: str, image: np.ndarray, params: List[int]) -> Optional[str]:
         """Encode to a temporary file in the same directory, then rename.
