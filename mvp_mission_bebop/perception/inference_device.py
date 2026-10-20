@@ -629,6 +629,20 @@ class _PinnedPredict:
         yolo.predict = pinned
         return loaded
 
+    def detect(self, image: Any, **kwargs: Any) -> Any:
+        imgsz = kwargs.pop("imgsz", None)
+        if imgsz is not None:
+            self._overrides["imgsz"] = imgsz
+        try:
+            return self._detector.detect(image, **kwargs)
+        except TypeError:
+            valid = {}
+            if "conf" in kwargs:
+                valid["conf"] = kwargs["conf"]
+            if "iou" in kwargs:
+                valid["iou"] = kwargs["iou"]
+            return self._detector.detect(image, **valid)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self.__dict__["_detector"], name)
 
