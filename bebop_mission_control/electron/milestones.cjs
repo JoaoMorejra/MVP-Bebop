@@ -11,6 +11,12 @@
  *   first line: `mission.start` when the operator's launch has spawned the
  *   mission, and `mission.countdown_3` three seconds before the countdown
  *   `mission.py --countdown` is running ends.
+ *
+ * Every key matching `MILESTONE_LINE` is forwarded; narration is decided in the
+ * renderer. `mission.flat_trim` and `mission.inspection_ready` (the victim
+ * assessment of the Stage 4 frame, `bmg.inspection.v1`, raised asynchronously
+ * between `mission.capture_done` and `mission.touchdown`) are forwarded and
+ * never narrated.
  */
 
 /** A milestone line on the mission's stdout. IPC contract with `milestones.py`. */

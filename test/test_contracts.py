@@ -653,6 +653,7 @@ SPEC_MILESTONE_KEYS = (
     "mission.mode",
     "mission.parameters",
     "mission.flat_trim",
+    "mission.inspection_ready",
 )
 
 

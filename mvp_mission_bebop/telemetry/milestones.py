@@ -80,6 +80,12 @@ MILESTONE_KEYS: Final[Tuple[str, ...]] = (
     #: Outcome of the Stage 1 flat trim, ``{"acknowledged": bool}``: the
     #: countdown overlay's IMU item follows it. Not narrated.
     "mission.flat_trim",
+    #: Victim assessment of the Stage 4 inspection frame, ``bmg.inspection.v1``
+    #: (``perception/assessment.py``). Raised asynchronously by the inspection
+    #: worker, after ``mission.capture_done`` and normally before
+    #: ``mission.touchdown``; the station draws the forensic report from it.
+    #: Not narrated.
+    "mission.inspection_ready",
 )
 
 
