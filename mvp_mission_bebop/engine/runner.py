@@ -40,6 +40,13 @@ _SPOKEN_STAGE_NAMES: Final[Dict[int, str]] = {
 #: would be recorded without its boxes.
 _DETECTION_REVEAL_STAGE: Final[int] = 3
 
+#: Longest wait for the victim assessment after a landed mission, in seconds.
+#: It normally settled during the return; this covers a slow device only.
+_INSPECTION_DRAIN_SEC: Final[float] = 1.0
+
+#: Longest wait for the inspection worker thread to exit, in seconds.
+_INSPECTION_STOP_SEC: Final[float] = 0.5
+
 
 class MissionRunner:
     """Executes mission steps in order and finalizes resources exactly once."""
@@ -248,6 +255,8 @@ class MissionRunner:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Landing command during cleanup failed: %s", exc)
 
+        self._stop_inspection_worker()
+
         for label, action in (
             ("ImageHandler", self.ctx.handler.cleanup),
             ("drone", self.ctx.drone.cleanup),
@@ -269,6 +278,27 @@ class MissionRunner:
             logger.warning("Nectar runtime shutdown exception: %s", exc)
 
         logger.info("Mission resource cleanup finalized.")
+
+    def _stop_inspection_worker(self) -> None:
+        """Settle the victim assessment and stop its thread, bounded.
+
+        Runs after the landing command, so it never delays one. Only a mission
+        that landed on its own waits for a pending assessment; an abort or a
+        failsafe stops at once, and whatever is pending is settled as
+        ``unavailable`` (``timeout``).
+        """
+        worker = getattr(self.ctx, "inspection_worker", None)
+        if worker is None:
+            return
+        try:
+            if self.ctx.blackboard.rtl_completed and not self._emergency.triggered:
+                if not worker.drain(_INSPECTION_DRAIN_SEC):
+                    logger.warning("Victim assessment still pending after %.1f s.", _INSPECTION_DRAIN_SEC)
+                worker.stop(_INSPECTION_STOP_SEC)
+            else:
+                worker.stop(0.0)
+        except Exception as exc:  # noqa: BLE001 - never blocks the teardown
+            logger.warning("Inspection worker shutdown exception: %s", exc)
 
     @staticmethod
     def _alerts_raised() -> int:
