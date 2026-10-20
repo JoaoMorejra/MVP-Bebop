@@ -197,6 +197,120 @@ export interface RawEvidence {
   timestamp: number;
 }
 
+/** `YYYYMMDD_HHMMSS` of an evidence filename (`accident_raw_<ts>.png`), or null. */
+export function captureStampOf(filename: string): string | null {
+  const match = /^accident_(?:raw|inspected|metadata)_(\d{8}_\d{6})\.(?:png|jpg|json)$/.exec(filename);
+  return match ? match[1] : null;
+}
+
+/** Wire schema of the victim assessment (`mvp_mission_bebop/perception/assessment.py`). */
+export const INSPECTION_SCHEMA = 'bmg.inspection.v1';
+
+/** Whether the inference on the inspection frame completed. */
+export type InspectionStatus = 'complete' | 'unavailable';
+
+/** What the report may state about the victim. */
+export type VictimStatus = 'detected' | 'not_detected' | 'unknown';
+
+/**
+ * Victim assessment of the Stage 4 frame, payload of `mission.inspection_ready`.
+ *
+ * Mirrors `InspectionAssessment.to_payload()`. `victim_detected` is carried
+ * but never read on its own: {@link victimStatusOf} derives the status from
+ * `status` first, so an `unavailable` assessment is always `unknown`.
+ */
+export interface InspectionAssessment {
+  schema: typeof INSPECTION_SCHEMA;
+  capture_stamp: string;
+  status: InspectionStatus;
+  reason: string | null;
+  victim_detected: boolean;
+  victim_count: number;
+  victim_confidence: number | null;
+  /** `[x1, y1, x2, y2]` pixels, highest confidence first, at most eight. */
+  victim_boxes: [number, number, number, number][];
+  /** `[width, height]` of the inferred frame, pixels. */
+  frame: [number, number];
+  inference_ms: number;
+  model: string;
+  imgsz: number | null;
+  conf: number;
+  completed_at_utc: string;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+const isCount = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 0;
+
+/**
+ * Validate a `mission.inspection_ready` payload.
+ *
+ * Returns null for an unknown schema or any malformed field: a payload this
+ * build cannot vouch for is treated as no assessment at all, never as one.
+ */
+export function parseInspectionAssessment(payload: unknown): InspectionAssessment | null {
+  if (!isRecord(payload) || payload.schema !== INSPECTION_SCHEMA) return null;
+  const {
+    capture_stamp,
+    status,
+    reason,
+    victim_detected,
+    victim_count,
+    victim_confidence,
+    victim_boxes,
+    frame,
+    inference_ms,
+    model,
+    imgsz,
+    conf,
+    completed_at_utc,
+  } = payload;
+  if (typeof capture_stamp !== 'string' || !capture_stamp.trim()) return null;
+  if (status !== 'complete' && status !== 'unavailable') return null;
+  if (reason !== null && typeof reason !== 'string') return null;
+  if (status === 'unavailable' && reason === null) return null;
+  if (typeof victim_detected !== 'boolean' || !isCount(victim_count)) return null;
+  if (victim_confidence !== null && !(isFiniteNumber(victim_confidence) && victim_confidence >= 0 && victim_confidence <= 1)) {
+    return null;
+  }
+  if (!Array.isArray(victim_boxes) || victim_boxes.length > 8) return null;
+  const boxes: [number, number, number, number][] = [];
+  for (const box of victim_boxes) {
+    if (!Array.isArray(box) || box.length !== 4 || !box.every(isCount)) return null;
+    boxes.push([box[0], box[1], box[2], box[3]]);
+  }
+  if (victim_count < boxes.length) return null;
+  if (!Array.isArray(frame) || frame.length !== 2 || !frame.every((side) => isCount(side) && side > 0)) return null;
+  if (!isFiniteNumber(inference_ms) || inference_ms < 0) return null;
+  if (typeof model !== 'string') return null;
+  if (imgsz !== null && !(isCount(imgsz) && imgsz > 0)) return null;
+  if (!isFiniteNumber(conf) || conf < 0 || conf > 1) return null;
+  if (typeof completed_at_utc !== 'string' || !completed_at_utc) return null;
+  return {
+    schema: INSPECTION_SCHEMA,
+    capture_stamp,
+    status,
+    reason,
+    victim_detected,
+    victim_count,
+    victim_confidence,
+    victim_boxes: boxes,
+    frame: [frame[0] as number, frame[1] as number],
+    inference_ms,
+    model,
+    imgsz,
+    conf,
+    completed_at_utc,
+  };
+}
+
+/** What the report may state: `unknown` without an assessment or when the inference is unavailable. */
+export function victimStatusOf(assessment: InspectionAssessment | null): VictimStatus {
+  if (!assessment || assessment.status !== 'complete') return 'unknown';
+  return assessment.victim_count > 0 ? 'detected' : 'not_detected';
+}
+
 export interface MissionStepEvent {
   stepNumber: number;
   stepName: string;
