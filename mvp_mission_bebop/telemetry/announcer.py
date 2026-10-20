@@ -22,6 +22,17 @@ import threading
 import time
 from typing import Any, Awaitable, Callable, Dict, Final, List, Optional, Tuple
 
+from mvp_mission_bebop.telemetry.inspection_report import (
+    FORENSIC_CLOSERS,
+    FORENSIC_FINDINGS,
+    FORENSIC_LINKERS,
+    FORENSIC_OPENERS,
+    HISTORY_FILENAME,
+    _decapitalise,
+    build_inspection_report,
+    victim_status_of,
+)
+
 #: ``google.genai`` and its ``types``, loaded by :func:`_load_genai` on the
 #: first synthesis. Importing them costs ~1.8 s, and a mission under a ground
 #: station session never synthesizes (``station_narrates``), so the import is
@@ -1402,116 +1413,41 @@ def speak(
 # Forensic report
 #
 # Four findings, one per topic the operator is required to clear before a claim
-# can be closed remotely. Each exists in several wordings and the order is drawn
-# fresh per flight, so two consecutive missions never produce the same-looking
-# report -- a demonstration that reads as a live assessment rather than a canned
-# slide. The ground station holds the same table in
-# `src/lib/forensics.ts` and is the one that decides the order for a given
-# flight; this copy is what the mission side uses when it narrates on its own.
+# can be closed remotely. The tables, the order rules and the cross-flight memory
+# live in `telemetry/inspection_report.py`; the victim line follows the victim
+# assessment of the inspection frame. The ground station holds the same tables in
+# `src/lib/forensics.ts` and is the one that decides the report for a given
+# flight; this side is what the mission uses when it narrates on its own.
 # -----------------------------------------------------------------------------
-
-FORENSIC_FINDINGS: Dict[str, List[str]] = {
-    "police": [
-        "Sem necessidade de polícia",
-        "Acionamento policial dispensado",
-        "Sem demanda para autoridade policial",
-        "Segurança pública não requisitada",
-    ],
-    "samu": [
-        "Sem necessidade de Samu",
-        "Socorro médico dispensado",
-        "Atendimento emergencial não necessário",
-        "SAMU dispensado para a ocorrência",
-    ],
-    "victim": [
-        "Estado do acidentado não é grave",
-        "Vítima consciente e sem gravidade",
-        "Acidentado sem ferimentos críticos",
-        "Condição da vítima considerada leve",
-    ],
-    "vehicle": [
-        "Veículo não danificado",
-        "Sem danos estruturais aparentes no veículo",
-        "Integridade do automóvel preservada",
-        "Veículo sem avarias mecânicas",
-    ],
-}
-
-#: What leads each finding when read, so the report is talked through rather
-#: than listed. Same pools as ``src/lib/forensics.ts``; every finding is a
-#: clearance, so the connectors add and never contrast.
-FORENSIC_OPENERS: Final[tuple] = (
-    "Para começar,",
-    "De início,",
-    "Logo de cara,",
-    "Começando pelo essencial,",
-    "De saída,",
-    "Abrindo a análise,",
-)
-FORENSIC_LINKERS: Final[tuple] = (
-    "Além disso,",
-    "Na sequência,",
-    "Somado a isso,",
-    "Em seguida,",
-    "Outro ponto:",
-    "Também observamos:",
-    "E mais:",
-)
-FORENSIC_CLOSERS: Final[tuple] = (
-    "Por fim,",
-    "Para fechar,",
-    "Para arrematar,",
-    "E, para concluir,",
-    "Encerrando,",
-    "Por último,",
-)
-
-
-def _decapitalise(line: str) -> str:
-    """Lower the first letter so a line reads on after an ordinal.
-
-    An acronym is left alone: "SAMU dispensado" must not become "sAMU".
-    """
-    if len(line) > 1 and line[1].isupper():
-        return line
-    return line[0].lower() + line[1:]
 
 FORENSIC_INTRO = "Inspeção do sinistro concluída. Apresentando laudo preliminar."
 FORENSIC_OUTRO = "Relatório pericial emitido e pronto para exportação."
 
 
-def build_forensic_report(seed: Optional[int] = None) -> List[Dict[str, str]]:
-    """Draw one report: a wording per topic, in a shuffled order.
+def build_forensic_report(
+    seed: Optional[int] = None,
+    assessment: Optional[Any] = None,
+    history_path: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Draw one report: a wording per topic, in the order rules of the engine.
 
     Returns one dict per finding with ``topic``, ``card`` (the line the station
     displays) and ``speech`` (the same line as the copilot reads it, led by an
-    opener, a linker or a closer; the two linkers of a report differ).
+    opener, a linker or a closer; the two linkers of a report differ). Without
+    ``assessment`` the victim line is the neutral one (``unknown``); without
+    ``history_path`` the report is drawn without cross-flight memory.
     """
-    rng = random.Random(seed)
-    topics = list(FORENSIC_FINDINGS)
-    rng.shuffle(topics)
-    linkers = rng.sample(FORENSIC_LINKERS, max(0, len(topics) - 2))
-    report: List[Dict[str, str]] = []
-    for index, topic in enumerate(topics):
-        card = rng.choice(FORENSIC_FINDINGS[topic])
-        if index == 0:
-            connector = rng.choice(FORENSIC_OPENERS)
-        elif index == len(topics) - 1:
-            connector = rng.choice(FORENSIC_CLOSERS)
-        else:
-            connector = linkers[index - 1]
-        report.append(
-            {
-                "topic": topic,
-                "card": card,
-                "speech": f"{connector} {_decapitalise(card)}.",
-            }
-        )
-    return report
+    return build_inspection_report(
+        victim_status_of(assessment),
+        history_path=history_path,
+        rng=random.Random(seed),
+    )
 
 
 def announce_forensic_report(
     report: Optional[List[Dict[str, str]]] = None,
+    assessment: Optional[Any] = None,
+    history_path: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """Read a whole report aloud, one finding at a time.
 
@@ -1521,7 +1457,11 @@ def announce_forensic_report(
     on the sentence that describes it -- but the mission process can narrate a
     report with one call.
     """
-    findings = report if report is not None else build_forensic_report()
+    findings = (
+        report
+        if report is not None
+        else build_forensic_report(assessment=assessment, history_path=history_path)
+    )
     lines = [FORENSIC_INTRO, *(finding["speech"] for finding in findings), FORENSIC_OUTRO]
     # No pause between lines: the next two are synthesized while one plays, as
     # the station does, so the report runs on without dead air.
@@ -1736,7 +1676,7 @@ if __name__ == "__main__":
         sys.exit(serve_stdin())
 
     if args.forensic_report:
-        findings = announce_forensic_report()
+        findings = announce_forensic_report(history_path=os.path.join(".", HISTORY_FILENAME))
         print(json.dumps(findings, ensure_ascii=False))
         get_announcer().close()
         sys.exit(0)
