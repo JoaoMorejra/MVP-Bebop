@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Camera, ShieldCheck, Square } from 'lucide-react';
+import { Camera, ScanSearch, ShieldCheck, Square } from 'lucide-react';
 import type { RawEvidence } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
 import { TOPIC_LABEL } from '../../lib/forensics';
@@ -19,6 +19,11 @@ interface ForensicPanelProps {
   report: Finding[] | null;
   /** How many of them the copilot has read so far. */
   reportRevealed: number;
+  /**
+   * The aircraft is down and the report waits for the victim assessment of the
+   * capture: the victim card holds a visual placeholder and nothing is read.
+   */
+  reportAnalyzing?: boolean;
   /** The closing line as the copilot said it, so screen and voice agree. */
   reportClosing?: string | null;
   onFinish: () => void;
@@ -119,6 +124,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   landed,
   report,
   reportRevealed,
+  reportAnalyzing = false,
   reportClosing,
   onFinish,
   lock,
@@ -166,6 +172,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
 
   const inspecting = stage === 4;
   const presenting = (landed || missionOver) && Boolean(latest) && Boolean(report);
+  const analyzing = (landed || missionOver) && Boolean(latest) && !report && reportAnalyzing;
 
   return (
     <section className="flex min-h-0 flex-col gap-2.5">
@@ -179,12 +186,14 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
               )}
             />
             <h2 className="font-cond text-sm tracking-wide text-frost">
-              {presenting ? 'Laudo preliminar de inspeção' : 'Painel forense de evidências'}
+              {presenting || analyzing ? 'Laudo preliminar de inspeção' : 'Painel forense de evidências'}
             </h2>
           </span>
           <span className="font-cond text-3xs tracking-wide text-haze-deep">
             {presenting && report
               ? `${reportRevealed}/${report.length} constatações`
+              : analyzing
+              ? 'analisando imagem'
               : latest
               ? `${count} ${count === 1 ? 'captura nesta missão' : 'capturas nesta missão'}`
               : 'aguardando câmera na posição vertical'}
@@ -198,7 +207,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
                 'relative block w-full shrink-0 overflow-hidden rounded-bezel border border-strut',
                 'transition-all duration-[900ms] ease-settle',
                 // On touchdown the frame yields the column to the findings.
-                presenting ? 'h-[38%]' : 'h-full',
+                presenting || analyzing ? 'h-[38%]' : 'h-full',
                 arrived && 'anim-land'
               )}
             >
@@ -270,6 +279,25 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
                   {reportClosing ?? PHRASE_POOLS['inspection.outro'][0]}
                 </li>
               ) : null}
+            </ul>
+          ) : analyzing ? (
+            <ul aria-live="polite" aria-busy="true" className="min-h-0 flex-1 pr-0.5">
+              <li
+                data-finding-state="analyzing"
+                className="mb-2 flex items-start gap-3 rounded-bezel border border-strut-soft bg-abyss/30 px-3.5 py-3"
+              >
+                <span className="mt-[1px] flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-strut">
+                  <ScanSearch size={11} strokeWidth={2.5} className="text-mint/70 anim-breathe" aria-hidden />
+                </span>
+                <span className="min-w-0">
+                  <span className="font-cond text-2xs uppercase tracking-[0.12em] text-mint/60">
+                    {TOPIC_LABEL.victim}
+                  </span>
+                  <span className="mt-0.5 block text-[15px] font-medium leading-snug text-haze anim-breathe">
+                    Analisando imagem
+                  </span>
+                </span>
+              </li>
             </ul>
           ) : null}
         </div>

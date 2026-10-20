@@ -152,3 +152,64 @@ describe('rotorsTurning', () => {
     expect(rotorsTurning(undefined)).toBe(false);
   });
 });
+
+describe('the report waiting for the victim assessment', () => {
+  const LATEST = { filename: 'accident_raw_20261020_101500.png', url: 'file:///x.png', timestamp: 1 };
+
+  function renderReport(props: { report: { topic: 'victim'; card: string; speech: string }[] | null; analyzing: boolean }) {
+    act(() =>
+      root.render(
+        <ForensicPanel
+          latest={LATEST}
+          count={1}
+          stage={5}
+          missionOver
+          landed
+          report={props.report}
+          reportRevealed={0}
+          reportAnalyzing={props.analyzing}
+          onFinish={vi.fn()}
+          lock={GROUNDED}
+        />
+      )
+    );
+  }
+
+  it('holds a placeholder victim card with no finding text while analyzing', () => {
+    renderReport({ report: null, analyzing: true });
+    const card = container.querySelector('[data-finding-state="analyzing"]');
+    expect(card?.textContent).toContain('Analisando imagem');
+    expect(card?.textContent).toContain('Estado do acidentado');
+    expect(container.querySelector('ul')?.getAttribute('aria-busy')).toBe('true');
+    expect(container.textContent).toContain('analisando imagem');
+  });
+
+  it('replaces the placeholder with the drawn findings', () => {
+    renderReport({
+      report: [{ topic: 'victim', card: 'Cena sem vítimas aparentes', speech: 'Por fim, cena sem vítimas aparentes.' }],
+      analyzing: false,
+    });
+    expect(container.querySelector('[data-finding-state="analyzing"]')).toBeNull();
+    expect(container.textContent).toContain('Cena sem vítimas aparentes');
+  });
+
+  it('shows no placeholder before the aircraft is down', () => {
+    act(() =>
+      root.render(
+        <ForensicPanel
+          latest={LATEST}
+          count={1}
+          stage={5}
+          missionOver={false}
+          landed={false}
+          report={null}
+          reportRevealed={0}
+          reportAnalyzing
+          onFinish={vi.fn()}
+          lock={LOCKED}
+        />
+      )
+    );
+    expect(container.querySelector('[data-finding-state="analyzing"]')).toBeNull();
+  });
+});
