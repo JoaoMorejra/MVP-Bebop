@@ -47,19 +47,21 @@ function render(overrides: Partial<Props>): void {
     onConnect: noop,
     onStartDriver: noop,
     onStopDriver: noop,
-    params: { no_fly: true, mission_mode: 'intermediate' },
+    params: { no_fly: true, mission_mode: 'simple' },
     paramDefaults: null,
     paramsStatus: 'ready',
     paramsError: null,
     changedPaths: new Set<string>(),
     dirty: false,
-    hasPreset: false,
-    presetActive: false,
+    presets: [],
+    activePresetId: null,
     onEdit: noop,
     onModeChange: noop,
     onSave: noop,
     onDiscard: noop,
-    onSavePreset: noop,
+    onSavePreset: () => null,
+    onRenamePreset: () => null,
+    onDeletePreset: noop,
     onApplyPreset: noop,
     failsafe: { enabled: true, thresholdPct: 20 },
     onFailsafeChange: noop,
@@ -84,19 +86,19 @@ describe('PreflightScreen mission mode selector', () => {
     const group = host.querySelector('[role="radiogroup"]')!;
     expect(group).not.toBeNull();
     expect(group.compareDocumentPosition(dial()) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(radios().map((r) => r.getAttribute('aria-checked'))).toEqual(['false', 'true', 'false']);
+    expect(radios().map((r) => r.getAttribute('aria-checked'))).toEqual(['true', 'false']);
   });
 
   it('reads a document without a mode as the full mission', () => {
     render({ params: { no_fly: true } });
-    expect(radios()[2].getAttribute('aria-checked')).toBe('true');
+    expect(radios()[1].getAttribute('aria-checked')).toBe('true');
   });
 
   it('hands the picked mode to onModeChange', () => {
     const onModeChange = vi.fn();
     render({ onModeChange });
-    act(() => radios()[0].click());
-    expect(onModeChange).toHaveBeenCalledWith('simple');
+    act(() => radios()[1].click());
+    expect(onModeChange).toHaveBeenCalledWith('advanced');
   });
 
   it('locks the selector while modeLocked holds', () => {

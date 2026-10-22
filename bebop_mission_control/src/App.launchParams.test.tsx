@@ -71,6 +71,7 @@ const hoisted = vi.hoisted(() => {
       state: 'idle',
       stage: 0,
       ran: false,
+      refusal: null as { field: string; reason: string } | null,
       launch,
       abort: async () => undefined,
       reset: () => undefined,
@@ -87,7 +88,7 @@ const hoisted = vi.hoisted(() => {
     stream: { fps: 0 },
     camera: { tilt: -20, available: false, set: () => undefined, reset: () => undefined },
     copilot: { say: async () => undefined, cancel: () => undefined, prepare: () => undefined },
-    narration: {},
+    narration: { enqueue: vi.fn(), preempt: vi.fn() },
     forensic: { revealed: false, closing: false },
     voice: { level: 1, setVolume: () => undefined, toggleMute: () => undefined },
   };
@@ -164,6 +165,7 @@ beforeEach(() => {
   hoisted.stable.params.dirty = false;
   hoisted.stable.params.save = vi.fn(async (): Promise<boolean> => true);
   hoisted.stable.mission.state = 'idle';
+  hoisted.stable.mission.refusal = null;
   hoisted.stable.mission.beginBenchStage = () => undefined;
   hoisted.stable.mission.refuseBenchStage = () => undefined;
   for (const key of Object.keys(hoisted.props)) delete hoisted.props[key];
@@ -254,6 +256,49 @@ describe('a bench routine and its countdown', () => {
   });
 });
 
+describe('the flight plan at the click', () => {
+  it('speaks the plan of the document sent, without the return', async () => {
+    hoisted.stable.params.working = { ...hoisted.doc, rtl: { ...hoisted.doc.rtl, enabled: false } };
+    const enqueue = hoisted.stable.narration.enqueue as ReturnType<typeof vi.fn>;
+    enqueue.mockClear();
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    const call0 = enqueue.mock.calls.find(([label]) => label === 'plan');
+    expect(call0).toBeDefined();
+    const line = (call0![1] as () => string)();
+    expect(line).toMatch(/^Plano de voo: /);
+    expect(line).not.toMatch(/retorno|base|marcador/i);
+  });
+});
+
+describe('a launch document the mission refuses (exit 78)', () => {
+  it('cancels the countdown, stays on pre-flight and shows the reason and the field', async () => {
+    hoisted.stable.params.working = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, countdown_sec: 10 } };
+    await mount();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    expect(hoisted.props.countdown?.seconds).toBe(10);
+
+    delete hoisted.props.countdown;
+    delete hoisted.props.cockpit;
+    hoisted.stable.mission.refusal = {
+      field: 'kinematics.target_altitude_m',
+      reason: '0.50 m abaixo do mínimo de 1.30 m sobre o totem de 1.00 m',
+    };
+    await mount();
+    delete hoisted.props.countdown;
+    await mount();
+
+    expect(hoisted.props.countdown).toBeUndefined();
+    expect(hoisted.props.cockpit).toBeUndefined();
+    expect(String(hoisted.props.preflight?.launchError)).toContain('Lançamento recusado: 0.50 m abaixo do mínimo');
+    expect(hoisted.props.preflight?.refusedPath).toBe('kinematics.target_altitude_m');
+  });
+});
+
 describe('launchParamsJson', () => {
   it('writes the threshold under battery.land_pct and keeps every other field', () => {
     const doc = { rtl: { timeout_sec: 60 }, battery: { other: 1 } };
@@ -319,7 +364,11 @@ describe('the parameter document as the only source of a launch', () => {
   });
 
   it('blocks an inexecutable combination before saving it, naming the conflicts', async () => {
-    const doc = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, target_altitude_m: 0.1, altitude_ceiling_margin_m: 0 } };
+    const doc = {
+      ...hoisted.doc,
+      platform: { height_m: 1, venue_ceiling_agl_m: 1.9 },
+      kinematics: { ...hoisted.doc.kinematics, target_altitude_m: 1.85, altitude_ceiling_margin_m: 0 },
+    };
     hoisted.stable.params.working = doc;
     hoisted.stable.params.dirty = true;
     await mount();
@@ -329,7 +378,7 @@ describe('the parameter document as the only source of a launch', () => {
     expect(hoisted.launch).not.toHaveBeenCalled();
     expect(hoisted.stable.params.save).not.toHaveBeenCalled();
     const message = String(hoisted.props.preflight.launchError);
-    expect(message).toContain('Teto abaixo da altura de decolagem do firmware');
+    expect(message).toContain('Cota colada no teto do local');
     // E04 reads kinematics.climb_deadband_m, which this document does not hold: skipped, not invented.
     expect(message).not.toContain('Margem do teto menor que a banda de chegada');
   });
@@ -394,7 +443,7 @@ describe('the parameter document as the only source of a launch', () => {
     await act(async () => {
       await call('preflight', 'onLaunch');
     });
-    const edited = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, target_altitude_m: 2.4 } };
+    const edited = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, target_altitude_m: 1.9 } };
     hoisted.stable.params.working = edited;
     hoisted.stable.params.committed = edited;
     await mount();
@@ -403,7 +452,7 @@ describe('the parameter document as the only source of a launch', () => {
     });
     expect(hoisted.launch).toHaveBeenCalledTimes(2);
     expect(sent(hoisted.launch.mock.calls[0][0]).kinematics.target_altitude_m).toBe(1.6);
-    expect(sent(hoisted.launch.mock.calls[1][0]).kinematics.target_altitude_m).toBe(2.4);
+    expect(sent(hoisted.launch.mock.calls[1][0]).kinematics.target_altitude_m).toBe(1.9);
   });
 });
 
@@ -517,7 +566,7 @@ describe('the mission mode selector lock', () => {
   };
 
   it('locks from the click on the dial, and sends the document of the click', async () => {
-    const clicked = { ...hoisted.doc, mission_mode: 'intermediate' };
+    const clicked = { ...hoisted.doc, mission_mode: 'advanced', rtl: { ...hoisted.doc.rtl, enabled: false } };
     hoisted.stable.params.working = clicked;
     hoisted.stable.params.committed = hoisted.doc;
     hoisted.stable.params.dirty = true;
@@ -554,7 +603,9 @@ describe('the mission mode selector lock', () => {
     });
     expect(hoisted.launch).toHaveBeenCalledTimes(1);
     expect(hoisted.props.preflight.modeLocked, 'unlocked while the process was being spawned').toBe(true);
-    expect(JSON.parse(String(hoisted.launch.mock.calls[0][0].paramsJson)).mission_mode).toBe('intermediate');
+    const sentDoc = JSON.parse(String(hoisted.launch.mock.calls[0][0].paramsJson));
+    expect(sentDoc.mission_mode).toBe('advanced');
+    expect(sentDoc.rtl.enabled).toBe(false);
 
     await act(async () => {
       resolveLaunch({ success: false, error: 'spawn failed' });

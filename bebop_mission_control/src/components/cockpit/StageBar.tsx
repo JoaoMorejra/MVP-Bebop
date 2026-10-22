@@ -33,6 +33,8 @@ interface StageBarProps {
   onToggleMute: () => void;
   /** Relabels the last stage; the sheet is locked during flight, so it matches the launched mode. */
   missionMode?: MissionMode;
+  /** Return plan of the flight (`rtl.enabled`): relabels the last stage and sets the plan chip. */
+  rtlEnabled?: boolean;
 }
 
 /**
@@ -97,6 +99,7 @@ export const StageBar: React.FC<StageBarProps> = ({
   onVolume,
   onToggleMute,
   missionMode = 'advanced',
+  rtlEnabled = true,
 }) => {
   const aborted = state === 'aborting' || state === 'aborted' || state === 'faulted';
   const running = state === 'running' || state === 'arming';
@@ -136,7 +139,7 @@ export const StageBar: React.FC<StageBarProps> = ({
                   </span>
                   <span className="truncate font-cond text-sm font-semibold tracking-wide text-mint">
                     {stage > 0 ? `${stage} · ` : ''}
-                    {stageLabel(missionMode, stage, stageName)}
+                    {stageLabel(missionMode, stage, stageName, rtlEnabled)}
                   </span>
                 </>
               ) : null}
@@ -157,6 +160,12 @@ export const StageBar: React.FC<StageBarProps> = ({
               · salto para {pendingStage} pedido
             </span>
           ) : null}
+          <span
+            data-plan-chip="end"
+            className="shrink-0 rounded-full border border-strut-soft px-2 py-0.5 font-sans text-3xs text-haze"
+          >
+            {rtlEnabled ? 'Final: RTL + pouso de precisão' : 'Final: pouso no local'}
+          </span>
         </div>
 
         {/* Reserved for the dock. */}
@@ -231,7 +240,7 @@ export const StageBar: React.FC<StageBarProps> = ({
                         : 'text-haze'
                     )}
                   >
-                    {stageLabel(missionMode, step, stepLabel)}
+                    {stageLabel(missionMode, step, stepLabel, rtlEnabled)}
                   </span>
                 </span>
                 {active ? (

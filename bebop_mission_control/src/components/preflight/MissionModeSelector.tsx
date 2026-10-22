@@ -21,7 +21,7 @@ const PREVIOUS_KEYS: ReadonlySet<string> = new Set(['ArrowLeft', 'ArrowUp']);
 /**
  * The mission profile, as a segmented radio group.
  *
- * Three pills in the order of increasing ambition, the active one in the
+ * Two pills in the order of increasing ambition, the active one in the
  * brand's live mint, with the one-line summary of the active profile beneath
  * them. The group follows the WAI-ARIA radio pattern: only the active pill is
  * in the tab order (roving tabindex) and the arrow keys move the selection,

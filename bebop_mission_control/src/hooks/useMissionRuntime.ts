@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { LogLine, MissionLaunchOptions, RawEvidence } from '../types/bmg';
+import type { LaunchRefusedEvent, LogLine, MissionLaunchOptions, RawEvidence } from '../types/bmg';
 import type { MissionState } from '../types/mission';
 import { cues } from '../audio/cues';
 import { missionStateForExit } from '../lib/missionOutcome';
@@ -41,6 +41,8 @@ export function useMissionRuntime() {
   const [latestCapture, setLatestCapture] = useState<RawEvidence | null>(null);
   const [captureFlash, setCaptureFlash] = useState(false);
   const [captureCount, setCaptureCount] = useState(0);
+  /** The launch document the mission refused in this cycle, with the field and the reason; cleared by a launch. */
+  const [refusal, setRefusal] = useState<LaunchRefusedEvent | null>(null);
 
   const stageRef = useRef(0);
   /** Whether the process reported its own exit for the current run. */
@@ -93,6 +95,7 @@ export function useMissionRuntime() {
         cues.play('shutter');
         window.setTimeout(() => setCaptureFlash(false), 450);
       }),
+      bridge.onLaunchRefused?.((event) => setRefusal(event)) ?? (() => undefined),
       bridge.onMissionExit((event) => {
         exitSeen.current = true;
         processUp.current = false;
@@ -119,6 +122,7 @@ export function useMissionRuntime() {
       stageRef.current = 0;
       setStageName('');
       setExitCode(null);
+      setRefusal(null);
       exitSeen.current = false;
       setLatestCapture(null);
       setCaptureCount(0);
@@ -251,6 +255,7 @@ export function useMissionRuntime() {
     latestCapture,
     captureFlash,
     captureCount,
+    refusal,
     launch,
     abort,
     reset,

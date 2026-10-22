@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { AlertOctagon, AlertTriangle } from 'lucide-react';
-import { ALL_PARAMETERS } from '../../lib/parameterSchema';
+import { NUMBER_PARAMETERS } from '../../lib/parameterSchema';
 import type { ParameterConflict } from '../../lib/parameterConflicts';
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { getPath } from '../../lib/paths';
@@ -19,7 +19,7 @@ const EXTRA_LABELS: Readonly<Record<string, { label: string; unit?: string }>> =
 
 /** Label, current value and unit of one involved field, as the operator reads it. */
 export function describeField(working: ParamsDoc, path: string): { label: string; value: string } {
-  const spec = ALL_PARAMETERS.find((item) => item.path === path);
+  const spec = NUMBER_PARAMETERS.find((item) => item.path === path);
   const raw = getPath(working, path);
   const label = spec?.label ?? EXTRA_LABELS[path]?.label ?? path;
   const unit = spec?.unit ?? EXTRA_LABELS[path]?.unit ?? '';

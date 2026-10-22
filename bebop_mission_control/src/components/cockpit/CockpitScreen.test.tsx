@@ -239,9 +239,96 @@ describe('Ctrl+C abort shortcut', () => {
     expect(onAbort).not.toHaveBeenCalled();
   });
 
-  it.each(['simple', 'intermediate', 'advanced'] as const)('aborts the same way in the %s mode', (mode) => {
+  it.each(['simple', 'advanced'] as const)('aborts the same way in the %s mode', (mode) => {
     const { onAbort } = renderCockpit({ missionState: 'running', missionMode: mode });
     press({ key: 'c', code: 'KeyC', ctrlKey: true });
     expect(onAbort).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('abort shortcut focus rules (D8)', () => {
+  const pressOn = (target: Element) => {
+    const event = new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', ctrlKey: true, bubbles: true, cancelable: true });
+    target.dispatchEvent(event);
+    return event;
+  };
+
+  it.each(['range', 'checkbox', 'radio', 'button'])('aborts with Ctrl+C while an input[type=%s] holds the focus', (type) => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    const input = document.createElement('input');
+    input.type = type;
+    document.body.appendChild(input);
+    input.focus();
+    pressOn(input);
+    expect(onAbort).toHaveBeenCalledTimes(1);
+    input.remove();
+  });
+
+  it('aborts with Ctrl+C while a select holds the focus', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    const select = document.createElement('select');
+    document.body.appendChild(select);
+    pressOn(select);
+    expect(onAbort).toHaveBeenCalledTimes(1);
+    select.remove();
+  });
+
+  it.each(['text', 'search', 'email', 'password', 'url', 'tel', 'number'])('leaves Ctrl+C to an input[type=%s]', (type) => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    const input = document.createElement('input');
+    input.type = type;
+    document.body.appendChild(input);
+    pressOn(input);
+    expect(onAbort).not.toHaveBeenCalled();
+    input.remove();
+  });
+});
+
+describe('abort shortcut through the main process (D8)', () => {
+  let deliver: (() => void) | null;
+  let setArmed: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    deliver = null;
+    setArmed = vi.fn();
+    (window as unknown as { bmgAPI: unknown }).bmgAPI = {
+      setCockpitAbortArmed: setArmed,
+      onAbortShortcut: (callback: () => void) => {
+        deliver = callback;
+        return () => {
+          deliver = null;
+        };
+      },
+    };
+  });
+
+  afterEach(() => {
+    delete (window as unknown as { bmgAPI?: unknown }).bmgAPI;
+  });
+
+  it('publishes the armed state and clears it on unmount', () => {
+    renderCockpit({ missionState: 'running' });
+    expect(setArmed).toHaveBeenLastCalledWith(true);
+    unmountCockpit();
+    expect(setArmed).toHaveBeenLastCalledWith(false);
+    expect(deliver).toBeNull();
+  });
+
+  it('publishes false while the abort is not available', () => {
+    renderCockpit({ missionState: 'idle', flyingState: 0 });
+    expect(setArmed).toHaveBeenLastCalledWith(false);
+  });
+
+  it('aborts exactly once for the shortcut the main process delivers, the window listener being off', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    act(() => deliver!());
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', ctrlKey: true, bubbles: true }));
+    expect(onAbort).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a delivered shortcut once the abort is no longer available', () => {
+    const { onAbort } = renderCockpit({ missionState: 'idle', flyingState: 0 });
+    act(() => deliver!());
+    expect(onAbort).not.toHaveBeenCalled();
   });
 });

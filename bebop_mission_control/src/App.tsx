@@ -32,9 +32,9 @@ import {
 import { useVoiceLevel } from './hooks/useVoiceLevel';
 import { useInspectionAssessment } from './hooks/useInspectionAssessment';
 import { useForensicReport } from './hooks/useForensicReport';
-import { LAUNCH_KEYS, reserveLaunchPhrase } from './lib/copilotPhrases';
+import { LAUNCH_KEYS, planSentence, reserveLaunchPhrase } from './lib/copilotPhrases';
 import { deepEqual, getPath } from './lib/paths';
-import { readMissionMode, type MissionMode } from './lib/missionMode';
+import { readMissionMode, readRtlEnabled, type MissionMode } from './lib/missionMode';
 import { launchBlockers, launchCountdownSec, reconcileCoupledPaths } from './lib/launchDocument';
 import { blockingConflicts } from './lib/parameterConflicts';
 import { isMissionOver } from './lib/missionOutcome';
@@ -42,7 +42,8 @@ import { useFinishLock } from './hooks/useFinishLock';
 import { reportMayStart } from './lib/finishLock';
 import { useGuardedAsync } from './hooks/useGuardedAsync';
 import { useMissionCountdown } from './hooks/useMissionCountdown';
-import { useModeEcho } from './hooks/useModeEcho';
+import { useModeEcho, type LaunchPlan } from './hooks/useModeEcho';
+import { launchesFromGround } from './lib/altitudeEnvelope';
 import { useLandProgress } from './hooks/useLandProgress';
 import { runCriticalBatteryReturn } from './lib/batteryReturn';
 
@@ -122,6 +123,10 @@ export const App: React.FC = () => {
   const [launchError, setLaunchError] = useState<string | null>(null);
   /** Profile of the launch in progress, as read from the document at the click. */
   const [launchedMode, setLaunchedMode] = useState<MissionMode | null>(null);
+  /** Return plan of the launch in progress (`rtl.enabled`), read with the mode. */
+  const [launchedRtl, setLaunchedRtl] = useState<boolean | null>(null);
+  /** Launch surface of the launch in progress, read with the mode. */
+  const [launchedSurface, setLaunchedSurface] = useState<'platform' | 'ground' | null>(null);
   const [benchStage, setBenchStage] = useState<number | null>(null);
   const [pendingStage, setPendingStage] = useState<number | null>(null);
   const [reportDismissed, setReportDismissed] = useState(false);
@@ -266,6 +271,8 @@ export const App: React.FC = () => {
       const doc = await commitLaunchDocument();
       if (!doc) return;
       setLaunchedMode(readMissionMode(doc));
+      setLaunchedRtl(readRtlEnabled(doc));
+      setLaunchedSurface(launchesFromGround(doc) ? 'ground' : 'platform');
       // A real parameter rather than a UI flourish: the mission reads the same
       // `kinematics.countdown_sec` from the document, so the overlay and the
       // aircraft count the same window. Zero means no countdown.
@@ -283,6 +290,12 @@ export const App: React.FC = () => {
       // mission runs its flat trim and ground reference inside it. The bench
       // runs the same one, checklist and abort included.
       if (seconds >= 1) setCounting(true);
+
+      // The plan is part of what the operator commits to at the click: said
+      // with the countdown, from the document sent (section 5.7).
+      const planLine = planSentence({ mode: readMissionMode(doc), rtlEnabled: readRtlEnabled(doc) });
+      prepareSpeech(planLine);
+      narration.enqueue('plan', () => planLine);
 
       // The document is the only source of the flight parameters (5.1): no
       // per-field option, so no fallback can stand in for a value the
@@ -307,7 +320,7 @@ export const App: React.FC = () => {
       launching.current = false;
       setLaunchPending(false);
     }
-  }, [commitLaunchDocument, failsafe.thresholdPct, mission, params, primeLaunchPhrases, resetTrack]);
+  }, [commitLaunchDocument, failsafe.thresholdPct, mission, narration, params, prepareSpeech, primeLaunchPhrases, resetTrack]);
 
   /**
    * One routine on the bench: same process, motors inert, and the same
@@ -416,13 +429,32 @@ export const App: React.FC = () => {
     if (counting && isMissionOver(mission.state)) finishCountdown();
   }, [counting, mission.state, finishCountdown]);
 
+  // A launch document the mission refused (exit 78): nothing was commanded, so
+  // the countdown is cancelled without opening the cockpit, and the operator
+  // stays on pre-flight with the reason and the refused field marked.
+  useEffect(() => {
+    if (!mission.refusal) return;
+    setCounting(false);
+    setScreen('preflight');
+    setLaunchError(`Lançamento recusado: ${mission.refusal.reason}`);
+  }, [mission.refusal]);
+
   const cancelCountdown = useCallback(async () => {
     setCounting(false);
     await mission.abort();
   }, [mission]);
 
+  const launchedPlan = useMemo<LaunchPlan | null>(
+    () =>
+      launchedRtl === null || launchedSurface === null
+        ? null
+        : { rtlEnabled: launchedRtl, takeoffSurface: launchedSurface },
+    [launchedRtl, launchedSurface]
+  );
+
   useModeEcho({
     requested: launchedMode,
+    plan: launchedPlan,
     onMismatch: (reported, requested) => {
       setLaunchError(
         `A missão iniciou no modo "${reported}", mas o modo "${requested}" foi selecionado. Missão abortada antes da decolagem.`
@@ -504,14 +536,16 @@ export const App: React.FC = () => {
       say: (label, text) => narration.preempt(label, () => text, 'URGENT'),
       gotoStage: () => (bridge ? bridge.gotoStage(RTL_STAGE) : Promise.resolve({ success: false })),
       land: () => landRef.current(),
-    }, launchedMode ?? readMissionMode(params.working ?? params.committed));
+    },
+    launchedMode ?? readMissionMode(params.working ?? params.committed),
+    launchedRtl ?? readRtlEnabled(params.working ?? params.committed));
     if (taken !== 'rtl') return;
     clearRtlWatchdog();
     rtlWatchdogRef.current = window.setTimeout(() => {
       rtlWatchdogRef.current = null;
       if (stageRef.current !== RTL_STAGE) void landRef.current();
     }, RTL_ACK_TIMEOUT_MS);
-  }, [bridge, clearRtlWatchdog, launchedMode, narration, params.committed, params.working, running]);
+  }, [bridge, clearRtlWatchdog, launchedMode, launchedRtl, narration, params.committed, params.working, running]);
 
   useEffect(() => {
     if (!failsafe.enabled || !inFlight || failsafeFiredRef.current) return;
@@ -559,6 +593,8 @@ export const App: React.FC = () => {
     setReportDismissed(false);
     setLaunchError(null);
     setLaunchedMode(null);
+    setLaunchedRtl(null);
+    setLaunchedSurface(null);
     setCounting(false);
     failsafeFiredRef.current = false;
     setFailsafeTriggered(false);
@@ -625,6 +661,7 @@ export const App: React.FC = () => {
           stage={mission.stage}
           stageName={mission.stageName}
           missionMode={readMissionMode(params.working ?? params.committed)}
+          rtlEnabled={launchedRtl ?? readRtlEnabled(params.working ?? params.committed)}
           streamFps={Math.round(stream.fps)}
           streamBridgeUp={stream.running}
           streamLive={stream.live}
@@ -685,15 +722,17 @@ export const App: React.FC = () => {
         paramsError={params.error}
         changedPaths={params.changedPaths}
         dirty={params.dirty}
-        hasPreset={Boolean(params.preset)}
-        presetActive={params.isPresetActive}
+        presets={params.presets}
+        activePresetId={params.activePresetId}
         onEdit={params.edit}
         onModeChange={(mode) => void params.switchMode(mode)}
         onSave={() => void params.save()}
         saveAttempted={params.saveAttempted}
         onDiscard={params.discard}
-        onSavePreset={params.saveAsPreset}
-        onApplyPreset={params.applyPreset}
+        onSavePreset={params.savePreset}
+        onApplyPreset={(id) => void params.applyPreset(id)}
+        onRenamePreset={params.renamePreset}
+        onDeletePreset={params.deletePreset}
         failsafe={failsafe}
         onFailsafeChange={changeFailsafe}
         failsafeTriggered={failsafeTriggered}
@@ -701,6 +740,8 @@ export const App: React.FC = () => {
         onVolume={voice.setVolume}
         onToggleMute={voice.toggleMute}
         launchError={launchError}
+        refusedPath={mission.refusal?.field ?? null}
+        altitudeNotice={params.altitudeNotice}
         onLaunch={() => void launch()}
         onOpenDiagnostics={() => setOverlay('diagnostics')}
         modeLocked={modeLocked}
@@ -739,6 +780,7 @@ export const App: React.FC = () => {
     modeLocked,
     params.working,
     params.committed,
+    launchedRtl,
   ]);
 
   return (

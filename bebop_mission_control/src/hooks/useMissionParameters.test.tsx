@@ -16,7 +16,7 @@ const bridge = {
 };
 vi.mock('./useBridge', () => ({ useBridge: () => bridge }));
 
-import { matchesPreset, useMissionParameters } from './useMissionParameters';
+import { useMissionParameters } from './useMissionParameters';
 
 let latest: ReturnType<typeof useMissionParameters>;
 const Probe = () => {
@@ -68,22 +68,25 @@ describe('useMissionParameters', () => {
     const preset = setPath(
       completeDocument({ no_fly: false, 'calibration.samples': 1, 'lateral_pid.kp': 9 }),
       'kinematics.target_altitude_m',
-      3.1
+      1.9
     );
     window.localStorage.setItem('bmg.operator-preset.advanced', JSON.stringify(preset));
     act(() => root.unmount());
     root = createRoot(host);
     await mount({ success: true, params: stored }, { success: true, params: completeDocument() });
 
-    act(() => latest.applyPreset());
-    expect(getPath(latest.working, 'kinematics.target_altitude_m')).toBe(3.1);
+    expect(latest.presets.map((item) => item.name)).toEqual(['Meu ajuste']);
+    await act(async () => {
+      await latest.applyPreset(latest.presets[0].id);
+    });
+    expect(getPath(latest.working, 'kinematics.target_altitude_m')).toBe(1.9);
     expect(getPath(latest.working, 'no_fly')).toBe(true);
     expect(getPath(latest.working, 'calibration.samples')).toBe(40);
     expect(getPath(latest.working, 'lateral_pid.kp')).toBe(0.42);
   });
 
   it('restores the factory values of the sheet fields only', async () => {
-    const stored = completeDocument({ no_fly: true, 'kinematics.target_altitude_m': 3.3, 'lateral_pid.kp': 0.77 });
+    const stored = completeDocument({ no_fly: true, 'kinematics.target_altitude_m': 1.95, 'lateral_pid.kp': 0.77 });
     const defaults = completeDocument({ no_fly: false, 'kinematics.target_altitude_m': 1.0, 'lateral_pid.kp': 0.35 });
     await mount({ success: true, params: stored }, { success: true, params: defaults });
     act(() => latest.applyFactory());
@@ -158,9 +161,8 @@ describe('useMissionParameters', () => {
   it('refuses to save a combination with an error conflict, in the hook itself', async () => {
     await mount({ success: true, params: validDocument() }, { success: true, params: validDocument() });
     bridge.saveParameters.mockClear();
-    act(() => latest.edit('kinematics.target_altitude_m', 0.1));
     act(() => latest.edit('kinematics.altitude_ceiling_margin_m', 0));
-    expect(latest.conflicts.map((c) => c.id)).toEqual(expect.arrayContaining(['E03', 'E04']));
+    expect(latest.conflicts.map((c) => c.id)).toEqual(expect.arrayContaining(['E04']));
     expect(latest.saveAttempted).toBe(false);
 
     let saved: boolean | undefined;
@@ -213,14 +215,12 @@ describe('useMissionParameters', () => {
     expect(latest.dirty).toBe(false);
   });
 
-  it('keeps a preset saved before the turn rate existed active', async () => {
+  it('keeps a favourite saved before the turn rate existed active', async () => {
     const preset = setPath(validDocument(), 'yaw_pattern', undefined);
-    expect(matchesPreset(validDocument(), preset)).toBe(true);
-    expect(matchesPreset(validDocument({ 'kinematics.target_altitude_m': 2.5 }), preset)).toBe(false);
     window.localStorage.setItem('bmg.operator-preset.advanced', JSON.stringify(preset));
     await mount({ success: true, params: validDocument() }, { success: true, params: validDocument() });
     expect(getPath(latest.working, 'yaw_pattern.scan_vyaw')).toBe(0.15);
-    expect(latest.isPresetActive).toBe(true);
+    expect(latest.activePresetId).toBe(latest.presets[0].id);
   });
 
   it('backfills the turn rate when the defaults arrive before the store', async () => {
@@ -253,70 +253,147 @@ async function mountReady(overrides: Record<string, unknown> = {}) {
 
 describe('per-mode parameters', () => {
   it('keeps the working values of each mode apart', async () => {
-    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 2.4 });
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
     await act(() => hook.current.switchMode('simple'));
     expect(hook.current.missionMode).toBe('simple');
-    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1); // squeezed copy
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1.6); // copied, inside the envelope
     act(() => hook.current.edit('kinematics.target_altitude_m', 0.7));
     await act(() => hook.current.save());
 
     await act(() => hook.current.switchMode('advanced'));
-    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(2.4);
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1.6);
     await act(() => hook.current.switchMode('simple'));
     expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(0.7);
   });
 
   it('never lets a save in one mode overwrite another mode\'s stored document', async () => {
-    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 2.4 });
-    await act(() => hook.current.switchMode('intermediate'));
-    act(() => hook.current.edit('kinematics.target_altitude_m', 3.1));
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
+    await act(() => hook.current.switchMode('simple'));
+    act(() => hook.current.edit('kinematics.target_altitude_m', 1.9));
     await act(() => hook.current.save());
     const advancedStored = JSON.parse(window.localStorage.getItem('bmg.working-parameters.advanced') ?? '{}');
-    expect(getPath(advancedStored, 'kinematics.target_altitude_m')).toBe(2.4);
+    expect(getPath(advancedStored, 'kinematics.target_altitude_m')).toBe(1.6);
   });
 
-  it('keeps one favourite per mode', async () => {
-    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 2.4 });
-    act(() => hook.current.saveAsPreset());
-    await act(() => hook.current.switchMode('intermediate'));
-    expect(hook.current.preset).toBeNull();
-    act(() => hook.current.edit('kinematics.target_altitude_m', 3.3));
-    act(() => hook.current.saveAsPreset());
+  it('keeps the favourites of each mode apart', async () => {
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
+    act(() => {
+      expect(hook.current.savePreset('Alto')).toBeNull();
+    });
+    await act(() => hook.current.switchMode('simple'));
+    expect(hook.current.presets).toEqual([]);
+    act(() => hook.current.edit('kinematics.target_altitude_m', 1.95));
+    act(() => {
+      expect(hook.current.savePreset('Giro')).toBeNull();
+    });
     await act(() => hook.current.switchMode('advanced'));
+    expect(hook.current.presets.map((item) => item.name)).toEqual(['Alto']);
     act(() => hook.current.edit('kinematics.target_altitude_m', 1.1));
-    act(() => hook.current.applyPreset());
-    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(2.4);
-    expect(window.localStorage.getItem('bmg.operator-preset.intermediate')).toContain('3.3');
+    await act(async () => {
+      await hook.current.applyPreset(hook.current.presets[0].id);
+    });
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1.6);
+    expect(window.localStorage.getItem('bmg.operator-presets.v2.simple')).toContain('1.95');
+  });
+
+  it('writes mission_config.json when a favourite is applied, as on a mode switch', async () => {
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
+    act(() => {
+      hook.current.savePreset('Alto');
+    });
+    act(() => hook.current.edit('kinematics.target_altitude_m', 1.1));
+    saveParameters.mockClear();
+    await act(async () => {
+      await hook.current.applyPreset(hook.current.presets[0].id);
+    });
+    expect(saveParameters).toHaveBeenLastCalledWith(expect.objectContaining({ kinematics: expect.objectContaining({ target_altitude_m: 1.6 }) }));
+    expect(hook.current.dirty).toBe(false);
+  });
+
+  it('renames and deletes favourites, refusing a duplicate name', async () => {
+    const hook = await mountReady({ mission_mode: 'advanced' });
+    act(() => {
+      hook.current.savePreset('A');
+      hook.current.savePreset('B');
+    });
+    const [first, second] = hook.current.presets;
+    let refused: string | null = null;
+    act(() => {
+      refused = hook.current.renamePreset(second.id, 'a');
+    });
+    expect(refused).toMatch(/Já existe/);
+    act(() => {
+      hook.current.renamePreset(first.id, 'C');
+      hook.current.deletePreset(second.id);
+    });
+    expect(hook.current.presets.map((item) => item.name)).toEqual(['C']);
   });
 
   it('reports the favourite as active only in its own mode', async () => {
     const hook = await mountReady({ mission_mode: 'advanced' });
-    act(() => hook.current.saveAsPreset());
-    expect(hook.current.isPresetActive).toBe(true);
-    await act(() => hook.current.switchMode('intermediate'));
-    expect(hook.current.isPresetActive).toBe(false);
+    act(() => {
+      hook.current.savePreset('Base');
+    });
+    expect(hook.current.activePresetId).toBe(hook.current.presets[0].id);
+    await act(() => hook.current.switchMode('simple'));
+    expect(hook.current.activePresetId).toBeNull();
+  });
+
+  it('restores the booleans and the altitude of each mode on Simples, Avançado, Simples', async () => {
+    const hook = await mountReady({ mission_mode: 'simple', 'platform.height_m': 1, 'kinematics.target_altitude_m': 1.8 });
+    act(() => hook.current.edit('rtl.enabled', false));
+    act(() => hook.current.edit('platform.takeoff_from_ground', true));
+    act(() => hook.current.edit('kinematics.target_altitude_m', 0.6));
+    await act(() => hook.current.switchMode('advanced'));
+    act(() => hook.current.edit('rtl.enabled', true));
+    act(() => hook.current.edit('platform.takeoff_from_ground', false));
+    act(() => hook.current.edit('kinematics.target_altitude_m', 1.5));
+    await act(() => hook.current.switchMode('simple'));
+    expect(getPath(hook.current.working, 'rtl.enabled')).toBe(false);
+    expect(getPath(hook.current.working, 'platform.takeoff_from_ground')).toBe(true);
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(0.6);
+    await act(() => hook.current.switchMode('advanced'));
+    expect(getPath(hook.current.working, 'rtl.enabled')).toBe(true);
+    expect(getPath(hook.current.working, 'platform.takeoff_from_ground')).toBe(false);
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1.5);
+  });
+
+  it('holds an altitude under the pad-top minimum at it, with a notice, when the surface goes back to the pad top', async () => {
+    const hook = await mountReady({ 'platform.height_m': 1, 'platform.takeoff_from_ground': true, 'kinematics.target_altitude_m': 0.5 });
+    expect(hook.current.altitudeNotice).toBeNull();
+    act(() => hook.current.edit('platform.takeoff_from_ground', false));
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1.3);
+    expect(hook.current.altitudeNotice).toBe('Cota ajustada para 1,30 m: mínimo sobre o totem.');
   });
 
   it('writes the active document to the store on a switch, leaving the sheet clean', async () => {
     const hook = await mountReady({ mission_mode: 'advanced' });
-    await act(() => hook.current.switchMode('intermediate'));
+    await act(() => hook.current.switchMode('simple'));
     expect(hook.current.dirty).toBe(false);
-    expect(saveParameters).toHaveBeenLastCalledWith(expect.objectContaining({ mission_mode: 'intermediate' }));
+    expect(saveParameters).toHaveBeenLastCalledWith(expect.objectContaining({ mission_mode: 'simple' }));
   });
 
   it('stashes unsaved edits of the mode being left', async () => {
-    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 2.4 });
-    act(() => hook.current.edit('kinematics.target_altitude_m', 3.7));
-    await act(() => hook.current.switchMode('intermediate'));
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
+    act(() => hook.current.edit('kinematics.target_altitude_m', 1.75));
+    await act(() => hook.current.switchMode('simple'));
     await act(() => hook.current.switchMode('advanced'));
-    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(3.7);
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1.75);
+  });
+
+  it('migrates a stored Intermediate document to Advanced without the return', async () => {
+    const hook = await mountReady({ mission_mode: 'intermediate', 'rtl.enabled': undefined });
+    expect(hook.current.missionMode).toBe('advanced');
+    expect(getPath(hook.current.working, 'rtl.enabled')).toBe(false);
+    expect(getPath(hook.current.committed, 'mission_mode')).toBe('advanced');
   });
 
   it('migrates the pre-modes document and favourite into the advanced mode', async () => {
     window.localStorage.setItem('bmg.operator-preset.v2', JSON.stringify(setPath(completeDocument(), 'kinematics.target_altitude_m', 1.9)));
     const hook = await mountReady({ mission_mode: 'advanced' });
-    expect(hook.current.preset).not.toBeNull();
-    expect(getPath(hook.current.preset, 'kinematics.target_altitude_m')).toBe(1.9);
+    expect(hook.current.presets.map((item) => item.name)).toEqual(['Meu ajuste']);
+    expect(hook.current.presets[0].values['kinematics.target_altitude_m']).toBe(1.9);
+    expect(window.localStorage.getItem('bmg.operator-preset.advanced')).toBeNull();
   });
 
   it('ignores a second switch issued while the first is still saving', async () => {
@@ -328,7 +405,7 @@ describe('per-mode parameters', () => {
     let second: Promise<boolean> = Promise.resolve(true);
     await act(async () => {
       first = hook.current.switchMode('simple');
-      second = hook.current.switchMode('intermediate');
+      second = hook.current.switchMode('advanced');
       await Promise.resolve();
     });
     expect(await second).toBe(false);
@@ -343,7 +420,7 @@ describe('per-mode parameters', () => {
 
   it('opens with the values it has when the storage throws', async () => {
     vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('blocked'); });
-    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 2.4 });
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
     expect(hook.current.status).toBe('ready');
     await act(() => hook.current.switchMode('simple'));
     expect(hook.current.missionMode).toBe('simple');

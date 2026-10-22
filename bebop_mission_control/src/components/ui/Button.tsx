@@ -19,25 +19,25 @@ interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   icon?: React.ReactNode;
 }
 
-export const Button: React.FC<ButtonProps> = ({
-  variant = 'quiet',
-  icon,
-  className,
-  children,
-  ...rest
-}) => (
-  <button
-    type="button"
-    {...rest}
-    className={cn(
-      'inline-flex items-center justify-center gap-2 rounded-bezel border px-3.5 py-1.5 text-sm',
-      'transition-all duration-150 ease-instrument',
-      'disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:brightness-100',
-      VARIANT[variant],
-      className
-    )}
-  >
-    {icon}
-    {children}
-  </button>
-);
+export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(function Button(
+  { variant = 'quiet', icon, className, children, ...rest },
+  ref
+) {
+  return (
+    <button
+      ref={ref}
+      type="button"
+      {...rest}
+      className={cn(
+        'inline-flex items-center justify-center gap-2 rounded-bezel border px-3.5 py-1.5 text-sm',
+        'transition-all duration-150 ease-instrument',
+        'disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:brightness-100',
+        VARIANT[variant],
+        className
+      )}
+    >
+      {icon}
+      {children}
+    </button>
+  );
+});

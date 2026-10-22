@@ -19,8 +19,8 @@ const FIXED_ALERT_SENTENCES: readonly string[] = [
   'Missão abortada. Pouso imediato comandado.',
   'Missão abortada.',
   ...Object.values(batteryCalls('advanced')),
-  ...Object.values(batteryCalls('intermediate')),
   ...Object.values(batteryCalls('simple')),
+  ...Object.values(batteryCalls('advanced', false)),
   'Falha na decolagem: decolagem não confirmada pela aeronave.',
   'Falha na decolagem.',
   'Falha de segurança.',
@@ -242,6 +242,8 @@ export function useFlightNarration(
   const parameters = useRef<MissionParametersPayload>({});
   const spoken = useRef(new Set<string>());
   const missionMode = useRef<MissionMode | null>(null);
+  /** The return plan the mission echoed on `mission.mode`; true until it says otherwise. */
+  const rtlEnabled = useRef(true);
 
   useEffect(() => {
     if (!bridge) return;
@@ -249,11 +251,12 @@ export function useFlightNarration(
       if (event.kind === 'alert') {
         const payload = event.payload ?? {};
         const pri = event.key === 'mission.abort' ? 'LAND' : 'URGENT';
-        queue.preempt(event.key, () => alertSentence(payload), pri);
+        queue.preempt(event.key, () => alertSentence(payload, event.key), pri);
         return;
       }
       if (event.key === 'mission.mode') {
         missionMode.current = parseMissionMode((event.payload ?? {}).mode);
+        rtlEnabled.current = (event.payload ?? {}).rtl_enabled !== false;
         return;
       }
       if (event.key === 'mission.parameters') {
@@ -262,7 +265,10 @@ export function useFlightNarration(
         // synthesized to disk while the aircraft is still on the ground.
         void bridge
           .cacheSpeech?.([
-            ...allMissionPhrases(parameters.current, missionMode.current ?? 'advanced'),
+            ...allMissionPhrases(parameters.current, {
+              mode: missionMode.current ?? 'advanced',
+              rtlEnabled: rtlEnabled.current,
+            }),
             ...allFindingSentences(),
             ...FIXED_ALERT_SENTENCES,
           ])
@@ -276,17 +282,18 @@ export function useFlightNarration(
         spoken.current.clear();
         parameters.current = {};
         missionMode.current = null;
+        rtlEnabled.current = true;
       }
       if (key === 'mission.scan_start' && !spoken.current.has('mission.takeoff')) return;
-      const mode = missionMode.current ?? 'advanced';
-      if (!isMilestoneAllowed(key, mode)) return;
+      const plan = { mode: missionMode.current ?? 'advanced', rtlEnabled: rtlEnabled.current };
+      if (!isMilestoneAllowed(key, plan)) return;
       if (spoken.current.has(key)) return;
       spoken.current.add(key);
       const payload = event.payload ?? {};
       // A launch line drawn ahead (`reserveLaunchPhrase`) is spoken as drawn,
       // so the audio synthesized for it at the click is the audio played.
       const launchLine = takeLaunchPhrase(key);
-      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, parameters.current, {}, mode), {
+      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, parameters.current, {}, plan), {
         stage: MILESTONE_STAGE[key],
       });
     });

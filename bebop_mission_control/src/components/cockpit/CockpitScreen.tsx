@@ -1,4 +1,5 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
+import { useBridge } from '../../hooks/useBridge';
 import type { MissionState, TelemetryView, TrackPoint } from '../../types/mission';
 import type { LandProgressPhase, RawEvidence, VoiceLevel } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
@@ -14,16 +15,25 @@ import { cn } from '../../lib/format';
 import { isMissionOver } from '../../lib/missionOutcome';
 import type { FinishLockResult } from '../../lib/finishLock';
 
+/** Input types that take typed text; the others (range, checkbox, radio, button) never do. */
+const TEXT_INPUT_TYPES: ReadonlySet<string> = new Set(['text', 'search', 'email', 'password', 'url', 'tel', 'number']);
+
 /**
- * Checks whether the key event target is an interactive text input or embedded terminal.
- * Used by R11 to prevent global Escape abort when typing.
+ * Checks whether the key event target takes typed text: a text-like `INPUT`, a
+ * `TEXTAREA`, an editable element or the diagnostics terminal, where Ctrl+C is
+ * copy or interrupt. Used by R11 to leave those keys alone.
+ *
+ * A range slider, a checkbox, a radio, a button and a `SELECT` do not: after a
+ * drag of the camera tilt or of the volume the focus stays on the slider, and
+ * treating it as a text field ignored the abort without a word.
  */
 export function isTextInputOrTerminal(target: EventTarget | null): boolean {
   if (!target || !(target instanceof HTMLElement)) return false;
   const tag = target.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') return TEXT_INPUT_TYPES.has(((target as HTMLInputElement).type || 'text').toLowerCase());
+  if (tag === 'TEXTAREA') return true;
   if (target.isContentEditable || target.getAttribute('contenteditable') === 'true') return true;
-  if (target.closest('.xterm, [data-terminal], [data-terminal-title], textarea, input, select')) return true;
+  if (target.closest('.xterm, [data-terminal], [data-terminal-title], textarea')) return true;
   return false;
 }
 
@@ -35,6 +45,8 @@ interface CockpitScreenProps {
   stage: number;
   stageName: string;
   missionMode?: MissionMode;
+  /** Return plan of the flight on screen (`rtl.enabled`). */
+  rtlEnabled?: boolean;
   streamFps: number;
   streamBridgeUp: boolean;
   streamLive: boolean;
@@ -100,6 +112,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   stage,
   stageName,
   missionMode,
+  rtlEnabled,
   streamFps,
   streamBridgeUp,
   streamLive,
@@ -131,14 +144,42 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   finishLock,
   landProgress,
 }) => {
+  const bridge = useBridge();
   const running = missionState === 'running' || missionState === 'arming';
   const over = isMissionOver(missionState);
 
-  // R11: Escape and Ctrl/Cmd+C fire onAbort exactly as the button does, while
-  // the abort is available. Ignored inside text fields and the diagnostics
-  // terminal, where Ctrl+C is copy / interrupt. When the abort is not
-  // available the event is left alone, so copy still works on the ground.
+  const armed = abortEnabled(missionState, telemetry.flying_state, landProgress);
+  const viaMain = Boolean(bridge?.onAbortShortcut && bridge.setCockpitAbortArmed);
+
+  // D8: the main process takes Ctrl/Cmd+C and Escape before the page while the
+  // abort is available, even with the focus in the video iframe or on a
+  // slider, and hands them back here. Disarmed on unmount.
   useEffect(() => {
+    if (!viaMain) return;
+    bridge!.setCockpitAbortArmed!(armed);
+  }, [bridge, viaMain, armed]);
+  useEffect(() => {
+    if (!viaMain) return;
+    return () => bridge!.setCockpitAbortArmed!(false);
+  }, [bridge, viaMain]);
+
+  const abortRef = useRef({ armed, onAbort });
+  abortRef.current = { armed, onAbort };
+  useEffect(() => {
+    if (!viaMain) return;
+    return bridge!.onAbortShortcut!(() => {
+      if (abortRef.current.armed) abortRef.current.onAbort();
+    });
+  }, [bridge, viaMain]);
+
+  // R11 without the bridge (a browser session, an older preload): Escape and
+  // Ctrl/Cmd+C fire onAbort exactly as the button does, while the abort is
+  // available. Ignored inside text fields and the diagnostics terminal, where
+  // Ctrl+C is copy / interrupt. When the abort is not available the event is
+  // left alone, so copy still works on the ground. With the bridge the main
+  // process consumes the key first, so the two never both fire.
+  useEffect(() => {
+    if (viaMain) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isAbortShortcut(event) === null) return;
       if (isTextInputOrTerminal(event.target)) return;
@@ -149,7 +190,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [missionState, telemetry.flying_state, landProgress, onAbort]);
+  }, [viaMain, missionState, telemetry.flying_state, landProgress, onAbort]);
 
   // The last gimbal command on /bebop/move_camera, from the mission's ramp or
   // the station's slider, as the telemetry bridge echoes it. A command, not a
@@ -166,6 +207,7 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
         stage={stage}
         stageName={stageName}
         missionMode={missionMode}
+        rtlEnabled={rtlEnabled}
         state={missionState}
         benchMode={benchMode}
         benchStage={benchStage}

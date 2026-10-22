@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { ForensicPanel } from './ForensicPanel';
 import { isAirborne } from '../../lib/flightState';
 import { FINISH_HOLD_MS, FINISH_REASONS, type FinishLockResult } from '../../lib/finishLock';
+import type { Finding } from '../../lib/forensics';
+import type { RawEvidence, ReportReadyEvent } from '../../types/bmg';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -211,5 +213,152 @@ describe('the report waiting for the victim assessment', () => {
       )
     );
     expect(container.querySelector('[data-finding-state="analyzing"]')).toBeNull();
+  });
+});
+
+describe('Visualizar Laudo Pericial', () => {
+  const REPORT: Finding[] = (['police', 'samu', 'victim', 'vehicle'] as const).map((topic) => ({
+    topic,
+    card: topic,
+    speech: topic,
+  }));
+  const LATEST: RawEvidence = {
+    filename: 'accident_raw_20261020_113500.png',
+    url: '/evidence/accident_raw_20261020_113500.png',
+    timestamp: 0,
+    occurrenceId: 'OC_20261020_143500',
+  };
+  const REPORT_URL = '/evidence/relatorio_OC_20261020_143500.html';
+
+  let reportListener: ((event: ReportReadyEvent) => void) | null;
+  let getReportUrl: Mock<[string?], Promise<string | null>>;
+
+  beforeEach(() => {
+    reportListener = null;
+    getReportUrl = vi.fn<[string?], Promise<string | null>>(async () => null);
+    (window as unknown as { bmgAPI: unknown }).bmgAPI = {
+      getReportUrl,
+      onReportReady: (cb: (event: ReportReadyEvent) => void) => {
+        reportListener = cb;
+        return () => {
+          reportListener = null;
+        };
+      },
+    };
+  });
+
+  afterEach(() => {
+    delete (window as unknown as { bmgAPI?: unknown }).bmgAPI;
+  });
+
+  async function renderReport(revealed: number, latest: RawEvidence = LATEST) {
+    await act(async () =>
+      root.render(
+        <ForensicPanel
+          latest={latest}
+          count={1}
+          stage={5}
+          missionOver
+          landed
+          report={REPORT}
+          reportRevealed={revealed}
+          onFinish={vi.fn()}
+          lock={GROUNDED}
+        />
+      )
+    );
+    return container.querySelector('[data-testid="open-report"]') as HTMLButtonElement | null;
+  }
+
+  it('stays hidden until the copilot has read all four findings', async () => {
+    expect(await renderReport(3)).toBeNull();
+    expect(await renderReport(4)).not.toBeNull();
+  });
+
+  it('asks the host for this occurrence and waits while the report is not on disk', async () => {
+    const button = await renderReport(4);
+    expect(getReportUrl).toHaveBeenCalledWith('OC_20261020_143500');
+    act(() => button!.click());
+    expect(container.querySelector('[data-testid="report-occurrence-id"]')?.textContent).toBe(
+      'OC_20261020_143500'
+    );
+    expect(container.querySelector('[data-testid="report-waiting"]')).not.toBeNull();
+    expect(container.querySelector('iframe')).toBeNull();
+  });
+
+  it('shows the report once announced, in a frame that cannot reach the bridge', async () => {
+    const button = await renderReport(4);
+    act(() => button!.click());
+    act(() => reportListener!({ filename: 'relatorio_OC_20261020_143500.html', url: REPORT_URL, occurrenceId: 'OC_20261020_143500' }));
+    const frame = container.querySelector('iframe') as HTMLIFrameElement;
+    expect(frame.getAttribute('src')).toBe(REPORT_URL);
+    expect(frame.getAttribute('sandbox')).not.toContain('allow-same-origin');
+  });
+
+  it('ignores a polled report from another occurrence', async () => {
+    getReportUrl.mockResolvedValue('/evidence/relatorio_OC_20260101_000000.html');
+    const button = await renderReport(4);
+    act(() => button!.click());
+    expect(container.querySelector('iframe')).toBeNull();
+  });
+
+  it('ignores an announced report for another occurrence', async () => {
+    const button = await renderReport(4);
+    act(() => button!.click());
+    act(() =>
+      reportListener!({
+        filename: 'relatorio_OC_20260101_000000.html',
+        url: '/evidence/relatorio_OC_20260101_000000.html',
+        occurrenceId: 'OC_20260101_000000',
+      })
+    );
+    expect(container.querySelector('iframe')).toBeNull();
+  });
+
+  it('opens only inside the cockpit and expands within the window', async () => {
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    const button = await renderReport(4);
+    act(() => button!.click());
+    act(() => reportListener!({ filename: 'relatorio_OC_20261020_143500.html', url: REPORT_URL }));
+    const buttons = Array.from(container.querySelectorAll('[role="dialog"] button'));
+    expect(buttons.some((b) => /nova aba/i.test(b.getAttribute('aria-label') ?? ''))).toBe(false);
+
+    const expand = container.querySelector('[data-testid="report-expand"]') as HTMLButtonElement;
+    act(() => expand.click());
+    expect(container.querySelector('[data-report-size]')?.getAttribute('data-report-size')).toBe('expanded');
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe(REPORT_URL);
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it('follows the report name recorded in the inspection package', async () => {
+    const latest: RawEvidence = {
+      ...LATEST,
+      occurrenceId: undefined,
+      inferencePackage: {
+        schema: 't4h.drone-inspection/1',
+        open_conversation: { data: {} },
+        message: { type: 'image', image: null, caption: '{}' },
+        caption: {},
+        pending: [{ campo: 'occurrence_id', motivo: 'ausente' }],
+        ready: false,
+        expected_report: 'relatorio_inspecao_sem_identificador.html',
+        position: { source: 'site', site: 'Transamerica Expo Center' },
+      },
+    };
+    const button = await renderReport(4, latest);
+    expect(getReportUrl).toHaveBeenCalledWith(undefined);
+    act(() => button!.click());
+    expect(container.querySelector('[data-testid="report-occurrence-id"]')?.textContent).toBe('sem identificador');
+    const url = '/evidence/relatorio_inspecao_sem_identificador.html';
+    act(() => reportListener!({ filename: 'relatorio_inspecao_sem_identificador.html', url }));
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe(url);
+  });
+
+  it('closes on Escape', async () => {
+    const button = await renderReport(4);
+    act(() => button!.click());
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })));
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
   });
 });

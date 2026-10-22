@@ -1,12 +1,31 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ALL_PARAMETERS, TRACKED_PATHS } from '../lib/parameterSchema';
-import { applySchemaFields, fillMissing, reconcileCoupledPaths, setLinkedPath } from '../lib/launchDocument';
+import { ALL_PARAMETERS, NUMBER_PARAMETERS, TRACKED_PATHS } from '../lib/parameterSchema';
+import {
+  applySchemaFields,
+  fillMissing,
+  altitudeAdjustment,
+  migrateLegacyMode,
+  normalizeForMode,
+  reconcileCoupledPaths,
+  setLinkedPath,
+} from '../lib/launchDocument';
 import { activeConflicts } from '../lib/parameterConflicts';
-import { parseMissionMode, readMissionMode, DEFAULT_MISSION_MODE, type MissionMode } from '../lib/missionMode';
+import { MISSION_MODES, parseMissionMode, readMissionMode, DEFAULT_MISSION_MODE, type MissionMode } from '../lib/missionMode';
+import {
+  activePresetId as findActivePreset,
+  addPreset,
+  applyPresetValues,
+  deletePreset,
+  migrateSinglePreset,
+  readPresets,
+  renamePreset,
+  writePresets,
+  type OperatorPreset,
+} from '../lib/operatorPresets';
 import {
   ACTIVE_MODE_KEY,
+  migrateLegacyIntermediate,
   migrateLegacyKeys,
-  presetKey,
   readStoredDoc,
   switchModeDocument,
   workingKey,
@@ -19,25 +38,13 @@ export type ParamsDoc = Record<string, unknown>;
 
 /** Mirrors written by each tracked path, so a slider counts as one change. */
 const MIRRORS_BY_PATH: ReadonlyMap<string, string[]> = new Map(
-  ALL_PARAMETERS.filter((spec) => spec.mirrors).map((spec) => [spec.path, spec.mirrors!.map((m) => m.path)])
+  NUMBER_PARAMETERS.filter((spec) => spec.mirrors).map((spec) => [spec.path, spec.mirrors!.map((m) => m.path)])
 );
 
-/**
- * Whether `working` holds the operator's preset.
- *
- * Compared over the six flight parameters the preset is about, not the whole
- * document: `mission.py` rewrites calibration statistics into the file on
- * every run, and `no_fly` is the arming mode rather than a tuning, so either
- * would make a preset read as inactive while every value the operator set is
- * still in place. A field the preset does not hold (saved before the field
- * existed) is not compared, as {@link applySchemaFields} does not apply it.
- */
-export function matchesPreset(working: ParamsDoc | null, preset: ParamsDoc | null): boolean {
-  if (!working || !preset) return false;
-  return ALL_PARAMETERS.every((spec) => {
-    const value = getPath(preset, spec.path);
-    return value === undefined || deepEqual(getPath(working, spec.path), value);
-  });
+/** A fresh favourite id: `crypto.randomUUID`, or a time-and-random id where the runtime lacks it. */
+function newPresetId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  return uuid ?? `preset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /**
@@ -61,11 +68,17 @@ export function useMissionParameters() {
   const [committed, setCommitted] = useState<ParamsDoc | null>(null);
   const [working, setWorking] = useState<ParamsDoc | null>(null);
   const [factory, setFactory] = useState<ParamsDoc | null>(null);
-  const [preset, setPreset] = useState<ParamsDoc | null>(null);
+  const [presets, setPresets] = useState<OperatorPreset[]>([]);
   const [status, setStatus] = useState<'loading' | 'ready' | 'saving' | 'error'>('loading');
   const [error, setError] = useState<string | null>(null);
   /** A save was refused for an error conflict; cleared by a save that goes through, or a discard. */
   const [saveAttempted, setSaveAttempted] = useState(false);
+  /**
+   * The last altitude the envelope of the launch surface moved, in the
+   * operator's words (D1): a value below the pad-top minimum is held at it,
+   * never silently. Cleared by a save or a discard.
+   */
+  const [altitudeNotice, setAltitudeNotice] = useState<string | null>(null);
 
   const missionMode: MissionMode = readMissionMode(working);
 
@@ -73,6 +86,8 @@ export function useMissionParameters() {
     let cancelled = false;
 
     migrateLegacyKeys(storage);
+    migrateLegacyIntermediate(storage);
+    for (const mode of MISSION_MODES) migrateSinglePreset(storage, mode.id, newPresetId);
 
     const restoreLocal = () => {
       let activeMode: MissionMode = DEFAULT_MISSION_MODE;
@@ -81,7 +96,8 @@ export function useMissionParameters() {
       } catch {
         /* an unreadable store falls back to the full mission */
       }
-      const parsed = readStoredDoc(storage, workingKey(activeMode));
+      const stored = readStoredDoc(storage, workingKey(activeMode));
+      const parsed = stored ? migrateLegacyMode(stored) : null;
       if (parsed && !cancelled) {
         // No bridge, so no mission to serve its defaults: "Restaurar
         // Padrões" stays unavailable rather than restoring this copy.
@@ -120,7 +136,8 @@ export function useMissionParameters() {
           // cruise (before the two were coupled). The working copy couples it
           // and the difference shows as a pending change, so a launch never
           // sends the pair the operator did not see.
-          const stored = served ? fillMissing(current.params, served) : current.params;
+          const migrated = migrateLegacyMode(current.params);
+          const stored = served ? fillMissing(migrated, served) : migrated;
           setCommitted(stored);
           setWorking(reconcileCoupledPaths(stored));
           setStatus('ready');
@@ -154,7 +171,7 @@ export function useMissionParameters() {
   }, [bridge, storage]);
 
   useEffect(() => {
-    setPreset(readStoredDoc(storage, presetKey(missionMode)));
+    setPresets(readPresets(storage, missionMode));
   }, [storage, missionMode]);
 
   const edit = useCallback((path: string, value: unknown) => {
@@ -178,7 +195,10 @@ export function useMissionParameters() {
 
   const dirty = changedPaths.size > 0;
 
-  const isPresetActive = useMemo(() => matchesPreset(working, preset), [working, preset]);
+  const activePresetId = useMemo(
+    () => findActivePreset(presets, missionMode, working),
+    [presets, missionMode, working]
+  );
 
   /** Conflicts between the working values, recomputed on every edit. */
   const conflicts = useMemo(() => activeConflicts(working), [working]);
@@ -190,6 +210,17 @@ export function useMissionParameters() {
    * the launch's own save of pending edits is refused the same way. Warnings
    * do not block; asking for confirmation is the sheet's job.
    */
+  // Every change of the working document is held inside the altitude envelope
+  // of its launch surface: a surface switched to the pad top raises a low
+  // altitude to the pad-top minimum, with a notice (section 5.2).
+  useEffect(() => {
+    if (!working) return;
+    const next = normalizeForMode(working);
+    if (next === working) return;
+    setAltitudeNotice(altitudeAdjustment(working, next));
+    setWorking(next);
+  }, [working]);
+
   const save = useCallback(async () => {
     if (!working) return false;
     if (conflicts.some((conflict) => conflict.severity === 'error')) {
@@ -215,48 +246,23 @@ export function useMissionParameters() {
     setStatus('ready');
     setError(null);
     setSaveAttempted(false);
+    setAltitudeNotice(null);
     return true;
   }, [bridge, working, conflicts, storage, missionMode]);
 
   const discard = useCallback(() => {
     setWorking(committed ? reconcileCoupledPaths(committed) : committed);
     setSaveAttempted(false);
+    setAltitudeNotice(null);
   }, [committed]);
 
-  /** Store the working values as this operator's preset. */
-  const saveAsPreset = useCallback(() => {
-    if (!working) return;
-    setPreset(working);
-    writeStoredDoc(storage, presetKey(missionMode), working);
-  }, [working, storage, missionMode]);
-
   /**
-   * The preset and the factory defaults are whole documents, but applying one
-   * moves only the sheet fields: PID gains, the calibration the mission wrote
-   * back and the arming mode stay as they are (5.8).
+   * Write `doc` as the active document of `mode`: to `mission_config.json`
+   * through the bridge and to the mode's working copy. A document with an
+   * error conflict is not written; the sheet marks the fields instead.
    */
-  const applyPreset = useCallback(() => {
-    if (preset) setWorking((prev) => (prev ? reconcileCoupledPaths(applySchemaFields(prev, preset)) : prev));
-  }, [preset]);
-
-  const applyFactory = useCallback(() => {
-    if (factory) setWorking((prev) => (prev ? reconcileCoupledPaths(applySchemaFields(prev, factory)) : prev));
-  }, [factory]);
-
-  const performSwitch = useCallback(
-    async (next: MissionMode): Promise<boolean> => {
-      if (!working || next === missionMode) return false;
-      const { doc, stash } = switchModeDocument({
-        working,
-        from: missionMode,
-        to: next,
-        stored: readStoredDoc(storage, workingKey(next)),
-        factory,
-      });
-      writeStoredDoc(storage, workingKey(missionMode), stash);
-      setWorking(doc);
-      setPreset(readStoredDoc(storage, presetKey(next)));
-      try { storage?.setItem(ACTIVE_MODE_KEY, next); } catch { /* the document is the source of truth */ }
+  const persistDocument = useCallback(
+    async (doc: ParamsDoc, mode: MissionMode): Promise<boolean> => {
       if (activeConflicts(doc).some((conflict) => conflict.severity === 'error')) {
         setSaveAttempted(true);
         return false;
@@ -270,14 +276,92 @@ export function useMissionParameters() {
           return false;
         }
       }
-      writeStoredDoc(storage, workingKey(next), doc);
+      writeStoredDoc(storage, workingKey(mode), doc);
       setCommitted(doc);
       setStatus('ready');
       setError(null);
       setSaveAttempted(false);
       return true;
     },
-    [bridge, factory, missionMode, storage, working]
+    [bridge, storage]
+  );
+
+  /**
+   * Save the working values as a favourite of the current mode named `name`.
+   * Returns why it was refused (empty or duplicate name, the limit of 12),
+   * in Portuguese, or `null` once saved.
+   */
+  const savePreset = useCallback(
+    (name: string): string | null => {
+      if (!working) return 'Parâmetros ainda não carregados.';
+      const result = addPreset(readPresets(storage, missionMode), name, working, newPresetId());
+      if (!result.ok) return result.error;
+      writePresets(storage, missionMode, result.presets);
+      setPresets(result.presets);
+      return null;
+    },
+    [working, storage, missionMode]
+  );
+
+  /** Rename favourite `id`; returns why it was refused, or `null`. */
+  const renamePresetById = useCallback(
+    (id: string, name: string): string | null => {
+      const result = renamePreset(readPresets(storage, missionMode), id, name);
+      if (!result.ok) return result.error;
+      writePresets(storage, missionMode, result.presets);
+      setPresets(result.presets);
+      return null;
+    },
+    [storage, missionMode]
+  );
+
+  /** Delete favourite `id` of the current mode. */
+  const deletePresetById = useCallback(
+    (id: string) => {
+      const next = deletePreset(readPresets(storage, missionMode), id);
+      writePresets(storage, missionMode, next);
+      setPresets(next);
+    },
+    [storage, missionMode]
+  );
+
+  /**
+   * Apply favourite `id`: its mode-owned values only (PID gains, the
+   * calibration the mission wrote back and the arming mode stay as they are),
+   * the altitude moved into the envelope of the launch surface, and the
+   * document written to `mission_config.json`, as on a mode switch.
+   */
+  const applyPresetById = useCallback(
+    async (id: string): Promise<boolean> => {
+      const preset = presets.find((item) => item.id === id);
+      if (!preset || !working) return false;
+      const doc = applyPresetValues(working, preset);
+      setWorking(doc);
+      return persistDocument(doc, missionMode);
+    },
+    [presets, working, persistDocument, missionMode]
+  );
+
+  const applyFactory = useCallback(() => {
+    if (factory) setWorking((prev) => (prev ? reconcileCoupledPaths(normalizeForMode(applySchemaFields(prev, factory))) : prev));
+  }, [factory]);
+
+  const performSwitch = useCallback(
+    async (next: MissionMode): Promise<boolean> => {
+      if (!working || next === missionMode) return false;
+      const { doc, stash } = switchModeDocument({
+        working,
+        from: missionMode,
+        to: next,
+        stored: readStoredDoc(storage, workingKey(next)),
+      });
+      writeStoredDoc(storage, workingKey(missionMode), stash);
+      setWorking(doc);
+      setPresets(readPresets(storage, next));
+      try { storage?.setItem(ACTIVE_MODE_KEY, next); } catch { /* the document is the source of truth */ }
+      return persistDocument(doc, next);
+    },
+    [missionMode, persistDocument, storage, working]
   );
 
   const switching = useRef(false);
@@ -299,20 +383,23 @@ export function useMissionParameters() {
     committed,
     working,
     factory,
-    preset,
+    presets,
+    activePresetId,
     missionMode,
     status,
     error,
     dirty,
     changedPaths,
-    isPresetActive,
     conflicts,
     saveAttempted,
+    altitudeNotice,
     edit,
     save,
     discard,
-    saveAsPreset,
-    applyPreset,
+    savePreset,
+    applyPreset: applyPresetById,
+    renamePreset: renamePresetById,
+    deletePreset: deletePresetById,
     applyFactory,
     switchMode,
   };

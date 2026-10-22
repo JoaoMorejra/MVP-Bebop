@@ -24,7 +24,7 @@ afterEach(() => {
   host.remove();
 });
 
-function render(missionMode?: MissionMode, stageName = 'Retornando base'): void {
+function render(missionMode?: MissionMode, stageName = 'Retornando base', rtlEnabled?: boolean): void {
   act(() =>
     root.render(
       <StageBar
@@ -40,17 +40,17 @@ function render(missionMode?: MissionMode, stageName = 'Retornando base'): void 
         onVolume={() => undefined}
         onToggleMute={() => undefined}
         missionMode={missionMode}
+        rtlEnabled={rtlEnabled}
       />
     )
   );
 }
 
 describe('StageBar stage 5 label by mission mode', () => {
-  it('intermediate shows Pouso no local in pills and header', () => {
-    render('intermediate');
-    expect(host.textContent).toContain('Pouso no local');
+  it('advanced with the return shows Retorno à base in pills and header', () => {
+    render('advanced');
+    expect(host.textContent).toContain('5 · Retorno à base');
     expect(host.textContent).not.toContain('Retornando base');
-    expect(host.textContent).toContain('5 · Pouso no local');
   });
 
   it('simple shows Pouso na base', () => {
@@ -59,8 +59,22 @@ describe('StageBar stage 5 label by mission mode', () => {
     expect(host.textContent).not.toContain('Retornando base');
   });
 
-  it('defaults to Retornando base', () => {
+  it('defaults to the advanced profile with the return', () => {
     render(undefined);
-    expect(host.textContent).toContain('Retornando base');
+    expect(host.textContent).toContain('Retorno à base');
+  });
+});
+
+describe('StageBar stage 5 label and plan chip by return plan', () => {
+  it.each(['simple', 'advanced'] as const)('says Pouso no local and never the base without the return (%s)', (mode) => {
+    render(mode, 'Retornando base', false);
+    expect(host.textContent).toContain('5 · Pouso no local');
+    expect(host.textContent).not.toMatch(/base|retorno/i);
+    expect(host.querySelector('[data-plan-chip="end"]')?.textContent).toBe('Final: pouso no local');
+  });
+
+  it('shows the return plan chip with the return', () => {
+    render('advanced', 'Retornando base', true);
+    expect(host.querySelector('[data-plan-chip="end"]')?.textContent).toBe('Final: RTL + pouso de precisão');
   });
 });

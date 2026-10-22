@@ -30,15 +30,15 @@ const press = (target: HTMLElement, key: string) =>
   });
 
 describe('MissionModeSelector', () => {
-  it('offers the three modes in order inside a radiogroup', () => {
+  it('offers the two modes in order inside a radiogroup', () => {
     act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
     expect(host.querySelector('[role="radiogroup"]')).not.toBeNull();
-    expect(radios().map((r) => r.textContent)).toEqual(['Simples', 'Intermediária', 'Avançada']);
+    expect(radios().map((r) => r.textContent)).toEqual(['Simples', 'Avançado']);
   });
 
   it('marks exactly the active mode', () => {
-    act(() => root.render(<MissionModeSelector value="intermediate" onChange={() => undefined} />));
-    expect(radios().map((r) => r.getAttribute('aria-checked'))).toEqual(['false', 'true', 'false']);
+    act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
+    expect(radios().map((r) => r.getAttribute('aria-checked'))).toEqual(['false', 'true']);
   });
 
   it('reports the mode the operator picks', () => {
@@ -51,7 +51,7 @@ describe('MissionModeSelector', () => {
   it('does not re-report the active mode', () => {
     const onChange = vi.fn();
     act(() => root.render(<MissionModeSelector value="advanced" onChange={onChange} />));
-    act(() => radios()[2].click());
+    act(() => radios()[1].click());
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -64,28 +64,28 @@ describe('MissionModeSelector', () => {
 
   it('describes the active mode under the control', () => {
     act(() => root.render(<MissionModeSelector value="simple" onChange={() => undefined} />));
-    expect(host.textContent).toContain('Não se desloca');
+    expect(host.textContent).toContain('Giro no lugar, foto e retorno do rumo');
   });
 });
 
 describe('MissionModeSelector keyboard', () => {
   it('keeps only the active mode in the tab order', () => {
-    act(() => root.render(<MissionModeSelector value="intermediate" onChange={() => undefined} />));
-    expect(radios().map((r) => r.tabIndex)).toEqual([-1, 0, -1]);
+    act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
+    expect(radios().map((r) => r.tabIndex)).toEqual([-1, 0]);
   });
 
   it('moves the selection with the arrow keys, wrapping at the ends', () => {
     const onChange = vi.fn();
     act(() => root.render(<MissionModeSelector value="advanced" onChange={onChange} />));
-    press(radios()[2], 'ArrowRight');
+    press(radios()[1], 'ArrowRight');
     expect(onChange).toHaveBeenLastCalledWith('simple');
-    press(radios()[2], 'ArrowLeft');
-    expect(onChange).toHaveBeenLastCalledWith('intermediate');
+    press(radios()[1], 'ArrowLeft');
+    expect(onChange).toHaveBeenLastCalledWith('simple');
   });
 
   it('moves the focus to the mode it selected', () => {
     function Controlled() {
-      const [mode, setMode] = React.useState<'simple' | 'intermediate' | 'advanced'>('simple');
+      const [mode, setMode] = React.useState<'simple' | 'advanced'>('simple');
       return <MissionModeSelector value={mode} onChange={setMode} />;
     }
     act(() => root.render(<Controlled />));
@@ -98,7 +98,7 @@ describe('MissionModeSelector keyboard', () => {
   it('ignores the arrow keys and announces the lock when disabled', () => {
     const onChange = vi.fn();
     act(() => root.render(<MissionModeSelector value="advanced" onChange={onChange} disabled />));
-    press(radios()[2], 'ArrowRight');
+    press(radios()[1], 'ArrowRight');
     expect(onChange).not.toHaveBeenCalled();
     expect(radios().every((r) => r.getAttribute('aria-disabled') === 'true')).toBe(true);
     expect(host.querySelector('[role="radiogroup"]')!.getAttribute('aria-disabled')).toBe('true');

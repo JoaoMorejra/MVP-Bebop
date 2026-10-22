@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Camera, ScanSearch, ShieldCheck, Square } from 'lucide-react';
+import { Camera, FileText, Maximize2, Minimize2, ScanSearch, ShieldCheck, Square, X } from 'lucide-react';
 import type { RawEvidence } from '../../types/bmg';
+import { useBridge } from '../../hooks/useBridge';
 import type { Finding } from '../../lib/forensics';
 import { TOPIC_LABEL } from '../../lib/forensics';
 import { PHRASE_POOLS } from '../../lib/copilotPhrases';
@@ -94,6 +95,141 @@ function stampOf(evidence: RawEvidence): string {
   return evidence.filename.replace(/^accident_(raw|inspected)_/, '').replace(/\.(png|jpg)$/, '');
 }
 
+/** How often the open report modal asks the host whether the report has landed. */
+export const REPORT_POLL_MS = 3000;
+
+/** The agent's report name for a capture without a valid identifier (`docs/PROJECT.md` §6). */
+export const REPORT_WITHOUT_IDENTIFIER = 'relatorio_inspecao_sem_identificador.html';
+
+/**
+ * Where the inference agent's report for this capture is served once written.
+ *
+ * The name is the one the mission recorded in the inspection package; without
+ * a package it follows the agent's rule. The identifier is never rebuilt from
+ * the file stamp, which is local time and would not match the UTC id.
+ */
+export function expectedReportUrl(evidence: RawEvidence): string {
+  const name =
+    evidence.inferencePackage?.expected_report ??
+    (evidence.occurrenceId ? `relatorio_${evidence.occurrenceId}.html` : REPORT_WITHOUT_IDENTIFIER);
+  return `/evidence/${name}`;
+}
+
+interface ReportModalProps {
+  /** Null when the capture carries no identifier. */
+  occurrenceId: string | null;
+  /** Null until the report is on disk. */
+  reportUrl: string | null;
+  onClose: () => void;
+}
+
+/**
+ * The inference agent's report, inside the cockpit.
+ *
+ * It never leaves the station's window: no new tab, no system browser (the
+ * host refuses every `window.open`). Expanding fills the window instead.
+ *
+ * The report is HTML written by an external agent and served from the
+ * cockpit's own origin, so the frame is sandboxed without `allow-same-origin`:
+ * with both that and `allow-scripts` a same-origin document can lift its own
+ * sandbox and reach `window.parent.bmgAPI`. The report's scripts still run,
+ * under an opaque origin; it is self-contained, the photograph embedded.
+ */
+export const ReportModal: React.FC<ReportModalProps> = ({ occurrenceId, reportUrl, onClose }) => {
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className={cn('fixed inset-0 z-[70] flex items-center justify-center', expanded ? 'p-0' : 'p-6')}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="report-modal-title"
+    >
+      <div aria-hidden className="absolute inset-0 bg-abyss/85 backdrop-blur-md" onClick={onClose} />
+      <div
+        data-report-size={expanded ? 'expanded' : 'framed'}
+        className={cn(
+          'anim-rise relative flex w-full flex-col overflow-hidden border border-strut bg-hull-deep shadow-2xl',
+          expanded ? 'h-full rounded-none' : 'h-full max-h-[92vh] max-w-6xl rounded-panel'
+        )}
+      >
+        <header className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-strut-soft px-4">
+          <span className="flex min-w-0 items-center gap-3">
+            <FileText size={16} strokeWidth={2} className="shrink-0 text-mint" aria-hidden />
+            <h2 id="report-modal-title" className="truncate font-cond text-sm tracking-wide text-frost">
+              Laudo Pericial — Inspeção Aérea Autônoma
+            </h2>
+            <span
+              data-testid="report-occurrence-id"
+              className="shrink-0 rounded-full border border-mint/50 bg-mint/10 px-2.5 py-0.5 font-mono text-2xs text-mint-bright"
+            >
+              {occurrenceId ?? 'sem identificador'}
+            </span>
+          </span>
+          <span className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setExpanded((value) => !value)}
+              data-testid="report-expand"
+              title={expanded ? 'Restaurar' : 'Expandir'}
+              aria-label={expanded ? 'Restaurar tamanho do laudo' : 'Expandir laudo'}
+              aria-pressed={expanded}
+              className="flex h-8 w-8 items-center justify-center rounded-bezel border border-strut text-haze transition-colors hover:border-mint/60 hover:text-mint-bright"
+            >
+              {expanded ? (
+                <Minimize2 size={14} strokeWidth={2} aria-hidden />
+              ) : (
+                <Maximize2 size={14} strokeWidth={2} aria-hidden />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              title="Fechar"
+              aria-label="Fechar laudo"
+              className="flex h-8 w-8 items-center justify-center rounded-bezel border border-strut text-haze transition-colors hover:border-mint/60 hover:text-frost"
+            >
+              <X size={15} strokeWidth={2} aria-hidden />
+            </button>
+          </span>
+        </header>
+
+        <div className="min-h-0 flex-1 p-3">
+          {reportUrl ? (
+            <iframe
+              src={reportUrl}
+              className="h-full w-full rounded-bezel border border-strut bg-hull-deep"
+              sandbox="allow-scripts"
+              title="Relatório de Inspeção"
+            />
+          ) : (
+            <div
+              data-testid="report-waiting"
+              className="flex h-full w-full flex-col items-center justify-center gap-4 rounded-bezel border border-strut-soft bg-abyss/60"
+            >
+              <FileText size={36} strokeWidth={1.5} className="anim-breathe text-mint" aria-hidden />
+              <p className="hud-legible text-base tracking-wide text-frost/90">
+                Aguardando emissão do laudo pelo agente de inferência visual...
+              </p>
+              <p className="font-mono text-2xs text-haze-deep">
+                verificação automática a cada {REPORT_POLL_MS / 1000} s
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 /**
  * The forensic wall: the capture, and what was concluded from it.
  *
@@ -173,6 +309,45 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   const inspecting = stage === 4;
   const presenting = (landed || missionOver) && Boolean(latest) && Boolean(report);
   const analyzing = (landed || missionOver) && Boolean(latest) && !report && reportAnalyzing;
+  const allTopicsSpoken = presenting && report !== null && reportRevealed >= report.length;
+
+  const bridge = useBridge();
+  const occurrenceId = latest?.occurrenceId ?? null;
+  const expectedUrl = latest ? expectedReportUrl(latest) : null;
+  const [reportUrl, setReportUrl] = useState<string | null>(null);
+  const [isModalOpen, setModalOpen] = useState(false);
+  const closeModal = useCallback(() => setModalOpen(false), []);
+
+  // Only this capture's own report is accepted, polled or announced: the host
+  // falls back to the newest report on disk, which may belong to an earlier
+  // flight.
+  const resolveReport = useCallback(async () => {
+    if (!bridge || !expectedUrl) return;
+    try {
+      const url = await bridge.getReportUrl(occurrenceId ?? undefined);
+      if (url === expectedUrl) setReportUrl(url);
+    } catch {
+      // The host is unreachable; the next poll or `bmg:report-ready` retries.
+    }
+  }, [bridge, expectedUrl, occurrenceId]);
+
+  useEffect(() => {
+    setReportUrl(null);
+    void resolveReport();
+  }, [resolveReport]);
+
+  useEffect(() => {
+    if (!bridge || !expectedUrl) return;
+    return bridge.onReportReady((event) => {
+      if (event.url === expectedUrl) setReportUrl(event.url);
+    });
+  }, [bridge, expectedUrl]);
+
+  useEffect(() => {
+    if (!isModalOpen || reportUrl) return;
+    const id = window.setInterval(() => void resolveReport(), REPORT_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [isModalOpen, reportUrl, resolveReport]);
 
   return (
     <section className="flex min-h-0 flex-col gap-2.5">
@@ -304,6 +479,17 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
       </div>
 
       <div className="flex shrink-0 items-center gap-2.5">
+        {allTopicsSpoken ? (
+          <button
+            type="button"
+            onClick={() => setModalOpen(true)}
+            data-testid="open-report"
+            className="anim-rise flex items-center gap-2 rounded-bezel border border-mint/70 bg-mint/10 px-4 py-2 text-sm font-semibold text-mint-bright transition-colors hover:bg-mint/20"
+          >
+            <FileText size={14} strokeWidth={2.25} aria-hidden />
+            Visualizar Laudo Pericial
+          </button>
+        ) : null}
         <button
           type="button"
           onClick={click}
@@ -330,6 +516,10 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
           {lock.requiresConfirm ? 'Segure para finalizar' : 'Finalizar missão'}
         </button>
       </div>
+
+      {isModalOpen && latest ? (
+        <ReportModal occurrenceId={occurrenceId} reportUrl={reportUrl} onClose={closeModal} />
+      ) : null}
     </section>
   );
 };

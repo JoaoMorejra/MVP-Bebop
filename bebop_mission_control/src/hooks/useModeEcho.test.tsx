@@ -3,7 +3,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MissionMode } from '../lib/missionMode';
-import { useModeEcho } from './useModeEcho';
+import { useModeEcho, type LaunchPlan } from './useModeEcho';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -15,13 +15,22 @@ let emit: (event: Milestone) => void = () => undefined;
 let container: HTMLDivElement;
 let root: Root;
 
-const Probe: React.FC<{ requested: MissionMode | null; onMismatch: (reported: string, requested: MissionMode) => void }> = ({
-  requested,
-  onMismatch,
-}) => {
-  useModeEcho({ requested, onMismatch });
+const Probe: React.FC<{
+  requested: MissionMode | null;
+  plan?: LaunchPlan | null;
+  onMismatch: (reported: string, requested: string) => void;
+}> = ({ requested, plan = null, onMismatch }) => {
+  useModeEcho({ requested, plan, onMismatch });
   return null;
 };
+
+const planEvent = (payload: Record<string, unknown>): Milestone => ({
+  kind: 'milestone',
+  key: 'mission.mode',
+  payload,
+  at: Date.now(),
+  source: 'mission',
+});
 
 const modeEvent = (mode: unknown): Milestone => ({
   kind: 'milestone',
@@ -31,9 +40,13 @@ const modeEvent = (mode: unknown): Milestone => ({
   source: 'mission',
 });
 
-async function mount(requested: MissionMode | null, onMismatch: (reported: string, requested: MissionMode) => void) {
+async function mount(
+  requested: MissionMode | null,
+  onMismatch: (reported: string, requested: string) => void,
+  plan: LaunchPlan | null = null
+) {
   await act(async () => {
-    root.render(<Probe requested={requested} onMismatch={onMismatch} />);
+    root.render(<Probe requested={requested} plan={plan} onMismatch={onMismatch} />);
   });
 }
 
@@ -102,6 +115,30 @@ describe('useModeEcho', () => {
   it('never acts when the mission reports nothing', async () => {
     const onMismatch = vi.fn();
     await mount('simple', onMismatch);
+    expect(onMismatch).not.toHaveBeenCalled();
+  });
+
+  it('compares the return plan and the launch surface the mission echoes', async () => {
+    const onMismatch = vi.fn();
+    const plan: LaunchPlan = { rtlEnabled: false, takeoffSurface: 'platform' };
+    await mount('advanced', onMismatch, plan);
+    await act(async () => emit(planEvent({ mode: 'advanced', rtl_enabled: false, takeoff_surface: 'platform' })));
+    expect(onMismatch).not.toHaveBeenCalled();
+    await act(async () => emit(planEvent({ mode: 'advanced', rtl_enabled: true, takeoff_surface: 'platform' })));
+    expect(onMismatch).toHaveBeenCalledWith('advanced, com RTL, totem', 'advanced, sem RTL, totem');
+  });
+
+  it('reports a launch surface the mission did not take', async () => {
+    const onMismatch = vi.fn();
+    await mount('simple', onMismatch, { rtlEnabled: true, takeoffSurface: 'ground' });
+    await act(async () => emit(planEvent({ mode: 'simple', rtl_enabled: true, takeoff_surface: 'platform' })));
+    expect(onMismatch).toHaveBeenCalledWith('simple, com RTL, totem', 'simple, com RTL, solo');
+  });
+
+  it('takes a payload without the plan fields as agreeing on them', async () => {
+    const onMismatch = vi.fn();
+    await mount('simple', onMismatch, { rtlEnabled: false, takeoffSurface: 'ground' });
+    await act(async () => emit(planEvent({ mode: 'simple' })));
     expect(onMismatch).not.toHaveBeenCalled();
   });
 });

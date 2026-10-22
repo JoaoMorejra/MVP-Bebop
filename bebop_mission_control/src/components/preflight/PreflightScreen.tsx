@@ -6,6 +6,7 @@ import type { LinkProgressEvent, LinkReadiness, WifiNetwork } from '../../types/
 import type { LinkPhase } from '../../hooks/useLink';
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { getPath } from '../../lib/paths';
+import type { OperatorPreset } from '../../lib/operatorPresets';
 import { readMissionMode, type MissionMode } from '../../lib/missionMode';
 import { preflightBlockedReason } from '../../lib/preflightGate';
 import { VideoBackdrop } from '../brand/VideoBackdrop';
@@ -41,16 +42,18 @@ interface PreflightScreenProps {
   paramsError: string | null;
   changedPaths: Set<string>;
   dirty: boolean;
-  hasPreset: boolean;
-  presetActive: boolean;
+  presets: readonly OperatorPreset[];
+  activePresetId: string | null;
   onEdit: (path: string, value: unknown) => void;
   onModeChange: (mode: MissionMode) => void;
   onSave: () => void;
   /** A save was refused for a conflict between parameters; the sheet marks the fields. */
   saveAttempted?: boolean;
   onDiscard: () => void;
-  onSavePreset: () => void;
-  onApplyPreset: () => void;
+  onSavePreset: (name: string) => string | null;
+  onApplyPreset: (id: string) => void;
+  onRenamePreset: (id: string, name: string) => string | null;
+  onDeletePreset: (id: string) => void;
 
   /** Battery failsafe, configured from the battery flyout. */
   failsafe: BatteryFailsafe;
@@ -63,6 +66,10 @@ interface PreflightScreenProps {
   onToggleMute: () => void;
 
   launchError: string | null;
+  /** Field of the launch document the mission refused; the sheet marks it. */
+  refusedPath?: string | null;
+  /** An altitude the envelope of the launch surface moved (`useMissionParameters.altitudeNotice`). */
+  altitudeNotice?: string | null;
   onLaunch: () => void;
   onOpenDiagnostics: () => void;
   /**
@@ -318,14 +325,18 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
                 changedPaths={props.changedPaths}
                 dirty={dirty}
                 saving={paramsStatus === 'saving'}
-                hasPreset={props.hasPreset}
-                presetActive={props.presetActive}
+                presets={props.presets}
+                activePresetId={props.activePresetId}
                 onEdit={props.onEdit}
                 onSave={props.onSave}
                 saveAttempted={props.saveAttempted}
                 onDiscard={props.onDiscard}
                 onSavePreset={props.onSavePreset}
                 onApplyPreset={props.onApplyPreset}
+                onRenamePreset={props.onRenamePreset}
+                onDeletePreset={props.onDeletePreset}
+                refusedPath={props.refusedPath ?? null}
+                altitudeNotice={props.altitudeNotice ?? null}
               />
             ) : (
               <div className="flex h-full items-center justify-center rounded-panel border border-strut-soft bg-hull">

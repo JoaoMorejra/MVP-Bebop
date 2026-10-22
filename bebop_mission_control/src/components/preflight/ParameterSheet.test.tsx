@@ -3,7 +3,8 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { completeDocument, validDocument } from '../../lib/__fixtures__/missionDocument';
-import { ALL_PARAMETERS } from '../../lib/parameterSchema';
+import { activeConflicts } from '../../lib/parameterConflicts';
+import { ALL_PARAMETERS, PARAMETER_GROUPS } from '../../lib/parameterSchema';
 import { getPath, setPath } from '../../lib/paths';
 import { ParameterSheet } from './ParameterSheet';
 
@@ -34,12 +35,14 @@ function render(working: Record<string, unknown>, defaults: Record<string, unkno
         changedPaths={new Set()}
         dirty={false}
         saving={false}
-        hasPreset={false}
-        presetActive={false}
+        presets={[]}
+        activePresetId={null}
         onEdit={onEdit}
         onSave={() => undefined}
         onDiscard={() => undefined}
-        onSavePreset={() => undefined}
+        onSavePreset={() => null}
+          onRenamePreset={() => null}
+          onDeletePreset={() => undefined}
         onApplyPreset={() => undefined}
       />
     )
@@ -54,7 +57,7 @@ describe('ParameterSheet defaults', () => {
   it('prints the default the mission holds, not one of its own', () => {
     const defaults = setPath(completeDocument(), 'kinematics.target_altitude_m', 1.0);
     render(completeDocument(), defaults);
-    expect(container.textContent).toContain('padrão 1.0m');
+    expect(container.textContent).toContain('padrão 1.00m');
   });
 
   it('restores every sheet field from the mission defaults', () => {
@@ -83,7 +86,7 @@ describe('ParameterSheet defaults', () => {
 
 describe('ParameterSheet slider ranges', () => {
   it.each([
-    ['kinematics.target_altitude_m', '0.1', '4'],
+    ['kinematics.target_altitude_m', '0.1', '2'],
     ['kinematics.altitude_ceiling_margin_m', '0', '2'],
     ['kinematics.forward_cruise_velocity', '0.01', '0.6'],
     ['gimbal.search_tilt_deg', '-45', '0'],
@@ -94,6 +97,35 @@ describe('ParameterSheet slider ranges', () => {
     const range = container.querySelector(`input[type="range"][aria-label="${spec.label}"]`) as HTMLInputElement;
     expect(range.min).toBe(min);
     expect(range.max).toBe(max);
+  });
+});
+
+describe('ParameterSheet launch refusal', () => {
+  it('marks the field the mission refused at the launch as an error', () => {
+    act(() =>
+      root.render(
+        <ParameterSheet
+          working={completeDocument()}
+          defaults={null}
+          changedPaths={new Set()}
+          dirty={false}
+          saving={false}
+          presets={[]}
+          activePresetId={null}
+          onEdit={() => undefined}
+          onSave={() => undefined}
+          onDiscard={() => undefined}
+          onSavePreset={() => null}
+          onRenamePreset={() => null}
+          onDeletePreset={() => undefined}
+          onApplyPreset={() => undefined}
+          refusedPath="kinematics.target_altitude_m"
+        />
+      )
+    );
+    const field = container.querySelector('[data-parameter="kinematics.target_altitude_m"]');
+    expect(field?.getAttribute('data-conflict')).toBe('error');
+    expect(container.querySelector('[data-parameter="kinematics.takeoff_stabilize_duration_sec"]')?.getAttribute('data-conflict')).toBeNull();
   });
 });
 
@@ -197,13 +229,15 @@ describe('ParameterSheet conflicts on save', () => {
           changedPaths={new Set(['kinematics.target_altitude_m'])}
           dirty
           saving={false}
-          hasPreset={false}
-          presetActive={false}
+          presets={[]}
+          activePresetId={null}
           saveAttempted={saveAttempted}
           onEdit={() => undefined}
           onSave={onSave}
           onDiscard={() => undefined}
-          onSavePreset={() => undefined}
+          onSavePreset={() => null}
+          onRenamePreset={() => null}
+          onDeletePreset={() => undefined}
           onApplyPreset={() => undefined}
         />
       )
@@ -217,7 +251,7 @@ describe('ParameterSheet conflicts on save', () => {
     act(() => Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Salvar')!.click());
   const altitudeCard = () =>
     container.querySelector('[data-parameter="kinematics.target_altitude_m"]') as HTMLElement;
-  const low = () => validDocument({ 'kinematics.target_altitude_m': 0.1, 'kinematics.altitude_ceiling_margin_m': 0 });
+  const low = () => validDocument({ 'platform.height_m': 1, 'kinematics.target_altitude_m': 1.25 });
 
   it('refuses an inexecutable combination: explains it and does not save', () => {
     const onSave = sheet(low());
@@ -225,9 +259,9 @@ describe('ParameterSheet conflicts on save', () => {
     expect(onSave).not.toHaveBeenCalled();
     expect(conflictDialog()).not.toBeNull();
     expect(conflictDialog()!.getAttribute('data-mode')).toBe('blocked');
-    expect(conflictDialog()!.textContent).toContain('Teto abaixo da altura de decolagem do firmware');
+    expect(conflictDialog()!.textContent).toContain('Cota fora do envelope da superfície de decolagem');
     expect(conflictDialog()!.textContent).toContain('Altitude de Voo');
-    expect(conflictDialog()!.textContent).toContain('0.1m');
+    expect(conflictDialog()!.textContent).toContain('1.25m');
     expect(dialogButton('Salvar mesmo assim')).toBeUndefined();
     act(() => dialogButton('Voltar e ajustar')!.click());
     expect(conflictDialog()).toBeNull();
@@ -256,8 +290,10 @@ describe('ParameterSheet conflicts on save', () => {
     save();
     act(() => dialogButton('Voltar e ajustar')!.click());
     expect(altitudeCard().getAttribute('data-conflict')).toBe('error');
-    // E03, E04, W03 and W15 all involve an envelope field (W05 retired).
-    expect(container.querySelector('[data-group-conflicts="envelope"]')?.textContent).toBe('4');
+    const envelopePaths = new Set(PARAMETER_GROUPS[0].items.map((item) => item.path));
+    const expected = activeConflicts(low()).filter((c) => c.paths.some((path) => envelopePaths.has(path))).length;
+    expect(expected).toBeGreaterThan(0);
+    expect(container.querySelector('[data-group-conflicts="envelope"]')?.textContent).toBe(String(expected));
 
     sheet(validDocument({ 'kinematics.target_altitude_m': 0.1, 'kinematics.altitude_ceiling_margin_m': 0.9 }));
     expect(altitudeCard().getAttribute('data-conflict')).toBe('warning');
@@ -283,18 +319,18 @@ describe('ParameterSheet by mission mode', () => {
     expect(text()).toContain('Velocidade de Deslocamento');
     expect(text()).toContain('Timeout de Retorno e Pouso ArUco');
     expect(text()).not.toContain('Velocidade de Giro');
-    expect(text()).toContain('Modo: Avançada');
+    expect(text()).toContain('Modo: Avançado');
   });
 
-  it('hides the return timeout and the turn rate in the intermediate mode', () => {
-    render(withMode('intermediate'), completeDocument());
+  it('hides the return timeout and the turn rate in the advanced mode without the return', () => {
+    render(setPath(withMode('advanced'), 'rtl.enabled', false), completeDocument());
     expect(text()).not.toContain('Timeout de Retorno e Pouso ArUco');
     expect(text()).not.toContain('Velocidade de Giro');
     expect(text()).toContain('Timeout de Procura/Varredura');
     expect(text()).toContain('Contagem Regressiva');
     expect(text()).toContain('Velocidade de Deslocamento');
     expect(text()).toContain('Gimbal & Câmera');
-    expect(text()).toContain('Modo: Intermediária');
+    expect(text()).toContain('Modo: Avançado');
   });
 
   it('swaps the cruise velocity for the turn rate in the simple mode', () => {
@@ -307,33 +343,35 @@ describe('ParameterSheet by mission mode', () => {
     expect(text()).toContain('Timeout de Procura/Varredura');
     expect(text()).toContain('Contagem Regressiva');
     expect(text()).toContain('Modo: Simples');
-    expect(text()).not.toContain('Margem do Teto de Altitude');
+    expect(text()).toContain('Margem do Teto de Altitude');
   });
 
-  it('keeps the ceiling margin in the intermediate and advanced modes', () => {
-    render(withMode('intermediate'), completeDocument());
+  it('keeps the ceiling margin in the advanced mode, with or without the return', () => {
+    render(setPath(withMode('advanced'), 'rtl.enabled', false), completeDocument());
     expect(text()).toContain('Margem do Teto de Altitude');
     render(withMode('advanced'), completeDocument());
     expect(text()).toContain('Margem do Teto de Altitude');
   });
 
-  it('offers the advanced settings in the simple and advanced modes only', () => {
+  it('offers the advanced settings only with the return, in both modes', () => {
     const hasButton = () =>
       Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.includes('Configurações Avançadas'));
     render(withMode('advanced'), completeDocument());
     expect(hasButton()).toBe(true);
     render(withMode('simple'), completeDocument());
     expect(hasButton()).toBe(true);
-    render(withMode('intermediate'), completeDocument());
+    render(setPath(withMode('advanced'), 'rtl.enabled', false), completeDocument());
+    expect(hasButton()).toBe(false);
+    render(setPath(withMode('simple'), 'rtl.enabled', false), completeDocument());
     expect(hasButton()).toBe(false);
   });
 
-  it('closes an open advanced dialog when the mode becomes intermediate', () => {
+  it('closes an open advanced dialog when the return is turned off', () => {
     render(withMode('advanced'), completeDocument());
     act(() => button('Configurações Avançadas').click());
     expect(container.querySelector('[role="dialog"]')).not.toBeNull();
     expect(container.textContent).toContain('Janela de centragem');
-    render(withMode('intermediate'), completeDocument());
+    render(setPath(withMode('advanced'), 'rtl.enabled', false), completeDocument());
     expect(container.querySelector('[role="dialog"]')).toBeNull();
     expect(container.textContent).not.toContain('Janela de centragem');
     render(withMode('advanced'), completeDocument());
@@ -345,5 +383,93 @@ describe('ParameterSheet by mission mode', () => {
     const onEdit = render(withMode('simple'), defaults);
     act(() => button('Restaurar Padrões').click());
     for (const spec of ALL_PARAMETERS) expect(onEdit).toHaveBeenCalledWith(spec.path, getPath(defaults, spec.path));
+  });
+});
+
+describe('ParameterSheet launch surface and return plan', () => {
+  const checkbox = (path: string) =>
+    container.querySelector(`[data-parameter="${path}"] input[type="checkbox"]`) as HTMLInputElement | null;
+  const card = (path: string) => container.querySelector(`[data-parameter="${path}"]`) as HTMLElement | null;
+  const pad = (overrides: Record<string, unknown> = {}) =>
+    completeDocument({ 'platform.height_m': 1, 'kinematics.target_altitude_m': 1.8, 'platform.venue_ceiling_agl_m': 2.5, ...overrides });
+
+  it('offers both booleans as labelled checkboxes that report a JSON boolean', () => {
+    const onEdit = render(pad(), completeDocument());
+    for (const path of ['platform.takeoff_from_ground', 'rtl.enabled']) {
+      const box = checkbox(path)!;
+      expect(box).not.toBeNull();
+      expect(box.labels?.[0]?.textContent).toMatch(path === 'rtl.enabled' ? /Retorno a base \(RTL\)/ : /Decolagem do Solo/);
+      expect(box.getAttribute('aria-describedby')).toBeTruthy();
+    }
+    expect(checkbox('rtl.enabled')!.checked).toBe(true);
+    act(() => checkbox('platform.takeoff_from_ground')!.click());
+    expect(onEdit).toHaveBeenCalledWith('platform.takeoff_from_ground', true);
+    act(() => checkbox('rtl.enabled')!.click());
+    expect(onEdit).toHaveBeenCalledWith('rtl.enabled', false);
+  });
+
+  it('places the surface right after the altitude', () => {
+    render(pad(), completeDocument());
+    const envelope = Array.from(container.querySelectorAll('[data-parameter]')).map((node) => node.getAttribute('data-parameter'));
+    const altitude = envelope.indexOf('kinematics.target_altitude_m');
+    expect(envelope[altitude + 1]).toBe('platform.takeoff_from_ground');
+  });
+
+  it('locks the margin on the pad top with the fixed ceiling as its legend, in both modes', () => {
+    for (const mode of ['simple', 'advanced']) {
+      render(pad({ mission_mode: mode }), completeDocument());
+      const margin = card('kinematics.altitude_ceiling_margin_m')!;
+      expect(margin.getAttribute('data-locked')).toBe('true');
+      expect(margin.textContent).toContain('Teto fixo do perfil de totem: 2,50 m sobre o piso');
+      expect((margin.querySelector('input[type="range"]') as HTMLInputElement).disabled).toBe(true);
+    }
+  });
+
+  it('unlocks the margin from the floor', () => {
+    render(pad({ 'platform.takeoff_from_ground': true }), completeDocument());
+    const margin = card('kinematics.altitude_ceiling_margin_m')!;
+    expect(margin.getAttribute('data-locked')).toBeNull();
+    expect((margin.querySelector('input[type="range"]') as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it('shows the plan chips of the document', () => {
+    render(pad(), completeDocument());
+    expect(container.querySelector('[data-plan-chip="end"]')?.textContent).toBe('Final: RTL + pouso de precisão');
+    expect(container.querySelector('[data-plan-chip="surface"]')?.textContent).toBe('Decolagem: totem 1,00 m');
+    render(pad({ 'rtl.enabled': false, 'platform.takeoff_from_ground': true }), completeDocument());
+    expect(container.querySelector('[data-plan-chip="end"]')?.textContent).toBe('Final: pouso no local');
+    expect(container.querySelector('[data-plan-chip="surface"]')?.textContent).toBe('Decolagem: solo');
+  });
+
+  it('shows the notice of an altitude the envelope moved', () => {
+    act(() =>
+      root.render(
+        <ParameterSheet
+          working={pad()}
+          defaults={null}
+          changedPaths={new Set()}
+          dirty={false}
+          saving={false}
+          presets={[]}
+          activePresetId={null}
+          onEdit={() => undefined}
+          onSave={() => undefined}
+          onDiscard={() => undefined}
+          onSavePreset={() => null}
+          onRenamePreset={() => null}
+          onDeletePreset={() => undefined}
+          onApplyPreset={() => undefined}
+          altitudeNotice="Cota ajustada para 1,30 m: mínimo sobre o totem."
+        />
+      )
+    );
+    expect(container.querySelector('[data-altitude-notice]')?.textContent).toBe('Cota ajustada para 1,30 m: mínimo sobre o totem.');
+  });
+
+  it('restores the booleans with the other sheet fields', () => {
+    const onEdit = render(pad({ 'rtl.enabled': false }), completeDocument());
+    act(() => button('Restaurar Padrões').click());
+    expect(onEdit).toHaveBeenCalledWith('rtl.enabled', true);
+    expect(onEdit).toHaveBeenCalledWith('platform.takeoff_from_ground', false);
   });
 });

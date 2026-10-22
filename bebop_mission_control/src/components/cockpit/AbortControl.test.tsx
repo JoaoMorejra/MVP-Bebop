@@ -111,9 +111,13 @@ describe('isTextInputOrTerminal (R11)', () => {
     expect(isTextInputOrTerminal(textarea)).toBe(true);
   });
 
-  it('identifies select elements', () => {
-    const select = document.createElement('select');
-    expect(isTextInputOrTerminal(select)).toBe(true);
+  it('does not take a select, a range, a checkbox or a button for a text field (D8)', () => {
+    expect(isTextInputOrTerminal(document.createElement('select'))).toBe(false);
+    for (const type of ['range', 'checkbox', 'radio', 'button']) {
+      const input = document.createElement('input');
+      input.type = type;
+      expect(isTextInputOrTerminal(input)).toBe(false);
+    }
   });
 
   it('identifies contenteditable elements', () => {

@@ -144,8 +144,8 @@ describe('copilot repertoire by mission mode', () => {
     renderPhrase(variant, { speed: spokenSpeed(0.2) ?? '' })
   );
 
-  it('drops mission.rtl_start in a reduced mode even if it arrives', async () => {
-    emit(milestone('mission.mode', { mode: 'intermediate' }));
+  it('drops mission.rtl_start without the return even if it arrives', async () => {
+    emit(milestone('mission.mode', { mode: 'advanced', rtl_enabled: false }));
     emit(milestone('mission.rtl_start', { inspected: true, marker_guided: true }));
     await settle();
     expect(spoken).toEqual([]);
