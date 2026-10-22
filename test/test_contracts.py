@@ -210,7 +210,9 @@ _FROZEN_CONFIGURATION_KEYS = frozenset(
         "calibration.altitude_anchor_gate_m",
         "calibration.altitude_anchor_tau_sec",
         "calibration.altitude_estimator",
+        "calibration.altitude_measurement_noise_m",
         "calibration.altitude_probe_enabled",
+        "calibration.firmware_altitude_source",
         "calibration.mad_outlier_sigma",
         "calibration.max_ground_dispersion_m",
         "calibration.min_ground_samples",
@@ -219,8 +221,12 @@ _FROZEN_CONFIGURATION_KEYS = frozenset(
         "calibration.plausibility_max_speed_mps",
         "calibration.plausibility_reject_streak",
         "calibration.sample_buffer_size",
+        "calibration.terrain_step_noise_scale",
+        "calibration.vertical_accel_noise_mps2",
+        "calibration.vertical_lag_tau_sec",
         "calibration.vz_max_accel_mps2",
         "calibration.vz_max_speed_mps",
+        "calibration.vz_measurement_noise_mps",
         "calibration.vz_reject_streak",
         "dead_reckoning.enabled",
         "dead_reckoning.max_integration_step_sec",
@@ -329,6 +335,7 @@ _FROZEN_CONFIGURATION_KEYS = frozenset(
         "platform.rise_feedforward_mps",
         "platform.sag_feedforward_mps",
         "platform.sonar_half_angle_deg",
+        "platform.takeoff_from_ground",
         "platform.venue_ceiling_agl_m",
         "rtl.arrival_radius_m",
         "rtl.assisted_descent_speed",
@@ -346,6 +353,7 @@ _FROZEN_CONFIGURATION_KEYS = frozenset(
         "rtl.deadband_m",
         "rtl.descent_stall_epsilon_m",
         "rtl.descent_stall_sec",
+        "rtl.enabled",
         "rtl.final_hover_delay_sec",
         "rtl.kd",
         "rtl.kp",
@@ -454,6 +462,14 @@ def _flatten_keys(node, prefix=""):
 
 
 def test_the_lateral_refactor_adds_and_removes_no_configuration_field():
+    """The serialized layout is exactly the frozen one; the local store never holds more.
+
+    ``mission_config.json`` is git-ignored and written back by the mission on
+    every run, so on a station that has not flown since a field was added it
+    lacks that field. A key missing from it is tolerated when the dataclass
+    gives it a default (``load_from_file`` fills it); a key it holds that the
+    layout does not know is not.
+    """
     import mvp_mission_bebop
 
     shipped = os.path.join(os.path.dirname(mvp_mission_bebop.__file__), "mission_config.json")
@@ -462,7 +478,8 @@ def test_the_lateral_refactor_adds_and_removes_no_configuration_field():
     serialized = set(_flatten_keys(MissionParameters().to_dict()))
 
     assert serialized == _FROZEN_CONFIGURATION_KEYS
-    assert on_disk == _FROZEN_CONFIGURATION_KEYS
+    assert on_disk <= _FROZEN_CONFIGURATION_KEYS, sorted(on_disk - _FROZEN_CONFIGURATION_KEYS)
+    assert (_FROZEN_CONFIGURATION_KEYS - on_disk) <= serialized
 
 
 # -------------------------------------------------------------------- evidence
@@ -663,6 +680,63 @@ def test_the_emitted_keys_are_exactly_the_spec_pool_keys():
     assert MILESTONE_KEYS == SPEC_MILESTONE_KEYS
 
 
+#: Alerts the mission hands to the station. ``mission.launch_refused`` is the
+#: only key added by the launch-envelope work; it is registered in
+#: ``milestones.py``, ``electron/milestones.cjs`` and ``copilotPhrases.ts``.
+SPEC_ALERT_KEYS = (
+    "mission.abort",
+    "mission.step_failed",
+    "mission.failsafe",
+    "mission.init_failed",
+    "mission.calibration_failed",
+    "mission.takeoff_failed",
+    "mission.alert",
+    "mission.launch_refused",
+)
+
+
+def test_the_stage_five_names_follow_the_profile_and_the_return_plan():
+    from mvp_mission_bebop.mission_mode import MissionMode
+    from mvp_mission_bebop.steps.pipeline import build_steps
+
+    names = {
+        (mode.value, rtl): build_steps(mode, rtl)[5]().name for mode in MissionMode for rtl in (True, False)
+    }
+    assert names == {
+        ("advanced", True): "STEP 5: ArUco RTL & Precision Landing",
+        ("simple", True): "STEP 5: ArUco Centering & Base Landing",
+        ("advanced", False): "STEP 5: Landing at Inspection Point",
+        ("simple", False): "STEP 5: Landing at Inspection Point",
+    }
+    for name in names.values():
+        assert STEP_LINE.search(f"--- [{name}] ---").group(1) == "5"
+
+
+def test_the_alert_keys_are_exactly_the_spec_alert_keys():
+    from mvp_mission_bebop.telemetry.milestones import ALERT_KEYS
+
+    assert ALERT_KEYS == SPEC_ALERT_KEYS
+
+
+def test_the_launch_refusal_alert_is_registered_at_the_station():
+    station = os.path.join(_REPO, "bebop_mission_control")
+    for relative in ("electron/milestones.cjs", "src/lib/copilotPhrases.ts"):
+        with open(os.path.join(station, relative), encoding="utf-8") as handle:
+            assert "'mission.launch_refused'" in handle.read(), relative
+
+
+def test_the_standby_critical_paths_are_the_same_on_both_sides():
+    from mvp_mission_bebop.engine.launch import CRITICAL_PATHS
+
+    with open(os.path.join(_REPO, "bebop_mission_control", "electron", "missionStandby.cjs"), encoding="utf-8") as handle:
+        source = handle.read()
+    block = re.search(r"const CRITICAL_PATHS = \[(.*?)\];", source, re.S)
+    assert block is not None
+    assert tuple(re.findall(r"'([^']+)'", block.group(1))) == CRITICAL_PATHS
+    for path in ("mission_mode", "rtl.enabled", "platform.takeoff_from_ground"):
+        assert path in CRITICAL_PATHS
+
+
 def test_a_milestone_line_is_matched_by_the_gcs_and_never_as_a_step():
     from mvp_mission_bebop.telemetry.milestones import encode_milestone
 
@@ -677,14 +751,23 @@ def test_a_milestone_line_is_matched_by_the_gcs_and_never_as_a_step():
 
 
 def test_the_mode_milestone_is_matched_by_the_gcs_with_its_payload():
+    from mvp_mission_bebop.mission import mission_mode_payload
     from mvp_mission_bebop.telemetry.milestones import encode_milestone
 
-    line = encode_milestone("mission.mode", {"mode": "simple"})
+    params = MissionParameters()
+    params.mission_mode = "simple"
+    params.rtl.enabled = False
+    params.platform.height_m = 1.0
+    params.kinematics.target_altitude_m = 1.8
+    payload = mission_mode_payload(params)
+    assert payload == {"mode": "simple", "rtl_enabled": False, "takeoff_surface": "platform", "target_altitude_m": 1.8}
+
+    line = encode_milestone("mission.mode", payload)
 
     match = MILESTONE_LINE.search(line)
     assert match is not None
     assert match.group(1) == "mission.mode"
-    assert json.loads(match.group(2)) == {"mode": "simple"}
+    assert json.loads(match.group(2)) == payload
 
 
 def test_an_empty_payload_is_still_an_object():
@@ -904,6 +987,7 @@ def test_exit_codes_are_distinct_and_keep_their_wire_values():
     assert exit_codes.EXIT_ABORTED_LANDED == 3
     assert exit_codes.EXIT_TOUCHDOWN_UNCONFIRMED == 4
     assert exit_codes.FORCED_EXIT_CODE == 130
+    assert exit_codes.EXIT_LAUNCH_REFUSED == 78
     values = [
         exit_codes.EXIT_COMPLETE,
         exit_codes.EXIT_FAILURE,
@@ -944,7 +1028,7 @@ def test_gcs_outcome_map_uses_the_same_exit_codes():
 
     with open(_OUTCOME_TS, encoding="utf-8") as handle:
         source = handle.read()
-    for name in ("EXIT_COMPLETE", "EXIT_ABORTED_LANDED", "EXIT_TOUCHDOWN_UNCONFIRMED"):
+    for name in ("EXIT_COMPLETE", "EXIT_ABORTED_LANDED", "EXIT_TOUCHDOWN_UNCONFIRMED", "EXIT_LAUNCH_REFUSED"):
         match = re.search(rf"export const {name} = (\d+);", source)
         assert match, f"{name} missing from missionOutcome.ts"
         assert int(match.group(1)) == getattr(exit_codes, name), name

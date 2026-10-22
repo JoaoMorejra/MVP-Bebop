@@ -145,7 +145,7 @@ class FilteredPID:
         self._last_measurement = 0.0
         self._primed = False
 
-    def update(self, measurement: float, dt: float) -> float:
+    def update(self, measurement: float, dt: float, *, hold_integral: bool = False) -> float:
         """Compute the control effort for one cycle.
 
         Parameters
@@ -155,6 +155,10 @@ class FilteredPID:
         dt : float
             Interval since the previous update, in seconds. Supply the value
             reported by ``LoopRate.tick`` rather than a nominal period.
+        hold_integral : bool
+            Keep the integral where it is this cycle: the measurement is a
+            propagation, not an observation, and integrating it would wind up
+            against an error nobody measured.
         """
         gains = self._gains
 
@@ -188,7 +192,8 @@ class FilteredPID:
 
         proportional = gains.kp * error
 
-        self._integral += gains.ki * error * dt
+        if not hold_integral:
+            self._integral += gains.ki * error * dt
         self._integral = max(
             gains.integral_limits[0], min(gains.integral_limits[1], self._integral)
         )

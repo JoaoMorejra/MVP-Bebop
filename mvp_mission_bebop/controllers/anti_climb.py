@@ -105,8 +105,12 @@ class AltitudeAntiClimbGovernor:
         current_relative_alt: float,
         dt: Optional[float] = None,
         vx_commanded: float = 0.0,
+        hold_integrator: bool = False,
     ) -> float:
         """Corrective vertical velocity command, always ``<= 0``.
+
+        ``hold_integrator`` keeps the integral where it is this cycle, as
+        :meth:`AltitudeHoldGovernor.compute_vz` does.
 
         Parameters
         ----------
@@ -148,7 +152,7 @@ class AltitudeAntiClimbGovernor:
                 excess,
             )
 
-        command = self._pid.update(excess, interval)
+        command = self._pid.update(excess, interval, hold_integral=hold_integrator)
         return max(-self.config.max_descent_speed, min(0.0, command))
 
     def reset(self) -> None:

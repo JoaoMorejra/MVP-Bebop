@@ -96,6 +96,7 @@ class BenchtopDroneProxy:
         simulator: Optional[KinematicSimulator] = None,
         motion_tracker: Optional[DeadReckoningTracker] = None,
         yaw_authority: Optional[YawAuthority] = None,
+        vertical_command_listener: Optional[Callable[[float], None]] = None,
     ) -> None:
         self._no_fly: bool = bool(no_fly)
         self.yaw_authority: YawAuthority = yaw_authority if yaw_authority is not None else YawAuthority()
@@ -107,6 +108,11 @@ class BenchtopDroneProxy:
         # forgot to report its own motion. A tracker that is only as complete as
         # the discipline of five separate control loops is not a tracker.
         self.motion_tracker = motion_tracker
+        #: Told every normalized ``vz`` actually sent, after every clamp: the
+        #: process input of the terrain-aware vertical filter
+        #: (``OdometrySupervisor.note_commanded_vz``). The value the governor
+        #: asked for is not what flew when the failsafe clamped it.
+        self.vertical_command_listener = vertical_command_listener
         #: Whether :meth:`connect` found the driver; ``None`` before it ran.
         self.driver_reachable: Optional[bool] = None
 
@@ -220,6 +226,11 @@ class BenchtopDroneProxy:
 
         if self.motion_tracker is not None:
             self.motion_tracker.command(vx=vx, vy=vy, vz=vz, vyaw=vyaw, duration=duration)
+        if self.vertical_command_listener is not None:
+            try:
+                self.vertical_command_listener(float(vz))
+            except Exception as exc:  # noqa: BLE001 - the estimator never blocks a command
+                logger.debug("Vertical command listener failed: %s", exc)
 
         if self.no_fly:
             if self.simulator is not None:

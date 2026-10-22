@@ -263,6 +263,7 @@ class AltitudeHoldGovernor:
         current_relative_alt: float,
         dt: Optional[float] = None,
         vx_commanded: float = 0.0,
+        hold_integrator: bool = False,
     ) -> float:
         """Corrective vertical velocity command, in normalized units.
 
@@ -283,6 +284,10 @@ class AltitudeHoldGovernor:
             induces, ahead of the integral term's reactive correction.
             Defaults to zero, which reproduces this method's behaviour before
             the parameter existed.
+        hold_integrator : bool
+            The altitude only propagates (``OdometrySupervisor.vertical_coasting``):
+            the integral term does not accumulate this cycle, an anti-windup
+            for the absence of a measurement.
 
         Returns
         -------
@@ -306,14 +311,16 @@ class AltitudeHoldGovernor:
             if self._forcing_descent:
                 self._forcing_descent = False
                 logger.info("[PLATFORM reentry_descent released]")
-            return self._regulate(current_relative_alt, interval, feedforward)
+            return self._regulate(current_relative_alt, interval, feedforward, hold_integrator)
         except BaseException:
             # Whatever failed, the next cycle must not inherit guard authority
             # it did not re-establish.
             self._engage(False)
             raise
 
-    def _regulate(self, current_relative_alt: float, interval: float, feedforward: float) -> float:
+    def _regulate(
+        self, current_relative_alt: float, interval: float, feedforward: float, hold_integrator: bool = False
+    ) -> float:
         """One cycle of the law under the limits currently in force."""
         if not math.isfinite(current_relative_alt):
             # An absent measurement, not a large one. Coasting on the profile's
@@ -363,7 +370,7 @@ class AltitudeHoldGovernor:
         # setpoint at zero, so feeding ``-excursion`` in as the measurement makes
         # a positive excursion -- the drone is low -- produce a positive, i.e.
         # ascending, demand.
-        demand = self._pid.update(-excursion, interval)
+        demand = self._pid.update(-excursion, interval, hold_integral=hold_integrator)
         command = self._clamp(self._profile.step(self._bound(demand + feedforward), interval))
 
         climbing = command > 0.0
