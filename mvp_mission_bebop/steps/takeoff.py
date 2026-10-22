@@ -17,8 +17,9 @@ from mvp_mission_bebop.controllers.profiling import (
 from mvp_mission_bebop.engine.launch import CountdownTicker
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
+from mvp_mission_bebop.launch_envelope import launches_from_ground
 from mvp_mission_bebop.mission_mode import MissionMode
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 logger = logging.getLogger("Step1Takeoff")
@@ -39,6 +40,11 @@ _LOW_TARGET_MARGIN_M: Final[float] = 0.05
 #: Poll period of the remaining IMU settle before the takeoff, seconds.
 _SETTLE_POLL_SEC: Final[float] = 0.01
 
+#: Time the altitude must stay inside ``governor.deadband_m`` of the target for
+#: the post-takeoff descent to count as converged, in seconds. About five
+#: odometry samples at the driver's 5 Hz.
+_DESCENT_SETTLE_WINDOW_SEC: Final[float] = 1.0
+
 
 class _NoPerception:
     """Stand-in for a context without a perception pipeline."""
@@ -52,6 +58,17 @@ class _NoPerception:
 #: ARSDK flying states that confirm the airframe has left the ground: takingoff
 #: (1) and hovering (2). ``usertakeoff`` (6) waits on the ground.
 _TAKEOFF_CONFIRMING_STATES: Final[FrozenSet[int]] = frozenset({1, 2})
+
+
+def _ceiling_transition(ctx: MissionContext, name: str) -> None:
+    """Call a takeoff-transient transition of the odometry supervisor, when it has one.
+
+    Duck-typed: the stage-level test doubles of the supervisor predate the
+    ceiling schedule and have nothing to transition.
+    """
+    transition = getattr(ctx.odom_supervisor, name, None)
+    if callable(transition):
+        transition()
 
 
 def takeoff_confirmed(flying_state: Optional[int], relative_altitude: float, min_altitude: float) -> bool:
@@ -120,8 +137,8 @@ class TakeoffStep(BaseStep):
                 val = getattr(bb, attr, None)
                 if val is not None:
                     payload[attr] = round(val, 3) if isinstance(val, float) else val
-        if self._mode is MissionMode.SIMPLE:
-            payload["native"] = True
+        payload["takeoff_surface"] = "ground" if launches_from_ground(ctx.params) else "platform"
+        payload["target_altitude_m"] = round(float(kinematics.target_altitude_m), 2)
         emit_milestone("mission.takeoff", payload)
 
     def execute(self, ctx: MissionContext) -> StepStatus:
@@ -222,15 +239,9 @@ class TakeoffStep(BaseStep):
         if status is not StepStatus.SUCCESS:
             return status
 
-        if self._mode is MissionMode.SIMPLE:
-            logger.info(
-                "Simple profile: native firmware takeoff; the corrective ascent is skipped and "
-                "the airframe flies at the height the firmware reached."
-            )
-        else:
-            status = self._ascend(ctx)
-            if status is not StepStatus.SUCCESS:
-                return status
+        status = self._acquire_altitude(ctx)
+        if status is not StepStatus.SUCCESS:
+            return status
 
         status = self._finalize(ctx)
         if status is StepStatus.SUCCESS:
@@ -492,9 +503,10 @@ class TakeoffStep(BaseStep):
         sleeps 3 s after publishing.
         """
         target_altitude = ctx.params.relative_target_altitude_m
+        _ceiling_transition(ctx, "arm_ceiling_transient")
         logger.info(
-            "Issuing takeoff (nominal altitude %.2f m above the launch point, ceiling %.2f m). "
-            "Note: the Bebop firmware selects its own launch altitude.",
+            "Issuing takeoff (nominal altitude %.2f m above the launch point, ceiling %.2f m during "
+            "the native profile). Note: the Bebop firmware selects its own launch altitude.",
             target_altitude,
             ctx.odom_supervisor.altitude_ceiling,
         )
@@ -621,7 +633,7 @@ class TakeoffStep(BaseStep):
         ends as soon as a :class:`SettlementDetector` over the vertical axis
         reports convergence, and that duration is only the ceiling. The detector
         is planar, so altitude goes in the x slot with y held at zero, exactly
-        as in :meth:`_ascend`: its isotropic sigma then reduces to the standard
+        as in :meth:`_acquire_altitude`: its isotropic sigma then reduces to the standard
         deviation of the altitude.
 
         Two kinds of sample are kept out of the window because they look like
@@ -658,6 +670,8 @@ class TakeoffStep(BaseStep):
         rate = LoopRate(kinematics.control_loop_hz)
         last_sample: Optional[int] = None
         report = None
+        venue_streak = 0
+        venue_limit = max(1, int(getattr(kinematics, "ceiling_breach_streak", 3)))
 
         while deadline.active:
             if ctx.interrupted():
@@ -672,6 +686,17 @@ class TakeoffStep(BaseStep):
             if snapshot.sample_count == last_sample:
                 continue
             last_sample = snapshot.sample_count
+
+            # The firmware controls the altitude here; only the venue ceiling
+            # justifies cutting its launch profile short (section 3.5).
+            venue_check = getattr(ctx.odom_supervisor, "venue_ceiling_breached", None)
+            venue_streak = venue_streak + 1 if venue_check is not None and venue_check(snapshot.relative_altitude) else 0
+            if venue_streak >= venue_limit:
+                self._halt(ctx)
+                ctx.failsafe.trigger_emergency_land(
+                    f"Venue ceiling breached during the launch profile at {snapshot.relative_altitude:.2f} m."
+                )
+                return StepStatus.FAILURE
 
             if snapshot.relative_altitude < min_altitude:
                 settlement.reset()
@@ -691,6 +716,7 @@ class TakeoffStep(BaseStep):
                     snapshot.relative_altitude,
                     report,
                 )
+                _ceiling_transition(ctx, "end_native_profile")
                 return StepStatus.SUCCESS
 
         # Not a fault: this is the full wait the phase always used to make.
@@ -699,6 +725,7 @@ class TakeoffStep(BaseStep):
             ceiling_sec,
             report if report is not None else "no airborne odometry samples",
         )
+        _ceiling_transition(ctx, "end_native_profile")
         return StepStatus.SUCCESS
 
     @staticmethod
@@ -717,8 +744,14 @@ class TakeoffStep(BaseStep):
 
     # ------------------------------------------------------------------ ascent
 
-    def _ascend(self, ctx: MissionContext) -> StepStatus:
-        """Close the gap between the firmware's hover height and the target.
+    def _acquire_altitude(self, ctx: MissionContext) -> StepStatus:
+        """Close the gap between the firmware's hover height and the target, either way.
+
+        Both profiles fly it. Above the target band (``governor.deadband_m``)
+        the airframe descends under the altitude governor
+        (:meth:`_descend_to_target`); below ``climb_deadband_m`` it climbs as
+        described next. On the pad top the target is at or below the native
+        height (D1), so only a flight from the floor can climb.
 
         The Bebop ends its launch profile at its own factory height, around one
         metre, and ignores the altitude the SDK was given. Every mission
@@ -743,6 +776,8 @@ class TakeoffStep(BaseStep):
         ceiling = ctx.odom_supervisor.altitude_ceiling
 
         altitude = ctx.odom_supervisor.snapshot().relative_altitude
+        if altitude > target + ctx.params.governor.deadband_m:
+            return self._descend_to_target(ctx, target)
         if altitude >= target - deadband:
             logger.info(
                 "No ascent required: holding %.2f m against a %.2f m target.", altitude, target
@@ -935,6 +970,108 @@ class TakeoffStep(BaseStep):
             )
         return StepStatus.SUCCESS
 
+    def _descend_to_target(self, ctx: MissionContext, target: float) -> StepStatus:
+        """Descend from the firmware's hover height onto a lower target.
+
+        Translation is held at zero and ``vz`` comes from the altitude
+        governor, as in the pad-departure settle of Stage 2: the governor is
+        the law that holds the altitude for the rest of the flight, so the
+        hand-over to Stage 2 carries no step in the vertical command. The
+        ceiling and, outside ``no_fly``, the system health are checked every
+        cycle. Convergence is the altitude inside ``governor.deadband_m`` of
+        the target for :data:`_DESCENT_SETTLE_WINDOW_SEC` (a
+        :class:`SettlementDetector` over fresh odometry samples only).
+        ``kinematics.climb_timeout_sec`` bounds the loop; reaching it is not a
+        fault and the mission continues under the governor.
+        """
+        kinematics = ctx.params.kinematics
+        band = ctx.params.governor.deadband_m
+        ceiling = ctx.odom_supervisor.altitude_ceiling
+        altitude = ctx.odom_supervisor.snapshot().relative_altitude
+        logger.info(
+            "Closing a %.2f m altitude surplus: %.2f m -> %.2f m under the altitude governor "
+            "(band %.2f m, ceiling %.2f m).",
+            altitude - target,
+            altitude,
+            target,
+            band,
+            ceiling,
+        )
+        self._announce("Descendo", "ajustando altitude de operação")
+        settlement = SettlementDetector(
+            SettlementCriteria(
+                window_sec=_DESCENT_SETTLE_WINDOW_SEC,
+                min_samples=kinematics.takeoff_settle_min_samples,
+                max_speed=kinematics.takeoff_settle_max_vz_mps,
+                max_position_sigma=kinematics.takeoff_settle_max_altitude_sigma_m,
+                max_distance=band,
+            )
+        )
+        rate = LoopRate(kinematics.control_loop_hz)
+        deadline = Deadline(kinematics.climb_timeout_sec)
+        last_sample: Optional[int] = None
+        converged = False
+
+        while deadline.active:
+            if ctx.interrupted():
+                self._halt(ctx)
+                return StepStatus.ABORTED
+
+            snapshot = ctx.odom_supervisor.snapshot()
+            altitude = snapshot.relative_altitude
+            self._call_takeoff_once_confirmed(ctx, altitude)
+
+            if ctx.odom_supervisor.is_ceiling_breached():
+                self._halt(ctx)
+                ctx.failsafe.trigger_emergency_land(
+                    f"Altitude ceiling breached during the post-takeoff descent: "
+                    f"{altitude:.2f} m > {ceiling:.2f} m."
+                )
+                return StepStatus.FAILURE
+
+            if not ctx.drone.no_fly:
+                healthy, reason = ctx.failsafe.evaluate_system_health()
+                if not healthy:
+                    self._halt(ctx)
+                    ctx.failsafe.trigger_emergency_land(reason)
+                    return StepStatus.FAILURE
+
+            if ctx.grab_frame(timeout_sec=0.2) is not None:
+                ctx.failsafe.notify_frame_received()
+
+            dt = rate.tick()
+            vz = governed_vz(ctx, altitude, dt, vx_commanded=0.0)
+            safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
+            ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
+
+            if snapshot.sample_count == last_sample:
+                continue
+            last_sample = snapshot.sample_count
+            report = settlement.update(
+                x=altitude,
+                y=0.0,
+                speed=abs(snapshot.vz),
+                distance=abs(altitude - target),
+                timestamp=snapshot.timestamp,
+            )
+            if report.settled:
+                converged = True
+                break
+
+        self._halt(ctx)
+        altitude = ctx.odom_supervisor.snapshot().relative_altitude
+        if converged:
+            logger.info("Descent converged at %.2f m (target %.2f m).", altitude, target)
+        else:
+            logger.warning(
+                "Descent did not converge within %.1f s: holding %.2f m against a %.2f m "
+                "target. The mission continues under the altitude governor.",
+                kinematics.climb_timeout_sec,
+                altitude,
+                target,
+            )
+        return StepStatus.SUCCESS
+
     # -------------------------------------------------------------- completion
 
     def _finalize(self, ctx: MissionContext) -> StepStatus:
@@ -965,6 +1102,10 @@ class TakeoffStep(BaseStep):
                 )
                 ctx.failsafe.trigger_emergency_land("Ground reference lost during ascent.")
                 return StepStatus.FAILURE
+
+        # The altitude acquisition is over: the ratchet hands over to the
+        # nominal ceiling before the origin is frozen.
+        _ceiling_transition(ctx, "release_ceiling_transient")
 
         # Freeze the horizontal origin only now. Measuring it on the ground
         # would bake the ground-effect transient into the coordinate the drone

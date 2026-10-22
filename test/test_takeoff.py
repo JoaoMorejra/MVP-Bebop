@@ -100,7 +100,7 @@ class StubHandler:
 
 
 class ClimbContext:
-    """The attribute surface ``TakeoffStep._ascend`` actually touches.
+    """The attribute surface ``TakeoffStep._acquire_altitude`` actually touches.
 
     A real ``MissionContext`` drags in CvBridge and a live ROS publisher, which
     the ascent never uses. Duck-typing keeps the test on the control law.
@@ -218,7 +218,7 @@ def test_ascent_reaches_the_configured_target_altitude(monkeypatch):
     params = climb_params(target=1.80)
     ctx, _ = airborne_context(monkeypatch, params)
 
-    status = TakeoffStep()._ascend(ctx)
+    status = TakeoffStep()._acquire_altitude(ctx)
 
     altitude = ctx.odom_supervisor.snapshot().relative_altitude
     assert status is StepStatus.SUCCESS
@@ -231,7 +231,7 @@ def test_ascent_stays_under_the_safety_ceiling(monkeypatch):
     ctx, _ = airborne_context(monkeypatch, params)
     ceiling = ctx.odom_supervisor.altitude_ceiling
 
-    TakeoffStep()._ascend(ctx)
+    TakeoffStep()._acquire_altitude(ctx)
 
     assert ctx.odom_supervisor.snapshot().relative_altitude <= ceiling
 
@@ -241,7 +241,7 @@ def test_ascent_revokes_climb_authority_on_completion(monkeypatch):
     params = climb_params(target=1.80)
     ctx, _ = airborne_context(monkeypatch, params)
 
-    TakeoffStep()._ascend(ctx)
+    TakeoffStep()._acquire_altitude(ctx)
 
     assert ctx.failsafe.climb_authorized is False
     safe_vz, _ = ctx.failsafe.clamp_kinematics(0.20, 0.0, allow_climb=True)
@@ -257,7 +257,7 @@ def test_ascent_leaves_the_vertical_command_zeroed(monkeypatch):
     params = climb_params(target=1.80)
     ctx, simulator = airborne_context(monkeypatch, params)
 
-    TakeoffStep()._ascend(ctx)
+    TakeoffStep()._acquire_altitude(ctx)
     settled = ctx.odom_supervisor.snapshot().relative_altitude
 
     for _ in range(30):
@@ -273,7 +273,7 @@ def test_no_ascent_is_commanded_when_already_at_target(monkeypatch):
     ctx, simulator = airborne_context(monkeypatch, params)
     before = ctx.odom_supervisor.snapshot().relative_altitude
 
-    status = TakeoffStep()._ascend(ctx)
+    status = TakeoffStep()._acquire_altitude(ctx)
 
     assert status is StepStatus.SUCCESS
     assert ctx.failsafe.climb_authorized is False
@@ -287,7 +287,7 @@ def test_ceiling_breach_during_ascent_triggers_emergency_landing(monkeypatch):
         monkeypatch, params, supervisor_factory=OvershootingSupervisor, breach_after=3
     )
 
-    status = TakeoffStep()._ascend(ctx)
+    status = TakeoffStep()._acquire_altitude(ctx)
 
     assert status is StepStatus.FAILURE
     assert ctx.failsafe.failsafe_active is True
@@ -300,7 +300,7 @@ def test_emergency_event_aborts_the_ascent(monkeypatch):
     ctx, _ = airborne_context(monkeypatch, params)
     ctx.emergency_event.set()
 
-    status = TakeoffStep()._ascend(ctx)
+    status = TakeoffStep()._acquire_altitude(ctx)
 
     assert status is StepStatus.ABORTED
     assert ctx.failsafe.climb_authorized is False
@@ -319,7 +319,7 @@ def test_ascent_never_commands_more_than_the_authorized_climb_rate(monkeypatch):
         original(vx=vx, vy=vy, vz=vz, vyaw=vyaw, duration=duration)
 
     monkeypatch.setattr(ctx.drone, "move_velocity", record)
-    TakeoffStep()._ascend(ctx)
+    TakeoffStep()._acquire_altitude(ctx)
 
     assert commanded, "the ascent issued no vertical command at all"
     assert max(commanded) <= params.kinematics.max_climb_speed_mps + 1e-6
@@ -530,7 +530,9 @@ def test_takeoff_is_called_when_odometry_leaves_the_ground_with_the_configured_a
     ctx = scripted_context(params, lambda n: (0.0 if n < 5 else 0.6, 0.0, True))
     step = TakeoffStep()
     step._stabilize(ctx)
-    assert milestones == [("mission.takeoff", {"altitude_m": 2.3})]
+    assert milestones == [
+        ("mission.takeoff", {"altitude_m": 2.3, "takeoff_surface": "ground", "target_altitude_m": 2.3})
+    ]
 
 
 def test_takeoff_is_never_called_for_an_airframe_that_stayed_down(milestones):

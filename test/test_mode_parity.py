@@ -1,4 +1,4 @@
-"""The safety envelope is the same in the three profiles."""
+"""The safety envelope is the same in the two profiles."""
 
 from __future__ import annotations
 
@@ -133,8 +133,8 @@ def test_the_health_check_can_skip_only_the_video_item():
     assert healthy_with_video is False and "stream" in reason.lower()
 
 
-@pytest.mark.parametrize("mode", [MissionMode.INTERMEDIATE, MissionMode.SIMPLE])
-def test_an_abort_during_the_final_stage_still_commands_the_landing(mode):
+@pytest.mark.parametrize("mode, rtl_enabled", [(MissionMode.ADVANCED, False), (MissionMode.SIMPLE, True)])
+def test_an_abort_during_the_final_stage_still_commands_the_landing(mode, rtl_enabled):
     import logging
 
     from mvp_mission_bebop.steps import rtl as rtl_module
@@ -142,9 +142,10 @@ def test_an_abort_during_the_final_stage_still_commands_the_landing(mode):
     from test_simple_mode_steps import land_ctx
 
     drone, ctx = land_ctx(mode.value)
+    ctx.params.rtl.enabled = rtl_enabled
     ctx.emergency_event.set()
 
-    step = ClosedLoopRTLStep(mode=mode)
+    step = ClosedLoopRTLStep(mode=mode, rtl_enabled=rtl_enabled)
     step._build_sensor = lambda _ctx: None
     records = []
 

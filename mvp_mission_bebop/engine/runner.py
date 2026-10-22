@@ -11,6 +11,7 @@ import nectar
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.engine.exit_codes import EXIT_ABORTED_LANDED, mission_exit_code
 from mvp_mission_bebop.engine.signals import EmergencyHandler
+from mvp_mission_bebop.mission_mode import spoken_stage_five_name
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 
 logger = logging.getLogger("MissionRunner")
@@ -24,13 +25,13 @@ _EMERGENCY_BURST_COUNT: int = 5
 #: Spacing between commands in that burst.
 _EMERGENCY_BURST_INTERVAL_SEC: float = 0.04
 
-#: Stage names as the station speaks them in a failure alert.
+#: Stage names as the station speaks them in a failure alert. Stage 5 depends
+#: on the return plan (``mission_mode.spoken_stage_five_name``).
 _SPOKEN_STAGE_NAMES: Final[Dict[int, str]] = {
     1: "Decolagem",
     2: "Varredura",
     3: "Aproximação",
     4: "Inspeção",
-    5: "Retorno à base",
 }
 
 #: First stage that presupposes a confirmed target. A run entering it without
@@ -165,7 +166,7 @@ class MissionRunner:
                         stage = self.stage_numbers[index]
                         self._announce_failure(
                             "Falha na etapa",
-                            _SPOKEN_STAGE_NAMES.get(stage, f"etapa {stage}"),
+                            self._spoken_stage_name(stage),
                             priority="CRITICAL",
                             airborne=bool(getattr(getattr(self.ctx, "blackboard", None), "takeoff_committed", False)),
                         )
@@ -224,6 +225,13 @@ class MissionRunner:
         return index
 
     # ------------------------------------------------------------ termination
+
+    def _spoken_stage_name(self, stage: int) -> str:
+        """The stage as the failure alert speaks it; stage 5 by the return plan of the flight."""
+        if stage == 5:
+            rtl = getattr(getattr(self.ctx, "params", None), "rtl", None)
+            return spoken_stage_five_name(bool(getattr(rtl, "enabled", True)))
+        return _SPOKEN_STAGE_NAMES.get(stage, f"etapa {stage}")
 
     def _transmit_emergency_landing(self, budget_sec: float) -> None:
         """Transmit a controlled landing within the supplied time budget.

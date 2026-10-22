@@ -50,7 +50,7 @@ from mvp_mission_bebop.controllers.visual_servoing import ServoCommand
 from mvp_mission_bebop.engine.rate import MAX_INTERVAL_SEC, Deadline, LoopRate
 from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker, TrackerGains
 from mvp_mission_bebop.mission_mode import MissionMode
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the runtime import out
@@ -60,7 +60,6 @@ logger = logging.getLogger("Step3Tracking")
 
 _STEP_NAMES: Final[Dict[MissionMode, str]] = {
     MissionMode.ADVANCED: "STEP 3: Visual Servoing & Coupled Guidance",
-    MissionMode.INTERMEDIATE: "STEP 3: Visual Servoing & Coupled Guidance",
     MissionMode.SIMPLE: "STEP 3: Yaw Servoing & Coupled Guidance",
 }
 
@@ -426,7 +425,7 @@ class VisualServoingStep(BaseStep):
         simple = self._mode is MissionMode.SIMPLE
         lateral = 0.0 if simple else command.vy
         yaw = command.vyaw if simple else 0.0
-        vz = ctx.governor.compute_vz(
+        vz = governed_vz(ctx, 
             ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=abs(lateral)
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, yaw)
@@ -459,7 +458,7 @@ class VisualServoingStep(BaseStep):
     @staticmethod
     def _hold(ctx: MissionContext, dt: Optional[float] = None) -> None:
         """Command station keeping, keeping the anti-climb governor engaged."""
-        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude, dt)
+        vz = governed_vz(ctx, ctx.odom_supervisor.snapshot().relative_altitude, dt)
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
 

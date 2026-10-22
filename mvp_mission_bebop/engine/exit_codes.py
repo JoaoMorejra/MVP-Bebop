@@ -27,6 +27,13 @@ EXIT_TOUCHDOWN_UNCONFIRMED: Final[int] = 4
 #: The standby mission detected stale preconditions upon receiving go (R4b).
 EXIT_STANDBY_STALE: Final[int] = 6
 
+#: The launch document was refused before anything was commanded: a mission
+#: mode, a field type or the altitude envelope (``launch_envelope``) the mission
+#: cannot fly. ``EX_CONFIG`` of ``sysexits.h``. The station keeps the operator
+#: on the pre-flight screen with the reason and does not re-prepare a standby
+#: for the same document.
+EXIT_LAUNCH_REFUSED: Final[int] = 78
+
 #: The operator insisted with a second interrupt after the landing burst.
 FORCED_EXIT_CODE: Final[int] = 130
 

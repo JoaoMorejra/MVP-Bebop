@@ -22,6 +22,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Final, List, Optional, Tuple, Union
 
+from mvp_mission_bebop.estimation.ceiling_schedule import CeilingSchedule
 from mvp_mission_bebop.parameter_conflicts import evaluate_parameter_conflicts
 from mvp_mission_bebop.parameters import MissionParameters
 
@@ -135,7 +136,8 @@ def audit_safe_envelopes(
         )
 
     target = _real(kinematics.target_altitude_m)
-    pad = max(0.0, _real(params.platform.height_m) or 0.0)
+    schedule = CeilingSchedule(kinematics, params.platform)
+    pad = schedule.pad_height_m
     altitude = None if target is None else target - pad
     floor = max(
         _real(vision.min_altitude_for_ibvs_m) or 0.0,
@@ -157,8 +159,9 @@ def audit_safe_envelopes(
         _real(kinematics.climb_settle_max_position_sigma_m) or 0.0
     )
     # The floor is a sum of two decimal constants: compare with a tolerance so
-    # a margin set exactly at it is not reported for binary rounding alone.
-    if margin is None or margin < margin_floor - 1e-9:
+    # a margin set exactly at it is not reported for binary rounding alone. On
+    # the pad top the margin is not read (D2).
+    if not schedule.on_pad_top and (margin is None or margin < margin_floor - 1e-9):
         diverge(
             "kinematics.altitude_ceiling_margin_m",
             kinematics.altitude_ceiling_margin_m,
@@ -298,14 +301,18 @@ def _audit_platform(
                 f"> target_altitude_m={kinematics.target_altitude_m}",
                 "the operating height is at or above the venue ceiling",
             )
-        else:
-            margin = _real(kinematics.altitude_ceiling_margin_m) or 0.0
-            if target is not None and target + margin >= venue_value - VENUE_CEILING_CLEARANCE_M:
+        elif target is not None and _real(kinematics.altitude_ceiling_margin_m) is not None:
+            # The nominal ceiling over the floor, in the frame the venue is
+            # stated in. On the pad top the ceiling is fixed and capped by the
+            # venue by design (D2), so only a launch from the floor is judged.
+            schedule = CeilingSchedule(kinematics, platform)
+            ceiling_floor = schedule.nominal_m() + schedule.pad_height_m
+            if not schedule.on_pad_top and ceiling_floor >= venue_value - VENUE_CEILING_CLEARANCE_M:
                 diverge(
                     "platform.venue_ceiling_agl_m",
                     venue,
-                    f"> {target + margin + VENUE_CEILING_CLEARANCE_M:g} "
-                    "(target_altitude_m + altitude_ceiling_margin_m + 0.2)",
+                    f"> {ceiling_floor + VENUE_CEILING_CLEARANCE_M:g} "
+                    "(nominal ceiling over the floor + 0.2)",
                     "the venue clamps the safety ceiling to within 0.2 m of it",
                 )
 

@@ -44,6 +44,11 @@ from mvp_mission_bebop.perception.worker import (
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, OdometrySupervisor
 from mvp_mission_bebop.telemetry.flat_trim_ack import FlatTrimAckTracker
+from mvp_mission_bebop.telemetry.inference_package import (
+    build_inference_package,
+    drone_occurrence_id,
+    format_utc,
+)
 from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
 
 logger = logging.getLogger("MissionContext")
@@ -463,6 +468,11 @@ class MissionContext:
         record.timestamp = timestamp
         output_dir = self.params.output_dir
 
+        # One UTC instant for the identifier and the sidecar, so the occurrence
+        # id and its timestamp can never disagree by a second boundary.
+        captured_at = datetime.now(timezone.utc)
+        record.occurrence_id = drone_occurrence_id(captured_at)
+
         if raw_frame is not None:
             record.raw_path = self._write_atomic(
                 os.path.join(output_dir, f"accident_raw_{timestamp}.png"),
@@ -484,6 +494,7 @@ class MissionContext:
                 record,
                 snapshot,
                 native_photo,
+                captured_at,
             )
 
         return record
@@ -543,17 +554,62 @@ class MissionContext:
         record: EvidenceRecord,
         snapshot: Optional[OdometrySnapshot],
         native_photo: Optional[Dict[str, Any]] = None,
+        captured_at: Optional[datetime] = None,
     ) -> Optional[str]:
         """Write the forensic sidecar describing the capture.
 
-        Purely additive: the GCS assembles its report client-side and reads no
-        such file, so the schema here is free to evolve. ``native_photo`` is
-        the aircraft's acknowledgement of the 14 MP photo; its
-        ``remote_path``/``local_path`` are filled after touchdown by
+        The sidecar is the handoff to the visual inference agent: its
+        ``inference_package`` (``telemetry/inference_package.py``) holds the
+        session data, the image reference and the caption exactly as the agent
+        consumes them. The GCS watcher (``electron/main.cjs:readCaptureTelemetry``)
+        reads ``occurrence_id``, ``latitude``, ``longitude``, ``timestamp_utc``,
+        ``telemetry_caption`` and ``inference_package`` and forwards them on
+        ``bmg:raw-evidence-ready``; those keys are a contract. ``latitude`` and
+        ``longitude`` are the fixed demonstration site
+        (``inference_package.SITE_LATITUDE``/``SITE_LONGITUDE``).
+        ``native_photo`` is the aircraft's acknowledgement of the 14 MP photo;
+        its ``remote_path``/``local_path`` are filled after touchdown by
         ``bebop_mission_control/streamer/media_fetch.py``.
+
+        Parameters
+        ----------
+        path : str
+            Destination of the sidecar.
+        record : EvidenceRecord
+            The capture being described.
+        snapshot : OdometrySnapshot, optional
+            Odometry at the capture instant.
+        native_photo : dict, optional
+            Acknowledgement of the aircraft's native photo.
+        captured_at : datetime, optional
+            Timezone-aware capture instant. Falls back to the current instant.
+
+        Returns
+        -------
+        str or None
+            ``path`` on success, ``None`` when the write failed.
         """
+        if captured_at is None:
+            captured_at = datetime.now(timezone.utc)
+        occurrence_id = record.occurrence_id or drone_occurrence_id(captured_at)
+        record.occurrence_id = occurrence_id
+
+        package = build_inference_package(
+            occurrence_id,
+            captured_at,
+            record.raw_path,
+            record.annotated_path,
+        )
+        caption = package["caption"]
+
         payload: Dict[str, Any] = {
-            "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "occurrence_id": occurrence_id,
+            "latitude": caption.get("latitude"),
+            "longitude": caption.get("longitude"),
+            "captured_at_utc": format_utc(captured_at),
+            "timestamp_utc": caption.get("timestamp_utc"),
+            "telemetry_caption": caption,
+            "inference_package": package,
             "timestamp": record.timestamp,
             "raw_image": os.path.basename(record.raw_path) if record.raw_path else None,
             "annotated_image": (

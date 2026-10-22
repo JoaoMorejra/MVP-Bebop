@@ -42,7 +42,7 @@ from mvp_mission_bebop.controllers.yaw_pattern import YawRateLimiter
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
 from mvp_mission_bebop.mission_mode import MissionMode
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot
 
@@ -53,7 +53,6 @@ logger = logging.getLogger("Step2Search")
 
 _STEP_NAMES: Final[Dict[MissionMode, str]] = {
     MissionMode.ADVANCED: "STEP 2: Lateral Left Search",
-    MissionMode.INTERMEDIATE: "STEP 2: Lateral Left Search",
     MissionMode.SIMPLE: "STEP 2: Yaw Scan Search",
 }
 
@@ -489,7 +488,7 @@ class LateralSearchStep(BaseStep):
             return
         profiled = profile.step(target_mps, dt)
         vy = shaper.shape(ctx.speed_calibration.to_normalized(profiled, axis="lateral"), dt)
-        vz = ctx.governor.compute_vz(
+        vz = governed_vz(ctx, 
             ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=abs(vy)
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
@@ -534,7 +533,7 @@ class LateralSearchStep(BaseStep):
         if ramp is None:
             ramp = self._yaw_ramp = YawRateLimiter(ctx.params.yaw_pattern.scan_ramp_per_sec)
         vyaw = ramp.step(target_vyaw, dt)
-        vz = ctx.governor.compute_vz(
+        vz = governed_vz(ctx, 
             ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=0.0
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, vyaw)

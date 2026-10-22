@@ -23,11 +23,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Final, List, Mapping, Optional, Set, Tuple
 
+from mvp_mission_bebop.launch_envelope import ALTITUDE_MAX_M, ALTITUDE_MIN_M, PAD_CLEARANCE_M, VENUE_HEADROOM_M
+
 #: Height at which the Bebop 2 firmware ends its takeoff, in metres. The
 #: airframe ignores the altitude it is handed and stabilizes here
-#: (``actuators/simulator.FIRMWARE_HOVER_ALTITUDE_M``, ``TakeoffStep._ascend``).
-#: Estimated from the code's comments, not measured in flight. Rule E03 rests
-#: on it.
+#: (``actuators/simulator.FIRMWARE_HOVER_ALTITUDE_M``, ``TakeoffStep._acquire_altitude``).
+#: Estimated from the code's comments, not measured in flight. The ceiling
+#: ratchet (``estimation.ceiling_schedule``) rests on it.
 FIRMWARE_HOVER_HEIGHT_M: Final[float] = 1.0
 
 #: Resolution floor of one marker module for a reliable decode, pixels (W12).
@@ -100,6 +102,9 @@ _RETURN_TILT = "rtl.camera_tilt_deg"
 _TAG = "rtl.tag_size"
 _MARKER_ID = "rtl.target_aruco_id"
 _MARKER_DICT = "rtl.marker_dict"
+_PAD = "platform.height_m"
+_GROUND = "platform.takeoff_from_ground"
+_VENUE = "platform.venue_ceiling_agl_m"
 
 _MISSING = object()
 
@@ -198,6 +203,21 @@ class _Evaluation:
         tag = self.read(_TAG)
         return tag if tag is not None and 0.0 < tag <= 1.0 else None
 
+    def from_ground(self) -> bool:
+        """Whether the flight takes off from the floor: the flag set, or no pad (``launch_envelope``)."""
+        if _get(self.doc, _GROUND) is True:
+            return True
+        pad = self.read(_PAD)
+        return pad is None or pad <= 0.0
+
+    def envelope(self) -> Tuple[float, float]:
+        """``launch_envelope.altitude_envelope`` over the document, without the venue cap."""
+        if self.from_ground():
+            return ALTITUDE_MIN_M, ALTITUDE_MAX_M
+        settle = self.read(_SETTLE_FLOOR)
+        clearance = max(PAD_CLEARANCE_M, settle if settle is not None else PAD_CLEARANCE_M)
+        return max(ALTITUDE_MIN_M, (self.read(_PAD) or 0.0) + clearance), ALTITUDE_MAX_M
+
     def noise_band(self) -> Optional[float]:
         band, sigma = self.read(_CLIMB_BAND), self.read(_CLIMB_SIGMA)
         return None if band is None or sigma is None else band + 2.0 * sigma
@@ -225,20 +245,20 @@ class _Evaluation:
         )
 
     def e03(self) -> Finding:
-        h, m = self.read(_ALTITUDE), self.read(_MARGIN)
-        if h is None or m is None or h + m >= FIRMWARE_HOVER_HEIGHT_M - _EPS:
-            return None
-        return (
-            (_ALTITUDE, _MARGIN),
-            f"O teto (altitude + margem = {_m2(h + m)}) fica abaixo da altura em que o firmware estabiliza a "
-            f"decolagem (~{_m2(FIRMWARE_HOVER_HEIGHT_M)}).",
-            f"Aumente a margem para pelo menos {_m2(FIRMWARE_HOVER_HEIGHT_M - h)} ou a altitude para pelo menos "
-            f"{_m2(FIRMWARE_HOVER_HEIGHT_M - m)}.",
-        )
+        """Retired: the ceiling ratchet covers the end of the native takeoff.
+
+        A ceiling under the firmware's takeoff height used to trip right after
+        liftoff; the ratchet of ``estimation.ceiling_schedule`` keeps the
+        ceiling above the native height plus the margin until the altitude
+        acquisition converges, so no combination of altitude and margin trips
+        it any more. Kept in the catalogue to preserve the rule ids and order
+        shared with the station.
+        """
+        return None
 
     def e04(self) -> Finding:
         m, band = self.read(_MARGIN), self.read(_CLIMB_BAND)
-        if m is None or band is None or m >= band - _EPS:
+        if not self.from_ground() or m is None or band is None or m >= band - _EPS:
             return None
         return (
             (_MARGIN,),
@@ -308,23 +328,38 @@ class _Evaluation:
             return None
         return ((_MARKER_DICT,), f"Dicionário {dictionary!r} não reconhecido.", "Dicionário da lista da estação.")
 
+    def e10(self) -> Finding:
+        h = self.read(_ALTITUDE)
+        if h is None:
+            return None
+        low, high = self.envelope()
+        if low - _EPS <= h <= high + _EPS:
+            return None
+        if h < low and not self.from_ground():
+            message = f"Cota de {_m2(h)} abaixo do mínimo de {_m2(low)} sobre o totem (topo do totem + folga)."
+        else:
+            message = f"Cota de {_m2(h)} fora da faixa de {_m2(low)} a {_m2(high)} sobre o piso."
+        return ((_ALTITUDE,), message, f"Cota entre {_m2(low)} e {_m2(high)}.")
+
+    def e11(self) -> Finding:
+        h, venue = self.read(_ALTITUDE), self.read(_VENUE)
+        if h is None or venue is None or h <= venue - VENUE_HEADROOM_M + _EPS:
+            return None
+        return (
+            (_ALTITUDE, _VENUE),
+            f"Cota de {_m2(h)} a menos de {_m2(VENUE_HEADROOM_M)} do teto do local ({_m2(venue)}).",
+            f"Cota de no máximo {_m2(venue - VENUE_HEADROOM_M)}.",
+        )
+
     # ---------------------------------------------------------------- warnings
 
     def w01(self) -> Finding:
-        h, m, band = self.read(_ALTITUDE), self.read(_MARGIN), self.noise_band()
-        if "E03" in self.fired or h is None or m is None or band is None:
-            return None
-        if h + m >= FIRMWARE_HOVER_HEIGHT_M + band - _EPS:
-            return None
-        return (
-            (_ALTITUDE, _MARGIN),
-            f"Teto de {_m2(h + m)}, a menos de {_m2(band)} da altura de decolagem do firmware.",
-            f"Altitude + margem de pelo menos {_m2(FIRMWARE_HOVER_HEIGHT_M + band)}.",
-        )
+        """Retired with E03: the ceiling ratchet covers the end of the native takeoff."""
+        return None
 
     def w02(self) -> Finding:
         m, band = self.read(_MARGIN), self.noise_band()
-        if "E04" in self.fired or m is None or band is None or m >= band - _EPS:
+        if not self.from_ground() or "E04" in self.fired or m is None or band is None or m >= band - _EPS:
             return None
         return ((_MARGIN,), f"Margem de {_m2(m)} abaixo do ruído de sonar e barômetro ({_m2(band)}).", f"Margem de pelo menos {_m2(band)}.")
 
@@ -440,6 +475,8 @@ _CATALOGUE: Final[Tuple[Tuple[str, str, str], ...]] = (
     ("E07", "error", "Tamanho de tag inválido"),
     ("E08", "error", "ID do marcador fora do dicionário"),
     ("E09", "error", "Dicionário do marcador não reconhecido"),
+    ("E10", "error", "Cota fora do envelope da superfície de decolagem"),
+    ("E11", "error", "Cota colada no teto do local"),
     ("W01", "warning", "Teto próximo da altura de decolagem do firmware"),
     ("W02", "warning", "Margem do teto abaixo do ruído dos sensores"),
     ("W03", "warning", "Altitude abaixo do piso da guiagem visual"),

@@ -88,23 +88,18 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
 )
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
-from mvp_mission_bebop.mission_mode import MissionMode
+from mvp_mission_bebop.mission_mode import MissionMode, stage_five_name
 from mvp_mission_bebop.perception.intrinsics import (
     DRIVER_PACKAGE,
     CalibrationMismatch,
     apply_driver_calibration,
 )
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, TelemetryHealth
 
 logger = logging.getLogger("Step5RTL")
 
-_STEP_NAMES: Final[Dict[MissionMode, str]] = {
-    MissionMode.ADVANCED: "STEP 5: ArUco RTL & Precision Landing",
-    MissionMode.INTERMEDIATE: "STEP 5: Landing at Inspection Point",
-    MissionMode.SIMPLE: "STEP 5: ArUco Centering & Base Landing",
-}
 
 #: Publish an annotated telemetry frame every Nth cycle. Grabbing a frame blocks,
 #: and the return leg needs its cadence more than it needs every frame.
@@ -457,8 +452,12 @@ class ClosedLoopRTLStep(BaseStep):
         is what lets the whole return leg be flown against a synthetic marker in
         a unit test with no camera, no calibration files and no ROS.
     mode : MissionMode
-        Mission profile, keyword-only. Selects the stage name; ``ADVANCED`` (the
-        default) is the historical return leg.
+        Mission profile, keyword-only. ``ADVANCED`` (the default) is the
+        historical return leg.
+    rtl_enabled : bool
+        ``rtl.enabled`` of the flight, keyword-only; selects the stage name
+        (``mission_mode.stage_five_name``). Which branch :meth:`execute` flies
+        is read from ``ctx.params.rtl.enabled``, the same value at the launch.
     """
 
     def __init__(
@@ -468,8 +467,9 @@ class ClosedLoopRTLStep(BaseStep):
         sensor: Optional[ArucoMarkerSensor] = None,
         *,
         mode: MissionMode = MissionMode.ADVANCED,
+        rtl_enabled: bool = True,
     ) -> None:
-        super().__init__(_STEP_NAMES[mode])
+        super().__init__(f"STEP 5: {stage_five_name(mode, rtl_enabled)}")
         self._mode = mode
         self._guidance = guidance
         self._centering = centering
@@ -508,7 +508,10 @@ class ClosedLoopRTLStep(BaseStep):
         guidance.reset()
         ctx.speed_calibration.warn_if_uncalibrated("RTL guidance")
 
-        if self._mode is MissionMode.INTERMEDIATE:
+        # Without the return the marker sensor is never built and nothing
+        # names the base: the profile does not matter, both land in place.
+        # The battery failsafe jumps here and inherits the same branch.
+        if not rtl_cfg.enabled:
             return self._land_in_place(ctx, guidance)
 
         # The centering law is constructed here, before anything flies, and not
@@ -649,14 +652,17 @@ class ClosedLoopRTLStep(BaseStep):
         self._assert_tilt(ctx)
 
     def _land_in_place(self, ctx: MissionContext, guidance: RTLGuidanceController) -> StepStatus:
-        """Intermediate profile: land vertically where the inspection ended.
+        """Without the return (``rtl.enabled`` false): land where the inspection ended.
 
-        No return leg, no marker sensor and no ``mission.rtl_start`` milestone:
-        that milestone is narrated as "iniciando retorno à base" and nothing here
-        returns. ``mission.landing`` and ``mission.touchdown`` carry
-        ``at_base: False``, which selects the in-place phrasing.
+        Either profile. No return leg, no marker sensor and no
+        ``mission.rtl_start`` milestone: that milestone is narrated as
+        "iniciando retorno à base" and nothing here returns. ``mission.landing``
+        and ``mission.touchdown`` carry ``at_base: False``, which selects the
+        in-place phrasing. In the Simple profile the airframe never left the pad
+        and lands on its top; the platform monitor is inert there, so the
+        touchdown threshold is not discounted (:meth:`_grounded_altitude`).
         """
-        logger.info("Intermediate profile: no return leg; landing at the inspection point.")
+        logger.info("No return leg (rtl.enabled = false): landing at the inspection point.")
         self._announce("Pouso no local", "inspeção concluída, executando pouso no local da inspeção")
         self._halt_translation(ctx)
         return self._touchdown(ctx, guidance, at_base=False)
@@ -1161,7 +1167,7 @@ class ClosedLoopRTLStep(BaseStep):
         )
 
         snapshot = ctx.odom_supervisor.snapshot()
-        vz = ctx.governor.compute_vz(snapshot.relative_altitude, dt, vx_commanded=abs(vy))
+        vz = governed_vz(ctx, snapshot.relative_altitude, dt, vx_commanded=abs(vy))
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(0.0, vy)
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
@@ -1320,7 +1326,7 @@ class ClosedLoopRTLStep(BaseStep):
         # The governor's feedforward argument is the norm of the horizontal
         # demand: the centering closes in 2D and the return approach is lateral.
         snapshot = ctx.odom_supervisor.snapshot()
-        vz = ctx.governor.compute_vz(
+        vz = governed_vz(ctx, 
             snapshot.relative_altitude, dt, vx_commanded=math.hypot(command.vx, command.vy)
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
@@ -1339,7 +1345,7 @@ class ClosedLoopRTLStep(BaseStep):
             # Near the pad edge an exactly zero gaz hands the vertical axis to
             # the firmware's sonar hover, which is what the edge guard exists
             # to avoid. The governor keeps it, as in every other phase.
-            vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude)
+            vz = governed_vz(ctx, ctx.odom_supervisor.snapshot().relative_altitude)
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(0.0, 0.0)
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
@@ -1862,7 +1868,7 @@ class ClosedLoopRTLStep(BaseStep):
         reference: Optional[ReturnReference] = None,
     ) -> GuidanceCommand:
         """Compute one cycle of guidance and transmit it."""
-        vz_governor = ctx.governor.compute_vz(snapshot.relative_altitude, dt)
+        vz_governor = governed_vz(ctx, snapshot.relative_altitude, dt)
         command = guidance.compute(snapshot, vz_governor, dt, phase=phase, reference=reference)
 
         # Saturate rather than raise: a rounding error must not end the mission.

@@ -212,7 +212,7 @@ class YawDrone:
         self.commands: List[Tuple[float, float, float, float]] = []
         self._ctx = ctx
         self._period = period
-        self.no_fly = False
+        self.no_fly = True
 
     def move_velocity(self, vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=None):
         self.commands.append((vx, vy, vz, vyaw))
@@ -555,15 +555,17 @@ def land_ctx(mode_name: str, **drone_kwargs):
     return drone, ctx
 
 
-def test_the_intermediate_profile_lands_in_place_without_building_a_marker_sensor():
-    drone, ctx = land_ctx("intermediate")
+@pytest.mark.parametrize("mode", list(MissionMode))
+def test_without_the_return_both_profiles_land_in_place_without_building_a_marker_sensor(mode):
+    drone, ctx = land_ctx(mode.value)
+    ctx.params.rtl.enabled = False
     ctx.params.rtl.target_aruco_id = 10_000  # not a valid marker: must be irrelevant here
 
     class ExplodingSensor:
         def __getattr__(self, name):
-            raise AssertionError("the intermediate profile must not touch the marker sensor")
+            raise AssertionError("a landing without the return must not touch the marker sensor")
 
-    step = ClosedLoopRTLStep(sensor=ExplodingSensor(), mode=MissionMode.INTERMEDIATE)
+    step = ClosedLoopRTLStep(sensor=ExplodingSensor(), mode=mode, rtl_enabled=False)
     status = step.execute(ctx)
 
     assert status is StepStatus.SUCCESS
@@ -572,13 +574,15 @@ def test_the_intermediate_profile_lands_in_place_without_building_a_marker_senso
     assert all(vyaw == 0.0 for *_rest, vyaw in drone.commands)
 
 
-def test_the_intermediate_profile_does_not_announce_a_return():
-    drone, ctx = land_ctx("intermediate")
+@pytest.mark.parametrize("mode", list(MissionMode))
+def test_without_the_return_no_profile_announces_one(mode):
+    drone, ctx = land_ctx(mode.value)
+    ctx.params.rtl.enabled = False
     milestones = []
     original = rtl_module.emit_milestone
     rtl_module.emit_milestone = lambda key, payload=None: milestones.append((key, payload))
     try:
-        ClosedLoopRTLStep(mode=MissionMode.INTERMEDIATE).execute(ctx)
+        ClosedLoopRTLStep(mode=mode, rtl_enabled=False).execute(ctx)
     finally:
         rtl_module.emit_milestone = original
 

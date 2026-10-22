@@ -22,6 +22,9 @@ class EvidenceRecord:
     metadata_path: Optional[str] = None
     timestamp: Optional[str] = None
     detections: List[Dict[str, object]] = field(default_factory=list)
+    #: Official occurrence identifier, ``OC_YYYYMMDD_HHMMSS`` in UTC. Keys the
+    #: visual inference agent's report (``relatorio_<occurrence_id>.html``).
+    occurrence_id: Optional[str] = None
 
     @property
     def captured(self) -> bool:

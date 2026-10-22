@@ -16,6 +16,83 @@ from typing import Any, Dict, Final, List, Optional, Tuple, Union
 
 logger = logging.getLogger("MissionParameters")
 
+#: Fields a document may only set with a JSON boolean, as ``(section, name)``.
+#: A truthy string (``"false"``) or ``0``/``1`` would otherwise be stored and
+#: read with the opposite or an unintended meaning.
+STRICT_BOOL_FIELDS: Final[Tuple[Tuple[str, str], ...]] = (("rtl", "enabled"), ("platform", "takeoff_from_ground"))
+
+#: Mission mode removed from the station and the mission; stored documents that
+#: still name it are migrated by :func:`migrate_legacy_mission_mode`.
+LEGACY_INTERMEDIATE_MODE: Final[str] = "intermediate"
+
+_legacy_mode_warned = False
+
+
+class ParameterTypeError(TypeError):
+    """A document field of the wrong type, refused before anything flies.
+
+    Parameters
+    ----------
+    field : str
+        Dotted path of the field (``"rtl.enabled"``).
+    reason : str
+        Short explanation in Portuguese, fit to be shown to the operator.
+
+    Attributes
+    ----------
+    field : str
+    reason : str
+    """
+
+    def __init__(self, field: str, reason: str) -> None:
+        super().__init__(f"{field}: {reason}")
+        self.field = field
+        self.reason = reason
+
+
+def migrate_legacy_mission_mode(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Carry a document of the removed Intermediate profile over to its equivalent.
+
+    The Intermediate profile was exactly the Advanced one with no return leg.
+    A document whose ``mission_mode`` reads ``"intermediate"`` (after trimming
+    and lower-casing) becomes ``"advanced"`` with ``rtl.enabled = False``; an
+    ``rtl.enabled`` the document states explicitly is kept. The station applies
+    the same rule (``launchDocument.ts:migrateLegacyMode``).
+
+    Pure and idempotent: ``raw`` is never mutated, and a migrated document
+    migrates to itself. Logs one warning per process the first time it
+    migrates.
+
+    Parameters
+    ----------
+    raw : dict
+        Parameter document, as read from JSON.
+
+    Returns
+    -------
+    dict
+        ``raw`` itself when nothing changes, else a migrated shallow copy (the
+        ``rtl`` section is copied too).
+    """
+    global _legacy_mode_warned
+    if not isinstance(raw, dict):
+        return raw
+    mode = raw.get("mission_mode")
+    if not isinstance(mode, str) or mode.strip().lower() != LEGACY_INTERMEDIATE_MODE:
+        return raw
+    migrated = dict(raw)
+    migrated["mission_mode"] = "advanced"
+    rtl = dict(raw["rtl"]) if isinstance(raw.get("rtl"), dict) else {}
+    rtl.setdefault("enabled", False)
+    migrated["rtl"] = rtl
+    if not _legacy_mode_warned:
+        _legacy_mode_warned = True
+        logger.warning(
+            "mission_mode 'intermediate' was removed; flying 'advanced' with rtl.enabled=%s.",
+            rtl["enabled"],
+        )
+    return migrated
+
 
 @dataclass
 class NetworkConfig:
@@ -474,12 +551,18 @@ class FlightKinematicsConfig:
     #: a settled hover still shows is bounded by the settle sigma; a ceiling
     #: inside that band trips ``OdometrySupervisor.is_ceiling_breached`` in nominal flight.
     #: Below :attr:`climb_deadband_m` itself it trips on arrival (station rule
-    #: E04), and ``target_altitude_m + altitude_ceiling_margin_m`` must clear
-    #: the firmware takeoff height, about one metre, or the ceiling trips right
-    #: after liftoff (E03, ``parameter_conflicts.FIRMWARE_HOVER_HEIGHT_M``).
+    #: E04; W10 below the band). The end of the firmware's launch profile is
+    #: covered by the ceiling ratchet (``estimation.ceiling_schedule``), not by
+    #: this margin.
+    #:
+    #: Read only for a launch from the floor: on the pad top the ceiling is
+    #: fixed at ``max(target, native height) + TOTEM_CEILING_HEADROOM_M`` (D2)
+    #: and the stored value is ignored.
     altitude_ceiling_margin_m: float = 0.60
     #: Consecutive odometry samples above the ceiling required to declare a breach.
-    #: 3 samples at 15 Hz = ~200 ms debounce, rejecting instantaneous ultrasonic/baro spikes.
+    #: ``/bebop/odom`` arrives at about 5 Hz (the driver integrates
+    #: ``SpeedChanged`` at the firmware's rate), so 3 samples are about 0.6 s of
+    #: debounce, rejecting instantaneous ultrasonic/baro spikes.
     ceiling_breach_streak: int = 3
     #: Search cruise setpoint, normalized. Stage 2 flies it as a leftward
     #: lateral velocity (``vy > 0``, FLU) along the outbound track; the name is
@@ -576,7 +659,7 @@ class FlightKinematicsConfig:
     climb_deadband_m: float = 0.05
     #: Hard bound on the Stage 1 climb, in seconds. Reaching it is not a fault:
     #: the mission continues at the altitude actually achieved. Kept short
-    #: because the stall detector (in _ascend) provides an earlier exit when
+    #: because the stall detector (in TakeoffStep._acquire_altitude) provides an earlier exit when
     #: the firmware rejects the commanded vz.
     climb_timeout_sec: float = 15.0
     #: Multivariate settling gate for the climb. The drone must hold inside the
@@ -644,6 +727,15 @@ class ReturnToLaunchConfig:
     it is better than having no return leg.
     """
 
+    #: End of flight after the evidence. ``True``: the full return, with the
+    #: marker search, the centering and the precision landing on the pad
+    #: (in the Simple profile, the centering over the pad it never left).
+    #: ``False``: the airframe lands where it is right after the evidence, in
+    #: every profile; the marker fields below are then not read.
+    #:
+    #: Safe envelope: a ``bool``. ``update_from_dict`` refuses anything else
+    #: (:class:`ParameterTypeError`): the string ``"false"`` is truthy.
+    enabled: bool = True
     #: Speed ceiling of the odometric return along the return track (body Y,
     #: to the right in the lateral flight pattern), in normalized units.
     max_speed: float = 0.10
@@ -971,11 +1063,14 @@ class CalibrationConfig:
 
     #: Altitude source for live odometry: ``"legacy"`` keeps ``pose.z`` behind
     #: the position plausibility gate above; ``"vz_gated"`` integrates the
-    #: gated vertical speed instead (``estimation.vertical_estimator``). Stays
-    #: ``"legacy"`` until field test F-2 shows a ``vz`` step at the pad edge.
+    #: gated vertical speed instead (``estimation.vertical_estimator``);
+    #: ``"terrain_kf"`` runs the terrain-aware Kalman filter
+    #: (``estimation.terrain_vertical_filter``). Stays ``"legacy"`` until the
+    #: emulated M1/M2/M3 criteria and field identification F-ID pass (D7).
     #:
-    #: Safe envelope: one of ``"legacy"``, ``"vz_gated"``; anything else is
-    #: refused with ``ValueError`` when the odometry supervisor is built.
+    #: Safe envelope: one of ``"legacy"``, ``"vz_gated"``, ``"terrain_kf"``;
+    #: anything else is refused with ``ValueError`` when the odometry
+    #: supervisor is built.
     altitude_estimator: str = "legacy"
     #: Ceiling on a trusted vertical speed sample, in metres per second.
     #:
@@ -994,6 +1089,42 @@ class CalibrationConfig:
     #: Innovation beyond which the anchor does not correct, in metres; 3 s of
     #: persistent disagreement is logged.
     altitude_anchor_gate_m: float = 0.25
+
+    # ------------------------------------------- terrain-aware Kalman filter
+
+    #: What ``/bebop/states/altitude`` (``AltitudeChanged``) measures, for the
+    #: ``"terrain_kf"`` estimator: ``"unknown"`` (logged only, never used),
+    #: ``"baro"`` (the airframe's height, plus a bias the filter estimates) or
+    #: ``"sonar_fused"`` (the height over the terrain below, which steps by the
+    #: pad height at its edge). Stays ``"unknown"`` until field test F-ID-1. [A CONFIRMAR]
+    #:
+    #: Safe envelope: one of ``"unknown"``, ``"baro"``, ``"sonar_fused"``.
+    firmware_altitude_source: str = "unknown"
+    #: First-order lag of the airframe's vertical speed to the commanded
+    #: ``gaz``, in seconds: the process model of ``"terrain_kf"``. [A CONFIRMAR]
+    #:
+    #: Safe envelope: ``(0.05, 2.0]``.
+    vertical_lag_tau_sec: float = 0.35
+    #: Process noise of ``"terrain_kf"``: the unmodelled vertical
+    #: acceleration, 1-sigma, in metres per second squared. [A CONFIRMAR]
+    #:
+    #: Safe envelope: ``(0, 10]``.
+    vertical_accel_noise_mps2: float = 1.5
+    #: Noise of the reported ``speedZ``, 1-sigma, in metres per second. [A CONFIRMAR]
+    #:
+    #: Safe envelope: ``(0, 1]``.
+    vz_measurement_noise_mps: float = 0.08
+    #: Noise of ``AltitudeChanged`` as a measurement, 1-sigma, in metres. [A CONFIRMAR]
+    #:
+    #: Safe envelope: ``(0, 1]``.
+    altitude_measurement_noise_m: float = 0.10
+    #: Factor on the ``speedZ`` noise variance while the platform edge guard
+    #: window is open (``LEAVING``/``ENTERING``): the sonar step is expected
+    #: there, so ``speedZ`` weighs less and a rejected sample is not taken as
+    #: a new regime until the window closes. [A CONFIRMAR]
+    #:
+    #: Safe envelope: ``[1, 1000]``.
+    terrain_step_noise_scale: float = 16.0
 
 
 @dataclass
@@ -1163,10 +1294,19 @@ class PlatformConfig:
     the floor.
     """
 
-    #: Height of the pad top above the floor, in metres.
+    #: Height of the pad top above the floor, in metres: the physical pad,
+    #: whichever surface the flight takes off from.
     #:
     #: Safe envelope: ``>= 0``. ``0.0`` is a launch from the floor.
     height_m: float = 0.0
+    #: Launch surface. ``False``: the airframe takes off from the top of the
+    #: pad of :attr:`height_m`. ``True``: it takes off from the floor and
+    #: :attr:`height_m` takes no part in the flight
+    #: (``mission_mode.apply_launch_surface`` zeroes it in memory, after the
+    #: document was persisted).
+    #:
+    #: Safe envelope: a ``bool``. ``update_from_dict`` refuses anything else.
+    takeoff_from_ground: bool = False
     #: Venue ceiling above the floor, in metres; ``None`` when unknown.
     #:
     #: Clamps the effective altitude ceiling to ``venue_ceiling_agl_m -
@@ -1332,8 +1472,9 @@ class YawPatternConfig:
 class MissionParameters:
     """Root container consolidating all configurable mission subsystems.
 
-    ``mission_mode`` selects the mission profile: ``simple``, ``intermediate``
-    or ``advanced``. Resolved once by ``mission_mode.apply_mission_mode``.
+    ``mission_mode`` selects the mission profile: ``simple`` or ``advanced``.
+    Resolved once by ``mission_mode.apply_mission_mode``; the removed
+    ``intermediate`` is migrated on load (:func:`migrate_legacy_mission_mode`).
     """
 
     network: NetworkConfig = field(default_factory=NetworkConfig)
@@ -1368,7 +1509,8 @@ class MissionParameters:
         -------
         float
             ``target_altitude_m - platform.height_m``; exactly
-            ``target_altitude_m`` when no pad is configured.
+            ``target_altitude_m`` when no pad is configured or the flight
+            takes off from the floor (``platform.takeoff_from_ground``).
 
         Raises
         ------
@@ -1380,12 +1522,14 @@ class MissionParameters:
             existed.
         """
         target = float(self.kinematics.target_altitude_m)
-        height = float(self.platform.height_m)
+        height = 0.0 if self.platform.takeoff_from_ground is True else float(self.platform.height_m)
         if height <= 0.0:
             return target
         relative = target - height
         floor = float(self.kinematics.takeoff_settle_min_altitude_m)
-        if relative < floor:
+        # 1e-9 m of slack: ``1.4 - 1.0`` is 0.39999999999999991 in binary, and
+        # the station offers exactly ``pad + clearance`` as its lowest altitude.
+        if relative < floor - 1e-9:
             raise ValueError(
                 f"target_altitude_m={target:g} leaves {relative:g} m above a {height:g} m pad, "
                 f"under takeoff_settle_min_altitude_m={floor:g}"
@@ -1435,8 +1579,24 @@ class MissionParameters:
 
         Unknown keys are ignored, which is what lets new configuration fields be
         introduced without invalidating an on-disk config written by an older
-        build, or a ``--params-json`` payload sent by an older GCS.
+        build, or a ``--params-json`` payload sent by an older GCS. A document of
+        the removed Intermediate profile is migrated first
+        (:func:`migrate_legacy_mission_mode`).
+
+        Raises
+        ------
+        ParameterTypeError
+            If a field of :data:`STRICT_BOOL_FIELDS` holds anything but a
+            ``bool``. Checked over the whole document before any field is
+            written, so a refused document leaves this instance untouched.
         """
+        data = migrate_legacy_mission_mode(data)
+        for section, name in STRICT_BOOL_FIELDS:
+            values = data.get(section) if isinstance(data, dict) else None
+            if isinstance(values, dict) and name in values and not isinstance(values[name], bool):
+                raise ParameterTypeError(
+                    f"{section}.{name}", f"precisa ser verdadeiro ou falso, recebeu {values[name]!r}"
+                )
 
         def _apply(target: Any, values: Dict[str, Any]) -> None:
             for key, value in values.items():
@@ -1478,13 +1638,27 @@ class MissionParameters:
 
     @classmethod
     def load_from_file(cls, file_path: str) -> MissionParameters:
-        """Load parameters from JSON on disk, falling back to defaults if missing or invalid."""
+        """Load parameters from JSON on disk, falling back to defaults if missing or invalid.
+
+        A document of the removed Intermediate profile is migrated
+        (:func:`migrate_legacy_mission_mode`).
+
+        Raises
+        ------
+        ParameterTypeError
+            If a field of :data:`STRICT_BOOL_FIELDS` is not a ``bool``. Unlike
+            an unreadable file, this is not replaced by the defaults: the store
+            states a return plan or a launch surface, and flying the opposite of
+            what it states is worse than refusing to start.
+        """
         params = cls()
         if os.path.exists(file_path):
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                params.update_from_dict(data)
+                params.update_from_dict(migrate_legacy_mission_mode(data))
+            except ParameterTypeError:
+                raise
             except Exception as exc:  # noqa: BLE001 - a bad config must not block flight
                 logger.warning("Failed to load %s: %s. Using defaults.", file_path, exc)
         return params

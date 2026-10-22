@@ -51,16 +51,21 @@ from mvp_mission_bebop.estimation.convergence import SettlementCriteria, Settlem
 from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.perception.inspection_worker import InspectionJob
 from mvp_mission_bebop.perception.worker import detector_kwargs
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus
+from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 logger = logging.getLogger("Step4Inspection")
 
 _STEP_NAMES: Final[Dict[MissionMode, str]] = {
     MissionMode.ADVANCED: "STEP 4: Motionless Nadir Hover & Evidence Capture",
-    MissionMode.INTERMEDIATE: "STEP 4: Motionless Nadir Hover & Evidence Capture",
     MissionMode.SIMPLE: "STEP 4: Motionless Nadir Hover & Evidence Capture",
 }
+
+#: Gimbal tilt held into a landing in place (``rtl.enabled`` false), in
+#: degrees. The marker fields, ``rtl.camera_tilt_deg`` included, are hidden from
+#: the operator without the return, so a stored value must not decide where the
+#: camera points; near-nadir keeps the touchdown spot in view.
+STOW_GIMBAL_TILT_DEG: Final[float] = -80.0
 
 #: Smallest tilt change worth transmitting, in degrees. Below it the gimbal
 #: command is not re-sent, so a converged law does not flood the gimbal topic.
@@ -172,10 +177,15 @@ class NadirInspectionStep(BaseStep):
             logger.error("Stage 4 finished without recording any evidence.")
 
         if self._mode is MissionMode.SIMPLE:
+            # With or without the return, the Simple profile lands on the
+            # takeoff heading. Only an interrupt fails the restore; a window
+            # that expires returns SUCCESS and Stage 5 still lands from the
+            # heading reached.
             status = self._restore_heading(ctx)
             if status is not StepStatus.SUCCESS:
                 return status
-            self._point_gimbal(ctx, float(ctx.params.rtl.camera_tilt_deg))
+            tilt = float(ctx.params.rtl.camera_tilt_deg) if ctx.params.rtl.enabled else STOW_GIMBAL_TILT_DEG
+            self._point_gimbal(ctx, tilt)
 
         return StepStatus.SUCCESS
 
@@ -731,7 +741,7 @@ class NadirInspectionStep(BaseStep):
     @staticmethod
     def _transmit_yaw(ctx: MissionContext, vyaw: float, dt: float) -> None:
         """Send a yaw command through the failsafe with every translation channel at zero."""
-        vz = ctx.governor.compute_vz(
+        vz = governed_vz(ctx, 
             ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=0.0
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, vyaw)
@@ -802,7 +812,7 @@ class NadirInspectionStep(BaseStep):
         still actively correcting -- see :meth:`_await_stillness` -- do not
         have to recompute it.
         """
-        vz = ctx.governor.compute_vz(ctx.odom_supervisor.snapshot().relative_altitude, dt)
+        vz = governed_vz(ctx, ctx.odom_supervisor.snapshot().relative_altitude, dt)
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
         ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
         return safe_vz

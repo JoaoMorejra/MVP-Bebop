@@ -48,7 +48,9 @@ MAX_GO_DELAY_SEC: Final[float] = 1.0
 STANDBY_READY_LINE: Final[str] = "[STANDBY] ready"
 
 #: Parameters consumed while preparing: the arming mode, the network and
-#: topics, the detector and the loops built before the go.
+#: topics, the detector and the loops built before the go. The mission mode,
+#: the return plan and the launch surface close the list: a standby prepared
+#: for another profile, plan or surface never receives the go.
 CRITICAL_PATHS: Final[Tuple[str, ...]] = (
     "no_fly",
     "network.drone_ip",
@@ -60,6 +62,9 @@ CRITICAL_PATHS: Final[Tuple[str, ...]] = (
     "vision.inference_imgsz",
     "kinematics.control_loop_hz",
     "dead_reckoning.enabled",
+    "mission_mode",
+    "rtl.enabled",
+    "platform.takeoff_from_ground",
 )
 
 
@@ -81,6 +86,8 @@ def _normalized(path: str, value: Any) -> Any:
             return normalize_inference_device(value)
         if path == "vision.inference_imgsz":
             return normalize_imgsz(value)
+        if path == "mission_mode" and isinstance(value, str):
+            return value.strip().lower()
     except (TypeError, ValueError):
         return ("invalid", repr(value))
     if isinstance(value, bool) or value is None:

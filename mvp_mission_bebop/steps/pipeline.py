@@ -14,16 +14,19 @@ from mvp_mission_bebop.steps.takeoff import TakeoffStep
 from mvp_mission_bebop.steps.tracking import VisualServoingStep
 
 
-def build_steps(mode: MissionMode) -> Dict[int, Callable[[], BaseStep]]:
+def build_steps(mode: MissionMode, rtl_enabled: bool = True) -> Dict[int, Callable[[], BaseStep]]:
     """Factories for the five stages of ``mode``, keyed by stage number.
 
-    Stage 1 is identical in every profile. Stages 2 to 5 receive the profile at
-    construction; it is never read from the parameter document by the steps.
+    Every stage receives the profile at construction; it is never read from
+    the parameter document by the steps. Stage 5 also receives the return plan,
+    which names it (``mission_mode.stage_five_name``).
 
     Parameters
     ----------
     mode : MissionMode
         Resolved mission profile (``apply_mission_mode`` has already run).
+    rtl_enabled : bool
+        ``rtl.enabled`` of the flight.
 
     Returns
     -------
@@ -35,5 +38,5 @@ def build_steps(mode: MissionMode) -> Dict[int, Callable[[], BaseStep]]:
         2: functools.partial(LateralSearchStep, mode=mode),
         3: functools.partial(VisualServoingStep, mode=mode),
         4: functools.partial(NadirInspectionStep, mode=mode),
-        5: functools.partial(ClosedLoopRTLStep, mode=mode),
+        5: functools.partial(ClosedLoopRTLStep, mode=mode, rtl_enabled=bool(rtl_enabled)),
     }

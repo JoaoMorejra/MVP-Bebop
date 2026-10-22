@@ -42,7 +42,7 @@ from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
 from mvp_mission_bebop.controllers.yaw_pattern import YawServoingController, validate_yaw_pattern
-from mvp_mission_bebop.engine.exit_codes import EXIT_ABORTED_LANDED
+from mvp_mission_bebop.engine.exit_codes import EXIT_ABORTED_LANDED, EXIT_LAUNCH_REFUSED
 from mvp_mission_bebop.engine.launch import (
     EXIT_STANDBY_MISMATCH,
     EXIT_STANDBY_STALE,
@@ -58,11 +58,13 @@ from mvp_mission_bebop.engine.startup_timing import StartupTimer, process_age_ms
 from mvp_mission_bebop.engine.stage_gate import StageRequestHandler
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
-from mvp_mission_bebop.mission_mode import MissionMode, apply_mission_mode, neutralize_launch_pad
+from mvp_mission_bebop.launch_envelope import launches_from_ground, validate_launch_envelope
+from mvp_mission_bebop.mission_mode import MissionMode, apply_launch_surface, apply_mission_mode
 from mvp_mission_bebop.parameters import (
     COUNTDOWN_MIN_SEC,
     BatteryConfig,
     MissionParameters,
+    ParameterTypeError,
     VisionConfig,
 )
 from mvp_mission_bebop.perception.inference_device import (
@@ -92,7 +94,7 @@ from mvp_mission_bebop.telemetry.battery import (
 )
 from mvp_mission_bebop.telemetry.bench import BenchTelemetryPublisher
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
-from mvp_mission_bebop.telemetry.milestones import emit_milestone
+from mvp_mission_bebop.telemetry.milestones import emit_alert, emit_milestone
 from mvp_mission_bebop.telemetry.mission_parameters import spoken_parameters
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
 from mvp_mission_bebop.telemetry.flat_trim_ack import FlatTrimAckTracker
@@ -244,10 +246,10 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         choices=[mode.value for mode in MissionMode],
         default=None,
         help=(
-            "Mission profile: simple (yaw-only search, no translation), intermediate "
-            "(full mission, lands where the inspection ends) or advanced (full mission "
-            "with the ArUco return). Overrides mission_mode in the parameter store and "
-            "in --params-json (default: advanced)."
+            "Mission profile: simple (yaw-only search, no translation) or advanced "
+            "(lateral search and visual approach). The end of flight is rtl.enabled, "
+            "not the profile. Overrides mission_mode in the parameter store and in "
+            "--params-json (default: advanced)."
         ),
     )
     parser.add_argument(
@@ -370,6 +372,72 @@ def _config_file(args: argparse.Namespace) -> str:
     return args.config or os.path.join(os.path.dirname(__file__), "mission_config.json")
 
 
+def flight_plan_phrase(params: MissionParameters) -> str:
+    """The end of flight as the start announcement states it, in Portuguese."""
+    if params.rtl.enabled:
+        return "retorno à base com pouso de precisão ao final"
+    return "pouso no local após a foto"
+
+
+def mission_mode_payload(params: MissionParameters) -> Dict[str, Any]:
+    """Payload of the ``mission.mode`` milestone: what this run will fly.
+
+    Read before the pad is resolved for the flight, so ``takeoff_surface`` and
+    ``target_altitude_m`` (over the floor) are the ones the operator set.
+
+    Returns
+    -------
+    dict
+        ``{"mode", "rtl_enabled", "takeoff_surface", "target_altitude_m"}``;
+        ``takeoff_surface`` is ``"ground"`` or ``"platform"``.
+    """
+    return {
+        "mode": MissionMode(params.mission_mode).value,
+        "rtl_enabled": bool(params.rtl.enabled),
+        "takeoff_surface": "ground" if launches_from_ground(params) else "platform",
+        "target_altitude_m": float(params.kinematics.target_altitude_m),
+    }
+
+
+def launch_refusal(error: BaseException) -> Tuple[str, str]:
+    """Field and operator-facing reason of a refused launch document.
+
+    Parameters
+    ----------
+    error : BaseException
+        Raised while resolving the document. A ``launch_envelope.LaunchEnvelopeError``
+        (or any error carrying ``field`` and ``reason`` strings) names its own
+        field; anything else is a mission mode the mission cannot parse.
+
+    Returns
+    -------
+    tuple of str
+        ``(field, reason)``, the payload of ``mission.launch_refused``.
+    """
+    field = getattr(error, "field", None)
+    reason = getattr(error, "reason", None)
+    if not isinstance(field, str) or not field:
+        field = "mission_mode"
+    if not isinstance(reason, str) or not reason:
+        reason = f"documento recusado: {error}"
+    return field, reason
+
+
+def refuse_launch(error: BaseException) -> None:
+    """Report a refused launch document on the station's two channels.
+
+    Emits the ``mission.launch_refused`` alert and prints the
+    ``[LAUNCH_REFUSED] <field>: <reason>`` line the station falls back on. Both
+    are stdout writes and need no ROS node, so the cold start reports a refusal
+    before the SDK is up. The caller releases what it holds and exits with
+    ``EXIT_LAUNCH_REFUSED``.
+    """
+    field, reason = launch_refusal(error)
+    logger.error("Launch document refused: %s: %s", field, reason)
+    emit_alert("mission.launch_refused", {"field": field, "reason": reason})
+    print(f"[LAUNCH_REFUSED] {field}: {reason}", flush=True)
+
+
 def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
     """Merge the parameter store, ``--params-json`` and the CLI flags, then persist.
 
@@ -393,10 +461,16 @@ def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
     SystemExit
         On a malformed ``--params-json``, ``--fly`` together with ``--no-fly``,
         or a countdown that is not a finite number of at least
-        :data:`~mvp_mission_bebop.parameters.COUNTDOWN_MIN_SEC`.
+        :data:`~mvp_mission_bebop.parameters.COUNTDOWN_MIN_SEC`. With
+        ``EXIT_LAUNCH_REFUSED``, after :func:`refuse_launch`, on a mission mode
+        or a launch envelope the mission cannot fly.
     """
     config_file = _config_file(args)
-    params = MissionParameters.load_from_file(config_file)
+    try:
+        params = MissionParameters.load_from_file(config_file)
+    except ParameterTypeError as error:
+        refuse_launch(error)
+        sys.exit(EXIT_LAUNCH_REFUSED)
     # The arming mode is never taken from the parameter store on disk.
     # An invocation always defaults to armed (no_fly = False) unless
     # explicitly commanded otherwise via --no-fly or --params-json.
@@ -418,7 +492,11 @@ def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
             raise SystemExit(
                 "--params-json must be a JSON object of MissionParameters fields."
             )
-        params.update_from_dict(custom_data)
+        try:
+            params.update_from_dict(custom_data)
+        except ParameterTypeError as error:
+            refuse_launch(error)
+            sys.exit(EXIT_LAUNCH_REFUSED)
 
     if args.height is not None:
         params.kinematics.target_altitude_m = args.height
@@ -467,8 +545,10 @@ def resolve_parameters(args: argparse.Namespace) -> MissionParameters:
         params.kinematics.countdown_sec = args.countdown
     try:
         apply_mission_mode(params, getattr(args, "mode", None))
+        validate_launch_envelope(params)
     except (TypeError, ValueError) as error:
-        raise SystemExit(f"mission_mode: {error}") from error
+        refuse_launch(error)
+        sys.exit(EXIT_LAUNCH_REFUSED)
     _validate_countdown(params)
     _persist_parameters(params, config_file)
     return params
@@ -696,7 +776,7 @@ def main() -> None:
         from mvp_mission_bebop.telemetry.announcer import announce_sync
         announce_sync(
             "Iniciando Missão",
-            details={"etapa": "iniciando missão, carregando parâmetros"},
+            details={"etapa": "iniciando missão, carregando parâmetros", "plano": flight_plan_phrase(params)},
             wait=False,
         )
     except Exception as vocal_err:
@@ -770,6 +850,7 @@ def main() -> None:
         simulator=simulator,
         motion_tracker=motion_tracker,
         yaw_authority=yaw_authority,
+        vertical_command_listener=odom_supervisor.note_commanded_vz,
     )
 
 
@@ -937,6 +1018,7 @@ def main() -> None:
         now_mono = time.monotonic()
         flying_state_data["state"] = state
         flying_state_data["timestamp"] = now_mono
+        odom_supervisor.note_flying_state(state)
         ctx = ctx_holder[0]
         if ctx is not None:
             ctx.flying_state = state
@@ -1025,11 +1107,15 @@ def main() -> None:
             handler.cleanup()
             nectar.shutdown()
             sys.exit(EXIT_STANDBY_MISMATCH)
-        params.update_from_dict(command["params"])
         try:
+            params.update_from_dict(command["params"])
             apply_mission_mode(params, getattr(args, "mode", None))
+            validate_launch_envelope(params)
         except (TypeError, ValueError) as error:
-            raise SystemExit(f"mission_mode: {error}") from error
+            refuse_launch(error)
+            handler.cleanup()
+            nectar.shutdown()
+            sys.exit(EXIT_LAUNCH_REFUSED)
         _validate_countdown(params)
         _persist_parameters(params, _config_file(args))
         try:
@@ -1061,16 +1147,10 @@ def main() -> None:
     # D2: the station speaks the numbers of this document and of no other.
     # Emitted after every normalization above (and, from standby, after the
     # go), so it is exactly what the steps will fly.
-    emit_milestone("mission.mode", {"mode": MissionMode(params.mission_mode).value})
+    emit_milestone("mission.mode", mission_mode_payload(params))
     emit_milestone("mission.parameters", spoken_parameters(params, calibration))
 
-    if MissionMode(params.mission_mode) is MissionMode.SIMPLE:
-        neutralize_launch_pad(params)
-        logger.info(
-            "Simple profile: launch pad height %.2f m is ignored for the flight (no translation); "
-            "ceiling anchored on the native takeoff height.",
-            getattr(params, "launch_pad_height_m_original", 0.0),
-        )
+    apply_launch_surface(params)
 
     governor_class = (
         AltitudeHoldGovernor if params.governor.hold_enabled else AltitudeAntiClimbGovernor
@@ -1241,7 +1321,7 @@ def main() -> None:
             logger.info("[NO-FLY] Simulated landing completed at the end of the run.")
         telemetry_node.destroy_node()
 
-    all_steps = build_steps(mission_mode)
+    all_steps = build_steps(mission_mode, bool(params.rtl.enabled))
 
     selection = parse_stage_selection(getattr(args, "stages", None))
     if selection is None:
