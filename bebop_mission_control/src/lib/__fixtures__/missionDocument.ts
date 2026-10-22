@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { REQUIRED_LAUNCH_NUMBERS } from '../launchDocument';
+import { REQUIRED_LAUNCH_BOOLEANS, REQUIRED_LAUNCH_NUMBERS } from '../launchDocument';
 import { setPath, type Doc } from '../paths';
 
-/** A parameter document with every number a launch requires, plus fields the schema does not list. */
+/** A parameter document with every number and boolean a launch requires, plus fields the schema does not list. */
 export function completeDocument(overrides: Record<string, unknown> = {}): Doc {
   let doc: Doc = {
     no_fly: false,
@@ -15,6 +15,7 @@ export function completeDocument(overrides: Record<string, unknown> = {}): Doc {
   REQUIRED_LAUNCH_NUMBERS.forEach((path, index) => {
     doc = setPath(doc, path, index + 1);
   });
+  for (const [path, value] of Object.entries(REQUIRED_LAUNCH_BOOLEANS)) doc = setPath(doc, path, value);
   for (const [path, value] of Object.entries(overrides)) doc = setPath(doc, path, value);
   return doc;
 }

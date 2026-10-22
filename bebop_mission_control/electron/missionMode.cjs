@@ -11,7 +11,14 @@
  * the station can confirm it before takeoff.
  */
 
-const MISSION_MODES = Object.freeze(['simple', 'intermediate', 'advanced']);
+const MISSION_MODES = Object.freeze(['simple', 'advanced']);
+
+/**
+ * Refusal of the removed profile. The renderer migrates stored documents before
+ * they reach here (`launchDocument.ts:migrateLegacyMode`), so only an external
+ * document still names it.
+ */
+const INTERMEDIATE_REMOVED = 'Modo Intermediário removido: use Avançado sem RTL.';
 
 /**
  * @param {unknown} doc Launch document (parsed JSON object).
@@ -26,6 +33,7 @@ function normalizeLaunchMode(doc) {
     return { ok: true, doc: { ...source, mission_mode: 'advanced' }, mode: 'advanced', defaulted: true };
   }
   const token = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (token === 'intermediate') return { ok: false, error: INTERMEDIATE_REMOVED };
   if (!MISSION_MODES.includes(token)) {
     return {
       ok: false,
@@ -35,4 +43,4 @@ function normalizeLaunchMode(doc) {
   return { ok: true, doc: { ...source, mission_mode: token }, mode: token, defaulted: false };
 }
 
-module.exports = { MISSION_MODES, normalizeLaunchMode };
+module.exports = { INTERMEDIATE_REMOVED, MISSION_MODES, normalizeLaunchMode };

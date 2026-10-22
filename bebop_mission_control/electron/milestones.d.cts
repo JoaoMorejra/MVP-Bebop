@@ -11,6 +11,7 @@ export interface MilestoneMessage {
 
 export declare const MILESTONE_LINE: RegExp;
 export declare const ALERT_LINE: RegExp;
+export declare const LAUNCH_REFUSED_ALERT: 'mission.launch_refused';
 export declare const COUNTDOWN_CALL_SEC: number;
 export declare const STEP_LINE: RegExp;
 

@@ -23,6 +23,9 @@ const { MEDIA_FETCH_ARGS, createNativePhotoFetch } = require('./nativePhotos.cjs
 const { readParameterFile, writeJsonAtomic } = require('./parameterStore.cjs');
 const { cleanOrphanShm, createSsidChangeDetector, restartRos2Daemon } = require('./rosHousekeeping.cjs');
 const { createStandbyManager } = require('./missionStandby.cjs');
+const { createLaunchRefusalTracker } = require('./launchRefusal.cjs');
+const { createAbortShortcutGuard } = require('./abortShortcut.cjs');
+const { createMissionLogFile } = require('./missionLogFile.cjs');
 const { createOrphanReaper, parseOrphanCandidates } = require('./orphanMissions.cjs');
 const { createLandSupervisor } = require('./landSupervisor.cjs');
 const { evaluateLaunchReadiness } = require('./launchReadiness.cjs');
@@ -176,10 +179,18 @@ const LOG_EVENTS = {
   driver: 'bmg:driver-log',
 };
 
+// Section 4.4: every mission.py launched also writes its stdout and stderr to
+// userData/logs/mission_<YYYYMMDD_HHMMSS>.log, 30 kept (electron/missionLogFile.cjs).
+const missionLogFile = createMissionLogFile({
+  directory: () => process.env.BMG_MISSION_LOG_DIR || path.join(app.getPath('userData'), 'logs'),
+  warn: (text) => process.stderr.write(text),
+});
+
 function recordLog(channel, entry) {
   const line = { ...entry, at: Date.now() };
   const buffer = logs[channel];
   if (!buffer) return;
+  if (channel === 'mission') missionLogFile.write(entry.type, entry.text);
   buffer.push(line);
   if (buffer.length > LOG_LIMIT) buffer.splice(0, buffer.length - LOG_LIMIT);
   send(LOG_EVENTS[channel], line);
@@ -868,6 +879,16 @@ function createWindow(port) {
     callback(permission === 'geolocation' || permission === 'media');
   });
 
+  // Nothing leaves the cockpit: the inspection report is shown in its own
+  // sandboxed frame (`ForensicPanel`'s ReportModal), never in another window or
+  // the system browser. A child window would also inherit the preload, and with
+  // it the whole bridge (terminal included), for HTML written by an external
+  // agent.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    console.warn('[BMG] Refused window.open:', url);
+    return { action: 'deny' };
+  });
+
   // Closing the window is quitting the station. With a mission running or the
   // aircraft in the air that is a decision, not a click: the quit path asks,
   // and the window only goes once the landing has been handled.
@@ -918,10 +939,29 @@ function createWindow(port) {
  */
 function watchMissionDirectory() {
   const pendingCaptures = new Map();
+  const pendingReports = new Map();
   try {
     if (!fs.existsSync(MISSION_DIR)) return;
     fs.watch(MISSION_DIR, (_eventType, filename) => {
       if (!filename) return;
+
+      if (isReportFilename(filename)) {
+        // The inference agent is not known to write atomically: wait for the
+        // event burst to settle and for a non-empty file before announcing.
+        clearTimeout(pendingReports.get(filename));
+        pendingReports.set(filename, setTimeout(() => {
+          pendingReports.delete(filename);
+          const reportPath = path.join(MISSION_DIR, filename);
+          if (!fs.existsSync(reportPath) || fs.statSync(reportPath).size === 0) return;
+          send('bmg:report-ready', {
+            filename,
+            url: `/evidence/${filename}`,
+            occurrenceId: reportOccurrenceId(filename),
+          });
+        }, 400));
+        return;
+      }
+
       if (!filename.startsWith('accident_raw_') && !filename.startsWith('accident_inspected_')) return;
 
       const stamp = filename.replace(/\.(png|jpg)$/, '').replace(/^accident_(raw|inspected)_/, '');
@@ -930,12 +970,21 @@ function watchMissionDirectory() {
       const rawPath = path.join(MISSION_DIR, rawFilename);
       const inspectedPath = path.join(MISSION_DIR, inspectedFilename);
 
-      clearTimeout(pendingCaptures.get(stamp));
-      pendingCaptures.set(stamp, setTimeout(() => {
+      const metadataPath = path.join(MISSION_DIR, `accident_metadata_${stamp}.json`);
+
+      // The sidecar is renamed into place after both images, so the announce
+      // waits a bounded time for it: the telemetry it carries is what the
+      // inference agent needs. With `inspection.write_metadata_sidecar` off it
+      // never comes, and the capture is announced without it.
+      const announce = (attempt) => {
         pendingCaptures.delete(stamp);
         const rawReady = fs.existsSync(rawPath) && fs.statSync(rawPath).size > 1000;
         const inspectedReady = fs.existsSync(inspectedPath) && fs.statSync(inspectedPath).size > 1000;
         if (!rawReady && !inspectedReady) return;
+        if (!fs.existsSync(metadataPath) && attempt < SIDECAR_WAIT_ATTEMPTS) {
+          pendingCaptures.set(stamp, setTimeout(() => announce(attempt + 1), CAPTURE_DEBOUNCE_MS));
+          return;
+        }
 
         send('bmg:raw-evidence-ready', {
           filename: rawReady ? rawFilename : inspectedFilename,
@@ -947,12 +996,87 @@ function watchMissionDirectory() {
           rawUrl: rawReady ? `/evidence/${rawFilename}` : null,
           annotatedUrl: inspectedReady ? `/evidence/${inspectedFilename}` : `/evidence/${rawFilename}`,
           timestamp: Date.now(),
+          ...readCaptureTelemetry(metadataPath),
         });
-      }, 400));
+      };
+
+      clearTimeout(pendingCaptures.get(stamp));
+      pendingCaptures.set(stamp, setTimeout(() => announce(0), CAPTURE_DEBOUNCE_MS));
     });
   } catch (err) {
     console.warn('[BMG] Could not watch the mission directory:', err.message);
   }
+}
+
+/** fs.watch event burst of one capture, and the sidecar wait step. */
+const CAPTURE_DEBOUNCE_MS = 400;
+/** Sidecar wait: 5 x 400 ms after the images settle. */
+const SIDECAR_WAIT_ATTEMPTS = 5;
+
+/** Identifiers the inference agent accepts: `OC_YYYYMMDD_HHMMSS` or a Central id. */
+const OCCURRENCE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+/** The agent's report for a capture without a valid identifier. */
+const REPORT_WITHOUT_IDENTIFIER = 'relatorio_inspecao_sem_identificador.html';
+
+/** `relatorio_<occurrence_id>.html`, the inference agent's report. */
+function isReportFilename(filename) {
+  return filename.startsWith('relatorio_') && filename.endsWith('.html');
+}
+
+/** The occurrence id a report filename names, or undefined for the agent's fallback name. */
+function reportOccurrenceId(filename) {
+  if (filename === REPORT_WITHOUT_IDENTIFIER) return undefined;
+  const id = filename.slice('relatorio_'.length, -'.html'.length);
+  return OCCURRENCE_ID_PATTERN.test(id) ? id : undefined;
+}
+
+function isCoordinate(latitude, longitude) {
+  return (
+    typeof latitude === 'number' &&
+    typeof longitude === 'number' &&
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
+    Math.abs(latitude) <= 90 &&
+    Math.abs(longitude) <= 180
+  );
+}
+
+/**
+ * Telemetry of one capture, from its `accident_metadata_<stamp>.json` sidecar
+ * (`MissionContext._write_metadata`).
+ *
+ * Only what the mission wrote is forwarded. Nothing is filled in: no venue
+ * coordinates, no wall-clock instant and no identifier rebuilt from the file
+ * stamp, because the agent treats every value it receives as measured. A field
+ * the sidecar lacks is left undefined; a missing sidecar yields `{}`.
+ */
+function readCaptureTelemetry(metadataPath) {
+  let metadata;
+  try {
+    if (!fs.existsSync(metadataPath)) return {};
+    metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf-8'));
+  } catch (err) {
+    console.warn('[BMG] Unreadable capture sidecar:', err.message);
+    return {};
+  }
+  if (!metadata || typeof metadata !== 'object') return {};
+
+  const telemetry = {};
+  if (typeof metadata.occurrence_id === 'string' && OCCURRENCE_ID_PATTERN.test(metadata.occurrence_id)) {
+    telemetry.occurrenceId = metadata.occurrence_id;
+  }
+  if (isCoordinate(metadata.latitude, metadata.longitude)) {
+    telemetry.latitude = metadata.latitude;
+    telemetry.longitude = metadata.longitude;
+  }
+  if (typeof metadata.timestamp_utc === 'string') telemetry.timestampUtc = metadata.timestamp_utc;
+  if (metadata.telemetry_caption && typeof metadata.telemetry_caption === 'object') {
+    telemetry.telemetryCaption = metadata.telemetry_caption;
+  }
+  if (metadata.inference_package && typeof metadata.inference_package === 'object') {
+    telemetry.inferencePackage = metadata.inference_package;
+  }
+  return telemetry;
 }
 
 // -----------------------------------------------------------------------------
@@ -1722,6 +1846,28 @@ ipcMain.handle('bmg:get-env-info', async () => {
 });
 
 ipcMain.handle('bmg:get-telemetry', async () => latestTelemetry);
+
+/**
+ * The served URL of the inference agent's report, or null while none is on disk.
+ * The report for `occurrenceId` wins; otherwise the most recent one present.
+ */
+ipcMain.handle('bmg:get-report-url', async (_event, occurrenceId) => {
+  try {
+    if (!fs.existsSync(MISSION_DIR)) return null;
+    if (typeof occurrenceId === 'string' && OCCURRENCE_ID_PATTERN.test(occurrenceId)) {
+      const specific = `relatorio_${occurrenceId}.html`;
+      if (fs.existsSync(path.join(MISSION_DIR, specific))) return `/evidence/${specific}`;
+    }
+    const reports = fs
+      .readdirSync(MISSION_DIR)
+      .filter(isReportFilename)
+      .map((name) => ({ name, mtime: fs.statSync(path.join(MISSION_DIR, name)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    return reports.length > 0 ? `/evidence/${reports[0].name}` : null;
+  } catch (_err) {
+    return null;
+  }
+});
 
 ipcMain.handle('bmg:get-stream-status', async () => fetchStreamStatus());
 
@@ -2638,6 +2784,7 @@ async function startMissionProcess(options = {}) {
       missionProcess = spawn(NECTAR_ACTIVATOR, ['python3', ...args], { cwd: MISSION_DIR, env });
     }
     missionStartedAt = Date.now();
+    missionLogFile.open();
 
     // Flight-script milestones travel on their own channel rather than on
     // `bmg:step-change`, which stays the five-stage contract it has always
@@ -2649,6 +2796,8 @@ async function startMissionProcess(options = {}) {
       send('bmg:milestone', message);
     };
     const milestones = createMilestoneParser(forwardMilestone);
+    // Exit 78: the mission refused the document before commanding anything.
+    const refusals = createLaunchRefusalTracker();
     // The stage machine. `mission.py` logs `--- [STEP N: ...] ---` from each
     // step's `execute`, on stdout, which is what makes this reliable.
     const stepMarkers = createStepMarkerParser((stepNumber) => {
@@ -2671,6 +2820,7 @@ async function startMissionProcess(options = {}) {
       recordLog('mission', { type: 'stdout', text });
       milestones.push(text);
       stepMarkers.push(text);
+      refusals.push(text);
     });
 
     missionProcess.stderr.on('data', (data) => {
@@ -2680,10 +2830,14 @@ async function startMissionProcess(options = {}) {
     missionProcess.on('close', (code, signal) => {
       milestones.flush();
       stepMarkers.flush();
+      refusals.flush();
       missionProcess = null;
       missionStartedAt = null;
       recordLog('mission', { type: 'exit', text: `[BMG] Missão finalizada com código ${code}\n` });
+      const refused = refusals.refusal(code);
+      if (refused) send('bmg:launch-refused', refused);
       send('bmg:mission-exit', { code, signal });
+      missionLogFile.close();
       refreshStandby();
       nativePhotoFetch.missionExited();
     });
@@ -3260,6 +3414,16 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+// D8: the cockpit abort shortcut is taken before the page sees the key, so a
+// focused range input or the video iframe cannot swallow it. Armed only while
+// the cockpit says the abort is available; the renderer runs the same handler
+// as the abort button (`electron/abortShortcut.cjs`).
+const abortShortcut = createAbortShortcutGuard({ deliver: () => send('bmg:abort-shortcut') });
+ipcMain.on('bmg:cockpit-abort-armed', (_event, payload) => abortShortcut.setArmed(payload && payload.armed));
+app.on('browser-window-created', (_event, window) => {
+  window.webContents.on('before-input-event', (event, input) => abortShortcut.handle(event, input));
 });
 
 app.on('before-quit', (event) => {

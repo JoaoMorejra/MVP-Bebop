@@ -28,9 +28,12 @@ import {
   allMissionPhrases,
   isMilestoneAllowed,
   poolForMilestone,
-  poolsForMode,
+  poolsForPlan,
+  PLAN_PHRASES,
+  planPhraseKey,
+  planSentence,
+  type FlightPlan,
 } from './copilotPhrases';
-import type { MissionMode } from './missionMode';
 
 /** Deterministic PRNG, so a failure is reproducible rather than flaky. */
 function seeded(seed: number): () => number {
@@ -462,41 +465,74 @@ describe('battery warning (3.7)', () => {
   });
 });
 
-/** Sentences no mode may speak, by what each mode does NOT do. */
-const FORBIDDEN: Record<MissionMode, RegExp | null> = {
-  simple: /velocidade|cruzeiro|retilíne|linear|por segundo|deslocamento|deslocando|avanço|retorno|retornando|regress/i,
-  intermediate: /retorn|regress|rota de volta|marcador|na base|à base|base de lançamento/i,
-  advanced: null,
-};
+/** What the Simple profile never does: translate. */
+const SIMPLE_FORBIDDEN = /velocidade|cruzeiro|retilíne|linear|por segundo|deslocamento|deslocando|avanço|retorno|retornando|regress/i;
+/** What a flight without the return never does: return, find a marker, land on a base. */
+const NO_RTL_FORBIDDEN = /retorn|regress|rota de volta|marcador|na base|à base|base de lançamento/i;
 
-describe('copilot repertoire by mission mode', () => {
-  it.each(['simple', 'intermediate'] as const)('never says what the %s mode does not do', (mode) => {
-    for (const key of poolsForMode(mode)) {
-      for (const sentence of PHRASE_POOLS[key]) {
-        expect(sentence, `${mode} / ${key}`).not.toMatch(FORBIDDEN[mode]!);
+const PLANS: ReadonlyArray<FlightPlan> = [
+  { mode: 'simple', rtlEnabled: true },
+  { mode: 'simple', rtlEnabled: false },
+  { mode: 'advanced', rtlEnabled: true },
+  { mode: 'advanced', rtlEnabled: false },
+];
+
+describe('copilot repertoire by flight plan', () => {
+  it('never says what the simple mode does not do', () => {
+    for (const rtlEnabled of [true, false]) {
+      for (const key of poolsForPlan({ mode: 'simple', rtlEnabled })) {
+        for (const sentence of PHRASE_POOLS[key]) expect(sentence, key).not.toMatch(SIMPLE_FORBIDDEN);
       }
     }
   });
 
-  it('keeps the full repertoire for the advanced mode', () => {
-    expect(poolsForMode('advanced')).toEqual(expect.arrayContaining(['mission.rtl_start', 'mission.rtl_start_no_target', 'mission.scan_start', 'mission.approaching']));
+  it.each(['simple', 'advanced'] as const)('never caches a return, a marker or a base without the return (%s)', (mode) => {
+    const spoken = allMissionPhrases({ target_altitude_m: 1.8, cruise_mps: 0.2 }, { mode, rtlEnabled: false });
+    expect(spoken.length).toBeGreaterThan(0);
+    for (const sentence of spoken) expect(sentence).not.toMatch(NO_RTL_FORBIDDEN);
+    const pools = poolsForPlan({ mode, rtlEnabled: false });
+    expect(pools).toContain('mission.landing_in_place');
+    expect(pools).toContain('mission.touchdown_in_place');
+    for (const key of ['mission.landing', 'mission.touchdown', 'mission.rtl_start', 'mission.rtl_start_no_target'] as const) {
+      expect(pools).not.toContain(key);
+    }
   });
 
-  it('never reaches the return pools from the reduced modes', () => {
-    for (const mode of ['simple', 'intermediate'] as const) {
-      const reachable = poolsForMode(mode);
+  it('never speaks a return, a marker or a base without the return, whatever the payload claims', () => {
+    for (const mode of ['simple', 'advanced'] as const) {
+      for (let i = 0; i < 12; i += 1) {
+        const options = { storage: null, random: () => i / 12 };
+        const plan = { mode, rtlEnabled: false };
+        for (const key of ['mission.landing', 'mission.touchdown', 'mission.capture_done'] as const) {
+          const text = phraseForMilestone(key, { at_base: true, confirmed: true, target_confirmed: true }, {}, options, plan);
+          expect(text, `${mode} / ${key}`).not.toMatch(NO_RTL_FORBIDDEN);
+        }
+      }
+    }
+  });
+
+  it('keeps the full repertoire for the advanced mode with the return', () => {
+    expect(poolsForPlan('advanced')).toEqual(
+      expect.arrayContaining(['mission.rtl_start', 'mission.rtl_start_no_target', 'mission.scan_start', 'mission.approaching'])
+    );
+    expect(poolsForPlan({ mode: 'advanced', rtlEnabled: true })).toContain('mission.landing_in_place');
+  });
+
+  it('reaches the return pools only in the advanced mode with the return', () => {
+    for (const plan of PLANS) {
+      const returns = plan.mode === 'advanced' && plan.rtlEnabled;
+      const reachable = poolsForPlan(plan);
       for (const key of ['mission.rtl_start', 'mission.rtl_start_jump', 'mission.rtl_start_no_target'] as const) {
-        expect(reachable).not.toContain(key);
+        expect(reachable.includes(key)).toBe(returns);
       }
-      expect(isMilestoneAllowed('mission.rtl_start', mode)).toBe(false);
+      expect(isMilestoneAllowed('mission.rtl_start', plan)).toBe(returns);
     }
-    expect(isMilestoneAllowed('mission.rtl_start', 'advanced')).toBe(true);
   });
 
-  it('allows every other milestone in every mode', () => {
+  it('allows every other milestone in every plan', () => {
     const keys: MilestoneKey[] = ['mission.takeoff', 'mission.scan_start', 'mission.target_found', 'mission.approaching', 'mission.capture_done', 'mission.landing', 'mission.touchdown'];
-    for (const mode of ['simple', 'intermediate', 'advanced'] as const) {
-      for (const key of keys) expect(isMilestoneAllowed(key, mode)).toBe(true);
+    for (const plan of PLANS) {
+      for (const key of keys) expect(isMilestoneAllowed(key, plan)).toBe(true);
     }
   });
 
@@ -511,7 +547,7 @@ describe('copilot repertoire by mission mode', () => {
     for (const payload of [{ ibvs: true }, { ibvs: false }, {}]) {
       expect(poolForMilestone('mission.approaching', payload, 'simple')).toBe('mission.approaching_yaw');
     }
-    expect(poolForMilestone('mission.approaching', { ibvs: true }, 'intermediate')).toBe('mission.approaching');
+    expect(poolForMilestone('mission.approaching', { ibvs: true }, { mode: 'advanced', rtlEnabled: false })).toBe('mission.approaching');
     expect(poolForMilestone('mission.approaching', { ibvs: true })).toBe('mission.approaching');
   });
 
@@ -521,9 +557,11 @@ describe('copilot repertoire by mission mode', () => {
     expect(poolForMilestone('mission.takeoff', {}, 'simple')).toBe('mission.takeoff_native');
   });
 
-  it('announces the landing in place, not a return, in the intermediate mode', () => {
-    expect(poolForMilestone('mission.landing', { at_base: false }, 'intermediate')).toBe('mission.landing_in_place');
-    expect(poolForMilestone('mission.touchdown', { confirmed: true, at_base: false }, 'intermediate')).toBe('mission.touchdown_in_place');
+  it.each(['simple', 'advanced'] as const)('announces the landing in place, not a return, without the return (%s)', (mode) => {
+    const plan = { mode, rtlEnabled: false };
+    expect(poolForMilestone('mission.landing', { at_base: false }, plan)).toBe('mission.landing_in_place');
+    expect(poolForMilestone('mission.touchdown', { confirmed: true, at_base: false }, plan)).toBe('mission.touchdown_in_place');
+    expect(poolForMilestone('mission.landing', { at_base: true }, plan)).toBe('mission.landing_in_place');
   });
 
   it('announces the landing on the base in the simple mode', () => {
@@ -540,11 +578,36 @@ describe('copilot repertoire by mission mode', () => {
   it('caches only the sentences the mode can speak', () => {
     const parameters = { target_altitude_m: 1, cruise_mps: 0.2 };
     const simple = allMissionPhrases(parameters, 'simple');
-    const intermediate = allMissionPhrases(parameters, 'intermediate');
+    const inPlace = allMissionPhrases(parameters, { mode: 'advanced', rtlEnabled: false });
     const advanced = allMissionPhrases(parameters);
     expect(simple.some((s) => PHRASE_POOLS['mission.rtl_start'].includes(s))).toBe(false);
-    expect(intermediate.some((s) => PHRASE_POOLS['mission.rtl_start'].includes(s))).toBe(false);
+    expect(inPlace.some((s) => PHRASE_POOLS['mission.rtl_start'].includes(s))).toBe(false);
     expect(advanced.some((s) => PHRASE_POOLS['mission.rtl_start'].includes(s))).toBe(true);
     expect(simple.some((s) => PHRASE_POOLS['mission.scan_start_yaw'].includes(s))).toBe(true);
+  });
+});
+
+describe('flight plan sentences', () => {
+  it('has three variants per plan and picks the pool of the plan', () => {
+    for (const pool of Object.values(PLAN_PHRASES)) expect(pool).toHaveLength(3);
+    expect(planPhraseKey({ mode: 'advanced', rtlEnabled: true })).toBe('plan.rtl');
+    expect(planPhraseKey({ mode: 'simple', rtlEnabled: true })).toBe('plan.rtl');
+    expect(planPhraseKey({ mode: 'advanced', rtlEnabled: false })).toBe('plan.land_in_place');
+    expect(planPhraseKey({ mode: 'simple', rtlEnabled: false })).toBe('plan.land_in_place_simple');
+  });
+
+  it('never names a return, a base or a marker without the return, and the Simple one restores the heading', () => {
+    for (const key of ['plan.land_in_place', 'plan.land_in_place_simple'] as const) {
+      for (const sentence of PLAN_PHRASES[key]) expect(sentence).not.toMatch(NO_RTL_FORBIDDEN);
+    }
+    for (const sentence of PLAN_PHRASES['plan.land_in_place_simple']) expect(sentence).toMatch(/rumo/);
+    for (const sentence of PLAN_PHRASES['plan.rtl']) expect(sentence).toMatch(/retorno/);
+  });
+
+  it('draws a sentence of the plan and caches the plan with the mission phrases', () => {
+    expect(PLAN_PHRASES['plan.rtl']).toContain(planSentence('advanced', () => 0.99));
+    const cached = allMissionPhrases({ target_altitude_m: 1.8 }, { mode: 'simple', rtlEnabled: false });
+    for (const sentence of PLAN_PHRASES['plan.land_in_place_simple']) expect(cached).toContain(sentence);
+    expect(cached).not.toContain(PLAN_PHRASES['plan.rtl'][0]);
   });
 });

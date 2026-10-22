@@ -37,6 +37,7 @@ export interface Spawned {
 export function loadMain(overrides: Record<string, string> = {}) {
   const env: Record<string, string> = {
     BMG_MISSION_CONFIG: join(mkdtempSync(join(tmpdir(), 'bmg-harness-')), 'mission_config.json'),
+    BMG_MISSION_LOG_DIR: mkdtempSync(join(tmpdir(), 'bmg-harness-logs-')),
     ...overrides,
   };
   const Module = require('node:module') as {

@@ -11,6 +11,7 @@ const ALLOWED = new Set([
   'lib/launchDocument.ts',
   'lib/parameterConflicts.ts',
   'lib/parameterModes.ts',
+  'lib/operatorPresets.ts',
   'lib/copilotPhrases.ts',
   'lib/batteryReturn.ts',
   'hooks/useMissionParameters.ts',

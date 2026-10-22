@@ -7,9 +7,10 @@ const ADVANCED_CALLS = {
   landing: 'Bateria crítica. Pouso de emergência iniciado.',
 } as const;
 
-const INTERMEDIATE_CALLS = {
+/** Either profile without the return (`rtl.enabled` false): stage 5 lands where it is. */
+const IN_PLACE_CALLS = {
   alreadyReturning: 'Bateria crítica. Pouso já em curso.',
-  returning: 'Bateria crítica. Pouso no local iniciado.',
+  returning: 'Bateria crítica: pousando no local.',
   landing: 'Bateria crítica. Pouso de emergência iniciado.',
 } as const;
 
@@ -19,11 +20,15 @@ const SIMPLE_CALLS = {
   landing: 'Bateria crítica. Pouso de emergência iniciado.',
 } as const;
 
-export type BatteryCalls = typeof ADVANCED_CALLS | typeof INTERMEDIATE_CALLS | typeof SIMPLE_CALLS;
+export type BatteryCalls = typeof ADVANCED_CALLS | typeof IN_PLACE_CALLS | typeof SIMPLE_CALLS;
 
-/** What the station says on a critical charge, by the profile being flown and the path actually taken. */
-export function batteryCalls(mode: MissionMode): BatteryCalls {
-  return mode === 'simple' ? SIMPLE_CALLS : mode === 'intermediate' ? INTERMEDIATE_CALLS : ADVANCED_CALLS;
+/**
+ * What the station says on a critical charge, by the plan being flown and the
+ * path actually taken. Without the return no call names the base.
+ */
+export function batteryCalls(mode: MissionMode, rtlEnabled = true): BatteryCalls {
+  if (!rtlEnabled) return IN_PLACE_CALLS;
+  return mode === 'simple' ? SIMPLE_CALLS : ADVANCED_CALLS;
 }
 
 export const BATTERY_CALLS = ADVANCED_CALLS;
@@ -51,9 +56,10 @@ export interface BatteryReturnHooks {
 export async function runCriticalBatteryReturn(
   action: FailsafeAction,
   hooks: BatteryReturnHooks,
-  mode: MissionMode = 'advanced'
+  mode: MissionMode = 'advanced',
+  rtlEnabled = true
 ): Promise<FailsafeAction> {
-  const calls = batteryCalls(mode);
+  const calls = batteryCalls(mode, rtlEnabled);
   if (action === 'none') {
     hooks.say('battery.critical', calls.alreadyReturning);
     return 'none';

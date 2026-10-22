@@ -17,6 +17,7 @@
  * drops the conflicts a mode never flies into, and the backend mirror stays
  * mode-agnostic.
  */
+import { ALTITUDE_MAX_M, ALTITUDE_MIN_M, VENUE_HEADROOM_M, launchesFromGround, padClearanceM, padHeightM } from './altitudeEnvelope';
 import { isPathActive, readMissionMode } from './missionMode';
 import { markerCount } from './parameterSchema';
 import { getPath } from './paths';
@@ -38,9 +39,10 @@ export interface ParameterConflict {
 /**
  * Height at which the Bebop 2 firmware ends its takeoff, metres. The airframe
  * ignores the altitude it is given and stabilizes here
- * (`actuators/simulator.py`, `FIRMWARE_HOVER_ALTITUDE_M`; `TakeoffStep._ascend`).
+ * (`actuators/simulator.py`, `FIRMWARE_HOVER_ALTITUDE_M`; `TakeoffStep._acquire_altitude`).
  * Estimated from the code's comments ("around one metre"), not measured in
- * flight: confirm against a real flight log. Rule E03 rests on it.
+ * flight: confirm against a real flight log. The mission's ceiling ratchet
+ * (`estimation/ceiling_schedule.py`) and {@link ceilingFloorFrame} rest on it.
  */
 export const FIRMWARE_HOVER_HEIGHT_M = 1.0;
 
@@ -53,7 +55,7 @@ export const FIRMWARE_HOVER_HEIGHT_M = 1.0;
 export const LOW_ALTITUDE_ADVISORY_M = 0.35;
 
 /**
- * Factory value of the ceiling-margin noise floor (W01, W02):
+ * Factory value of the ceiling-margin noise floor (W02):
  * `kinematics.climb_deadband_m` (0.05) plus twice
  * `kinematics.climb_settle_max_position_sigma_m` (0.08). The rules read both
  * fields from the document.
@@ -110,6 +112,7 @@ const P = {
   tag: 'rtl.tag_size',
   markerId: 'rtl.target_aruco_id',
   markerDict: 'rtl.marker_dict',
+  venue: 'platform.venue_ceiling_agl_m',
 } as const;
 
 /** Module grid of a dictionary family, without the black border; null when unknown. */
@@ -190,28 +193,22 @@ const RULES: readonly Rule[] = [
     },
   },
   {
+    // Retired: the mission's ceiling ratchet covers the end of the native
+    // takeoff (`estimation/ceiling_schedule.py`). Kept so the ids and the order
+    // shared with `parameter_conflicts.py` do not move.
     id: 'E03',
     severity: 'error',
     title: 'Teto abaixo da altura de decolagem do firmware',
-    evaluate: (read) => {
-      const h = read(P.altitude);
-      const m = read(P.margin);
-      if (h === null || m === null || h + m >= FIRMWARE_HOVER_HEIGHT_M - EPS) return null;
-      return {
-        paths: [P.altitude, P.margin],
-        message: `O teto (altitude + margem = ${m2(h + m)}) fica abaixo da altura em que o firmware estabiliza a decolagem (~${m2(FIRMWARE_HOVER_HEIGHT_M)}): a aeronave aciona pouso de emergência por teto logo após decolar.`,
-        fix: `Aumente a margem para pelo menos ${m2(FIRMWARE_HOVER_HEIGHT_M - h)} ou a altitude para pelo menos ${m2(FIRMWARE_HOVER_HEIGHT_M - m)}.`,
-      };
-    },
+    evaluate: () => null,
   },
   {
     id: 'E04',
     severity: 'error',
     title: 'Margem do teto menor que a banda de chegada',
-    evaluate: (read) => {
+    evaluate: (read, doc) => {
       const m = read(P.margin);
       const band = read(P.climbBand);
-      if (m === null || band === null || m >= band - EPS) return null;
+      if (!launchesFromGround(doc) || m === null || band === null || m >= band - EPS) return null;
       return {
         paths: [P.margin],
         message: `Margem de ${m2(m)} menor que a banda de chegada da subida (${m2(band)}): o teto dispara em voo nominal.`,
@@ -309,30 +306,56 @@ const RULES: readonly Rule[] = [
     },
   },
   {
+    id: 'E10',
+    severity: 'error',
+    title: 'Cota fora do envelope da superfície de decolagem',
+    evaluate: (read, doc) => {
+      const h = read(P.altitude);
+      if (h === null) return null;
+      const ground = launchesFromGround(doc);
+      const low = ground ? ALTITUDE_MIN_M : Math.max(ALTITUDE_MIN_M, padHeightM(doc) + padClearanceM(doc));
+      const high = ALTITUDE_MAX_M;
+      if (h >= low - EPS && h <= high + EPS) return null;
+      return {
+        paths: [P.altitude],
+        message:
+          h < low && !ground
+            ? `Cota de ${m2(h)} abaixo do mínimo de ${m2(low)} sobre o totem (topo do totem + folga).`
+            : `Cota de ${m2(h)} fora da faixa de ${m2(low)} a ${m2(high)} sobre o piso.`,
+        fix: `Cota entre ${m2(low)} e ${m2(high)}.`,
+      };
+    },
+  },
+  {
+    id: 'E11',
+    severity: 'error',
+    title: 'Cota colada no teto do local',
+    evaluate: (read) => {
+      const h = read(P.altitude);
+      const venue = read(P.venue);
+      if (h === null || venue === null || h <= venue - VENUE_HEADROOM_M + EPS) return null;
+      return {
+        paths: [P.altitude, P.venue],
+        message: `Cota de ${m2(h)} a menos de ${m2(VENUE_HEADROOM_M)} do teto do local (${m2(venue)}).`,
+        fix: `Cota de no máximo ${m2(venue - VENUE_HEADROOM_M)}.`,
+      };
+    },
+  },
+  {
+    // Retired with E03: the ceiling ratchet covers the end of the native takeoff.
     id: 'W01',
     severity: 'warning',
     title: 'Teto próximo da altura de decolagem do firmware',
-    evaluate: (read, _doc, fired) => {
-      const h = read(P.altitude);
-      const m = read(P.margin);
-      const band = noiseBand(read);
-      if (fired.has('E03') || h === null || m === null || band === null) return null;
-      if (h + m >= FIRMWARE_HOVER_HEIGHT_M + band - EPS) return null;
-      return {
-        paths: [P.altitude, P.margin],
-        message: `Teto de ${m2(h + m)}, a menos de ${m2(band)} da altura de decolagem do firmware (~${m2(FIRMWARE_HOVER_HEIGHT_M)}): o sobressinal da decolagem e o ruído de sonar e barômetro podem acionar o pouso por teto.`,
-        fix: `Leve altitude + margem a pelo menos ${m2(FIRMWARE_HOVER_HEIGHT_M + band)}.`,
-      };
-    },
+    evaluate: () => null,
   },
   {
     id: 'W02',
     severity: 'warning',
     title: 'Margem do teto abaixo do ruído dos sensores',
-    evaluate: (read, _doc, fired) => {
+    evaluate: (read, doc, fired) => {
       const m = read(P.margin);
       const band = noiseBand(read);
-      if (fired.has('E04') || m === null || band === null || m >= band - EPS) return null;
+      if (!launchesFromGround(doc) || fired.has('E04') || m === null || band === null || m >= band - EPS) return null;
       return {
         paths: [P.margin],
         message: `Margem de ${m2(m)} abaixo do ruído de sonar e barômetro (${m2(band)}): risco de pouso de emergência por teto.`,
@@ -564,7 +587,7 @@ export function evaluateParameterConflicts(doc: unknown): ParameterConflict[] {
 export function activeConflicts(doc: unknown): ParameterConflict[] {
   const mode = readMissionMode(doc);
   return evaluateParameterConflicts(doc).filter(
-    (conflict) => conflict.paths.length === 0 || conflict.paths.some((path) => isPathActive(mode, path))
+    (conflict) => conflict.paths.length === 0 || conflict.paths.some((path) => isPathActive(mode, path, doc))
   );
 }
 

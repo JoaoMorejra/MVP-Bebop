@@ -195,6 +195,62 @@ export interface RawEvidence {
   rawUrl?: string | null;
   annotatedUrl?: string;
   timestamp: number;
+  // Telemetry from the capture sidecar (`accident_metadata_<ts>.json`), exactly
+  // as the mission wrote it. Undefined when the sidecar lacks the field: the
+  // station never fills one in.
+  /** `OC_YYYYMMDD_HHMMSS` (UTC) or a Central id. */
+  occurrenceId?: string;
+  /** Demonstration site (`MAP_ANCHOR`), WGS-84 degrees. */
+  latitude?: number;
+  longitude?: number;
+  /** ISO 8601 UTC ending in `Z`. */
+  timestampUtc?: string;
+  /** Caption of the visual inference agent's message: only the fields the mission could vouch for. */
+  telemetryCaption?: TelemetryCaption;
+  /** Everything needed to submit the capture to the agent (`telemetry/inference_package.py`). */
+  inferencePackage?: InferencePackage;
+}
+
+/** Caption of the agent's image message (Agent Drone Inferência Visual, `docs/PROJECT.md` §3). */
+export interface TelemetryCaption {
+  occurrence_id?: string;
+  latitude?: number;
+  longitude?: number;
+  timestamp_utc?: string;
+}
+
+export type TelemetryCaptionField = keyof TelemetryCaption;
+
+/** A caption field the mission could not provide, in the agent's own vocabulary. */
+export interface TelemetryPending {
+  campo: TelemetryCaptionField;
+  motivo: 'ausente' | 'invalido';
+}
+
+export interface InferencePackage {
+  schema: string;
+  open_conversation: { data: { occurrence_id?: string } };
+  message: {
+    type: 'image';
+    image: { filename: string; mime_type: 'image/png' | 'image/jpeg'; contains_detector_overlay: boolean } | null;
+    /** The caption serialised exactly as it is sent. */
+    caption: string;
+  };
+  caption: TelemetryCaption;
+  pending: TelemetryPending[];
+  /** False when no image reached disk. */
+  ready: boolean;
+  /** `relatorio_<occurrence_id>.html`, or the agent's name for a report without one. */
+  expected_report: string;
+  /** The coordinates are the fixed demonstration site (`MAP_ANCHOR`, `lib/siteAnchor.ts`). */
+  position: { source: 'site'; site: string };
+}
+
+/** `bmg:report-ready`: the inference agent wrote `relatorio_<occurrence_id>.html`. */
+export interface ReportReadyEvent {
+  filename: string;
+  url: string;
+  occurrenceId?: string;
 }
 
 /** `YYYYMMDD_HHMMSS` of an evidence filename (`accident_raw_<ts>.png`), or null. */
@@ -335,6 +391,17 @@ export interface MilestoneEvent {
 export interface MissionExitEvent {
   code: number | null;
   signal: string | null;
+}
+
+/**
+ * The mission refused its launch document before commanding anything and
+ * exited with `EXIT_LAUNCH_REFUSED` (78). Sent just before `bmg:mission-exit`.
+ */
+export interface LaunchRefusedEvent {
+  /** Dotted path of the refused field, as the parameter sheet names it. */
+  field: string;
+  /** Short reason, in Portuguese. */
+  reason: string;
 }
 
 export interface LogLine {
@@ -569,6 +636,8 @@ export interface BmgAPI {
   getStreamStatus: () => Promise<StreamStatus>;
   getDiagnostics: () => Promise<DiagnosticsReport>;
   getLogHistory: () => Promise<{ mission: LogLine[]; driver: LogLine[] }>;
+  /** Served URL of the report for `occurrenceId`, else the newest report on disk, else null. */
+  getReportUrl: (occurrenceId?: string) => Promise<string | null>;
 
   /** Open an interactive bash on a PTY, sized to the terminal on screen. */
   terminalSpawn: (options?: { cols?: number; rows?: number }) => Promise<TerminalSpawnResult>;
@@ -581,9 +650,16 @@ export interface BmgAPI {
   onStepChange: (cb: (step: MissionStepEvent) => void) => () => void;
   onMilestone: (cb: (event: MilestoneEvent) => void) => () => void;
   onRawEvidenceReady: (cb: (evidence: RawEvidence) => void) => () => void;
+  onReportReady: (cb: (event: ReportReadyEvent) => void) => () => void;
   onMissionLog: (cb: (log: LogLine) => void) => () => void;
   onDriverLog: (cb: (log: LogLine) => void) => () => void;
   onMissionExit: (cb: (event: MissionExitEvent) => void) => () => void;
+  /** Optional: a preload older than the launch refusal does not expose it. */
+  onLaunchRefused?: (cb: (event: LaunchRefusedEvent) => void) => () => void;
+  /** D8: whether the cockpit abort is available; the main process then takes Ctrl/Cmd+C and Escape. */
+  setCockpitAbortArmed?: (armed: boolean) => void;
+  /** D8: Ctrl/Cmd+C or Escape taken by the main process while armed. */
+  onAbortShortcut?: (cb: () => void) => () => void;
   onLinkProgress: (cb: (event: LinkProgressEvent) => void) => () => void;
   onLandProgress: (cb: (event: LandProgressEvent) => void) => () => void;
   onAnnounceDone: (cb: (event: AnnounceDoneEvent) => void) => () => void;

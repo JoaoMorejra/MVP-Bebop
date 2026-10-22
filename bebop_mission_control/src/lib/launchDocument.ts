@@ -7,30 +7,33 @@
  * to the operator, instead of being replaced by a figure they never saw.
  */
 import {
+  TAKEOFF_FROM_GROUND_PATH,
+  altitudeEnvelopeViolation,
+  clampAltitude,
+  inAltitudeEnvelope,
+  launchesFromGround,
+} from './altitudeEnvelope';
+import {
   ALL_PARAMETERS,
   ALTITUDE_PATH,
+  BOOLEAN_PARAMETERS,
+  NUMBER_PARAMETERS,
   CENTERING_TIMEOUT_RANGE_SEC,
   isKnownMarkerDictionary,
   markerCount,
   type ParameterSpec,
 } from './parameterSchema';
 import {
+  LEGACY_INTERMEDIATE_MODE,
   MISSION_MODE_PATH,
+  RTL_ENABLED_PATH,
   hasInvalidMissionMode,
   isPathActive,
   readMissionMode,
-  simpleAltitudeRange,
   type MissionMode,
 } from './missionMode';
 import { blockingConflicts } from './parameterConflicts';
 import { getPath, setPath, type Doc } from './paths';
-
-/**
- * Ceiling margin the simple profile flies with, metres. Mirror of
- * `SIMPLE_CEILING_MARGIN_M` in `mission_mode.py`, which pins it at the go; used
- * when the factory document holds no finite margin.
- */
-export const SIMPLE_CEILING_MARGIN_M = 0.6;
 
 const FORWARD_PATH = 'kinematics.forward_cruise_velocity';
 const REVERSE_PATH = 'rtl.reverse_cruise_velocity';
@@ -42,7 +45,7 @@ const CENTERING_TIMEOUT_PATH = 'rtl.centering_timeout_sec';
 
 /** Largest pad marker edge the sheet accepts, in metres. */
 export const MAX_TAG_SIZE_M = 1.0;
-const FORWARD_SPEC = ALL_PARAMETERS.find((spec) => spec.path === FORWARD_PATH)!;
+const FORWARD_SPEC = NUMBER_PARAMETERS.find((spec) => spec.path === FORWARD_PATH)!;
 
 /**
  * Highest horizontal speed ceiling the station lifts to on its own.
@@ -58,12 +61,13 @@ export const MAX_LIFTED_CEILING = 0.95;
 export const CEILING_CLEARANCE = 0.05;
 
 /**
- * Numbers a launch refuses to go without: every field the parameter sheet
- * edits, and every one the station used to pass as its own CLI flag.
+ * Numbers a launch refuses to go without: every numeric field the parameter
+ * sheet edits, and every one the station used to pass as its own CLI flag. The
+ * sheet's booleans are not numbers: they are {@link REQUIRED_LAUNCH_BOOLEANS}.
  */
 export const REQUIRED_LAUNCH_NUMBERS: readonly string[] = Array.from(
   new Set([
-    ...ALL_PARAMETERS.map((spec) => spec.path),
+    ...NUMBER_PARAMETERS.map((spec) => spec.path),
     'kinematics.target_altitude_m',
     'kinematics.forward_cruise_velocity',
     'kinematics.hover_duration_sec',
@@ -104,12 +108,10 @@ const EXTRA_BOUNDS: Readonly<Record<string, Bounds>> = {
   [CENTERING_TIMEOUT_PATH]: { low: CENTERING_TIMEOUT_RANGE_SEC.min, high: CENTERING_TIMEOUT_RANGE_SEC.max },
 };
 
-function inEnvelope(mode: MissionMode, path: string, value: number, doc?: unknown): boolean {
-  const spec = ALL_PARAMETERS.find((item) => item.path === path);
-  if (spec) {
-    const range = mode === 'simple' && path === ALTITUDE_PATH ? simpleAltitudeRange(doc) : spec.rangeByMode?.[mode];
-    return value >= (range?.min ?? spec.min) && value <= (range?.max ?? spec.max);
-  }
+function inEnvelope(path: string, value: number, doc?: unknown): boolean {
+  if (path === ALTITUDE_PATH) return inAltitudeEnvelope(doc, value);
+  const spec = NUMBER_PARAMETERS.find((item) => item.path === path);
+  if (spec) return value >= spec.min && value <= spec.max;
   const bounds = EXTRA_BOUNDS[path];
   if (!bounds) return true;
   const aboveLow = bounds.lowExclusive ? value > bounds.low : value >= bounds.low;
@@ -121,10 +123,39 @@ function finite(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+/**
+ * `doc` with the removed Intermediate profile carried over to its equivalent:
+ * `mission_mode: 'intermediate'` (any case, trimmed) becomes `'advanced'` with
+ * `rtl.enabled = false`, keeping an `rtl.enabled` the document states. Same
+ * rule as `parameters.migrate_legacy_mission_mode` in the mission. Pure and
+ * idempotent; returns `doc` itself when there is nothing to migrate.
+ */
+export function migrateLegacyMode<T extends Doc>(doc: T): T {
+  const raw = getPath(doc, MISSION_MODE_PATH);
+  if (typeof raw !== 'string' || raw.trim().toLowerCase() !== LEGACY_INTERMEDIATE_MODE) return doc;
+  const next = setPath(doc, MISSION_MODE_PATH, 'advanced');
+  return getPath(next, RTL_ENABLED_PATH) === undefined ? setPath(next, RTL_ENABLED_PATH, false) : next;
+}
+
 /** Schema paths introduced after a store may have been written; filled from the factory document when absent. */
 export const BACKFILL_PATHS: readonly string[] = ['yaw_pattern.scan_vyaw'];
 
-/** `doc` with each of `paths` taken from `factory` when `doc` does not hold a finite number there. */
+/**
+ * The sheet's booleans, with the value a store written before them stands for:
+ * the return (`rtl.enabled = true`) and the pad top
+ * (`platform.takeoff_from_ground = false`), what every flight did then. A
+ * launch never needs them present (the mission has the same defaults); one
+ * present must be a JSON boolean ({@link launchBlockers}).
+ */
+export const REQUIRED_LAUNCH_BOOLEANS: Readonly<Record<string, boolean>> = Object.fromEntries(
+  BOOLEAN_PARAMETERS.map((spec) => [spec.path, spec.path === TAKEOFF_FROM_GROUND_PATH ? false : true])
+);
+
+/**
+ * `doc` with each of `paths` taken from `factory` when `doc` does not hold a
+ * finite number there, and each of {@link REQUIRED_LAUNCH_BOOLEANS} filled when
+ * absent: from `factory` when it holds a boolean, else with its default.
+ */
 export function fillMissing<T extends Doc>(doc: T, factory: unknown, paths: readonly string[] = BACKFILL_PATHS): T {
   let next = doc;
   for (const path of paths) {
@@ -132,30 +163,39 @@ export function fillMissing<T extends Doc>(doc: T, factory: unknown, paths: read
     const value = getPath(factory, path);
     if (finite(value)) next = setPath(next, path, value);
   }
+  for (const [path, fallback] of Object.entries(REQUIRED_LAUNCH_BOOLEANS)) {
+    if (getPath(next, path) !== undefined) continue;
+    const value = getPath(factory, path);
+    next = setPath(next, path, typeof value === 'boolean' ? value : fallback);
+  }
   return next;
 }
 
 /**
- * `doc` made valid for `mode`: in the simple mode the altitude is squeezed into
- * the native-takeoff range over the pad of `doc` (`simpleAltitudeRange`) and the ceiling margin the sheet hides is pinned to
- * the factory value (the mission pins it as well, `mission_mode.apply_mission_mode`).
- * Other modes return `doc` itself. Without a finite factory margin it is pinned to {@link SIMPLE_CEILING_MARGIN_M}.
+ * What {@link normalizeForMode} did to the altitude of `before`, in the
+ * operator's words; `null` when it is unchanged. Shown next to the sheet so a
+ * value moved by a switch of surface or of mode is never silent.
  */
-export function normalizeForMode<T extends Doc>(doc: T, mode: MissionMode, factory: unknown): T {
-  if (mode !== 'simple') return doc;
-  let next = doc;
-  const altitude = getPath(next, 'kinematics.target_altitude_m');
-  if (finite(altitude)) {
-    const range = simpleAltitudeRange(next);
-    const clamped = Math.min(range.max, Math.max(range.min, altitude));
-    if (clamped !== altitude) next = setPath(next, 'kinematics.target_altitude_m', clamped);
-  }
-  const factoryMargin = getPath(factory, 'kinematics.altitude_ceiling_margin_m');
-  const margin = finite(factoryMargin) ? factoryMargin : SIMPLE_CEILING_MARGIN_M;
-  if ( getPath(next, 'kinematics.altitude_ceiling_margin_m') !== margin) {
-    next = setPath(next, 'kinematics.altitude_ceiling_margin_m', margin);
-  }
-  return next;
+export function altitudeAdjustment(before: unknown, after: unknown): string | null {
+  const was = getPath(before, ALTITUDE_PATH);
+  const now = getPath(after, ALTITUDE_PATH);
+  if (!finite(was) || !finite(now) || Math.abs(was - now) < 1e-9) return null;
+  const figure = `${now.toFixed(2).replace('.', ',')} m`;
+  if (now > was) return `Cota ajustada para ${figure}: mínimo sobre ${launchesFromGround(after) ? 'o piso' : 'o totem'}.`;
+  return `Cota ajustada para ${figure}: máximo permitido.`;
+}
+
+/**
+ * `doc` with the altitude moved into the slider range of its launch surface
+ * (`altitudeEnvelope.ts`), the same in every mode. Returns `doc` itself when the
+ * altitude is already inside, or is not a finite number ({@link launchBlockers}
+ * names it then). No other field is touched: the ceiling margin the operator set
+ * is kept.
+ */
+export function normalizeForMode<T extends Doc>(doc: T): T {
+  const altitude = getPath(doc, ALTITUDE_PATH);
+  if (!finite(altitude) || inAltitudeEnvelope(doc, altitude)) return doc;
+  return setPath(doc, ALTITUDE_PATH, clampAltitude(doc, altitude));
 }
 
 /**
@@ -163,10 +203,9 @@ export function normalizeForMode<T extends Doc>(doc: T, mode: MissionMode, facto
  * range, in declaration order. Each field is judged alone.
  */
 export function envelopeBlockers(doc: unknown): string[] {
-  const mode = readMissionMode(doc);
   return REQUIRED_LAUNCH_NUMBERS.filter((path) => {
     const value = getPath(doc, path);
-    return !finite(value) || !inEnvelope(mode, path, value, doc);
+    return !finite(value) || !inEnvelope(path, value, doc);
   });
 }
 
@@ -234,12 +273,14 @@ export function launchBlockers(doc: unknown): string[] {
   if (markerIdBlocked(doc)) outside.add(MARKER_ID_PATH);
   const blocked = REQUIRED_LAUNCH_NUMBERS.filter((path) => outside.has(path) || breaksCoupling(doc, path));
   if (!markerDictionaryAccepted(getPath(doc, MARKER_DICT_PATH))) blocked.push(MARKER_DICT_PATH);
+  const surface = altitudeEnvelopeViolation(doc);
+  if (surface !== null && !blocked.includes(surface)) blocked.push(surface);
   for (const conflict of blockingConflicts(doc)) {
     for (const path of conflict.paths) if (!blocked.includes(path)) blocked.push(path);
   }
   if (doc === null || typeof doc !== 'object') return blocked;
   const mode = readMissionMode(doc);
-  const active = blocked.filter((path) => isPathActive(mode, path));
+  const active = blocked.filter((path) => isPathActive(mode, path, doc));
   if (hasInvalidMissionMode(doc)) active.push(MISSION_MODE_PATH);
   return active;
 }
@@ -264,7 +305,7 @@ function signed(sign: 1 | -1, value: number): number {
 export function setLinkedPath<T extends Doc>(doc: T, spec: ParameterSpec | string, value: unknown): T {
   const resolved = typeof spec === 'string' ? ALL_PARAMETERS.find((item) => item.path === spec) : spec;
   const path = typeof spec === 'string' ? spec : spec.path;
-  if (!resolved?.mirrors || !finite(value)) return setPath(doc, path, value);
+  if (resolved?.kind !== 'number' || !resolved.mirrors || !finite(value)) return setPath(doc, path, value);
   const rounded = roundTo(value, resolved.precision);
   let next = setPath(doc, path, rounded);
   for (const mirror of resolved.mirrors) next = setPath(next, mirror.path, signed(mirror.sign, rounded));
@@ -288,7 +329,7 @@ function ceilToFiveHundredths(value: number): number {
  */
 export function reconcileCoupledPaths<T extends Doc>(doc: T): T {
   let next = doc;
-  for (const spec of ALL_PARAMETERS) {
+  for (const spec of NUMBER_PARAMETERS) {
     const source = getPath(doc, spec.path);
     if (!spec.mirrors || !finite(source)) continue;
     for (const mirror of spec.mirrors) {
@@ -357,7 +398,7 @@ export function advancedFieldErrors(doc: unknown): Partial<Record<string, string
     errors[TAG_SIZE_PATH] = `O tamanho precisa ser maior que zero e no máximo ${MAX_TAG_SIZE_M.toFixed(1)} m.`;
   }
   const window = getPath(doc, CENTERING_TIMEOUT_PATH);
-  if (!finite(window) || !inEnvelope(readMissionMode(doc), CENTERING_TIMEOUT_PATH, window, doc)) {
+  if (!finite(window) || !inEnvelope(CENTERING_TIMEOUT_PATH, window, doc)) {
     errors[CENTERING_TIMEOUT_PATH] = `A janela de centragem precisa ficar entre ${CENTERING_TIMEOUT_RANGE_SEC.min} e ${CENTERING_TIMEOUT_RANGE_SEC.max} s.`;
   }
   return errors;

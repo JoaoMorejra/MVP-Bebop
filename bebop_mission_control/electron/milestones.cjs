@@ -31,6 +31,15 @@ const MILESTONE_LINE = /\[MILESTONE ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$/;
 const ALERT_LINE = /\[ALERT ([a-z]+\.[a-z0-9_]+)\] (\{.*\})$/;
 
 /**
+ * The alert a mission raises when it refuses its launch document before
+ * commanding anything, `{field, reason}`, right before it exits with
+ * `EXIT_LAUNCH_REFUSED` (`mvp_mission_bebop/engine/exit_codes.py`). Registered
+ * in `telemetry/milestones.py:ALERT_KEYS`; `launchRefusal.cjs` turns it into
+ * `bmg:launch-refused`.
+ */
+const LAUNCH_REFUSED_ALERT = 'mission.launch_refused';
+
+/**
  * The stage marker each step logs on entry, `--- [STEP N: <name>] ---`. IPC
  * contract pinned by `test/test_contracts.py::STEP_LINE`.
  */
@@ -180,6 +189,7 @@ function scheduleCountdownTicks(countdownSec, emit, now = Date.now) {
 module.exports = {
   ALERT_LINE,
   COUNTDOWN_CALL_SEC,
+  LAUNCH_REFUSED_ALERT,
   MILESTONE_LINE,
   STEP_LINE,
   createLineBuffer,

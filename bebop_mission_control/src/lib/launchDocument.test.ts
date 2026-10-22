@@ -10,15 +10,18 @@ import {
   envelopeBlockers,
   fillMissing,
   launchBlockers,
+  REQUIRED_LAUNCH_BOOLEANS,
+  altitudeAdjustment,
   launchCountdownSec,
+  migrateLegacyMode,
   normalizeForMode,
   reconcileCoupledPaths,
   setLinkedPath,
-  SIMPLE_CEILING_MARGIN_M,
 } from './launchDocument';
 import {
   ADVANCED_PATHS,
   ALL_PARAMETERS,
+  NUMBER_PARAMETERS,
   MARKER_DICTIONARIES,
   TRACKED_PATHS,
   isKnownMarkerDictionary,
@@ -50,7 +53,10 @@ describe('launchBlockers', () => {
   });
 
   it('requires every number the operator edits and every one the old flags carried', () => {
-    for (const spec of ALL_PARAMETERS) expect(REQUIRED_LAUNCH_NUMBERS).toContain(spec.path);
+    for (const spec of NUMBER_PARAMETERS) expect(REQUIRED_LAUNCH_NUMBERS).toContain(spec.path);
+    for (const spec of ALL_PARAMETERS.filter((item) => item.kind === 'boolean')) {
+      expect(REQUIRED_LAUNCH_NUMBERS).not.toContain(spec.path);
+    }
     for (const path of [
       'kinematics.hover_duration_sec',
       'rtl.max_speed',
@@ -129,23 +135,23 @@ describe('launchBlockers outside the envelope', () => {
   });
 });
 
-const forwardSpec = ALL_PARAMETERS.find((spec) => spec.path === 'kinematics.forward_cruise_velocity')!;
+const forwardSpec = NUMBER_PARAMETERS.find((spec) => spec.path === 'kinematics.forward_cruise_velocity')!;
 
 describe('slider ranges', () => {
   it.each([
-    ['kinematics.target_altitude_m', 0.1, 4.0, 0.1, 1],
+    ['kinematics.target_altitude_m', 0.1, 2.0, 0.05, 2],
     ['kinematics.altitude_ceiling_margin_m', 0.0, 2.0, 0.05, 2],
     ['kinematics.forward_cruise_velocity', 0.01, 0.6, 0.01, 2],
     ['gimbal.search_tilt_deg', -45, 0, 1, 0],
     ['gimbal.nadir_tilt_deg', -80, 0, 1, 0],
   ])('%s spans [%s, %s] in steps of %s', (path, min, max, step, precision) => {
-    const spec = ALL_PARAMETERS.find((item) => item.path === path)!;
+    const spec = NUMBER_PARAMETERS.find((item) => item.path === path)!;
     expect([spec.min, spec.max, spec.step, spec.precision]).toEqual([min, max, step, precision]);
   });
 
   it.each([
     ['kinematics.target_altitude_m', 0.1],
-    ['kinematics.target_altitude_m', 4.0],
+    ['kinematics.target_altitude_m', 2.0],
     ['kinematics.altitude_ceiling_margin_m', 0.0],
     ['kinematics.altitude_ceiling_margin_m', 2.0],
     ['kinematics.forward_cruise_velocity', 0.01],
@@ -160,7 +166,7 @@ describe('slider ranges', () => {
 
   it.each([
     ['kinematics.target_altitude_m', 0.09],
-    ['kinematics.target_altitude_m', 4.01],
+    ['kinematics.target_altitude_m', 2.01],
     ['kinematics.altitude_ceiling_margin_m', -0.01],
     ['kinematics.altitude_ceiling_margin_m', 2.01],
     ['kinematics.forward_cruise_velocity', 0.0],
@@ -361,8 +367,8 @@ describe('advanced marker settings', () => {
 });
 
 describe('launchBlockers by mission mode', () => {
-  it('does not block an intermediate launch on a field it never uses', () => {
-    const doc = { ...validDocument(), mission_mode: 'intermediate' } as Record<string, unknown>;
+  it('does not block a launch without the return on a field it never uses', () => {
+    const doc = setPath({ ...validDocument(), mission_mode: 'advanced' }, 'rtl.enabled', false) as Record<string, unknown>;
     const broken = setPath(setPath(doc, 'rtl.timeout_sec', 9999), 'rtl.target_aruco_id', -4);
     expect(launchBlockers(broken)).toEqual([]);
   });
@@ -382,7 +388,6 @@ describe('launchBlockers by mission mode', () => {
   it('blocks a simple launch without a turn rate, and no other mode', () => {
     const doc = setPath(validDocument(), 'yaw_pattern.scan_vyaw', undefined);
     expect(launchBlockers(setPath(doc, 'mission_mode', 'simple'))).toEqual(['yaw_pattern.scan_vyaw']);
-    expect(launchBlockers(setPath(doc, 'mission_mode', 'intermediate'))).toEqual([]);
     expect(launchBlockers(setPath(doc, 'mission_mode', 'advanced'))).toEqual([]);
   });
 
@@ -420,103 +425,137 @@ describe('fillMissing', () => {
 
   it('leaves the path alone when the factory does not hold a finite number either', () => {
     const doc = { no_fly: true };
+    expect(getPath(fillMissing(doc, {}), 'yaw_pattern.scan_vyaw')).toBeUndefined();
+  });
+
+  it('backfills the booleans a store written before them lacks, from the factory or their default', () => {
+    expect(fillMissing({}, {})).toEqual({ rtl: { enabled: true }, platform: { takeoff_from_ground: false } });
+    expect(getPath(fillMissing({}, { rtl: { enabled: false } }), 'rtl.enabled')).toBe(false);
+    const doc = { rtl: { enabled: false }, platform: { takeoff_from_ground: true } };
     expect(fillMissing(doc, {})).toBe(doc);
   });
 });
 
 describe('normalizeForMode', () => {
-  const factory = { kinematics: { altitude_ceiling_margin_m: 0.6 } };
-
-  it('squeezes the altitude into the simple range and pins the margin', () => {
-    const doc = { kinematics: { target_altitude_m: 1.8, altitude_ceiling_margin_m: 0.1 } };
-    const next = normalizeForMode(doc, 'simple', factory);
-    expect(next.kinematics).toMatchObject({ target_altitude_m: 1, altitude_ceiling_margin_m: 0.6 });
+  it('moves an altitude over the floor envelope to its bound', () => {
+    const next = normalizeForMode({ kinematics: { target_altitude_m: 3.0, altitude_ceiling_margin_m: 0.1 } });
+    expect(next.kinematics).toMatchObject({ target_altitude_m: 2, altitude_ceiling_margin_m: 0.1 });
   });
 
-  it('raises an altitude below the simple floor', () => {
-    const next = normalizeForMode({ kinematics: { target_altitude_m: 0.3 } }, 'simple', factory);
-    expect((next.kinematics as { target_altitude_m: number }).target_altitude_m).toBe(0.7);
+  it('raises an altitude under the pad minimum to 1.30 m over a 1 m pad', () => {
+    const next = normalizeForMode({ platform: { height_m: 1 }, kinematics: { target_altitude_m: 0.5 } });
+    expect((next.kinematics as { target_altitude_m: number }).target_altitude_m).toBe(1.3);
   });
 
-  it('leaves the other modes untouched, by reference', () => {
-    const doc = { kinematics: { target_altitude_m: 1.8, altitude_ceiling_margin_m: 0.1 } };
-    expect(normalizeForMode(doc, 'advanced', factory)).toBe(doc);
-    expect(normalizeForMode(doc, 'intermediate', factory)).toBe(doc);
+  it('returns the same document when the altitude is inside the envelope', () => {
+    const doc = { platform: { height_m: 1 }, kinematics: { target_altitude_m: 1.8, altitude_ceiling_margin_m: 0.1 } };
+    expect(normalizeForMode(doc)).toBe(doc);
   });
 
-  it('uses the pad of the document: clamps 1.0 to 1.7 and 3.0 to 2.0 with platform.height_m = 1', () => {
-    const altitudeOf = (value: number, pad: number) =>
-      (normalizeForMode({ platform: { height_m: pad }, kinematics: { target_altitude_m: value } }, 'simple', factory)
-        .kinematics as { target_altitude_m: number }).target_altitude_m;
-    expect(altitudeOf(1.0, 1)).toBe(1.7);
-    expect(altitudeOf(3.0, 1)).toBe(2);
-    expect(altitudeOf(1.8, 1)).toBe(1.8);
-    expect(altitudeOf(1.8, 0)).toBe(1);
-    expect(altitudeOf(0.3, 0)).toBe(0.7);
+  it('leaves a missing altitude for the launch checks to name', () => {
+    const doc = { platform: { height_m: 1 } };
+    expect(normalizeForMode(doc)).toBe(doc);
   });
 
-  it('pins the mission margin when there is no factory value', () => {
-    const doc = { kinematics: { target_altitude_m: 0.8, altitude_ceiling_margin_m: 0.1 } };
-    const next = normalizeForMode(doc, 'simple', null);
-    expect(next.kinematics).toMatchObject({ target_altitude_m: 0.8, altitude_ceiling_margin_m: SIMPLE_CEILING_MARGIN_M });
-    expect(SIMPLE_CEILING_MARGIN_M).toBe(0.6);
-  });
-
-  it('returns the same document when the margin is pinned and the altitude is in range', () => {
-    const doc = { kinematics: { target_altitude_m: 0.8, altitude_ceiling_margin_m: 0.6 } };
-    expect(normalizeForMode(doc, 'simple', null)).toBe(doc);
-    expect(normalizeForMode(doc, 'simple', factory)).toBe(doc);
+  it('rounds the bound to the slider resolution, inside the envelope', () => {
+    const next = normalizeForMode({ platform: { height_m: 0.125 }, kinematics: { target_altitude_m: 0.2 } });
+    expect((next.kinematics as { target_altitude_m: number }).target_altitude_m).toBe(0.45);
   });
 });
 
-describe('launch checks in the simple mode', () => {
-  it('does not block on a ceiling margin the mode hides', () => {
-    const doc = { ...completeDocument(), mission_mode: 'simple' } as Record<string, unknown>;
-    const broken = setPath(setPath(doc, 'kinematics.altitude_ceiling_margin_m', -3), 'kinematics.target_altitude_m', 0.8);
-    expect(launchBlockers(broken)).not.toContain('kinematics.altitude_ceiling_margin_m');
+describe('launch checks on the shared envelope', () => {
+  it('does not block on a ceiling margin the pad top ignores, in either mode, and does from the floor', () => {
+    for (const mode of ['simple', 'advanced']) {
+      const doc = { ...completeDocument(), mission_mode: mode } as Record<string, unknown>;
+      const pad = setPath(setPath(doc, 'platform.height_m', 1), 'kinematics.target_altitude_m', 1.8);
+      const broken = setPath(pad, 'kinematics.altitude_ceiling_margin_m', -3);
+      expect(launchBlockers(broken)).not.toContain('kinematics.altitude_ceiling_margin_m');
+      expect(launchBlockers(setPath(broken, 'platform.takeoff_from_ground', true))).toContain(
+        'kinematics.altitude_ceiling_margin_m'
+      );
+    }
   });
 
-  it('blocks an altitude above the native height only in the simple mode', () => {
-    const base = setPath(completeDocument(), 'kinematics.target_altitude_m', 1.4) as Record<string, unknown>;
-    expect(launchBlockers({ ...base, mission_mode: 'simple' })).toContain('kinematics.target_altitude_m');
-    expect(launchBlockers({ ...base, mission_mode: 'advanced' })).not.toContain('kinematics.target_altitude_m');
+  it('judges the altitude of every mode over the pad of the document (BUG 1.1)', () => {
+    const base = setPath(completeDocument(), 'platform.height_m', 1) as Record<string, unknown>;
+    for (const mode of ['simple', 'advanced']) {
+      const doc = setPath(base, 'mission_mode', mode);
+      expect(launchBlockers(setPath(doc, 'kinematics.target_altitude_m', 1.25))).toContain('kinematics.target_altitude_m');
+      expect(launchBlockers(setPath(doc, 'kinematics.target_altitude_m', 1.8))).not.toContain('kinematics.target_altitude_m');
+      expect(launchBlockers(setPath(doc, 'kinematics.target_altitude_m', 2.05))).toContain('kinematics.target_altitude_m');
+    }
   });
 
-  it('judges the simple altitude over the pad of the document', () => {
-    const base = setPath(
-      setPath(completeDocument(), 'platform.height_m', 1),
-      'mission_mode',
-      'simple'
-    ) as Record<string, unknown>;
-    expect(launchBlockers(setPath(base, 'kinematics.target_altitude_m', 1.0))).toContain('kinematics.target_altitude_m');
-    expect(launchBlockers(setPath(base, 'kinematics.target_altitude_m', 1.8))).not.toContain('kinematics.target_altitude_m');
+  it('blocks a malformed pad height the mission would refuse', () => {
+    const doc = setPath(completeDocument(), 'platform.height_m', -1);
+    expect(launchBlockers(doc)).toContain('platform.height_m');
+  });
+
+  it('blocks a boolean field written as a string', () => {
+    expect(launchBlockers(setPath(completeDocument(), 'rtl.enabled', 'false'))).toContain('rtl.enabled');
+    expect(launchBlockers(setPath(completeDocument(), 'platform.takeoff_from_ground', 1))).toContain(
+      'platform.takeoff_from_ground'
+    );
   });
 
   it('raises no conflict citing the margin for any altitude of the simple slider over a 1 m pad', () => {
-    const factory = factoryDocument();
-    for (let step = 17; step <= 20; step += 1) {
+    for (let step = 26; step <= 40; step += 1) {
       const doc = normalizeForMode(
         setPath(
           setPath(setPath(validDocument(), 'platform.height_m', 1), 'mission_mode', 'simple'),
           'kinematics.target_altitude_m',
-          step / 10
-        ),
-        'simple',
-        factory
+          step / 20
+        )
       );
       expect(activeConflicts(doc).filter((c) => c.paths.includes('kinematics.altitude_ceiling_margin_m'))).toEqual([]);
     }
   });
+});
 
-  it('raises no conflict citing the margin for any altitude the simple slider offers, with the pinned margin', () => {
-    const factory = factoryDocument();
-    for (let altitude = 0.7; altitude <= 1.0001; altitude += 0.1) {
-      const doc = normalizeForMode(
-        setPath(setPath(validDocument(), 'mission_mode', 'simple'), 'kinematics.target_altitude_m', Math.round(altitude * 10) / 10),
-        'simple',
-        factory
-      );
-      expect(activeConflicts(doc).filter((c) => c.paths.includes('kinematics.altitude_ceiling_margin_m'))).toEqual([]);
+describe('migrateLegacyMode', () => {
+  it('carries an Intermediate document over to Advanced without the return', () => {
+    const doc = { mission_mode: ' Intermediate ', rtl: { tag_size: 0.2 } };
+    const next = migrateLegacyMode(doc);
+    expect(next).toEqual({ mission_mode: 'advanced', rtl: { tag_size: 0.2, enabled: false } });
+    expect(doc).toEqual({ mission_mode: ' Intermediate ', rtl: { tag_size: 0.2 } });
+  });
+
+  it('keeps an explicit return plan and is idempotent', () => {
+    const next = migrateLegacyMode({ mission_mode: 'intermediate', rtl: { enabled: true } });
+    expect(getPath(next, 'rtl.enabled')).toBe(true);
+    expect(migrateLegacyMode(next)).toBe(next);
+  });
+
+  it('returns a current document itself', () => {
+    for (const doc of [{}, { mission_mode: 'simple' }, { mission_mode: 'advanced', rtl: { enabled: false } }]) {
+      expect(migrateLegacyMode(doc)).toBe(doc);
     }
+  });
+});
+
+describe('altitudeAdjustment', () => {
+  it('says what the envelope did to the altitude, in the operator\'s words', () => {
+    const before = { platform: { height_m: 1, takeoff_from_ground: false }, kinematics: { target_altitude_m: 0.5 } };
+    const after = normalizeForMode(before);
+    expect(getPath(after, 'kinematics.target_altitude_m')).toBe(1.3);
+    expect(altitudeAdjustment(before, after)).toBe('Cota ajustada para 1,30 m: mínimo sobre o totem.');
+    expect(altitudeAdjustment(after, after)).toBeNull();
+    const high = { kinematics: { target_altitude_m: 2.4 } };
+    expect(altitudeAdjustment(high, normalizeForMode(high))).toBe('Cota ajustada para 2,00 m: máximo permitido.');
+  });
+
+  it('re-applies the envelope when the surface goes back to the pad top', () => {
+    const ground = { platform: { height_m: 1, takeoff_from_ground: true }, kinematics: { target_altitude_m: 0.5 } };
+    expect(normalizeForMode(ground)).toBe(ground);
+    const padTop = setPath(ground, 'platform.takeoff_from_ground', false);
+    expect(getPath(normalizeForMode(padTop), 'kinematics.target_altitude_m')).toBe(1.3);
+  });
+
+  it('does not block a launch on a boolean the document does not hold, and backfills it', () => {
+    const doc = validDocument();
+    for (const path of Object.keys(REQUIRED_LAUNCH_BOOLEANS)) {
+      expect(launchBlockers(setPath(doc, path, undefined))).not.toContain(path);
+    }
+    expect(REQUIRED_LAUNCH_BOOLEANS).toEqual({ 'platform.takeoff_from_ground': false, 'rtl.enabled': true });
   });
 });

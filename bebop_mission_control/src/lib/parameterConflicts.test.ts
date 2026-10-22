@@ -9,7 +9,6 @@ import {
   LOW_CEILING_MARGIN_ADVISORY_M,
   evaluateParameterConflicts,
 } from './parameterConflicts';
-import { SIMPLE_ALTITUDE_RANGE_M } from './missionMode';
 import { getPath, setPath, type Doc } from './paths';
 
 interface ConflictCase {
@@ -61,23 +60,28 @@ describe('evaluateParameterConflicts', () => {
     expect(new Set(found.map((c) => c.id)).size).toBe(found.length);
   });
 
-  it('explains the ceiling below the firmware takeoff height with the numbers and a computed fix', () => {
-    const [e03] = evaluateParameterConflicts(caseDocument({ 'kinematics.target_altitude_m': 0.5, 'kinematics.altitude_ceiling_margin_m': 0.45 }));
-    expect(e03.id).toBe('E03');
-    expect(e03.paths).toEqual(['kinematics.target_altitude_m', 'kinematics.altitude_ceiling_margin_m']);
-    expect(e03.message).toContain('0.95 m');
-    expect(e03.fix).toContain('0.50 m');
-    expect(e03.fix).toContain('0.55 m');
+  it('no longer refuses a low ceiling: the mission ratchets it through the native takeoff (E03 and W01 retired)', () => {
+    const ids = (overrides: Record<string, unknown>) => evaluateParameterConflicts(caseDocument(overrides)).map((c) => c.id);
+    expect(ids({ 'kinematics.target_altitude_m': 0.5, 'kinematics.altitude_ceiling_margin_m': 0.45 })).not.toContain('E03');
+    expect(ids({ 'kinematics.target_altitude_m': 0.5, 'kinematics.altitude_ceiling_margin_m': 0.5 })).not.toContain('W01');
   });
 
-  it('requires a 0.9 m margin at 0.1 m, and refuses a zero margin outright', () => {
-    const ids = (overrides: Record<string, unknown>) =>
-      evaluateParameterConflicts(caseDocument(overrides))
-        .filter((c) => c.severity === 'error')
-        .map((c) => c.id);
-    expect(ids({ 'kinematics.target_altitude_m': 0.1, 'kinematics.altitude_ceiling_margin_m': 0.85 })).toContain('E03');
-    expect(ids({ 'kinematics.target_altitude_m': 0.1, 'kinematics.altitude_ceiling_margin_m': 0.9 })).toEqual([]);
-    expect(ids({ 'kinematics.target_altitude_m': 4, 'kinematics.altitude_ceiling_margin_m': 0 })).toEqual(['E04']);
+  it('refuses an altitude outside the envelope of the launch surface (E10), citing the pad-top minimum', () => {
+    const pad = { 'platform.height_m': 1, 'platform.takeoff_from_ground': false };
+    const [e10] = evaluateParameterConflicts(caseDocument({ ...pad, 'kinematics.target_altitude_m': 1.25 })).filter((c) => c.id === 'E10');
+    expect(e10.paths).toEqual(['kinematics.target_altitude_m']);
+    expect(e10.message).toContain('1.30 m sobre o totem');
+    const ids = (overrides: Record<string, unknown>) => evaluateParameterConflicts(caseDocument(overrides)).map((c) => c.id);
+    expect(ids({ ...pad, 'kinematics.target_altitude_m': 1.3 })).not.toContain('E10');
+    expect(ids({ 'kinematics.target_altitude_m': 2.05 })).toContain('E10');
+    expect(ids({ 'platform.height_m': 1, 'platform.takeoff_from_ground': true, 'kinematics.target_altitude_m': 0.5 })).not.toContain('E10');
+  });
+
+  it('judges the ceiling margin only for a launch from the floor (E04, W02)', () => {
+    const ids = (overrides: Record<string, unknown>) => evaluateParameterConflicts(caseDocument(overrides)).map((c) => c.id);
+    expect(ids({ 'kinematics.altitude_ceiling_margin_m': 0 })).toContain('E04');
+    expect(ids({ 'platform.height_m': 1, 'kinematics.target_altitude_m': 1.8, 'kinematics.altitude_ceiling_margin_m': 0 })).not.toContain('E04');
+    expect(ids({ 'platform.height_m': 1, 'kinematics.target_altitude_m': 1.8, 'kinematics.altitude_ceiling_margin_m': 0.1 })).not.toContain('W02');
   });
 
   it('accepts the fastest cruise once the ceiling is reconciled', () => {
@@ -137,7 +141,6 @@ describe('evaluateParameterConflicts', () => {
   it('keeps its advisory constants equal to what the factory fields derive', () => {
     const factory = factoryDocument();
     expect(FIRMWARE_HOVER_HEIGHT_M).toBe(1.0);
-    expect(SIMPLE_ALTITUDE_RANGE_M.max).toBe(FIRMWARE_HOVER_HEIGHT_M);
     expect(LOW_ALTITUDE_ADVISORY_M).toBe(
       Math.max(getPath(factory, 'vision.min_altitude_for_ibvs_m') as number, getPath(factory, 'kinematics.takeoff_settle_min_altitude_m') as number)
     );

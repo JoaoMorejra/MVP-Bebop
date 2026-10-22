@@ -8,14 +8,18 @@ import type { MissionState } from '../types/mission';
 export const EXIT_COMPLETE = 0;
 export const EXIT_ABORTED_LANDED = 3;
 export const EXIT_TOUCHDOWN_UNCONFIRMED = 4;
+export const EXIT_LAUNCH_REFUSED = 78;
 
 /**
  * The final state a mission exit status stands for.
  *
  * Only a clean completion reads `finished`. An operator abort and a touchdown
  * the odometry never confirmed used to exit 0 as well and were announced as a
- * safe landing at base; each now has its own state. Anything else, including a
- * forced exit, a signal and a launch that never started, is a fault.
+ * safe landing at base; each now has its own state. A launch document the
+ * mission refused before commanding anything (`EXIT_LAUNCH_REFUSED`) leaves the
+ * runtime `idle`: nothing ran, and the pre-flight screen shows why
+ * (`bmg:launch-refused`). Anything else, including a forced exit, a signal and
+ * a launch that never started, is a fault.
  */
 export function missionStateForExit(code: number | null | undefined): MissionState {
   switch (code) {
@@ -25,6 +29,8 @@ export function missionStateForExit(code: number | null | undefined): MissionSta
       return 'aborted';
     case EXIT_TOUCHDOWN_UNCONFIRMED:
       return 'finished_unconfirmed';
+    case EXIT_LAUNCH_REFUSED:
+      return 'idle';
     default:
       return 'faulted';
   }

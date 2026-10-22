@@ -57,10 +57,10 @@ describe('battery calls by mode', () => {
     expect(BATTERY_CALLS.returning).toBe('Bateria crítica. Retornando à base para pouso.');
   });
 
-  it('speaks a landing in place for the intermediate mode and never a return', () => {
-    const calls = batteryCalls('intermediate');
+  it.each(['simple', 'advanced'] as const)('speaks a landing in place without the return in the %s mode, never a return', (mode) => {
+    const calls = batteryCalls(mode, false);
     for (const text of Object.values(calls)) expect(text).not.toMatch(/retorn|base/i);
-    expect(calls.returning).toBe('Bateria crítica. Pouso no local iniciado.');
+    expect(calls.returning).toBe('Bateria crítica: pousando no local.');
   });
 
   it('speaks a landing on the base for the simple mode and never a return', () => {
@@ -71,7 +71,7 @@ describe('battery calls by mode', () => {
 
   it('says the call of the mode when the jump to stage 5 is acknowledged', async () => {
     const say = vi.fn();
-    await runCriticalBatteryReturn('rtl', { say, gotoStage: async () => ({ success: true }), land: async () => undefined }, 'intermediate');
-    expect(say).toHaveBeenCalledWith('battery.critical', 'Bateria crítica. Pouso no local iniciado.');
+    await runCriticalBatteryReturn('rtl', { say, gotoStage: async () => ({ success: true }), land: async () => undefined }, 'advanced', false);
+    expect(say).toHaveBeenCalledWith('battery.critical', 'Bateria crítica: pousando no local.');
   });
 });

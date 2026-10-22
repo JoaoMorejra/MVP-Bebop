@@ -10,7 +10,7 @@
  * statistics and the arming mode are shared and never travel between modes.
  */
 import type { MissionMode } from './missionMode';
-import { MISSION_MODE_PATH } from './missionMode';
+import { LEGACY_INTERMEDIATE_MODE, MISSION_MODE_PATH, RTL_ENABLED_PATH } from './missionMode';
 import { normalizeForMode, reconcileCoupledPaths } from './launchDocument';
 import { ADVANCED_PATHS, ALL_PARAMETERS } from './parameterSchema';
 import { getPath, setPath, type Doc } from './paths';
@@ -29,12 +29,16 @@ export const presetKey = (mode: MissionMode): string => `${PRESET_KEY_PREFIX}${m
 export interface StorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem?(key: string): void;
 }
 
 /** Paths whose values belong to a mode: the sheet fields, their mirrors and the advanced pad fields. */
 export const MODE_OWNED_PATHS: readonly string[] = Array.from(
   new Set([
-    ...ALL_PARAMETERS.flatMap((spec) => [spec.path, ...(spec.mirrors?.map((mirror) => mirror.path) ?? [])]),
+    ...ALL_PARAMETERS.flatMap((spec) => [
+      spec.path,
+      ...(spec.kind === 'number' ? spec.mirrors?.map((mirror) => mirror.path) ?? [] : []),
+    ]),
     ...ADVANCED_PATHS,
   ])
 );
@@ -97,8 +101,6 @@ export interface ModeSwitchInput {
   to: MissionMode;
   /** What `to` last used, or null the first time it is entered. */
   stored: Doc | null;
-  /** `MissionParameters.factory()`, for the values a mode pins. */
-  factory: unknown;
 }
 
 export interface ModeSwitchResult {
@@ -114,14 +116,55 @@ export interface ModeSwitchResult {
  * Switch the editing document from one mode to another.
  *
  * Pure. The target mode's owned values come from `stored` when it has any,
- * otherwise from a copy of `working` (first use). The mode is then normalised
- * (the Simple altitude range, the pinned margin) and the coupled cruise paths
- * are reconciled.
+ * otherwise from a copy of `working` (first use). The altitude is then moved
+ * into the envelope of the launch surface and the coupled cruise paths are
+ * reconciled.
  */
-export function switchModeDocument({ working, from, to, stored, factory }: ModeSwitchInput): ModeSwitchResult {
+export function switchModeDocument({ working, from, to, stored }: ModeSwitchInput): ModeSwitchResult {
   const stash = setPath(working, MISSION_MODE_PATH, from);
   const base = stored ? applyOwnedPaths(working, stored) : working;
   const moved = setPath(base, MISSION_MODE_PATH, to);
-  const doc = reconcileCoupledPaths(normalizeForMode(moved, to, factory));
+  const doc = reconcileCoupledPaths(normalizeForMode(moved));
   return { doc, stash, usedStored: stored !== null };
+}
+
+/**
+ * Carry the keys of the removed Intermediate profile over to the Advanced one.
+ *
+ * `bmg.active-mode = 'intermediate'` becomes `'advanced'`, and the Advanced
+ * working document receives `rtl.enabled = false` (the Intermediate profile was
+ * the Advanced one without the return); an Advanced document that does not
+ * exist yet is started from the Intermediate one. The Intermediate working
+ * document and favourite keys are then removed. Idempotent; every storage
+ * fault is swallowed, the document on disk being the source of truth.
+ */
+export function migrateLegacyIntermediate(storage: StorageLike | null): void {
+  if (!storage) return;
+  const legacyWorking = `${WORKING_KEY_PREFIX}${LEGACY_INTERMEDIATE_MODE}`;
+  const legacyPreset = `${PRESET_KEY_PREFIX}${LEGACY_INTERMEDIATE_MODE}`;
+  let active: string | null = null;
+  try {
+    active = storage.getItem(ACTIVE_MODE_KEY);
+  } catch {
+    active = null;
+  }
+  if (active !== null && active.trim().toLowerCase() === LEGACY_INTERMEDIATE_MODE) {
+    const base = readStoredDoc(storage, workingKey('advanced')) ?? readStoredDoc(storage, legacyWorking);
+    if (base) {
+      const migrated = setPath(setPath(base, MISSION_MODE_PATH, 'advanced'), RTL_ENABLED_PATH, false);
+      writeStoredDoc(storage, workingKey('advanced'), migrated);
+    }
+    try {
+      storage.setItem(ACTIVE_MODE_KEY, 'advanced');
+    } catch {
+      /* the next mode switch writes it again */
+    }
+  }
+  for (const key of [legacyWorking, legacyPreset]) {
+    try {
+      storage.removeItem?.(key);
+    } catch {
+      /* an undeletable key is never read again */
+    }
+  }
 }

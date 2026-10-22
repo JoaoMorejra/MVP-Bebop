@@ -25,7 +25,16 @@
  * text may change by mode (`hints`, `summaries`): {@link groupsForMode} builds
  * the sheet of one mode. A field hidden in a mode keeps its stored value.
  */
-import { MISSION_MODE_PATH, SIMPLE_ALTITUDE_RANGE_M, simpleAltitudeRange, type MissionMode } from './missionMode';
+import {
+  ALTITUDE_PATH,
+  RTL_ENABLED_PATH,
+  TAKEOFF_FROM_GROUND_PATH,
+  altitudeSliderRange,
+  ceilingFloorFrame,
+  launchesFromGround,
+  type AltitudeRange,
+} from './altitudeEnvelope';
+import { MISSION_MODE_PATH, inactivePaths, type MissionMode } from './missionMode';
 
 export type ParameterGroupId = 'envelope' | 'gimbal' | 'timeouts';
 
@@ -37,6 +46,12 @@ interface Common {
   modes?: ReadonlyArray<MissionMode>;
   /** Replaces `hint` in the modes named. */
   hints?: Partial<Record<MissionMode, string>>;
+  /**
+   * Why the field cannot be edited with the rest of `doc`, shown in its place
+   * of a hint; `null` when it can. A field that has one stays on the sheet
+   * while the flight does not read it (`missionMode.ts:inactivePaths`).
+   */
+  disabledReason?: (doc: unknown) => string | null;
 }
 
 export interface NumberParameter extends Common {
@@ -45,15 +60,20 @@ export interface NumberParameter extends Common {
   max: number;
   step: number;
   unit?: string;
-  /** Replaces `min` and `max` in the modes named; a bound left out keeps the field's own. */
-  rangeByMode?: Partial<Record<MissionMode, { min?: number; max?: number }>>;
+  /** Replaces `min` and `max` with a range that depends on the rest of the document. */
+  rangeFor?: (doc: unknown) => AltitudeRange;
   /** Decimal places used for display and for change detection. */
   precision: number;
   /** Paths written together with `path`, each as `sign * value`. */
   mirrors?: ReadonlyArray<{ path: string; sign: 1 | -1 }>;
 }
 
-export type ParameterSpec = NumberParameter;
+/** A yes/no field, edited with a checkbox. Its value is always a JSON boolean. */
+export interface BooleanParameter extends Common {
+  kind: 'boolean';
+}
+
+export type ParameterSpec = NumberParameter | BooleanParameter;
 
 export interface ParameterGroup {
   id: ParameterGroupId;
@@ -62,6 +82,18 @@ export interface ParameterGroup {
   /** Replaces `summary` in the modes named. */
   summaries?: Partial<Record<MissionMode, string>>;
   items: ParameterSpec[];
+}
+
+/**
+ * Why the ceiling margin is locked: on the pad top the mission ignores it and
+ * flies a fixed ceiling (D2, `estimation/ceiling_schedule.py`), stated over the
+ * floor.
+ */
+function ceilingMarginLock(doc: unknown): string | null {
+  if (launchesFromGround(doc)) return null;
+  const ceiling = ceilingFloorFrame(doc);
+  const figure = ceiling === null ? '' : `: ${ceiling.toFixed(2).replace('.', ',')} m sobre o piso`;
+  return `Teto fixo do perfil de totem${figure}`;
 }
 
 export const PARAMETER_GROUPS: ParameterGroup[] = [
@@ -75,24 +107,26 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         kind: 'number',
         path: 'kinematics.target_altitude_m',
         label: 'Altitude de Voo',
-        hint: 'Altitude de voo e teto de segurança estabilizado.',
-        hints: {
-          simple:
-            'Altura do voo, até a altura nativa de decolagem do Bebop (1,0 m). A aeronave decola pela rotina nativa e mantém essa altura.',
-        },
+        hint: 'Cota sobre o piso. Decolando do totem, o mínimo é a altura do totem mais 0,30 m.',
         min: 0.1,
-        max: 4,
-        rangeByMode: { simple: { min: SIMPLE_ALTITUDE_RANGE_M.min, max: SIMPLE_ALTITUDE_RANGE_M.max } },
-        step: 0.1,
+        max: 2,
+        rangeFor: altitudeSliderRange,
+        step: 0.05,
         unit: 'm',
-        precision: 1,
+        precision: 2,
+      },
+      {
+        kind: 'boolean',
+        path: TAKEOFF_FROM_GROUND_PATH,
+        label: 'Decolagem do Solo',
+        hint: 'Desmarcada: decola do topo do totem de 1,0 m. Marcada: decola do piso e libera a margem de teto.',
       },
       {
         kind: 'number',
         path: 'kinematics.altitude_ceiling_margin_m',
         label: 'Margem do Teto de Altitude',
         hint: 'Tolerância acima da altitude alvo antes de acionar pouso de emergência por segurança.',
-        modes: ['advanced', 'intermediate'],
+        disabledReason: ceilingMarginLock,
         min: 0,
         max: 2,
         step: 0.05,
@@ -110,7 +144,7 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         unit: 'm/s',
         precision: 2,
         mirrors: [{ path: 'rtl.reverse_cruise_velocity', sign: -1 }],
-        modes: ['advanced', 'intermediate'],
+        modes: ['advanced'],
       },
       {
         kind: 'number',
@@ -171,7 +205,6 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
     summary: 'Quanto tempo a busca e o retorno podem durar, e a contagem antes da decolagem',
     summaries: {
       simple: 'Quanto tempo a busca por giro pode durar, e a contagem antes da decolagem',
-      intermediate: 'Quanto tempo a busca pode durar, e a contagem antes da decolagem',
     },
     items: [
       {
@@ -181,13 +214,22 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         hint: 'Sem sinistro confirmado neste tempo, a varredura encerra e a aeronave retorna.',
         hints: {
           simple: 'Tempo máximo girando em busca do sinistro. Sem alvo confirmado neste tempo, a aeronave fotografa a referência e pousa.',
-          intermediate: 'Sem sinistro confirmado neste tempo, a varredura encerra, a aeronave fotografa a referência e pousa onde estiver.',
         },
         min: 5,
         max: 180,
         step: 1,
         unit: 's',
         precision: 0,
+      },
+      {
+        kind: 'boolean',
+        path: RTL_ENABLED_PATH,
+        label: 'Retorno a base (RTL)',
+        hint: 'Marcada: retorna, centraliza no ArUco e pousa na base. Desmarcada: pousa no local logo após a foto.',
+        hints: {
+          simple:
+            'Marcada: retorna, centraliza no ArUco e pousa na base. Desmarcada: pousa no local logo após a foto. O rumo volta ao da decolagem antes do pouso.',
+        },
       },
       {
         kind: 'number',
@@ -216,35 +258,41 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
   },
 ];
 
-export const ALTITUDE_PATH = 'kinematics.target_altitude_m';
+export { ALTITUDE_PATH };
 
-function modeRange(
-  item: ParameterSpec,
-  mode: MissionMode,
-  simpleAltitude: { min: number; max: number }
-): { min?: number; max?: number } {
-  const range = mode === 'simple' && item.path === ALTITUDE_PATH ? simpleAltitude : item.rangeByMode?.[mode];
-  return { min: range?.min ?? item.min, max: range?.max ?? item.max };
+function resolveItem(item: ParameterSpec, doc: unknown): ParameterSpec {
+  if (item.kind !== 'number') return item;
+  const range = item.rangeFor?.(doc);
+  return { ...item, min: range?.min ?? item.min, max: range?.max ?? item.max };
 }
 
 export const ALL_PARAMETERS: ParameterSpec[] = PARAMETER_GROUPS.flatMap((g) => g.items);
 
+/** The sheet's numeric fields, edited with a slider. */
+export const NUMBER_PARAMETERS: NumberParameter[] = ALL_PARAMETERS.filter(
+  (spec): spec is NumberParameter => spec.kind === 'number'
+);
+
+/** The sheet's yes/no fields, edited with a checkbox. */
+export const BOOLEAN_PARAMETERS: BooleanParameter[] = ALL_PARAMETERS.filter(
+  (spec): spec is BooleanParameter => spec.kind === 'boolean'
+);
+
 /**
  * The cards of the sheet for `mode`: items the mode does not use removed, texts resolved, empty cards dropped.
- * In the simple mode the altitude range follows the pad of `doc` (`platform.height_m`, 0 without a document).
+ * The altitude range follows the launch surface of `doc` (`altitudeEnvelope.ts`; the floor without a document),
+ * and a field the plan of `doc` does not read (`missionMode.ts:inactivePaths`, the return fields without the
+ * return) is left out, unless it has a `disabledReason`: it then stays on its card, locked.
  */
 export function groupsForMode(mode: MissionMode, doc?: unknown): ParameterGroup[] {
-  const simpleAltitude = simpleAltitudeRange(doc);
+  const inactive = inactivePaths(mode, doc);
   return PARAMETER_GROUPS.map((group) => ({
     ...group,
     summary: group.summaries?.[mode] ?? group.summary,
     items: group.items
       .filter((item) => !item.modes || item.modes.includes(mode))
-      .map((item) => ({
-        ...item,
-        hint: item.hints?.[mode] ?? item.hint,
-        ...modeRange(item, mode, simpleAltitude),
-      })),
+      .filter((item) => !inactive.has(item.path) || item.disabledReason !== undefined)
+      .map((item) => ({ ...resolveItem(item, doc), hint: item.hints?.[mode] ?? item.hint })),
   })).filter((group) => group.items.length > 0);
 }
 

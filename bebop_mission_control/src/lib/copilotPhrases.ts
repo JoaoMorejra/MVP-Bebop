@@ -367,7 +367,7 @@ const SIMPLE_ONLY_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>([
   'mission.approaching_yaw',
 ]);
 
-/** Landing pools that name the base: the intermediate mode lands where it stands. */
+/** Landing pools that name the base: a flight without the return lands where it stands. */
 const BASE_LANDING_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>(['mission.landing', 'mission.touchdown']);
 
 /** Landing pools that name the spot: the simple mode returns to the base, so it never lands elsewhere. */
@@ -376,23 +376,55 @@ const IN_PLACE_LANDING_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>([
   'mission.touchdown_in_place',
 ]);
 
-/** Pools a mission mode can reach. */
-export function poolsForMode(mode: MissionMode): readonly PoolKey[] {
+/**
+ * What a flight does, for the narration: the profile and the return plan
+ * (`rtl.enabled`). A bare mode stands for that mode with the return, which is
+ * what every caller meant before the plan existed.
+ */
+export interface FlightPlan {
+  mode: MissionMode;
+  rtlEnabled: boolean;
+}
+
+export type PlanLike = MissionMode | FlightPlan;
+
+/** `plan` as a {@link FlightPlan}. */
+export function toPlan(plan: PlanLike = 'advanced'): FlightPlan {
+  return typeof plan === 'string' ? { mode: plan, rtlEnabled: true } : plan;
+}
+
+/** Words a flight without the return never says: it has no base, no return and no marker. */
+const RETURN_WORDING = /\bbase\b|retorn|regress|marcador|rota de volta/i;
+
+/**
+ * Pools a flight plan can reach.
+ *
+ * Without the return nothing that names the base, the return or the marker
+ * is reachable (`RETURN_POOLS`, `BASE_LANDING_POOLS`); the landing and the
+ * touchdown in place are. With the return everything the profile flies is,
+ * the landing in place staying the fallback of a marker never found. The
+ * Simple profile never translates and, with the return, lands on its pad.
+ */
+export function poolsForPlan(plan: PlanLike): readonly PoolKey[] {
+  const { mode, rtlEnabled } = toPlan(plan);
   return POOL_KEYS.filter((key) => {
-    if (mode !== 'advanced' && RETURN_POOLS.has(key)) return false;
-    if (mode === 'simple' && (TRANSLATION_POOLS.has(key) || IN_PLACE_LANDING_POOLS.has(key))) return false;
-    if (mode === 'intermediate' && BASE_LANDING_POOLS.has(key)) return false;
+    if ((mode !== 'advanced' || !rtlEnabled) && RETURN_POOLS.has(key)) return false;
+    if (!rtlEnabled && BASE_LANDING_POOLS.has(key)) return false;
+    if (mode === 'simple' && TRANSLATION_POOLS.has(key)) return false;
+    if (mode === 'simple' && rtlEnabled && IN_PLACE_LANDING_POOLS.has(key)) return false;
     if (mode !== 'simple' && SIMPLE_ONLY_POOLS.has(key)) return false;
     return true;
   });
 }
 
 /**
- * Whether the station may speak `key` in `mode`. The mission already withholds
- * the return milestone outside the advanced mode; this is the station's own guard.
+ * Whether the station may speak `key` in `plan`. The mission withholds the
+ * return milestone outside the Advanced profile with the return; this is the
+ * station's own guard.
  */
-export function isMilestoneAllowed(key: MilestoneKey, mode: MissionMode): boolean {
-  return !(key === 'mission.rtl_start' && mode !== 'advanced');
+export function isMilestoneAllowed(key: MilestoneKey, plan: PlanLike): boolean {
+  const { mode, rtlEnabled } = toPlan(plan);
+  return !(key === 'mission.rtl_start' && (mode !== 'advanced' || !rtlEnabled));
 }
 
 /**
@@ -409,8 +441,9 @@ export function isMilestoneAllowed(key: MilestoneKey, mode: MissionMode): boolea
 export function poolForMilestone(
   key: MilestoneKey,
   payload: Readonly<Record<string, unknown>>,
-  mode: MissionMode = 'advanced'
+  plan: PlanLike = 'advanced'
 ): PoolKey {
+  const { mode, rtlEnabled } = toPlan(plan);
   if (mode === 'simple') {
     if (key === 'mission.takeoff') return 'mission.takeoff_native';
     if (key === 'mission.scan_start') return 'mission.scan_start_yaw';
@@ -422,14 +455,14 @@ export function poolForMilestone(
   switch (key) {
     case 'mission.touchdown':
       if (payload.confirmed !== true) return 'mission.touchdown_unconfirmed';
-      return payload.at_base === true ? 'mission.touchdown' : 'mission.touchdown_in_place';
+      return payload.at_base === true && rtlEnabled ? 'mission.touchdown' : 'mission.touchdown_in_place';
     case 'mission.capture_done':
       return payload.target_confirmed === true ? 'mission.capture_done' : 'mission.capture_reference';
     case 'mission.rtl_start':
       if (payload.via_jump === true) return 'mission.rtl_start_jump';
       return payload.inspected === true ? 'mission.rtl_start' : 'mission.rtl_start_no_target';
     case 'mission.landing':
-      return payload.at_base === true ? 'mission.landing' : 'mission.landing_in_place';
+      return payload.at_base === true && rtlEnabled ? 'mission.landing' : 'mission.landing_in_place';
     case 'mission.approaching':
       return payload.ibvs === true ? 'mission.approaching' : 'mission.approaching_direct';
     default:
@@ -438,10 +471,12 @@ export function poolForMilestone(
 }
 
 /**
- * Variants a payload rules out within its pool: the landing marker is only
- * mentioned on a return the mission reported as marker-guided.
+ * Variants a payload or the plan rules out within its pool: the landing marker
+ * is only mentioned on a return the mission reported as marker-guided, and a
+ * flight without the return never names the base, the return or the marker.
  */
-function vetoFor(key: MilestoneKey, payload: Readonly<Record<string, unknown>>): (text: string) => boolean {
+function vetoFor(key: MilestoneKey, payload: Readonly<Record<string, unknown>>, plan: FlightPlan): (text: string) => boolean {
+  if (!plan.rtlEnabled) return (text) => RETURN_WORDING.test(text);
   if (key === 'mission.rtl_start' && payload.marker_guided !== true) return (text) => /marcador/i.test(text);
   return () => false;
 }
@@ -719,11 +754,12 @@ export function phraseForMilestone(
   payload: Readonly<Record<string, unknown>>,
   parameters: MissionParametersPayload,
   options: { storage?: StorageLike | null; random?: () => number } = {},
-  mode: MissionMode = 'advanced'
+  plan: PlanLike = 'advanced'
 ): string {
-  return nextPhrase(poolForMilestone(key, payload, mode), phraseValues(payload, parameters), {
+  const resolved = toPlan(plan);
+  return nextPhrase(poolForMilestone(key, payload, resolved), phraseValues(payload, parameters), {
     ...options,
-    veto: vetoFor(key, payload),
+    veto: vetoFor(key, payload, resolved),
   });
 }
 
@@ -733,32 +769,90 @@ const FLIGHT_ESTIMATE_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>(['mission.t
 /**
  * Every sentence the flight narration can say for a mission launched with
  * `parameters` (D2: the numbers are known before takeoff), for the copilot's
- * on-disk phrase cache, limited to the pools `mode` can reach. Variants whose placeholder has no value are left out;
- * `mission.target_found` is left out because its range is estimated in flight.
+ * on-disk phrase cache, limited to the pools `plan` can reach and, without the
+ * return, to sentences that name neither the base, the return nor the marker;
+ * the plan sentences of `plan` ({@link PLAN_PHRASES}) are included.
+ * Variants whose placeholder has no value are left out; `mission.target_found`
+ * is left out because its range is estimated in flight.
  */
-export function allMissionPhrases(parameters: MissionParametersPayload, mode: MissionMode = 'advanced'): string[] {
+export function allMissionPhrases(parameters: MissionParametersPayload, plan: PlanLike = 'advanced'): string[] {
+  const resolved = toPlan(plan);
   const values = phraseValues({}, parameters);
   delete values.location;
   const out = new Set<string>();
-  for (const key of poolsForMode(mode)) {
+  for (const key of poolsForPlan(resolved)) {
     if (FLIGHT_ESTIMATE_POOLS.has(key)) continue;
     for (const variant of PHRASE_POOLS[key]) {
       const rendered = renderPhrase(variant, values);
-      if (!/\{[a-z_]+\}/.test(rendered)) out.add(rendered);
+      if (/\{[a-z_]+\}/.test(rendered)) continue;
+      if (!resolved.rtlEnabled && RETURN_WORDING.test(rendered)) continue;
+      out.add(rendered);
     }
   }
+  for (const sentence of PLAN_PHRASES[planPhraseKey(resolved)]) out.add(sentence);
   return [...out];
+}
+
+/**
+ * The flight plan, spoken when the countdown starts from the launch document
+ * (section 5.7). Sentences of the station, not milestone pools: the mission
+ * raises nothing for them. Three variants each; the Simple profile without the
+ * return also says that the heading comes back before the landing.
+ */
+export const PLAN_PHRASES = {
+  'plan.rtl': [
+    'Plano de voo: inspeção com retorno à base e pouso de precisão.',
+    'Plano de voo: inspeção, retorno à base e pouso sobre o marcador.',
+    'Plano de voo: após a inspeção, retorno à base com pouso de precisão.',
+  ],
+  'plan.land_in_place': [
+    'Plano de voo: inspeção com pouso no local após a foto.',
+    'Plano de voo: inspeção e pouso no ponto da foto.',
+    'Plano de voo: após a foto, pouso no local da inspeção.',
+  ],
+  'plan.land_in_place_simple': [
+    'Plano de voo: inspeção com pouso no local após a foto; o rumo volta ao da decolagem antes do pouso.',
+    'Plano de voo: inspeção e pouso no local; antes do pouso, o rumo volta ao da decolagem.',
+    'Plano de voo: após a foto, o rumo volta ao da decolagem e a aeronave pousa no local.',
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
+export type PlanPhraseKey = keyof typeof PLAN_PHRASES;
+
+/** The plan pool of `plan`. */
+export function planPhraseKey(plan: PlanLike): PlanPhraseKey {
+  const { mode, rtlEnabled } = toPlan(plan);
+  if (rtlEnabled) return 'plan.rtl';
+  return mode === 'simple' ? 'plan.land_in_place_simple' : 'plan.land_in_place';
+}
+
+/** One sentence of the plan pool of `plan`; `random` in `[0, 1)` picks the variant. */
+export function planSentence(plan: PlanLike, random: () => number = Math.random): string {
+  const pool = PLAN_PHRASES[planPhraseKey(plan)];
+  return pool[Math.min(pool.length - 1, Math.floor(random() * pool.length))];
 }
 
 /** Said when an alert arrives without a sentence of its own. */
 const ALERT_FALLBACK = 'Alerta de voo recebido. Verifique a aeronave.';
 
 /**
+ * Alert of a launch document the mission refused before commanding anything,
+ * `{field, reason}` (`telemetry/milestones.py:ALERT_KEYS`).
+ */
+export const LAUNCH_REFUSED_ALERT = 'mission.launch_refused';
+
+/**
  * The sentence for a mission alert: the one the mission composed for it, which
  * carries the specific fault ("Alerta de voo: odometria perdida. ..."), or a
- * generic call when the payload has none.
+ * generic call when the payload has none. A refused launch is said with its
+ * reason, "Lançamento recusado: <reason>.".
  */
-export function alertSentence(payload: Readonly<Record<string, unknown>> | null | undefined): string {
+export function alertSentence(payload: Readonly<Record<string, unknown>> | null | undefined, key?: string): string {
+  if (key === LAUNCH_REFUSED_ALERT) {
+    const reason = payload?.reason;
+    const detail = typeof reason === 'string' && reason.trim() ? reason.trim().replace(/\.$/, '') : 'documento inválido';
+    return `Lançamento recusado: ${detail}.`;
+  }
   const text = payload?.text;
   return typeof text === 'string' && text.trim() ? text.trim() : ALERT_FALLBACK;
 }

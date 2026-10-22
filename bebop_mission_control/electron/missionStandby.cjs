@@ -15,10 +15,16 @@
  * commands nothing before its go.
  */
 
+const { EXIT_LAUNCH_REFUSED } = require('./launchRefusal.cjs');
+
 /** Printed by `mission.py --standby` once prepared (`engine/launch.py`). */
 const STANDBY_READY_LINE = '[STANDBY] ready';
 
-/** Fields `mission.py` reads while preparing (`engine/launch.py:CRITICAL_PATHS`). */
+/**
+ * Fields `mission.py` reads while preparing (`engine/launch.py:CRITICAL_PATHS`).
+ * The last three are the profile, the return plan and the launch surface: a
+ * standby prepared for another one never receives the go.
+ */
 const CRITICAL_PATHS = [
   'no_fly',
   'network.drone_ip',
@@ -30,15 +36,26 @@ const CRITICAL_PATHS = [
   'vision.inference_imgsz',
   'kinematics.control_loop_hz',
   'dead_reckoning.enabled',
+  'mission_mode',
+  'rtl.enabled',
+  'platform.takeoff_from_ground',
 ];
 
 const getPath = (doc, path) =>
   path.split('.').reduce((node, key) => (node && typeof node === 'object' ? node[key] : undefined), doc);
 
+/**
+ * What a document that leaves a field out flies with: the station sends the
+ * mode explicitly, a document read from an older store may not.
+ */
+const ABSENT_DEFAULTS = { mission_mode: 'advanced', 'rtl.enabled': true, 'platform.takeoff_from_ground': false };
+
 const normalize = (path, value) => {
+  if ((value === undefined || value === null) && path in ABSENT_DEFAULTS) return ABSENT_DEFAULTS[path];
   if (value === undefined || value === null) return null;
   if (path === 'vision.inference_device') return String(value).trim().toUpperCase();
   if (path === 'vision.inference_imgsz') return Number(value);
+  if (path === 'mission_mode') return String(value).trim().toLowerCase() || ABSENT_DEFAULTS.mission_mode;
   return value;
 };
 
@@ -61,12 +78,19 @@ function standbyKey(doc, driverRunning) {
  *   Starts `mission.py --standby` for `doc`.
  * @param {(text: string) => void} options.log
  * @param {number} [options.retryMs]  Pause before re-preparing after a standby exited.
+ *
+ * A standby that exits with `EXIT_LAUNCH_REFUSED` refused the stored document
+ * itself; preparing it again every `retryMs` would only be refused again. The
+ * manager holds it as refused and prepares nothing until `ensure` receives a
+ * different document, which is what the save of the parameter sheet does
+ * (`refreshStandby` after `bmg:save-parameters`).
  */
 function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
   let current = null; // { child, key, doc, driverRunning, ready, buffer }
   let wanted = null; // { doc, driverRunning }
   let retryTimer = null;
   let disposed = false;
+  let refusedDoc = null; // JSON of the document the last standby refused
 
   const clearRetry = () => {
     if (retryTimer) clearTimeout(retryTimer);
@@ -121,6 +145,12 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
     child.on('close', (code) => {
       if (current === entry) current = null;
       if (entry.taken || entry.released || disposed) return;
+      if (code === EXIT_LAUNCH_REFUSED) {
+        refusedDoc = JSON.stringify(entry.doc);
+        clearRetry();
+        log('[BMG] Missão em espera recusou o documento salvo; nenhuma nova preparação até os parâmetros mudarem.\n');
+        return;
+      }
       log(`[BMG] Missão em espera saiu (código ${code}); nova preparação em ${Math.round(retryMs / 1000)} s.\n`);
       clearRetry();
       retryTimer = setTimeout(() => {
@@ -134,6 +164,10 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
   const ensure = (doc, driverRunning) => {
     if (disposed || !doc || typeof doc !== 'object') return;
     wanted = { doc, driverRunning: Boolean(driverRunning) };
+    if (refusedDoc !== null) {
+      if (JSON.stringify(doc) === refusedDoc) return;
+      refusedDoc = null;
+    }
     const key = standbyKey(doc, driverRunning);
     if (current && current.key === key) return;
     if (current) {
@@ -165,6 +199,7 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
    * when it would hand over the prepared mission.
    */
   const unavailableReason = (doc, driverRunning) => {
+    if (!current && refusedDoc !== null) return 'missão em espera recusou o documento salvo';
     if (!current) return 'nenhuma missão em espera';
     if (!current.ready) return 'missão em espera ainda em preparo';
     if (current.key === standbyKey(doc, driverRunning)) return null;
@@ -189,6 +224,9 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
 
   const isStandby = (pid) => Boolean(current && current.child.pid === pid);
 
+  /** Whether the last standby refused its document and none is prepared until it changes. */
+  const isRefused = () => refusedDoc !== null;
+
   const dispose = () => {
     disposed = true;
     clearRetry();
@@ -197,7 +235,7 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
     if (entry) release(entry, 'estação encerrando');
   };
 
-  return { ensure, take, unavailableReason, pause, isStandby, dispose };
+  return { ensure, take, unavailableReason, pause, isStandby, isRefused, dispose };
 }
 
 module.exports = { CRITICAL_PATHS, STANDBY_READY_LINE, createStandbyManager, standbyKey };

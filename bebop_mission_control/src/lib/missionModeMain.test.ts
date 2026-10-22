@@ -10,13 +10,20 @@ const { MISSION_MODES, normalizeLaunchMode } = require('../../electron/missionMo
 };
 
 describe('normalizeLaunchMode', () => {
-  it('lists the three profiles', () => {
-    expect(MISSION_MODES).toEqual(['simple', 'intermediate', 'advanced']);
+  it('lists the two profiles', () => {
+    expect(MISSION_MODES).toEqual(['simple', 'advanced']);
+  });
+
+  it.each(['intermediate', ' Intermediate '])('refuses the removed profile %j with the migration hint', (raw) => {
+    expect(normalizeLaunchMode({ mission_mode: raw })).toEqual({
+      ok: false,
+      error: 'Modo Intermediário removido: use Avançado sem RTL.',
+    });
   });
 
   it.each([
     ['simple', 'simple'],
-    ['Intermediate', 'intermediate'],
+    ['Simple', 'simple'],
     [' ADVANCED ', 'advanced'],
   ])('normalises %j to %s and keeps the rest of the document', (raw, expected) => {
     const result = normalizeLaunchMode({ mission_mode: raw, kinematics: { countdown_sec: 3 } });

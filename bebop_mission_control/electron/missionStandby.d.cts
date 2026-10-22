@@ -10,6 +10,8 @@ export interface StandbyManager {
   unavailableReason(doc: unknown, driverRunning: boolean): string | null;
   pause(): void;
   isStandby(pid: number | undefined): boolean;
+  /** Whether the last standby exited 78 and none is prepared until the document changes. */
+  isRefused(): boolean;
   dispose(): void;
 }
 export declare function createStandbyManager(options: {

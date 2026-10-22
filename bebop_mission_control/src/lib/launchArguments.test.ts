@@ -72,7 +72,7 @@ describe('bmg:start-mission', () => {
     await endMission(missionSpawn());
   });
 
-  it.each(['simple', 'intermediate', 'advanced'] as const)(
+  it.each(['simple', 'advanced'] as const)(
     'carries the %s mission mode in --params-json, canonical and untouched by the CLI flags',
     async (mode) => {
       const doc = completeDocument({ mission_mode: mode === 'simple' ? 'Simple' : mode });

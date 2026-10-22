@@ -132,6 +132,39 @@ describe('createStandbyManager', () => {
     expect(children).toHaveLength(2);
   });
 
+  it('holds a standby that refused its document (exit 78) instead of retrying every 5 s', () => {
+    manager.ensure(doc(), true);
+    children[0].emit('close', 78, null);
+    vi.advanceTimersByTime(60000);
+    expect(children).toHaveLength(1);
+    expect(manager.isRefused()).toBe(true);
+    expect(manager.unavailableReason(doc(), true)).toBe('missão em espera recusou o documento salvo');
+    manager.ensure(doc(), false);
+    expect(children).toHaveLength(1);
+  });
+
+  it('prepares again once the saved document changes after a refusal', () => {
+    manager.ensure(doc(), true);
+    children[0].emit('close', 78, null);
+    manager.ensure(doc({ kinematics: { countdown_sec: 10, target_altitude_m: 1.3, control_loop_hz: 15 } }), true);
+    expect(children).toHaveLength(2);
+    expect(manager.isRefused()).toBe(false);
+  });
+
+  it('recycles a standby prepared for another mode, plan or launch surface', () => {
+    for (const changed of [
+      { mission_mode: 'simple' },
+      { rtl: { enabled: false } },
+      { platform: { takeoff_from_ground: true } },
+    ]) {
+      expect(standbyKey(doc(changed), true)).not.toBe(standbyKey(doc(), true));
+    }
+    expect(standbyKey(doc({ mission_mode: ' Simple ' }), true)).toBe(standbyKey(doc({ mission_mode: 'simple' }), true));
+    expect(standbyKey(doc(), true)).toBe(
+      standbyKey(doc({ mission_mode: 'advanced', rtl: { enabled: true }, platform: { takeoff_from_ground: false } }), true)
+    );
+  });
+
   it('knows its pid and stops on dispose', () => {
     manager.ensure(doc(), true);
     expect(manager.isStandby(children[0].pid)).toBe(true);
