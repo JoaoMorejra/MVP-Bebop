@@ -132,6 +132,37 @@ modelo de sonar; nenhum teste sem a aeronave os prova.
 - Degrau ou spike de `vz` na borda: promover `"vz_gated"`.
 - `fw_alt` imune ao sonar e `z_rel` com deriva: habilitar `altitude_anchor_enabled`.
 
+### 4.3.1 Identificação do degrau do totem (F-ID)
+
+Pré-requisito: o log persistente de missão da estação, em
+`<userData>/logs/mission_<AAAAMMDD_HHMMSS>.log` (os 30 mais recentes ficam guardados). Cada
+ensaio abaixo é um voo; anotar o nome do arquivo de log ao lado da caixa.
+
+- [ ] **F-ID-1 Identificação sem voo (aeronave na mão, motores desligados).** Levar o Bebop
+  ligado do topo do totem até fora dele, à altura constante, e voltar. Registrar `[ALT_PROBE]` e
+  `/bebop/odom`.
+  - Se o `AltitudeChanged` (`fw_alt`) saltar cerca de 1,0 m: `calibration.firmware_altitude_source = "sonar_fused"`.
+  - Se o `speedZ` mostrar um pico na borda: o firmware está em M2.
+  - [A CONFIRMAR] se o firmware publica altitude com os motores desligados. Se não publicar, passar ao F-ID-2.
+- [ ] **F-ID-2 Pairado baixo e travessia lenta.** Travessia a 0,05 m/s com o operador pronto no
+  Ctrl+C (aborta com o foco em qualquer controle da cabine). Voar uma vez com
+  `calibration.altitude_estimator = "legacy"` e outra com `"terrain_kf"`, e comparar os dois logs
+  persistidos (`[ALT_PROBE z_rel fw_alt]`, `[VERT_KF nis=... accepted=... T=...]`, `[PLATFORM ...]`).
+  O desfecho classifica o firmware:
+  - **M1:** a aeronave afunda ~1 m ao sair e sobe ~1 m ao reentrar, e o `speedZ` mostra o movimento.
+  - **M2:** o `speedZ` mostra um pico sem movimento real; com `legacy` o `z_rel` fica com degrau permanente.
+  - **M3:** nada acontece.
+- [ ] **F-0 (revisto).** Medir a altura real e o overshoot do fim da decolagem nativa sobre o
+  totem e sobre o solo (`[TIMING] t_takeoff_confirmed alt=`, `Liftoff transient`). Atualizar
+  `NATIVE_HOVER_HEIGHT_M` (`mission_mode.py`) somente se divergir mais de 0,10 m, mantendo a
+  paridade com `parameter_conflicts.FIRMWARE_HOVER_HEIGHT_M` e o simulador (há teste).
+
+**Regra de decisão:**
+- M2 confirmado: `altitude_estimator = "terrain_kf"` vira o padrão.
+- M1 confirmado: `"terrain_kf"` mais a calibração dos feedforwards da guarda (`sag_feedforward_mps`,
+  `rise_feedforward_mps`, F-4).
+- `AltitudeChanged` imune ao sonar: `firmware_altitude_source = "baro"`, com âncora.
+
 ### 4.4 Limite da bancada `--no-fly`
 Ensaiar o padrão lateral antes do voo com `mission.py --no-fly` (nunca armar motores nesse ensaio): conferir
 no log a sequência `[STEP 2: Lateral Left Search]` com `vy > 0` e `vx = 0`, o freeze do Stage 3, o
