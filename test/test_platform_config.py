@@ -80,10 +80,11 @@ def supervisor_for(params: MissionParameters) -> OdometrySupervisor:
     )
 
 
-def test_ceiling_is_measured_above_the_pad():
+def test_ceiling_is_measured_above_the_pad_and_fixed_there():
     params = pad_params(1.8, 1.0)
-    params.kinematics.altitude_ceiling_margin_m = 0.6
-    assert supervisor_for(params).altitude_ceiling == pytest.approx(1.4)
+    for margin in (0.0, 0.6, 1.5):
+        params.kinematics.altitude_ceiling_margin_m = margin
+        assert supervisor_for(params).altitude_ceiling == pytest.approx(1.6)
 
 
 def test_ceiling_is_clamped_by_the_venue():
@@ -97,8 +98,8 @@ def test_a_venue_above_the_ceiling_does_not_raise_it():
     params = pad_params(1.8, 1.0)
     params.kinematics.altitude_ceiling_margin_m = 0.6
     params.platform.ceiling_allowance_m = 0.5
-    params.platform.venue_ceiling_agl_m = 2.6
-    assert supervisor_for(params).altitude_ceiling == pytest.approx(1.4)
+    params.platform.venue_ceiling_agl_m = 2.8
+    assert supervisor_for(params).altitude_ceiling == pytest.approx(1.6)
 
 
 def test_ceiling_without_a_platform_section_is_unchanged():
@@ -124,10 +125,10 @@ def test_the_allowance_is_granted_only_inside_the_guard_and_never_past_the_venue
             odom._platform_report = PlatformReport(state, guarded, 0.6, 0.54, -1, 0.0)
         return odom.altitude_ceiling
 
-    assert ceiling(PlatformState.ENTERING, 2.6) == pytest.approx(1.6)
-    assert ceiling(PlatformState.ENTERING, None) == pytest.approx(1.9)
-    assert ceiling(PlatformState.OFF, 2.6) == pytest.approx(1.4)
-    assert ceiling(None, 2.6) == pytest.approx(1.4)
+    assert ceiling(PlatformState.ENTERING, 2.8) == pytest.approx(1.8)
+    assert ceiling(PlatformState.ENTERING, None) == pytest.approx(2.1)
+    assert ceiling(PlatformState.OFF, 2.8) == pytest.approx(1.6)
+    assert ceiling(None, 2.8) == pytest.approx(1.6)
 
 
 # ------------------------------------------------------------- envelope audit
@@ -202,12 +203,20 @@ def test_each_platform_envelope_violation_is_reported(field_name, value):
     assert expected in found
 
 
-def test_a_venue_ceiling_close_above_the_safety_ceiling_is_reported():
-    """target + margin = 2.4 m over the floor; a 2.5 m venue leaves 0.1 m of it."""
+def test_a_venue_ceiling_close_above_the_safety_ceiling_is_reported_from_the_floor():
+    """From the floor, target + margin = 2.4 m; a 2.5 m venue leaves 0.1 m of it."""
     params = pad_params(1.8, 1.0)
+    params.platform.takeoff_from_ground = True
     params.kinematics.altitude_ceiling_margin_m = 0.6
     params.platform.venue_ceiling_agl_m = 2.5
     assert platform_divergences(params) == ["platform.venue_ceiling_agl_m"]
+
+
+def test_the_venue_capping_the_fixed_pad_top_ceiling_is_by_design():
+    """On the pad top the ceiling is fixed and capped by the venue (D2); not a divergence."""
+    params = pad_params(1.8, 1.0)
+    params.platform.venue_ceiling_agl_m = 2.5
+    assert platform_divergences(params) == []
 
 
 def test_the_target_floor_is_judged_above_the_pad():

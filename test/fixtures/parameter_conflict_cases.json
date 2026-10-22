@@ -62,14 +62,13 @@
       }
     },
     {
-      "name": "e03_e04_operator_case",
+      "name": "e04_operator_case_h01_m0",
       "overrides": {
         "kinematics.target_altitude_m": 0.1,
         "kinematics.altitude_ceiling_margin_m": 0.0
       },
       "expect": {
         "errors": [
-          "E03",
           "E04"
         ],
         "warnings": [
@@ -77,33 +76,31 @@
           "W15"
         ]
       },
-      "note": "operator case h=0.1, m=0.0"
+      "note": "operator case h=0.1, m=0.0 from the floor: E03 retired, the ratchet covers the native takeoff"
     },
     {
-      "name": "e03_ceiling_below_hover",
+      "name": "e03_retired_ceiling_below_hover",
       "overrides": {
         "kinematics.target_altitude_m": 0.5,
         "kinematics.altitude_ceiling_margin_m": 0.45
       },
       "expect": {
-        "errors": [
-          "E03"
-        ],
+        "errors": [],
         "warnings": []
-      }
+      },
+      "note": "E03 retired (ceiling ratchet, section 3.5)"
     },
     {
-      "name": "e03_boundary_ceiling_at_hover",
+      "name": "w01_retired_ceiling_at_hover",
       "overrides": {
         "kinematics.target_altitude_m": 0.5,
         "kinematics.altitude_ceiling_margin_m": 0.5
       },
       "expect": {
         "errors": [],
-        "warnings": [
-          "W01"
-        ]
-      }
+        "warnings": []
+      },
+      "note": "W01 retired with E03"
     },
     {
       "name": "operator_case_h01_m09",
@@ -114,7 +111,6 @@
       "expect": {
         "errors": [],
         "warnings": [
-          "W01",
           "W03",
           "W15"
         ]
@@ -130,9 +126,7 @@
         "errors": [
           "E04"
         ],
-        "warnings": [
-          "W01"
-        ]
+        "warnings": []
       }
     },
     {
@@ -143,7 +137,6 @@
       "expect": {
         "errors": [],
         "warnings": [
-          "W01",
           "W02"
         ]
       }
@@ -630,7 +623,6 @@
       "expect": {
         "errors": [],
         "warnings": [
-          "W01",
           "W03",
           "W13"
         ]
@@ -646,6 +638,95 @@
         "errors": [],
         "warnings": []
       }
+    },
+    {
+      "name": "e10_below_the_pad_top_minimum",
+      "overrides": {
+        "platform.height_m": 1.0,
+        "platform.takeoff_from_ground": false,
+        "kinematics.target_altitude_m": 1.25
+      },
+      "expect": {
+        "errors": [
+          "E10"
+        ],
+        "warnings": []
+      },
+      "note": "pad 1.0: the minimum over the floor is 1.30 m (D1)"
+    },
+    {
+      "name": "e10_boundary_at_the_pad_top_minimum",
+      "overrides": {
+        "platform.height_m": 1.0,
+        "platform.takeoff_from_ground": false,
+        "kinematics.target_altitude_m": 1.3
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e10_above_the_maximum",
+      "overrides": {
+        "kinematics.target_altitude_m": 2.05
+      },
+      "expect": {
+        "errors": [
+          "E10"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e10_ground_flag_lowers_the_minimum",
+      "overrides": {
+        "platform.height_m": 1.0,
+        "platform.takeoff_from_ground": true,
+        "kinematics.target_altitude_m": 0.5
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e11_against_the_venue_ceiling",
+      "overrides": {
+        "platform.venue_ceiling_agl_m": 1.9,
+        "kinematics.target_altitude_m": 1.85
+      },
+      "expect": {
+        "errors": [
+          "E11"
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e11_boundary_venue_headroom",
+      "overrides": {
+        "platform.venue_ceiling_agl_m": 1.9,
+        "kinematics.target_altitude_m": 1.8
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "e04_w02_silent_on_the_pad_top",
+      "overrides": {
+        "platform.height_m": 1.0,
+        "platform.takeoff_from_ground": false,
+        "kinematics.target_altitude_m": 1.8,
+        "kinematics.altitude_ceiling_margin_m": 0.04
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      },
+      "note": "the margin is ignored on the pad top (D2)"
     }
   ]
 }

@@ -147,7 +147,7 @@ def test_the_audit_logs_each_conflict_as_one_json_line_and_never_raises():
         target.removeHandler(handler)
     lines = [line for line in handler.lines if line.startswith(f"[{CONFLICT_TAG}] ")]
     records = [json.loads(line[len(CONFLICT_TAG) + 3 :]) for line in lines]
-    assert [r["id"] for r in records if r["severity"] == "error"] == ["E03", "E04", "E05"]
+    assert [r["id"] for r in records if r["severity"] == "error"] == ["E04", "E05"]
     assert all({"id", "severity", "paths", "title", "message", "fix"} <= set(r) for r in records)
 
 

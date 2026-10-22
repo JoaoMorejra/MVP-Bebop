@@ -51,15 +51,15 @@ def test_dump_defaults_prints_the_factory_document_and_touches_nothing(tmp_path)
 
 def test_the_station_document_is_merged_over_the_file_without_flags(monkeypatch, tmp_path):
     stored = {"kinematics": {"target_altitude_m": 1.8, "countdown_sec": 6.0}, "lateral_pid": {"kp": 0.9}}
-    sent = {"kinematics": {"target_altitude_m": 2.2, "forward_cruise_velocity": 0.15}}
+    sent = {"kinematics": {"target_altitude_m": 1.9, "forward_cruise_velocity": 0.15}}
     params, config = resolve(monkeypatch, tmp_path, ["--no-fly", "--params-json", json.dumps(sent)], stored)
 
-    assert params.kinematics.target_altitude_m == pytest.approx(2.2)
+    assert params.kinematics.target_altitude_m == pytest.approx(1.9)
     assert params.kinematics.forward_cruise_velocity == pytest.approx(0.15)
     assert params.kinematics.countdown_sec == pytest.approx(6.0)
     assert params.lateral_pid.kp == pytest.approx(0.9)
     written = json.loads(config.read_text())
-    assert written["kinematics"]["target_altitude_m"] == pytest.approx(2.2)
+    assert written["kinematics"]["target_altitude_m"] == pytest.approx(1.9)
 
 
 def test_a_zero_countdown_is_respected(monkeypatch, tmp_path):

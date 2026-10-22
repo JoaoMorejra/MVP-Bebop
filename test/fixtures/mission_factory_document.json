@@ -7,7 +7,9 @@
     "altitude_anchor_gate_m": 0.25,
     "altitude_anchor_tau_sec": 6.0,
     "altitude_estimator": "legacy",
+    "altitude_measurement_noise_m": 0.1,
     "altitude_probe_enabled": true,
+    "firmware_altitude_source": "unknown",
     "mad_outlier_sigma": 3.0,
     "max_ground_dispersion_m": 0.15,
     "min_ground_samples": 12,
@@ -16,8 +18,12 @@
     "plausibility_max_speed_mps": 1.0,
     "plausibility_reject_streak": 3,
     "sample_buffer_size": 50,
+    "terrain_step_noise_scale": 16.0,
+    "vertical_accel_noise_mps2": 1.5,
+    "vertical_lag_tau_sec": 0.35,
     "vz_max_accel_mps2": 5.0,
     "vz_max_speed_mps": 1.5,
+    "vz_measurement_noise_mps": 0.08,
     "vz_reject_streak": 3
   },
   "dead_reckoning": {
@@ -150,6 +156,7 @@
     "rise_feedforward_mps": 0.0,
     "sag_feedforward_mps": 0.0,
     "sonar_half_angle_deg": 20.0,
+    "takeoff_from_ground": false,
     "venue_ceiling_agl_m": null
   },
   "rtl": {
@@ -169,6 +176,7 @@
     "deadband_m": 0.03,
     "descent_stall_epsilon_m": 0.04,
     "descent_stall_sec": 3.0,
+    "enabled": true,
     "final_hover_delay_sec": 2.0,
     "kd": 0.01,
     "kp": 0.15,
