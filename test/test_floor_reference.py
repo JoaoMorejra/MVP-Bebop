@@ -19,6 +19,7 @@ import pytest
 from mvp_mission_bebop.actuators import simulator as simulator_module
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
+from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.controllers.geometry import CameraIntrinsics, project_to_ground
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.parameters import MissionParameters
@@ -117,7 +118,9 @@ def test_the_takeoff_milestone_still_speaks_the_height_above_the_floor(monkeypat
     params = pad_params()
     odom = OdometrySupervisor(params.kinematics, params.timeouts, params.calibration, params.platform)
     TakeoffStep()._call_takeoff_once_confirmed(StepContext(params, RecordingDrone(), odom), 1.0)
-    assert emitted == [("mission.takeoff", {"altitude_m": 1.8})]
+    assert emitted == [
+        ("mission.takeoff", {"altitude_m": 1.8, "takeoff_surface": "platform", "target_altitude_m": 1.8})
+    ]
 
 
 def firmware_hover_context(monkeypatch, params, firmware_altitude=1.0):
@@ -136,10 +139,12 @@ def firmware_hover_context(monkeypatch, params, firmware_altitude=1.0):
             break
         time.sleep(0.002)
     failsafe = FailsafeSupervisor(drone, odom, params.timeouts)
-    return StepContext(params, drone, odom, failsafe)
+    ctx = StepContext(params, drone, odom, failsafe)
+    ctx.governor = AltitudeHoldGovernor(target_altitude=params.relative_target_altitude_m, config=params.governor)
+    return ctx
 
 
-def test_a_firmware_hover_above_the_relative_target_does_not_ascend(monkeypatch):
+def test_a_firmware_hover_above_the_relative_target_descends_without_a_climb_window(monkeypatch):
     params = pad_params()
     ctx = firmware_hover_context(monkeypatch, params)
     windows = []
@@ -151,16 +156,16 @@ def test_a_firmware_hover_above_the_relative_target_does_not_ascend(monkeypatch)
 
     ctx.failsafe.climb_window = recording_window
 
-    assert TakeoffStep()._ascend(ctx) is StepStatus.SUCCESS
+    assert TakeoffStep()._acquire_altitude(ctx) is StepStatus.SUCCESS
     assert windows == []
-    assert ctx.odom_supervisor.snapshot().relative_altitude == pytest.approx(1.0, abs=0.02)
+    assert ctx.odom_supervisor.snapshot().relative_altitude == pytest.approx(0.8, abs=params.governor.deadband_m + 0.02)
 
 
 def test_a_firmware_hover_at_one_metre_stays_under_the_pad_ceiling(monkeypatch):
     params = pad_params()
     ctx = firmware_hover_context(monkeypatch, params)
-    TakeoffStep()._ascend(ctx)
-    assert ctx.odom_supervisor.altitude_ceiling == pytest.approx(1.4)
+    TakeoffStep()._acquire_altitude(ctx)
+    assert ctx.odom_supervisor.altitude_ceiling == pytest.approx(1.6)
     assert not ctx.odom_supervisor.is_ceiling_breached()
 
 

@@ -393,11 +393,17 @@ def test_the_guard_reduces_the_sink_on_leaving_the_pad():
     assert guarded.stopped_while_off_target, "translated with more than 0.15 m of vertical error"
 
 
-def test_the_false_climb_on_re_entry_breaches_the_ceiling_without_the_guard():
-    """Regression of risk 1.5-M1: emergency landing in the air over the pad edge."""
+def test_the_false_climb_on_re_entry_is_bounded_by_the_fixed_pad_top_ceiling_without_the_guard():
+    """Risk 1.5-M1: the unguarded re-entry still climbs well off target.
+
+    It used to breach the 1.40 m ceiling of ``target + margin`` and land in the
+    air over the pad edge. The pad-top ceiling is now fixed at
+    ``max(target, native height) + 0.60`` (D2): the climb stays an altitude
+    error the guard exists to remove, under an absolute envelope.
+    """
     unguarded = fly_across_the_edge(guarded=False, inbound=True)
     assert unguarded.max_altitude > 1.4
-    assert unguarded.breached
+    assert unguarded.max_altitude < unguarded.ceiling_at_peak == pytest.approx(1.6)
 
 
 def test_the_guard_keeps_the_false_climb_under_the_effective_ceiling():

@@ -27,11 +27,13 @@ import pytest
 
 from mvp_mission_bebop.controllers.altitude_hold import AltitudeHoldGovernor
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
+from mvp_mission_bebop.estimation.ceiling_schedule import TOTEM_CEILING_HEADROOM_M
 from mvp_mission_bebop.estimation.platform_monitor import (
     DIRECTION_CONFIRM_SAMPLES,
     HYSTERESIS_M,
     PlatformState,
 )
+from mvp_mission_bebop.mission_mode import NATIVE_HOVER_HEIGHT_M
 from mvp_mission_bebop.parameters import MissionParameters
 from mvp_mission_bebop.steps import search as search_module
 from mvp_mission_bebop.steps.base import StepStatus
@@ -271,7 +273,7 @@ def test_motion_along_x_never_arms_the_guard(clock, edge):
 def test_the_return_from_the_right_enters_the_pad_through_entering(clock, edge):
     params = pad_params(edge)
     flight = Flight(params, clock)
-    base = TARGET_FLOOR_M - PAD_HEIGHT_M + CEILING_MARGIN_M
+    base = max(TARGET_FLOOR_M - PAD_HEIGHT_M, NATIVE_HOVER_HEIGHT_M) + TOTEM_CEILING_HEADROOM_M
     assert flight.odom.altitude_ceiling == pytest.approx(base)
     for s in round_trip()[: int(round(FAR_M / STEP_M)) + 1]:
         flight.at(s, "y", speed=0.2)

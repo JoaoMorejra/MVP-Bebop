@@ -30,7 +30,7 @@ from typing import Final, Optional, Tuple
 from mvp_mission_bebop.parameters import CalibrationConfig
 
 #: Values ``calibration.altitude_estimator`` accepts.
-ALTITUDE_ESTIMATORS: Final[Tuple[str, ...]] = ("legacy", "vz_gated")
+ALTITUDE_ESTIMATORS: Final[Tuple[str, ...]] = ("legacy", "vz_gated", "terrain_kf")
 
 #: Longest integration step, in seconds; the same cap as the driver's
 #: ``OdometryIntegrator(0.5)``.
