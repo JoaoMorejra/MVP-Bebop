@@ -119,8 +119,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--platform-edge", type=float, default=None, help="takeoff point to pad edge, metres")
     parser.add_argument("--sonar-half-angle", type=float, default=None, help="sonar beam half-angle, degrees")
     parser.add_argument("--sonar-hold-gain", type=float, default=None, help="firmware sonar hold gain, 1/s")
-    parser.add_argument("--fw-altitude-source", choices=("inertial", "sonar"), default=None,
+    parser.add_argument("--fw-altitude-source", choices=("inertial", "sonar", "baro", "sonar_fused"), default=None,
                         help="what states/altitude reports")
+    parser.add_argument("--altitude-source", dest="fw_altitude_source", choices=("baro", "sonar_fused"),
+                        help="what states/altitude reports: barometric, or the height over the terrain below")
+    parser.add_argument("--firmware-step-model", choices=("m1", "m2", "m3"), default=None,
+                        help="firmware answer to a terrain step: sonar hold, speed spike, or none")
+    parser.add_argument("--sonar-hold-any-gaz", action="store_true",
+                        help="m1: the sonar hold acts with any gaz, not only with gaz exactly zero")
+    parser.add_argument("--takeoff-overshoot-m", type=float, default=None,
+                        help="launch profile overshoot past the takeoff height, metres")
     parser.add_argument("--no-odometry-drift", action="store_true",
                         help="zero the odometric speed bias and its random walk; noise is kept")
     return parser
@@ -179,6 +187,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ("sonar_half_angle_deg", args.sonar_half_angle),
                 ("sonar_hold_gain", args.sonar_hold_gain),
                 ("fw_altitude_source", args.fw_altitude_source),
+                ("firmware_step_model", args.firmware_step_model),
+                ("takeoff_overshoot_m", args.takeoff_overshoot_m),
+                ("sonar_hold_any_gaz", True if args.sonar_hold_any_gaz else None),
             )
             if value is not None
         }

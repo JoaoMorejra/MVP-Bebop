@@ -325,8 +325,8 @@ def test_drift_along_x_leaves_the_pad_as_travel_along_y_does():
     assert sonar_range(1.1, 0.0, 0.8, 1.0, 1.0, 20.0) == pytest.approx(sonar_range(0.0, 1.1, 0.8, 1.0, 1.0, 20.0))
 
 
-def cruise_across_the_edge(gaz: float, gain: float = 2.0):
-    plant = airborne(PlantConfig(**PAD, sonar_hold_gain=gain, takeoff_altitude_m=0.8))
+def cruise_across_the_edge(gaz: float, gain: float = 2.0, **config):
+    plant = airborne(PlantConfig(**PAD, sonar_hold_gain=gain, takeoff_altitude_m=0.8, **config))
     start = plant.true_altitude
     plant.pcmd(plant.time, 0.0, 0.2, gaz, 0.0)
     lowest = start
@@ -381,9 +381,83 @@ def test_the_firmware_altitude_can_follow_the_sonar():
         ("sonar_half_angle_deg", 90.0),
         ("sonar_hold_gain", -1.0),
         ("sonar_hold_max_mps", 0.0),
-        ("fw_altitude_source", "baro"),
+        ("fw_altitude_source", "laser"),
+        ("firmware_step_model", "m4"),
+        ("takeoff_overshoot_m", -0.1),
     ],
 )
 def test_an_out_of_range_pad_config_is_refused(field, value):
     with pytest.raises((TypeError, ValueError)):
         PlantConfig(**{field: value})
+
+
+# --------------------------------------------- firmware terrain-step models (section 6)
+
+
+def odometry_z(events):
+    return [event.z for event in events if isinstance(event, OdometrySample)]
+
+
+def cruise_recording(gaz: float, **config):
+    plant = airborne(PlantConfig(**PAD, takeoff_altitude_m=0.8, **config))
+    plant.pcmd(plant.time, 0.0, 0.2, gaz, 0.0)
+    events = []
+    t = plant.time
+    while plant.true_position[1] < 3.0:
+        t += 0.01
+        events.extend(plant.advance(t))
+    return plant, events
+
+
+def test_m1_with_any_gaz_keeps_the_hold_while_the_mission_commands_gaz():
+    _plant, start, lowest = cruise_across_the_edge(gaz=0.01, sonar_hold_any_gaz=True)
+    assert start - lowest > 0.7
+
+
+def test_m2_never_moves_the_airframe_and_publishes_the_step_as_speed():
+    plant, events = cruise_recording(0.0, firmware_step_model="m2", sonar_hold_gain=2.0)
+    assert plant.true_altitude == pytest.approx(0.8, abs=1e-6)
+    samples = odometry_z(events)
+    assert max(samples) - min(samples) == pytest.approx(1.0, abs=0.02)
+    assert samples[-1] == pytest.approx(0.8 + 1.0, abs=0.02)
+
+
+def test_m2_gives_the_spike_back_on_re_entry():
+    plant, _events = cruise_recording(0.0, firmware_step_model="m2")
+    plant.pcmd(plant.time, 0.0, -0.2, 0.0, 0.0)
+    events = []
+    t = plant.time
+    while plant.true_position[1] > 0.0:
+        t += 0.01
+        events.extend(plant.advance(t))
+    run(plant, plant.time + 1.0)
+    assert odometry_z(events)[-1] == pytest.approx(0.8, abs=0.03)
+    assert plant.true_altitude == pytest.approx(0.8, abs=1e-6)
+
+
+def test_m3_neither_moves_nor_publishes_anything_at_the_edge():
+    plant, events = cruise_recording(0.0, firmware_step_model="m3", sonar_hold_gain=2.0)
+    assert plant.true_altitude == pytest.approx(0.8, abs=1e-6)
+    samples = odometry_z(events)
+    assert max(samples) - min(samples) < 0.02
+
+
+def test_the_takeoff_overshoot_climbs_past_the_height_and_comes_back_damped():
+    plant = BebopPlant(PlantConfig(**QUIET, takeoff_overshoot_m=0.25))
+    plant.takeoff(0.0)
+    peak = 0.0
+    t = 0.0
+    while plant.state is not FlyingState.HOVERING and t < 10.0:
+        t += 0.01
+        plant.advance(t)
+        peak = max(peak, plant.true_altitude)
+    assert peak == pytest.approx(1.25, abs=0.01)
+    run(plant, plant.time + 6.0)
+    assert plant.true_altitude == pytest.approx(1.0, abs=0.02)
+
+
+def test_the_firmware_altitude_can_be_barometric_or_over_the_terrain():
+    plant, _events = cruise_recording(0.0, firmware_step_model="m3", fw_altitude_source="sonar_fused")
+    assert plant.firmware_altitude == pytest.approx(plant.true_altitude + 1.0)
+    baro = BebopPlant(PlantConfig(**PAD, fw_altitude_source="baro"))
+    assert baro.firmware_altitude == baro.true_altitude

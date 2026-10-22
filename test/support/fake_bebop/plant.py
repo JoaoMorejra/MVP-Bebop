@@ -68,7 +68,24 @@ EMERGENCY_LANDING_MPS: Final[float] = 0.8
 #: Time ``EMERGENCY`` is held on the ground before ``LANDED``, seconds.
 EMERGENCY_SETTLE_SEC: Final[float] = 0.5
 #: Sources ``states/altitude`` can be published from.
-FW_ALTITUDE_SOURCES: Final[frozenset] = frozenset({"inertial", "sonar"})
+FW_ALTITUDE_SOURCES: Final[frozenset] = frozenset({"inertial", "sonar", "baro", "sonar_fused"})
+
+#: How the firmware answers a terrain step under the sonar (section 1.3 of
+#: ``docs/PROMPT_IMPLEMENTACAO_MODOS_RTL_TOTEM_ALTITUDE.md``): ``m1`` moves the
+#: airframe to keep the sonar range (the sonar hold), ``m2`` registers the
+#: step as a vertical speed spike and leaves the airframe where it is, ``m3``
+#: does nothing.
+FIRMWARE_STEP_MODELS: Final[frozenset] = frozenset({"m1", "m2", "m3"})
+
+#: Odometry samples an ``m2`` speed spike is spread over.
+STEP_SPIKE_SAMPLES: Final[int] = 2
+
+#: Rate at which the firmware brings a launch overshoot back to its takeoff
+#: height once it reports hovering, 1/s.
+OVERSHOOT_RETURN_GAIN: Final[float] = 1.0
+
+#: Distance to the takeoff height at which the overshoot return ends, metres.
+OVERSHOOT_RETURN_BAND_M: Final[float] = 0.01
 
 
 def _number(name: str, value: object) -> float:
@@ -199,9 +216,25 @@ class PlantConfig:
         document only for an exactly zero vertical command. ``0.0`` disables it.
     sonar_hold_max_mps : float
         Saturation of the sonar hold speed, m/s (> 0).
+    sonar_hold_any_gaz : bool
+        Model ``m1`` only: the hold acts with any ``gaz``, added to the commanded
+        speed, instead of only with ``gaz`` exactly zero (the worst case).
+    firmware_step_model : str
+        ``"m1"`` (the default, the sonar hold of ``sonar_hold_gain``), ``"m2"``
+        (the airframe does not move; the published ``speedZ`` carries a spike of
+        area ``+h`` leaving the pad and ``-h`` entering it, over
+        :data:`STEP_SPIKE_SAMPLES` samples, which the driver integrates into
+        ``odom.z``) or ``"m3"`` (no reaction). ``m2`` and ``m3`` ignore
+        ``sonar_hold_gain``.
+    takeoff_overshoot_m : float
+        The launch profile climbs this far past ``takeoff_altitude_m`` before it
+        reports hovering, then returns to it at :data:`OVERSHOOT_RETURN_GAIN`
+        (field symptom A), metres (>= 0).
     fw_altitude_source : str
-        What ``states/altitude`` reports: ``"inertial"`` (true altitude above the
-        takeoff point, the default) or ``"sonar"`` (the sonar range).
+        What ``states/altitude`` reports: ``"inertial"`` or ``"baro"`` (true
+        altitude above the takeoff point, the default), ``"sonar"`` (the
+        nearest-echo sonar range) or ``"sonar_fused"`` (the height over the
+        terrain directly below, ``z - surface``).
     seed : int
         Seed of the noise generator.
 
@@ -237,6 +270,9 @@ class PlantConfig:
     sonar_half_angle_deg: float = 20.0
     sonar_hold_gain: float = 0.0
     sonar_hold_max_mps: float = 0.5
+    sonar_hold_any_gaz: bool = False
+    firmware_step_model: str = "m1"
+    takeoff_overshoot_m: float = 0.0
     fw_altitude_source: str = "inertial"
     seed: int = 0
 
@@ -246,7 +282,7 @@ class PlantConfig:
         non_negative = ("latency_sec", "speed_noise_mps", "speed_bias_walk_mps", "max_tilt_rad",
                         "battery_drain_flying_pct_min", "battery_drain_ground_pct_min",
                         "flat_trim_ack_sec", "photo_busy_sec", "photo_taken_sec", "platform_height_m",
-                        "sonar_hold_gain")
+                        "sonar_hold_gain", "takeoff_overshoot_m")
         for item in fields(self):
             value = getattr(self, item.name)
             if item.name in ("gain_mps", "speed_bias_mps"):
@@ -262,6 +298,12 @@ class PlantConfig:
             elif item.name == "fw_altitude_source":
                 if value not in FW_ALTITUDE_SOURCES:
                     raise ValueError(f"fw_altitude_source must be one of {sorted(FW_ALTITUDE_SOURCES)}, got {value!r}")
+            elif item.name == "firmware_step_model":
+                if value not in FIRMWARE_STEP_MODELS:
+                    raise ValueError(f"firmware_step_model must be one of {sorted(FIRMWARE_STEP_MODELS)}, got {value!r}")
+            elif item.name == "sonar_hold_any_gaz":
+                if not isinstance(value, bool):
+                    raise TypeError(f"sonar_hold_any_gaz must be a bool, got {type(value).__name__}")
             else:
                 _number(item.name, value)
                 if item.name in positive and value <= 0.0:
@@ -450,6 +492,14 @@ class BebopPlant:
         self._odometry_last: Optional[float] = None
         self._events: List[PlantEvent] = []
         self._hold_reference: Optional[float] = None
+        #: Surface under the airframe at the last integration step, for the
+        #: ``m2`` speed spike on a terrain step.
+        self._last_surface = 0.0
+        #: ``m2``: speed spike area still to publish, metres, and samples left.
+        self._spike_area = 0.0
+        self._spike_samples = 0
+        #: Whether the launch overshoot is still being given back.
+        self._overshoot_return = False
 
     # ------------------------------------------------------------- readouts
 
@@ -487,8 +537,13 @@ class BebopPlant:
 
     @property
     def firmware_altitude(self) -> float:
-        """``states/altitude``: true altitude above the takeoff point, or the sonar range."""
-        return self.sonar_range if self.config.fw_altitude_source == "sonar" else self._position[2]
+        """``states/altitude``: true altitude above the takeoff point, the sonar range, or the height over the terrain."""
+        source = self.config.fw_altitude_source
+        if source == "sonar":
+            return self.sonar_range
+        if source == "sonar_fused":
+            return self._position[2] - self.surface
+        return self._position[2]
 
     @property
     def latched_pcmd(self) -> Vector3:
@@ -647,9 +702,10 @@ class BebopPlant:
             if self.time >= self._ramp_until - 1e-12:
                 self._ramp_until = None
                 self._set_state(FlyingState.TAKINGOFF)
-        elif state is FlyingState.TAKINGOFF and z >= self.config.takeoff_altitude_m - 1e-9:
-            self._position[2] = self.config.takeoff_altitude_m
+        elif state is FlyingState.TAKINGOFF and z >= self.config.takeoff_altitude_m + self.config.takeoff_overshoot_m - 1e-9:
+            self._position[2] = self.config.takeoff_altitude_m + self.config.takeoff_overshoot_m
             self._velocity[2] = 0.0
+            self._overshoot_return = self.config.takeoff_overshoot_m > 0.0
             self._set_state(FlyingState.HOVERING)
             self._update_piloted_state()
         elif state in (FlyingState.LANDING, FlyingState.EMERGENCY_LANDING) and z <= self.surface:
@@ -679,14 +735,26 @@ class BebopPlant:
         if state in PILOTED_STATES:
             horizontal_target = tuple(self._pcmd[i] * cfg.gain_mps[i] * cfg.efficiency for i in (0, 1))
             vertical_target = self._pcmd[2] * cfg.gain_mps[2] * cfg.efficiency
-            if cfg.sonar_hold_gain > 0.0 and self._pcmd[2] == 0.0:
+            holding = (
+                cfg.firmware_step_model == "m1"
+                and cfg.sonar_hold_gain > 0.0
+                and (self._pcmd[2] == 0.0 or cfg.sonar_hold_any_gaz)
+            )
+            if holding:
                 reading = self.sonar_range
                 if self._hold_reference is None:
                     self._hold_reference = reading
                 hold = -cfg.sonar_hold_gain * (reading - self._hold_reference)
-                vertical_target = max(-cfg.sonar_hold_max_mps, min(cfg.sonar_hold_max_mps, hold))
+                hold = max(-cfg.sonar_hold_max_mps, min(cfg.sonar_hold_max_mps, hold))
+                vertical_target = vertical_target + hold if cfg.sonar_hold_any_gaz else hold
             else:
                 self._hold_reference = None
+            if self._overshoot_return:
+                error = self._position[2] - cfg.takeoff_altitude_m
+                if abs(error) <= OVERSHOOT_RETURN_BAND_M:
+                    self._overshoot_return = False
+                else:
+                    vertical_target += -OVERSHOOT_RETURN_GAIN * error
         else:
             self._hold_reference = None
         if state is FlyingState.TAKINGOFF:
@@ -711,6 +779,15 @@ class BebopPlant:
         for axis in range(3):
             self._position[axis] += self._velocity[axis] * dt
         floor = self.surface
+        if cfg.firmware_step_model == "m2" and state not in (FlyingState.LANDED, FlyingState.MOTOR_RAMPING):
+            step = floor - self._last_surface
+            if abs(step) > 1e-9:
+                # The firmware reads the sonar jump as motion: leaving the pad
+                # (the floor drops away) looks like a climb, re-entering like a
+                # descent. The airframe does not move.
+                self._spike_area += -step
+                self._spike_samples = STEP_SPIKE_SAMPLES
+        self._last_surface = floor
         if self._position[2] < floor:
             self._position[2] = floor
             if self._velocity[2] < 0.0:
@@ -739,6 +816,13 @@ class BebopPlant:
         ]
         if self.state in (FlyingState.LANDED, FlyingState.MOTOR_RAMPING):
             reported = [0.0 if noise == 0.0 else self._rng.gauss(0.0, noise) * 0.1 for _ in range(3)]
+        if self._odometry_last is not None and self._spike_samples > 0:
+            span = min(self.time - self._odometry_last, ODOMETRY_MAX_STEP_SEC)
+            if span > 0.0:
+                part = self._spike_area / self._spike_samples
+                reported[2] += part / span
+                self._spike_area -= part
+                self._spike_samples -= 1
         if self._odometry_last is not None:
             dt = min(self.time - self._odometry_last, ODOMETRY_MAX_STEP_SEC)
             for axis in range(3):
