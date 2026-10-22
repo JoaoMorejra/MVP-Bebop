@@ -544,6 +544,9 @@ def _format_telemetry_statement(
             return f"Missão abortada, {details['acao']}."
         return "Missão abortada, pousando drone."
     if "iniciando missão" in action_lower:
+        plan = details.get("plano")
+        if isinstance(plan, str) and plan.strip():
+            return f"Missão iniciada. Parâmetros de voo carregados, {plan.strip()}."
         return "Missão iniciada. Parâmetros de voo carregados."
     if "decolagem autorizada" in action_lower or "contagem" in action_lower:
         return "Decolagem autorizada. Iniciando voo autônomo."
@@ -555,6 +558,8 @@ def _format_telemetry_statement(
         return "Alvo centrado. Iniciando inspeção estacionária."
     if "evidência" in action_lower or "foto" in action_lower:
         return "Registro fotográfico concluído. Evidência armazenada."
+    if "pouso no local" in action_lower:
+        return "Pouso no local iniciado. Inspeção concluída."
     if "retorno à base" in action_lower or "rtl" in action_lower:
         return "Retorno à base iniciado. Navegando para o ponto de lançamento."
     if "pouso seguro" in action_lower or "pouso concluído" in action_lower:

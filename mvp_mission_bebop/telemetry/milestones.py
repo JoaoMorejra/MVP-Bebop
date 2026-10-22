@@ -55,6 +55,10 @@ ALERT_KEYS: Final[Tuple[str, ...]] = (
     "mission.calibration_failed",
     "mission.takeoff_failed",
     "mission.alert",
+    #: The launch document was refused before the first command,
+    #: ``{"field": <dotted path>, "reason": <pt-BR>}``; the process then exits
+    #: with ``engine.exit_codes.EXIT_LAUNCH_REFUSED``.
+    "mission.launch_refused",
 )
 
 #: Milestones this process emits: the flight script in flight order, then
@@ -72,9 +76,11 @@ MILESTONE_KEYS: Final[Tuple[str, ...]] = (
     "mission.landing",
     "mission.battery_warning",
     "mission.touchdown",
-    #: Profile the mission resolved, ``{"mode": "simple|intermediate|advanced"}``,
-    #: raised once before ``mission.parameters``. The station compares it with
-    #: the profile requested and aborts on the ground on a divergence.
+    #: What the mission resolved, ``{"mode": "simple|advanced", "rtl_enabled":
+    #: bool, "takeoff_surface": "platform|ground", "target_altitude_m": float}``
+    #: (the altitude over the floor), raised once before ``mission.parameters``.
+    #: The station compares it with the document launched and aborts on the
+    #: ground on a divergence.
     "mission.mode",
     "mission.parameters",
     #: Outcome of the Stage 1 flat trim, ``{"acknowledged": bool}``: the

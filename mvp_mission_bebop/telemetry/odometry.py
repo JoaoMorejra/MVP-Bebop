@@ -35,6 +35,7 @@ from mvp_mission_bebop.estimation.altitude_plausibility import (
     AltitudePlausibilityFilter,
     PlausibilityLimits,
 )
+from mvp_mission_bebop.estimation.ceiling_schedule import CeilingSchedule
 from mvp_mission_bebop.estimation.platform_monitor import (
     UNKNOWN_REPORT,
     PlatformMonitor,
@@ -42,6 +43,7 @@ from mvp_mission_bebop.estimation.platform_monitor import (
     PlatformState,
     outbound_track_m,
 )
+from mvp_mission_bebop.estimation.terrain_vertical_filter import TerrainAwareVerticalFilter
 from mvp_mission_bebop.estimation.vertical_estimator import (
     VerticalStateEstimator,
     normalize_altitude_estimator,
@@ -241,6 +243,13 @@ class OdometrySupervisor:
         self._vertical: Optional[VerticalStateEstimator] = (
             VerticalStateEstimator(self.calibration_cfg) if mode == "vz_gated" else None
         )
+        #: The terrain-aware Kalman filter of ``"terrain_kf"``; ``None`` otherwise.
+        self._terrain: Optional[TerrainAwareVerticalFilter] = None
+        if mode == "terrain_kf":
+            gain = getattr(kinematics_cfg, "vertical_normalized_to_mps", None) or getattr(
+                kinematics_cfg, "normalized_to_mps", 1.0
+            )
+            self._terrain = TerrainAwareVerticalFilter(self.calibration_cfg, float(gain))
         self._vertical_lock = threading.Lock()
         self._vz_timeline: Optional[float] = None
         self._last_header_stamp: Optional[float] = None
@@ -283,6 +292,8 @@ class OdometrySupervisor:
         self._buffer_z: List[float] = []
         self._buffer_x: List[float] = []
         self._buffer_y: List[float] = []
+        #: The ceiling and its ratchet through the takeoff transient (section 3.5).
+        self.ceiling_schedule = CeilingSchedule(self.kinematics_cfg, self.platform_cfg)
         self._ceiling_breach_streak: int = 0
         #: Monotonic instant the current run of samples above the ceiling began.
         self._ceiling_breach_started: Optional[float] = None
@@ -338,7 +349,7 @@ class OdometrySupervisor:
             return
 
         z = sample[2]
-        if self._vertical is not None:
+        if self._vertical is not None or self._terrain is not None:
             z = self._estimate_altitude(msg, z, sample[5])
         elif self.calibration_cfg.plausibility_enabled:
             now = time.monotonic()
@@ -385,7 +396,8 @@ class OdometrySupervisor:
 
         with self._vertical_lock:
             estimator = self._vertical
-            if estimator is None:
+            terrain = self._terrain
+            if estimator is None and terrain is None:
                 return pose_z
             previous = self._last_header_stamp
             advancing = header is not None and (previous is None or header > previous)
@@ -399,9 +411,39 @@ class OdometrySupervisor:
                 self._last_header_stamp = header
             self._last_arrival = arrival
 
+            if terrain is not None:
+                if not terrain.seeded:
+                    terrain.reset(pose_z)
+                report = self._platform_report
+                window = report.guard_active or report.state in (PlatformState.LEAVING, PlatformState.ENTERING)
+                return terrain.update_velocity(vz, self._vz_timeline, guard_window=window)
             if not estimator.seeded:
                 estimator.reset(pose_z)
             return estimator.update_velocity(vz, self._vz_timeline)
+
+    def note_commanded_vz(self, gaz: float, stamp_sec: Optional[float] = None) -> None:
+        """The normalized ``vz`` the command proxy sent, after every clamp.
+
+        The process input of ``"terrain_kf"``; ignored by the other
+        estimators. ``stamp_sec`` is accepted for the record: the filter applies
+        the latest command from its next prediction on.
+        """
+        if self._terrain is None:
+            return
+        with self._vertical_lock:
+            self._terrain.note_command(gaz)
+
+    def vertical_coasting(self) -> bool:
+        """Whether the altitude only propagates, with no ``speedZ`` accepted lately (``"terrain_kf"``).
+
+        The altitude governor holds its integral meanwhile
+        (``AltitudeHoldGovernor.compute_vz(hold_integrator=True)``). Always
+        ``False`` for the other estimators.
+        """
+        if self._terrain is None:
+            return False
+        with self._vertical_lock:
+            return self._terrain.coasting
 
     def altitude_state_callback(self, msg: "Float32") -> None:
         """Ingest ``/bebop/states/altitude``. Runs on an executor thread.
@@ -421,6 +463,27 @@ class OdometrySupervisor:
             self._firmware_altitude = value
             self.firmware_altitude_stamp = now
             ground = self.ground_reference_altitude
+
+        if self._terrain is not None:
+            if ground is None or self.calibration_cfg.firmware_altitude_source == "unknown":
+                return
+            state = self._platform_report.state
+            prior = True if state is PlatformState.OFF else False if state is PlatformState.ON else None
+            with self._vertical_lock:
+                self._terrain.update_altitude(
+                    value + ground,
+                    now,
+                    pad_height_m=max(0.0, float(self.platform_cfg.height_m)),
+                    off_pad_prior=prior,
+                )
+                disagreement = self._terrain.datum_disagreement
+            if disagreement and not self._datum_flagged:
+                logger.warning(
+                    "[ALT_PROBE datum_disagreement] states/altitude has disagreed with the terrain "
+                    "filter beyond its gate for 3 s; it is not correcting."
+                )
+            self._datum_flagged = disagreement
+            return
 
         anchored = self._vertical is not None and self.calibration_cfg.altitude_anchor_enabled
         if not anchored or ground is None:
@@ -509,6 +572,8 @@ class OdometrySupervisor:
             self.last_odometry_timestamp = now
             self.sample_count += 1
             rel_alt = z if self.ground_reference_altitude is None else z - self.ground_reference_altitude
+            if self.ground_reference_altitude is not None:
+                self.ceiling_schedule.update(rel_alt, report.guard_active)
             if rel_alt > self.altitude_ceiling:
                 if self._ceiling_breach_streak == 0:
                     self._ceiling_breach_started = now
@@ -613,35 +678,49 @@ class OdometrySupervisor:
 
     @property
     def altitude_ceiling(self) -> float:
-        """Absolute relative-altitude ceiling, in metres.
+        """Relative-altitude ceiling in force, in metres.
 
-        Derived on read rather than frozen at construction, so a target altitude
-        changed after the supervisor was built is reflected instead of silently
-        ignored.
-
-        Measured in the control frame, above the launch point: the target is
-        ``target_altitude_m - platform.height_m``. While the platform edge guard
-        is active ``platform.ceiling_allowance_m`` is added -- re-entering the
-        pad reads as a sudden loss of height and the firmware climbs before the
-        guard can take it back -- and a known venue ceiling caps the result at
-        ``venue_ceiling_agl_m - platform.height_m`` in every case.
+        Delegates to :class:`CeilingSchedule` and is derived on read, so a
+        target changed or a pad resolved after construction is honoured. From
+        the floor it is ``target + altitude_ceiling_margin_m``; on the pad top
+        it is fixed at ``max(target, native height) + TOTEM_CEILING_HEADROOM_M``
+        (D2). While the platform edge guard is active
+        ``platform.ceiling_allowance_m`` is added. A known venue ceiling caps
+        the result at ``venue_ceiling_agl_m - h_p`` in every case, and it is
+        the only ceiling while the firmware flies its launch profile. Between
+        :meth:`arm_ceiling_transient` and :meth:`release_ceiling_transient` the
+        ceiling is the schedule's ratchet.
 
         Never takes the state lock: :meth:`_store_sample` reads it while
         holding it.
         """
-        platform = self.platform_cfg
-        height = max(0.0, float(platform.height_m))
-        ceiling = (
-            self.kinematics_cfg.target_altitude_m
-            - height
-            + self.kinematics_cfg.altitude_ceiling_margin_m
-        )
-        if self._platform_report.guard_active:
-            ceiling += max(0.0, float(platform.ceiling_allowance_m))
-        venue = platform.venue_ceiling_agl_m
-        if isinstance(venue, (int, float)) and not isinstance(venue, bool) and math.isfinite(venue):
-            ceiling = min(ceiling, float(venue) - height)
-        return ceiling
+        return self.ceiling_schedule.value(guard_active=self._platform_report.guard_active)
+
+    def arm_ceiling_transient(self) -> None:
+        """Open the takeoff transient, before the takeoff command (``CeilingSchedule.arm``)."""
+        with self._lock:
+            self.ceiling_schedule.arm()
+            self._ceiling_breach_streak = 0
+            self._ceiling_breach_started = None
+
+    def end_native_profile(self) -> None:
+        """The firmware's launch profile is over; the ratchet takes over. Idempotent."""
+        with self._lock:
+            self.ceiling_schedule.end_native_profile()
+
+    def release_ceiling_transient(self) -> None:
+        """Close the takeoff transient: the nominal ceiling from now on."""
+        with self._lock:
+            self.ceiling_schedule.release()
+
+    def note_flying_state(self, state: Optional[int]) -> None:
+        """Follow the ARSDK flying state: hovering (2) or flying (3) ends the native profile."""
+        if state in (2, 3):
+            self.end_native_profile()
+
+    def venue_ceiling_breached(self, relative_altitude: float) -> bool:
+        """Whether ``relative_altitude`` is above the venue ceiling, ``venue_ceiling_agl_m - h_p``."""
+        return relative_altitude > self.ceiling_schedule.venue_limit_m
 
     def calibrate_ground_reference(self) -> bool:
         """Freeze the ground-level reference (x0, y0, z0) with outlier rejection.
