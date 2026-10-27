@@ -12,15 +12,18 @@ import atexit
 import hashlib
 import json
 import logging
+import math
 import os
 import pathlib
 import queue
 import random
+import socket
 import sys
 import tempfile
 import threading
 import time
-from typing import Any, Awaitable, Callable, Dict, Final, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Dict, Final, Iterable, List, Optional, Sequence, Tuple
 
 from mvp_mission_bebop.telemetry.inspection_report import (
     FORENSIC_CLOSERS,
@@ -144,6 +147,197 @@ def synthesis_instruction(statement: str, verbatim: bool) -> str:
         "You are the autonomous flight copilot presenting the mission. "
         "Never add greetings, conversational filler, or address spectators."
     )
+
+
+#: Station override of the synthesis reachability probe: ``"1"`` forces the
+#: copilot offline (cache only), ``"0"`` never treats it as offline, and an
+#: absent, empty or ``"auto"`` value probes the endpoint.
+SPEECH_OFFLINE_ENV: Final[str] = "BMG_SPEECH_OFFLINE"
+SYNTHESIS_HOST: Final[str] = "generativelanguage.googleapis.com"
+SYNTHESIS_PORT: Final[int] = 443
+
+#: Last probe per endpoint: ``(monotonic instant, reachable)``.
+_reachability: Dict[Tuple[str, int], Tuple[float, bool]] = {}
+#: Probe running per endpoint, set when its verdict is stored. One at a time,
+#: so concurrent callers never stack connects or repeat the transition log.
+_probes_in_flight: Dict[Tuple[str, int], threading.Event] = {}
+_reachability_lock = threading.Lock()
+
+
+def _probe_endpoint(endpoint: Tuple[str, int], timeout_sec: float, done: threading.Event) -> None:
+    """Connect once to ``endpoint``, store the verdict and log a change of state."""
+    failure: Optional[OSError] = None
+    try:
+        with socket.create_connection(endpoint, timeout=timeout_sec):
+            reachable = True
+    except OSError as exc:
+        reachable = False
+        failure = exc
+    with _reachability_lock:
+        previous = _reachability.get(endpoint)
+        _reachability[endpoint] = (time.monotonic(), reachable)
+        if _probes_in_flight.get(endpoint) is done:
+            del _probes_in_flight[endpoint]
+    done.set()
+    if not reachable and (previous is None or previous[1]):
+        # Once per streak: the daemon's stderr reaches the station's log as
+        # "[copiloto]" lines, and from here on only cached lines speak.
+        logger.warning("Speech synthesis unreachable (%s:%d: %s); serving cached lines only.", *endpoint, failure)
+    elif reachable and previous is not None and not previous[1]:
+        logger.warning("Speech synthesis reachable again (%s:%d).", *endpoint)
+
+
+def synthesis_reachable(
+    host: str = SYNTHESIS_HOST,
+    port: int = SYNTHESIS_PORT,
+    timeout_sec: float = 1.0,
+    ttl_sec: float = 30.0,
+) -> bool:
+    """Whether the Live synthesis endpoint accepts a TCP connection.
+
+    Without a route every session attempt costs its 3 s connect timeout, twice
+    per line, so a line missing from the phrase cache stayed silent for up to
+    the 14 s speech ceiling. One TCP connect answers the same question.
+
+    The probe runs on a background thread. Once an endpoint has a verdict it
+    is returned immediately, and a verdict older than ``ttl_sec`` is refreshed
+    in the background (one probe per endpoint at a time), so no caller after
+    the first waits on name resolution, which no socket timeout bounds and
+    which stalls for seconds on a network without DNS such as the Bebop's
+    Wi-Fi. The first call waits for the first verdict at most ``timeout_sec``
+    and reads an unanswered probe as unreachable.
+
+    Parameters
+    ----------
+    host : str
+        Endpoint host name.
+    port : int
+        Endpoint TCP port, 1 to 65535.
+    timeout_sec : float
+        Connect timeout of one probe, and the longest the first call waits for
+        a verdict, seconds; must be positive.
+    ttl_sec : float
+        Age past which a returned verdict also starts a background refresh;
+        zero refreshes on every call.
+
+    Returns
+    -------
+    bool
+        False when :data:`SPEECH_OFFLINE_ENV` is ``"1"``, True when it is
+        ``"0"``. Otherwise the last stored verdict, or for an endpoint without
+        one, whether the first probe connected within ``timeout_sec``. Any
+        other value of the variable behaves as ``"auto"``.
+
+    Raises
+    ------
+    TypeError
+        If ``host`` is not a string, ``port`` is not an integer, or a duration
+        is not a real number.
+    ValueError
+        If ``host`` is empty, ``port`` is out of range, ``timeout_sec`` is not
+        positive or ``ttl_sec`` is negative.
+    """
+    if not isinstance(host, str):
+        raise TypeError(f"host must be str, got {type(host).__name__}")
+    if not host.strip():
+        raise ValueError("host must not be empty")
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise TypeError(f"port must be int, got {type(port).__name__}")
+    if not 1 <= port <= 65535:
+        raise ValueError(f"port must be in [1, 65535], got {port}")
+    for name, value in (("timeout_sec", timeout_sec), ("ttl_sec", ttl_sec)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be a real number, got {type(value).__name__}")
+    if timeout_sec <= 0.0:
+        raise ValueError(f"timeout_sec must be positive, got {timeout_sec}")
+    if ttl_sec < 0.0:
+        raise ValueError(f"ttl_sec must not be negative, got {ttl_sec}")
+
+    mode = os.environ.get(SPEECH_OFFLINE_ENV, "auto").strip().lower()
+    if mode == "1":
+        return False
+    if mode == "0":
+        return True
+
+    endpoint = (host.strip(), port)
+    with _reachability_lock:
+        previous = _reachability.get(endpoint)
+        pending = _probes_in_flight.get(endpoint)
+        stale = previous is None or (time.monotonic() - previous[0]) >= ttl_sec
+        if stale and pending is None:
+            pending = threading.Event()
+            _probes_in_flight[endpoint] = pending
+            threading.Thread(
+                target=_probe_endpoint,
+                args=(endpoint, float(timeout_sec), pending),
+                name="SpeechReachabilityProbe",
+                daemon=True,
+            ).start()
+    if previous is not None:
+        return previous[1]
+    if pending is None or not pending.wait(timeout=float(timeout_sec)):
+        return False
+    with _reachability_lock:
+        verdict = _reachability.get(endpoint)
+    return bool(verdict and verdict[1])
+
+
+def voice_readiness(
+    *,
+    genai_available: bool,
+    token: bool,
+    playback: bool,
+    cache_entries: int,
+) -> Tuple[bool, str]:
+    """Whether the copilot can speak, and the reason shown to the operator.
+
+    The voice is ready when there is an output device and either live
+    synthesis (the ``google.genai`` client plus an API key) or a non-empty
+    phrase cache. The cache case covers the station without network or key:
+    every line it says is synthesized ahead of the flight, so reporting it as
+    "sem voz" would block a launch whose narration is already on disk.
+
+    Parameters
+    ----------
+    genai_available : bool
+        Whether ``google.genai`` imports.
+    token : bool
+        Whether an API key was resolved.
+    playback : bool
+        Whether the audio output device started.
+    cache_entries : int
+        Usable phrase cache entries on disk; must not be negative.
+
+    Returns
+    -------
+    Tuple[bool, str]
+        ``(ready, detail)``. ``detail`` is ``"pronto"`` with live synthesis,
+        ``"pronto (voz em cache, sem rede)"`` when only the cache serves, and
+        otherwise names the first missing piece in the order synthesis client,
+        API key, audio device.
+
+    Raises
+    ------
+    TypeError
+        If ``cache_entries`` is not an integer.
+    ValueError
+        If ``cache_entries`` is negative.
+    """
+    if isinstance(cache_entries, bool) or not isinstance(cache_entries, int):
+        raise TypeError(f"cache_entries must be int, got {type(cache_entries).__name__}")
+    if cache_entries < 0:
+        raise ValueError(f"cache_entries must not be negative, got {cache_entries}")
+
+    synthesis = bool(genai_available) and bool(token)
+    if playback and synthesis:
+        return True, "pronto"
+    if playback and cache_entries > 0:
+        return True, "pronto (voz em cache, sem rede)"
+    if not genai_available:
+        return False, "google-genai não instalado"
+    if not token:
+        return False, "sem chave de API (SPEECH_API_KEY / GEMINI_API_KEY)"
+    return False, "sem dispositivo de áudio (PortAudio)"
 
 
 _cached_client: Optional[Any] = None
@@ -509,6 +703,16 @@ def _sentence(text: str) -> str:
     return text.strip().rstrip(".").strip() + "."
 
 
+#: Forced return on a critical charge (``steps/rtl.py``), said by the mission
+#: only when it narrates alone. Each is the first variant of the station's pool
+#: for the profile (``PHRASE_POOLS['mission.battery_return']`` and
+#: ``['mission.battery_return_simple']`` in ``src/lib/copilotPhrases.ts``), so
+#: the phrase cache holds one audio for both voices.
+BATTERY_RETURN_ACTION: Final[str] = "Retorno por bateria crítica"
+_BATTERY_RETURN_SENTENCE: Final[str] = "Bateria crítica. Missão interrompida. Retornando à base para pouso."
+_BATTERY_RETURN_SIMPLE_SENTENCE: Final[str] = "Bateria crítica. Missão interrompida. Pouso na base iniciado."
+
+
 def _format_telemetry_statement(
     action: str,
     details: Optional[Dict[str, Any]] = None,
@@ -518,12 +722,19 @@ def _format_telemetry_statement(
     A fault states its real reason (``details["erro"]`` or ``details["etapa"]``)
     and claims a landing only when ``details["em_voo"]`` is true: a failure on
     the ground used to be announced with "Executando pouso seguro" while the
-    aircraft sat on the pad.
+    aircraft sat on the pad. :data:`BATTERY_RETURN_ACTION` is said in the
+    wording of the profile in ``details["modo"]`` (``"simple"`` or
+    ``"advanced"``, the latter when absent).
     """
     details = details or {}
     action_lower = action.strip().lower()
     airborne = details.get("em_voo") is True
     reason = details.get("erro", details.get("etapa"))
+
+    if action_lower == BATTERY_RETURN_ACTION.lower():
+        if details.get("modo") == "simple":
+            return _BATTERY_RETURN_SIMPLE_SENTENCE
+        return _BATTERY_RETURN_SENTENCE
 
     if action_lower in _GROUND_FAULT_ACTIONS:
         head = action.strip() if not reason else f"{action.strip()}: {str(reason).strip()}"
@@ -539,7 +750,7 @@ def _format_telemetry_statement(
 
     if "abortar" in action_lower or "abortada" in action_lower or "abort" in action_lower:
         if details and "etapa" in details:
-            return str(details["etapa"]).capitalize()
+            return _sentence(str(details["etapa"]).capitalize())
         if details and "acao" in details:
             return f"Missão abortada, {details['acao']}."
         return "Missão abortada, pousando drone."
@@ -566,7 +777,7 @@ def _format_telemetry_statement(
         return "Pouso seguro concluído com sucesso."
 
     if details and "etapa" in details:
-        return str(details["etapa"]).capitalize()
+        return _sentence(str(details["etapa"]).capitalize())
 
     return f"Notificação de missão: {action}."
 
@@ -620,6 +831,55 @@ class PhraseCache:
             os.replace(partial, path)
         except OSError as exc:
             logger.debug("Phrase cache write failed (%s): %s", path, exc)
+
+    def missing(self, statements: Iterable[str], verbatim: bool = True) -> List[str]:
+        """The statements without a usable entry, stripped and deduplicated.
+
+        Parameters
+        ----------
+        statements : Iterable[str]
+            Sentences the station may speak. Empty or whitespace-only entries
+            are ignored.
+        verbatim : bool
+            Prompt mode the entries are looked up in.
+
+        Returns
+        -------
+        List[str]
+            Absent statements in first-seen order.
+
+        Raises
+        ------
+        TypeError
+            If ``statements`` is a bare string or yields a non-string item.
+        """
+        if isinstance(statements, (str, bytes)):
+            raise TypeError("statements must be an iterable of str, not a single string")
+        absent: List[str] = []
+        seen: set[str] = set()
+        for item in statements:
+            if not isinstance(item, str):
+                raise TypeError(f"statement must be str, got {type(item).__name__}")
+            statement = item.strip()
+            if not statement or statement in seen:
+                continue
+            seen.add(statement)
+            if not self.has(statement, verbatim):
+                absent.append(statement)
+        return absent
+
+    def entries(self) -> int:
+        """Number of entries on disk long enough to be speech.
+
+        Counted by file, so entries of another voice or model in the same
+        directory are included; the key hash does not reveal them.
+        """
+        try:
+            return sum(
+                1 for path in self.directory.glob("*.pcm") if path.is_file() and path.stat().st_size >= _MIN_AUDIO_BYTES
+            )
+        except OSError:
+            return 0
 
 
 class MissionAudioAnnouncer:
@@ -713,6 +973,10 @@ class MissionAudioAnnouncer:
             token = self.auth_token or _resolve_auth_token()
             if not token:
                 return
+            # Off the loop thread: a probe blocks for up to its connect timeout
+            # and a cached line may be playing from this loop meanwhile.
+            if not await asyncio.to_thread(synthesis_reachable):
+                return
             client = _get_synthesis_client(token)
             ctx = client.aio.live.connect(model=SYNTHESIZER_MODEL, config=self.session_config)
             session = await asyncio.wait_for(ctx.__aenter__(), timeout=3.0)
@@ -771,8 +1035,12 @@ class MissionAudioAnnouncer:
         """One Live turn for ``statement``. Returns the PCM and why the read ended.
 
         ``on_chunk`` receives each audio chunk as it arrives, so playback can
-        start on the first one instead of after the whole turn.
+        start on the first one instead of after the whole turn. Without a route
+        to the endpoint it returns ``(b"", "offline")`` without opening a
+        session.
         """
+        if not await asyncio.to_thread(synthesis_reachable):
+            return b"", "offline"
         session, ctx = await self._open_session()
         if session is None:
             return b"", "no_session"
@@ -838,11 +1106,77 @@ class MissionAudioAnnouncer:
         in the usual two seconds when it does.
         """
         audio, reason = await self._synthesize_once(statement, verbatim, on_chunk)
-        if len(audio) < _MIN_AUDIO_BYTES and reason != "no_session":
+        if len(audio) < _MIN_AUDIO_BYTES and reason not in ("no_session", "offline"):
             logger.debug("Synthesis produced no audio (%s); retrying on a fresh session.", reason)
             audio, reason = await self._synthesize_once(statement, verbatim, on_chunk)
         logger.debug("Synthesis ended: %s, %d bytes.", reason, len(audio))
         return audio
+
+    def synthesize_blocking(self, statement: str, verbatim: bool = True, timeout: float = 30.0) -> bytes:
+        """Synthesize ``statement`` on the announcer's loop and wait for the PCM.
+
+        Used by the pre-cache tool from a plain thread. The turn runs on this
+        announcer's own event loop, so it shares the warm Live session and the
+        retry of :meth:`_synthesize` with the narration instead of opening a
+        second client. Nothing is played and nothing is cached here.
+
+        Parameters
+        ----------
+        statement : str
+            Sentence to synthesize.
+        verbatim : bool
+            Prompt mode, as in :func:`synthesis_instruction`.
+        timeout : float
+            Longest wait for the turn, seconds; must be positive. On expiry the
+            turn is cancelled.
+
+        Returns
+        -------
+        bytes
+            The PCM of the turn, 24 kHz mono int16. Empty when the endpoint is
+            unreachable or the session produced no audio.
+
+        Raises
+        ------
+        TypeError
+            If ``statement`` is not a string or ``timeout`` is not a real number.
+        ValueError
+            If ``statement`` is blank or ``timeout`` is not positive.
+        RuntimeError
+            If no synthesis session can be opened: ``google.genai`` missing, no
+            API key, or the announcer loop stopped; or if called on the
+            announcer's own loop thread, where waiting would block the loop
+            that has to run the turn.
+        TimeoutError
+            If the turn did not finish within ``timeout``.
+        """
+        if not isinstance(statement, str):
+            raise TypeError(f"statement must be str, got {type(statement).__name__}")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError(f"timeout must be a real number, got {type(timeout).__name__}")
+        if timeout <= 0.0:
+            raise ValueError(f"timeout must be positive, got {timeout}")
+        loop = self._loop
+        if self.session_config is None or loop is None or loop.is_closed() or not self._active:
+            raise RuntimeError("no speech synthesis session: google-genai missing or announcer closed")
+        try:
+            running: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            raise RuntimeError("synthesize_blocking called on the announcer loop thread; the turn could never run")
+        if not (self.auth_token or _resolve_auth_token()):
+            raise RuntimeError("no speech synthesis session: no API key (SPEECH_API_KEY / GEMINI_API_KEY)")
+        text = statement.strip()
+        if not text:
+            raise ValueError("statement must not be empty")
+
+        future = asyncio.run_coroutine_threadsafe(self._synthesize(text, bool(verbatim)), loop)
+        try:
+            return future.result(timeout=float(timeout))
+        except BaseException:
+            future.cancel()
+            raise
 
     def prefetch(self, text: str) -> bool:
         """Synthesize a verbatim line ahead of its request.
@@ -889,7 +1223,8 @@ class MissionAudioAnnouncer:
 
         Runs one sentence at a time and only while nothing is queued or being
         synthesized for playback, so it never delays a line the operator is
-        waiting for. Returns how many sentences were scheduled.
+        waiting for. Returns how many sentences were scheduled; none without a
+        route to the synthesis endpoint (:func:`synthesis_reachable`).
         """
         pending: List[str] = []
         for text in texts:
@@ -897,6 +1232,8 @@ class MissionAudioAnnouncer:
             if statement and statement not in pending and not self._cache.has(statement, True):
                 pending.append(statement)
         if not pending or self._loop is None or self.session_config is None or not self._active:
+            return 0
+        if not synthesis_reachable():
             return 0
 
         async def fill() -> None:
@@ -1001,6 +1338,17 @@ class MissionAudioAnnouncer:
                     audio = await prefetched
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     audio = b""
+
+            if len(audio) < _MIN_AUDIO_BYTES and not await asyncio.to_thread(synthesis_reachable):
+                # Offline a cache miss has no voice to fall back on. Resolving
+                # it now lets the station move on at its own cadence instead of
+                # waiting out two session timeouts and the 14 s speech ceiling.
+                logger.warning("[SPEECH_MISS] '%s'", statement[:48])
+                self._queue.task_done()
+                if done_fut and not done_fut.done():
+                    done_fut.set_result(False)
+                continue
+
             streamed = False
 
             def log_start(started_source: str) -> None:
@@ -1341,6 +1689,210 @@ def get_announcer() -> MissionAudioAnnouncer:
         return _global_announcer
 
 
+#: Shortest speech accepted per word of a pre-cached line. Lines measured
+#: 0.51 s per word with the pace of ``_ACCENT_DIRECTIVE``; a turn cut by a
+#: dropped session or a server ``go_away`` returns a fraction of that and would
+#: otherwise be played at the fair as half a sentence.
+_MIN_SPEECH_SEC_PER_WORD: Final[float] = 0.25
+#: First wait between attempts of one pre-cached line, doubled per retry.
+_PRECACHE_BACKOFF_SEC: Final[float] = 2.0
+#: Longest wait for one pre-cached turn: two Live attempts of
+#: ``_FIRST_AUDIO_TIMEOUT_SEC`` plus a 20-word line streamed at speech pace.
+_PRECACHE_TURN_TIMEOUT_SEC: Final[float] = 30.0
+
+
+@dataclass(frozen=True)
+class PrecacheReport:
+    """Outcome of :func:`precache_phrases`.
+
+    Attributes
+    ----------
+    synthesized : int
+        Statements synthesized and stored in this run.
+    skipped : int
+        Statements already in the cache, not synthesized again.
+    failed : Tuple[str, ...]
+        Statements with no accepted audio after every attempt, in order.
+    """
+
+    synthesized: int
+    skipped: int
+    failed: Tuple[str, ...]
+
+
+def _minimum_speech_bytes(statement: str) -> int:
+    """Least PCM accepted as a complete reading of ``statement``.
+
+    Parameters
+    ----------
+    statement : str
+        Sentence the audio should read.
+
+    Returns
+    -------
+    int
+        ``_MIN_SPEECH_SEC_PER_WORD`` per word of 24 kHz mono int16, and never
+        less than ``_MIN_AUDIO_BYTES``.
+
+    Raises
+    ------
+    TypeError
+        If ``statement`` is not a string.
+    """
+    if not isinstance(statement, str):
+        raise TypeError(f"statement must be str, got {type(statement).__name__}")
+    bytes_per_sec = PCM_SAMPLE_RATE * PCM_CHANNELS * 2
+    return max(_MIN_AUDIO_BYTES, math.ceil(len(statement.split()) * _MIN_SPEECH_SEC_PER_WORD * bytes_per_sec))
+
+
+def _entry_is_complete(cache: PhraseCache, statement: str) -> bool:
+    """Whether ``statement`` has a verbatim entry at least :func:`_minimum_speech_bytes` long.
+
+    ``PhraseCache.has`` accepts any entry of ``_MIN_AUDIO_BYTES``, and the
+    daemon's ``warm_cache`` stores whatever a turn returned, so a cut turn can
+    sit in the cache as a fraction of its sentence. The pre-cache treats such
+    an entry as missing and overwrites it.
+    """
+    data = cache.get(statement, True)
+    return data is not None and len(data) >= _minimum_speech_bytes(statement)
+
+
+def _discard_partial(cache: PhraseCache, statement: str) -> None:
+    """Remove this process's ``.part`` of ``statement`` left by an interrupted :meth:`PhraseCache.put`."""
+    partial = cache.path_for(statement, True).with_suffix(f".{os.getpid()}.part")
+    try:
+        partial.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Partial cache entry not removed (%s): %s", partial, exc)
+
+
+def precache_phrases(
+    statements: Sequence[str],
+    *,
+    cache: Optional[PhraseCache] = None,
+    attempts: int = 3,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+) -> PrecacheReport:
+    """Synthesize into the phrase cache every verbatim statement not yet there.
+
+    Each statement is synthesized by the global announcer
+    (:meth:`MissionAudioAnnouncer.synthesize_blocking`, voice
+    ``SYNTHESIZER_VOICE``, model ``SYNTHESIZER_MODEL``) and stored with
+    :meth:`PhraseCache.put`, which writes a ``.part`` file and renames it, so an
+    entry is either complete or absent. A run interrupted by a dropped network
+    or Ctrl-C leaves only complete entries, its own ``.part`` removed, and the
+    next run synthesizes only what is still missing. An existing entry shorter
+    than :func:`_minimum_speech_bytes` counts as missing and is overwritten.
+
+    Parameters
+    ----------
+    statements : Sequence[str]
+        Sentences the station speaks verbatim. Stripped and deduplicated;
+        blank entries are ignored.
+    cache : Optional[PhraseCache]
+        Target cache; a default :class:`PhraseCache` when None.
+    attempts : int
+        Synthesis attempts per statement, at least 1. Retries wait
+        ``_PRECACHE_BACKOFF_SEC``, doubled each time; with the endpoint
+        unreachable the statement fails without further retries.
+    on_progress : Optional[Callable[[int, int, str], None]]
+        Called after each statement that needed synthesis with
+        ``(index, pending, statement)``, ``index`` from 1.
+
+    Returns
+    -------
+    PrecacheReport
+        Synthesized, skipped and failed statements. Audio shorter than
+        :func:`_minimum_speech_bytes` (a truncated turn) is never stored.
+
+    Raises
+    ------
+    TypeError
+        If ``statements`` is a bare string or holds a non-string, ``cache`` is
+        not a :class:`PhraseCache`, ``attempts`` is not an integer or
+        ``on_progress`` is not callable.
+    ValueError
+        If ``attempts`` is below 1, or statements are missing from the cache
+        and no API key resolves (:func:`_resolve_auth_token`).
+    RuntimeError
+        If the announcer cannot open a synthesis session at all.
+    """
+    if isinstance(statements, (str, bytes)) or not isinstance(statements, Sequence):
+        raise TypeError("statements must be a sequence of str, not a single string")
+    if cache is not None and not isinstance(cache, PhraseCache):
+        raise TypeError(f"cache must be a PhraseCache, got {type(cache).__name__}")
+    if isinstance(attempts, bool) or not isinstance(attempts, int):
+        raise TypeError(f"attempts must be int, got {type(attempts).__name__}")
+    if attempts < 1:
+        raise ValueError(f"attempts must be at least 1, got {attempts}")
+    if on_progress is not None and not callable(on_progress):
+        raise TypeError("on_progress must be callable")
+
+    store = cache if cache is not None else PhraseCache()
+    absent = set(store.missing(statements, verbatim=True))
+    pending: List[str] = []
+    seen: set[str] = set()
+    for item in statements:
+        statement = item.strip()
+        if not statement or statement in seen:
+            continue
+        seen.add(statement)
+        if statement in absent or not _entry_is_complete(store, statement):
+            pending.append(statement)
+    distinct = len(seen)
+    if not pending:
+        return PrecacheReport(synthesized=0, skipped=distinct, failed=())
+    if not _resolve_auth_token():
+        raise ValueError("no API key for speech synthesis (SPEECH_API_KEY / GEMINI_API_KEY)")
+
+    speaker = get_announcer()
+    synthesized = 0
+    failed: List[str] = []
+    for index, statement in enumerate(pending, start=1):
+        floor = _minimum_speech_bytes(statement)
+        accepted: Optional[bytes] = None
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(_PRECACHE_BACKOFF_SEC * (2 ** (attempt - 1)))
+            try:
+                audio = speaker.synthesize_blocking(statement, True, timeout=_PRECACHE_TURN_TIMEOUT_SEC)
+            except RuntimeError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one failed turn, retried
+                logger.warning("Synthesis attempt %d/%d failed for '%s': %s", attempt + 1, attempts, statement[:60], exc)
+                audio = b""
+            if len(audio) >= floor:
+                accepted = audio
+                break
+            if audio:
+                logger.warning(
+                    "Truncated synthesis rejected for '%s': %d bytes, at least %d expected.",
+                    statement[:60],
+                    len(audio),
+                    floor,
+                )
+            if not synthesis_reachable():
+                break
+        if accepted is None:
+            failed.append(statement)
+        else:
+            try:
+                store.put(statement, True, accepted)
+            except BaseException:
+                _discard_partial(store, statement)
+                raise
+            if _entry_is_complete(store, statement):
+                synthesized += 1
+            else:
+                failed.append(statement)
+        if on_progress is not None:
+            on_progress(index, len(pending), statement)
+
+    return PrecacheReport(synthesized=synthesized, skipped=distinct - len(pending), failed=tuple(failed))
+
+
 _alerts_raised: int = 0
 
 
@@ -1425,7 +1977,7 @@ def speak(
 # flight; this side is what the mission uses when it narrates on its own.
 # -----------------------------------------------------------------------------
 
-FORENSIC_INTRO = "Inspeção do sinistro concluída. Apresentando laudo preliminar."
+FORENSIC_INTRO = "Inspeção da ocorrência concluída. Apresentando laudo preliminar."
 FORENSIC_OUTRO = "Relatório pericial emitido e pronto para exportação."
 
 
@@ -1517,24 +2069,30 @@ def serve_stdin() -> int:
     announcer = get_announcer()
     lock = acquire_player_lock()
     # Said once, at startup, so a station whose copilot cannot speak learns it
-    # from the handshake rather than from four silent requests.
+    # from the handshake rather than from four silent requests. `voice_ready`
+    # is what the station gates on; `synthesis` keeps its former meaning for a
+    # station that predates it.
+    genai_available = _load_genai()[0] is not None
+    playback = bool(announcer.device._active)
+    cache_entries = announcer._cache.entries()
+    voice_ready, detail = voice_readiness(
+        genai_available=genai_available,
+        token=bool(announcer.auth_token),
+        playback=playback,
+        cache_entries=cache_entries,
+    )
     _emit_speech_event(
         {
             "event": "ready",
             "voice": SYNTHESIZER_VOICE,
             "model": SYNTHESIZER_MODEL,
-            "synthesis": _load_genai()[0] is not None and bool(announcer.auth_token),
-            "playback": announcer.device._active,
+            "synthesis": genai_available and bool(announcer.auth_token),
+            "playback": playback,
+            "voice_ready": voice_ready,
+            "cache_entries": cache_entries,
+            "offline": not synthesis_reachable(),
             **announcer.device.get_level(),
-            "detail": (
-                "google-genai não instalado"
-                if _load_genai()[0] is None
-                else "sem chave de API (SPEECH_API_KEY / GEMINI_API_KEY)"
-                if not announcer.auth_token
-                else "sem dispositivo de áudio (PortAudio)"
-                if not announcer.device._active
-                else "pronto"
-            ),
+            "detail": detail,
         }
     )
 
@@ -1604,10 +2162,20 @@ def serve_stdin() -> int:
                 # numbers are the mission's own parameters (D2) and the report
                 # combinations are finite (D1), so all of it can be on disk
                 # before the flight. Filled in the background, idle time only.
+                # `missing` is what stays silent if the route never returns.
                 texts = request.get("texts")
                 if isinstance(texts, list) and not announcer.device.get_level()["muted"]:
-                    scheduled = announcer.warm_cache([t for t in texts if isinstance(t, str)])
-                    _emit_speech_event({"event": "cache", "scheduled": scheduled, "requested": len(texts)})
+                    statements = [t for t in texts if isinstance(t, str)]
+                    scheduled = announcer.warm_cache(statements)
+                    _emit_speech_event(
+                        {
+                            "event": "cache",
+                            "scheduled": scheduled,
+                            "requested": len(texts),
+                            "missing": len(announcer._cache.missing(statements)),
+                            "offline": not synthesis_reachable(),
+                        }
+                    )
                 continue
             if op == "prepare":
                 text = request.get("text")

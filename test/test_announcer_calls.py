@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pathlib
+import re
 import threading
 import time
 import types
@@ -65,7 +67,12 @@ def _isolated_phrase_cache(monkeypatch, tmp_path_factory):
         (
             "Missão abortada",
             {"etapa": "missão abortada, pousando drone"},
-            "Missão abortada, pousando drone",
+            "Missão abortada, pousando drone.",
+        ),
+        (
+            "Marcador não localizado",
+            {"etapa": "marcador da base não localizado, executando pouso seguro no local"},
+            "Marcador da base não localizado, executando pouso seguro no local.",
         ),
         (
             "Falha de segurança",
@@ -96,6 +103,63 @@ def _isolated_phrase_cache(monkeypatch, tmp_path_factory):
 )
 def test_startup_and_failure_calls_keep_their_sentences(action, details, sentence):
     assert _format_telemetry_statement(action, details) == sentence
+
+
+_COPILOT_PHRASES_TS = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "bebop_mission_control"
+    / "src"
+    / "lib"
+    / "copilotPhrases.ts"
+)
+
+
+def _first_pool_variant(pool: str) -> str:
+    """First sentence of ``PHRASE_POOLS[pool]`` in ``copilotPhrases.ts``."""
+    source = _COPILOT_PHRASES_TS.read_text(encoding="utf-8")
+    match = re.search(rf"^  '{re.escape(pool)}': \[\n\s+'([^']+)'", source, re.MULTILINE)
+    assert match, pool
+    return match.group(1)
+
+
+@pytest.mark.parametrize(
+    "details, pool",
+    [
+        ({"modo": "advanced"}, "mission.battery_return"),
+        ({"modo": "simple"}, "mission.battery_return_simple"),
+        ({}, "mission.battery_return"),
+        (None, "mission.battery_return"),
+    ],
+)
+def test_the_battery_return_is_said_as_the_station_says_its_crossing(details, pool):
+    """Standalone, the mission says the first variant of the station's pool for the mode."""
+    sentence = _format_telemetry_statement("Retorno por bateria crítica", details)
+    assert sentence == _first_pool_variant(pool)
+
+
+def test_the_battery_return_sentences_are_the_agreed_ones():
+    assert (
+        _format_telemetry_statement("Retorno por bateria crítica", {"modo": "advanced"})
+        == "Bateria crítica. Missão interrompida. Retornando à base para pouso."
+    )
+    assert (
+        _format_telemetry_statement("Retorno por bateria crítica", {"modo": "simple"})
+        == "Bateria crítica. Missão interrompida. Pouso na base iniciado."
+    )
+
+
+@pytest.mark.parametrize("mode", ["advanced", "simple"])
+def test_the_forced_return_announces_the_battery_action_with_its_mode(monkeypatch, mode):
+    from mvp_mission_bebop.steps.rtl import ClosedLoopRTLStep
+
+    calls = []
+    monkeypatch.setattr(announcer, "announce_sync", lambda action, details=None, **kw: calls.append((action, details)))
+    ClosedLoopRTLStep._announce_battery_return(mode)
+    assert calls == [("Retorno por bateria crítica", {"modo": mode})]
+    source = (pathlib.Path(__file__).resolve().parents[1] / "mvp_mission_bebop" / "steps" / "rtl.py").read_text(
+        encoding="utf-8"
+    )
+    assert "self._announce_battery_return(self._mode.value)" in source
 
 
 # --------------------------------------------------------------------- runner
@@ -867,7 +931,11 @@ def test_every_played_line_logs_its_latency(cached_announcer):
     finally:
         target.removeHandler(handler)
         target.setLevel(previous)
-    lines = [r.getMessage() for r in records if r.getMessage().startswith("[SPEECH]")]
+    lines = [
+        r.getMessage()
+        for r in records
+        if r.getMessage().startswith("[SPEECH]") and "'Linha medida.'" in r.getMessage()
+    ]
     assert len(lines) == 2
     assert all("latency_ms=" in line for line in lines)
     assert "source=synth" in lines[0] and "source=cache" in lines[1]

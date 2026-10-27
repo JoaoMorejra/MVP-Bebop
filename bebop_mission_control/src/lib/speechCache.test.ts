@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { allMissionPhrases } from './copilotPhrases';
+import { PHRASE_POOLS, allMissionPhrases } from './copilotPhrases';
 import { allFindingSentences, buildForensicReport } from './forensics';
 import type { InspectionAssessment } from '../types/bmg';
 
@@ -30,16 +30,17 @@ describe('sentences known before the flight (3.9)', () => {
     expect(new Set(phrases).size).toBe(phrases.length);
   });
 
-  it('leaves out the target call, whose range is the flight estimate', () => {
+  it('includes the target call, which no longer depends on a flight estimate (D2)', () => {
     const phrases = allMissionPhrases({ target_altitude_m: 2.3 });
-    expect(phrases.some((line) => /Sinistro detectado|Alvo identificado/.test(line))).toBe(false);
+    expect(phrases.some((line) => /Ocorrência identificada|Acidente avistado|Alvo identificado/.test(line))).toBe(true);
+    for (const variant of PHRASE_POOLS['mission.target_found']) expect(phrases).toContain(variant);
   });
 
   it('enumerates every sentence the forensic report can say (D1)', () => {
     const sentences = allFindingSentences();
-    // 12 fixed wordings and 14 victim wordings (three branches), each after any
+    // 13 fixed wordings and 15 victim wordings (three branches), each after any
     // of the 19 connectors.
-    expect(sentences.length).toBe(494);
+    expect(sentences.length).toBe(28 * 19);
     for (const assessment of [null, DETECTED, { ...DETECTED, victim_count: 0, victim_boxes: [] }]) {
       const report = buildForensicReport({ assessment, storage: null, random: () => 0.3 });
       for (const finding of report) expect(sentences).toContain(finding.speech);
