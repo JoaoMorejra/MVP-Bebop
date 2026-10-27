@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clampThreshold, failsafeAction } from './batteryFailsafe';
+import { RETURNABLE_STAGES, batteryTriggerArmed, clampThreshold, failsafeAction, launchParamsJson } from './batteryFailsafe';
 
 describe('clampThreshold', () => {
   it('keeps every whole percentage from 0 to 100 exactly', () => {
@@ -21,20 +21,53 @@ describe('clampThreshold', () => {
 });
 
 describe('failsafeAction', () => {
-  it('flies the return from the search, the approach and the inspection', () => {
-    for (const stage of [2, 3, 4]) expect(failsafeAction(stage, true)).toBe('rtl');
+  it('flies the return from the climb, the search, the approach and the inspection', () => {
+    for (const stage of [1, 2, 3, 4]) expect(failsafeAction(stage, true)).toBe('rtl');
+    expect([...RETURNABLE_STAGES]).toEqual([1, 2, 3, 4]);
+  });
+
+  it('asks for the return while the mission runs even before any stage is reported', () => {
+    expect(failsafeAction(0, true)).toBe('rtl');
   });
 
   it('leaves a return already under way alone', () => {
     expect(failsafeAction(5, true)).toBe('none');
   });
 
-  it('lands in place over the pad during takeoff, and before any stage is reported', () => {
-    expect(failsafeAction(1, true)).toBe('land');
-    expect(failsafeAction(0, true)).toBe('land');
+  it('lands in place only when no mission process can take the jump', () => {
+    for (const stage of [0, 1, 2, 3, 4, 5]) expect(failsafeAction(stage, false)).toBe('land');
+  });
+});
+
+describe('batteryTriggerArmed', () => {
+  it('arms only in hovering (2) and flying (3)', () => {
+    expect(batteryTriggerArmed(2)).toBe(true);
+    expect(batteryTriggerArmed(3)).toBe(true);
   });
 
-  it('lands in place when no mission process can take the jump', () => {
-    for (const stage of [0, 2, 3, 5]) expect(failsafeAction(stage, false)).toBe('land');
+  it('stays disarmed on the ground, in the climb, in the descent and when unknown', () => {
+    for (const state of [0, 1, 4, 5, 6, 7, 8]) expect(batteryTriggerArmed(state), String(state)).toBe(false);
+    expect(batteryTriggerArmed(null)).toBe(false);
+    expect(batteryTriggerArmed(undefined)).toBe(false);
+  });
+});
+
+describe('launchParamsJson', () => {
+  const sent = (doc: unknown) => JSON.parse(launchParamsJson(doc, 25));
+
+  it('always sends the fixed 10 s countdown, whatever the document holds', () => {
+    for (const value of [3, 0, 30, undefined]) {
+      expect(sent({ kinematics: { countdown_sec: value, target_altitude_m: 2 } }).kinematics).toEqual({
+        countdown_sec: 10,
+        target_altitude_m: 2,
+      });
+    }
+    expect(sent(undefined).kinematics.countdown_sec).toBe(10);
+  });
+
+  it('writes the threshold into a clone and leaves the document alone', () => {
+    const doc = { kinematics: { countdown_sec: 3 }, battery: { land_pct: 10 } };
+    expect(sent(doc).battery.land_pct).toBe(25);
+    expect(doc).toEqual({ kinematics: { countdown_sec: 3 }, battery: { land_pct: 10 } });
   });
 });

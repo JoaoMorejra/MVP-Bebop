@@ -1,9 +1,9 @@
 """Unit tests for the onboard battery safety net (``telemetry.battery``).
 
-The ground station owns the battery failsafe; this net covers the runs it is
-not in command of. Its contract is narrow: silence without a fresh reading, a
-one-shot warning at a fixed 10 %, and a land in place at ``battery.land_pct``
-that goes through the existing ``trigger_emergency_land`` and nothing else.
+Its contract is narrow: silence without a fresh reading, a one-shot warning
+at a fixed 10 %, and a critical reason at ``battery.land_pct`` that is no
+longer a health failure. The return itself is requested through the one-shot
+hook (``test_battery_forced_return.py``); nothing here lands the aircraft.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def test_no_battery_telemetry_is_silent_and_never_lands(records):
 
     assert battery.telemetry_health() is TelemetryHealth.NEVER_RECEIVED
     assert battery.current_percentage() is None
-    assert battery.land_reason() is None
+    assert battery.critical_reason() is None
     assert failsafe.evaluate_system_health() == (True, "Nominal")
     assert actuator.landed == 0
     assert records.messages(logging.WARNING) == []
@@ -144,7 +144,7 @@ def test_a_stale_reading_is_not_acted_on(records):
 
     assert battery.telemetry_health() is TelemetryHealth.STALE
     assert battery.current_percentage() is None
-    assert battery.land_reason() is None
+    assert battery.critical_reason() is None
     assert failsafe.evaluate_system_health() == (True, "Nominal")
     assert actuator.landed == 0
     assert records.messages(logging.WARNING) == []
@@ -154,10 +154,11 @@ def test_a_fresh_sample_after_a_stale_one_restores_the_guard():
     failsafe, battery, _ = build(land_pct=30.0, stale_timeout_sec=0.02)
     battery.battery_callback(battery_msg(0.25))
     time.sleep(0.05)
-    assert failsafe.evaluate_system_health()[0] is True
+    assert battery.critical_reason() is None
 
     battery.battery_callback(battery_msg(0.25))
-    assert failsafe.evaluate_system_health()[0] is False
+    assert battery.critical_reason() is not None
+    assert failsafe.evaluate_system_health()[0] is True
 
 
 # ------------------------------------------------------------------ warning
@@ -204,49 +205,44 @@ def test_the_warning_milestone_is_a_valid_contract_line():
     assert line.startswith("[MILESTONE mission.battery_warning] ")
 
 
-# --------------------------------------------------------------------- land
+# ----------------------------------------------------------------- critical
 
 
-def test_land_fires_at_the_configured_threshold_and_not_above():
+def test_the_critical_reason_fires_at_the_configured_threshold_and_not_above():
     failsafe, battery, _ = build(land_pct=37.0)
 
     battery.battery_callback(battery_msg(0.38))
-    assert failsafe.evaluate_system_health() == (True, "Nominal")
+    assert battery.critical_reason() is None
 
     battery.battery_callback(battery_msg(0.37))
-    healthy, reason = failsafe.evaluate_system_health()
 
-    assert healthy is False
-    assert "Battery at 37%" in reason and "37%" in reason
+    assert battery.critical_reason() == "Battery at 37% <= return threshold 37%; returning to base."
+    assert failsafe.evaluate_system_health() == (True, "Nominal")
 
 
-def test_land_below_the_threshold_is_also_reported():
+def test_a_charge_below_the_threshold_is_also_critical():
     failsafe, battery, _ = build(land_pct=37.0)
     battery.inject_synthetic_reading(12)
-    assert failsafe.evaluate_system_health()[0] is False
+    assert battery.critical_reason() is not None
+    assert "landing in place" not in battery.critical_reason()
+    assert failsafe.evaluate_system_health()[0] is True
 
 
-def test_the_land_goes_through_the_existing_trigger_emergency_land(monkeypatch):
-    """The step call-site pattern: evaluate, then hand the reason to the failsafe."""
+def test_the_threshold_never_reaches_trigger_emergency_land(monkeypatch):
+    """The step call-site pattern: evaluate, then hand any failure to the failsafe."""
     failsafe, battery, actuator = build(land_pct=37.0)
     calls: List[str] = []
-    original = FailsafeSupervisor.trigger_emergency_land
-
-    def spy(self, reason):
-        calls.append(reason)
-        return original(self, reason)
-
-    monkeypatch.setattr(FailsafeSupervisor, "trigger_emergency_land", spy)
+    monkeypatch.setattr(FailsafeSupervisor, "trigger_emergency_land", lambda self, reason: calls.append(reason))
 
     battery.battery_callback(battery_msg(0.30))
     healthy, reason = failsafe.evaluate_system_health()
     if not healthy:
         failsafe.trigger_emergency_land(reason)
 
-    assert calls == [reason]
-    assert actuator.velocities == [(0.0, 0.0, 0.0, 0.0)]
-    assert actuator.landed == 1
-    assert failsafe.failsafe_active is True
+    assert (healthy, reason) == (True, "Nominal")
+    assert calls == []
+    assert actuator.velocities == [] and actuator.landed == 0
+    assert failsafe.failsafe_active is False
 
 
 def test_the_battery_module_carries_no_landing_logic_of_its_own():
@@ -256,6 +252,7 @@ def test_the_battery_module_carries_no_landing_logic_of_its_own():
     assert "goto_stage" not in source and "request_stage" not in source
     supervisor = BatterySupervisor(BatteryConfig())
     assert not any(hasattr(supervisor, name) for name in ("actuator", "drone", "failsafe"))
+    assert not hasattr(supervisor, "land_reason")
 
 
 # ---------------------------------------------------------------- parameter

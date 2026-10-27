@@ -1,77 +1,63 @@
 import type { FailsafeAction } from './batteryFailsafe';
-import type { MissionMode } from './missionMode';
-
-const ADVANCED_CALLS = {
-  alreadyReturning: 'Bateria crítica. Retorno à base já em curso.',
-  returning: 'Bateria crítica. Retornando à base para pouso.',
-  landing: 'Bateria crítica. Pouso de emergência iniciado.',
-} as const;
-
-/** Either profile without the return (`rtl.enabled` false): stage 5 lands where it is. */
-const IN_PLACE_CALLS = {
-  alreadyReturning: 'Bateria crítica. Pouso já em curso.',
-  returning: 'Bateria crítica: pousando no local.',
-  landing: 'Bateria crítica. Pouso de emergência iniciado.',
-} as const;
-
-const SIMPLE_CALLS = {
-  alreadyReturning: 'Bateria crítica. Pouso na base já em curso.',
-  returning: 'Bateria crítica. Pouso na base iniciado.',
-  landing: 'Bateria crítica. Pouso de emergência iniciado.',
-} as const;
-
-export type BatteryCalls = typeof ADVANCED_CALLS | typeof IN_PLACE_CALLS | typeof SIMPLE_CALLS;
 
 /**
- * What the station says on a critical charge, by the plan being flown and the
- * path actually taken. Without the return no call names the base.
+ * The station's only battery sentence of its own, said when it lands the
+ * aircraft where it is: no mission running, a jump the host could not carry,
+ * or a mission silent through both acknowledgement windows. The return itself
+ * is narrated from the mission's milestones (`mission.battery_return` and the
+ * RTL milestones flagged `battery_return`), so the crossing is said once.
  */
-export function batteryCalls(mode: MissionMode, rtlEnabled = true): BatteryCalls {
-  if (!rtlEnabled) return IN_PLACE_CALLS;
-  return mode === 'simple' ? SIMPLE_CALLS : ADVANCED_CALLS;
-}
-
-export const BATTERY_CALLS = ADVANCED_CALLS;
+export const BATTERY_LANDING_CALL = 'Bateria crítica. Pouso de emergência iniciado.';
 
 export interface BatteryReturnHooks {
   /** Speak through the narration queue, ahead of narration (`NarrationQueue.preempt`). */
   say: (label: string, text: string) => void;
-  /** Ask the mission to continue at the return stage; resolves with its acknowledgement. */
+  /** Ask the mission to continue at the return stage; resolves with the host's delivery of the request. */
   gotoStage: () => Promise<{ success: boolean }>;
   /** Land in place. */
   land: () => Promise<void>;
+  /**
+   * Wait for a mission that may still answer after a jump the host could not
+   * deliver: it starts the return on its own at the same charge. Resolves true
+   * when the landing is no longer needed (the return was acknowledged, or the
+   * aircraft is down). Absent, an undelivered jump lands at once.
+   */
+  graceWindow?: () => Promise<boolean>;
 }
 
 /**
- * The critical-battery response, spoken as it happens.
+ * The critical-battery response of the station.
  *
- * "Retornando à base" used to be said before the jump was even asked for, and
- * stayed said when the mission refused it and the aircraft landed where it
- * stood. The return call now follows the acknowledgement; a refused or failed
- * jump says it is landing, then lands.
+ * Parameters
+ * ----------
+ * action
+ *   The decision of `failsafeAction`.
+ * hooks
+ *   The narration queue, the stage jump and the landing.
  *
- * @returns The path taken: `rtl`, `land`, or `none` when a return was already
- *   under way.
+ * Returns
+ * -------
+ * The path taken: `rtl` when the request reached the mission (silent; the
+ * caller watches for the acknowledgement), `none` when a return was already
+ * under way or the grace window made the landing unnecessary (silent), `land`
+ * after the emergency call and the landing.
  */
 export async function runCriticalBatteryReturn(
   action: FailsafeAction,
-  hooks: BatteryReturnHooks,
-  mode: MissionMode = 'advanced',
-  rtlEnabled = true
+  hooks: BatteryReturnHooks
 ): Promise<FailsafeAction> {
-  const calls = batteryCalls(mode, rtlEnabled);
-  if (action === 'none') {
-    hooks.say('battery.critical', calls.alreadyReturning);
-    return 'none';
-  }
+  if (action === 'none') return 'none';
   if (action === 'rtl') {
     const jump = await hooks.gotoStage().catch(() => ({ success: false }));
-    if (jump.success) {
-      hooks.say('battery.critical', calls.returning);
-      return 'rtl';
-    }
+    if (jump.success) return 'rtl';
+    if (hooks.graceWindow && (await hooks.graceWindow())) return 'none';
   }
-  hooks.say('battery.critical', calls.landing);
-  await hooks.land();
+  await landOnCriticalBattery(hooks);
   return 'land';
+}
+
+/** The emergency landing: {@link BATTERY_LANDING_CALL}, then the landing. */
+export async function landOnCriticalBattery(hooks: Pick<BatteryReturnHooks, 'say' | 'land'>): Promise<void> {
+  hooks.say('battery.critical', BATTERY_LANDING_CALL);
+  await hooks.land();
 }

@@ -9,12 +9,16 @@ which republishes the ARSDK ``CommonState.BatteryStateChanged`` event every
 (``bebop_driver_node.cpp:227-252``), with ``present = false`` and a NaN
 ``percentage`` until the aircraft has reported a charge at all.
 
-The ground station owns the battery failsafe and the RTL-versus-land decision
-(``bebop_mission_control/src/lib/batteryFailsafe.ts``). This module is the
-redundant net inside the mission process for the runs the station is not in
-command of, and it does one thing: at ``battery.land_pct`` it asks
-:meth:`FailsafeSupervisor.trigger_emergency_land` to land the aircraft where it
-is. It never flies a return.
+The mission process is the single authority for the critical-charge return.
+At ``battery.land_pct``, with the airframe in the air, this module calls a
+one-shot hook (:meth:`BatterySupervisor.set_return_hook`) wired by
+``mission.py`` to ``MissionContext.request_battery_return_or_land``, which
+jumps the runner to Stage 5 through the station's stage gate and marks the
+return as forced, so Stage 5 flies the return of the active profile even with
+``rtl.enabled = false``. The charge is not a health condition: the airframe
+never lands in place because of it, only at the end of the return. The ground
+station (``bebop_mission_control/src/lib/batteryFailsafe.ts``) keeps its own
+trigger as redundancy. This module holds no actuator and commands nothing.
 
 A charge the aircraft has not reported is not a reading to act on. Absent or
 stale telemetry makes this module silent -- no warning, no failsafe -- and the
@@ -28,7 +32,7 @@ import logging
 import math
 import threading
 import time
-from typing import TYPE_CHECKING, Final, Optional, Union
+from typing import TYPE_CHECKING, Callable, Final, Optional, Union
 
 from mvp_mission_bebop.parameters import BatteryConfig
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
@@ -87,7 +91,7 @@ def normalize_percentage(value: Union[int, float, str], name: str = "percentage"
 
 
 class BatterySupervisor:
-    """Owns the latest battery reading and the land-threshold decision.
+    """Owns the latest battery reading and the critical-charge return request.
 
     Parameters
     ----------
@@ -118,6 +122,52 @@ class BatterySupervisor:
         self._percentage: Optional[float] = None
         self._timestamp: float = 0.0
         self._warning_emitted = False
+        self._return_hook: Optional[Callable[[str], bool]] = None
+        self._airborne: Optional[Callable[[], bool]] = None
+        self._return_requested = False
+
+    # ------------------------------------------------------------------ wiring
+
+    def set_return_hook(
+        self, hook: Callable[[str], bool], airborne: Callable[[], bool]
+    ) -> None:
+        """Install the callable that requests the critical-charge return.
+
+        Parameters
+        ----------
+        hook : Callable[[str], bool]
+            Called once per flight with :meth:`critical_reason` when a fresh
+            reading is at or below ``land_pct`` and ``airborne()`` is true. It
+            runs on the executor thread that delivered the reading. Its return
+            value says whether the return was requested; ``False`` means the
+            caller has already handled the refusal itself.
+        airborne : Callable[[], bool]
+            Whether the airframe is in the air. On the ground the hook never
+            fires: the Stage 1 pre-arm gate refuses that launch instead.
+
+        Raises
+        ------
+        TypeError
+            If either argument is not callable.
+        """
+        if not callable(hook):
+            raise TypeError(f"hook must be callable, got {type(hook).__name__}")
+        if not callable(airborne):
+            raise TypeError(f"airborne must be callable, got {type(airborne).__name__}")
+        with self._lock:
+            self._return_hook = hook
+            self._airborne = airborne
+
+    def reset_return(self) -> None:
+        """Rearm the one-shot return request for a new flight."""
+        with self._lock:
+            self._return_requested = False
+
+    @property
+    def return_requested(self) -> bool:
+        """True once the hook has been called this flight."""
+        with self._lock:
+            return self._return_requested
 
     # --------------------------------------------------------------- ingestion
 
@@ -153,6 +203,43 @@ class BatterySupervisor:
             self._timestamp = time.monotonic()
         if percentage <= BATTERY_WARNING_PCT:
             self._raise_warning(percentage)
+        if percentage <= self.land_pct:
+            self._request_return()
+
+    def _request_return(self) -> None:
+        """Call the return hook once per flight, airborne only.
+
+        The flag is taken under the lock before the call, so two readings
+        delivered on different executor threads cannot both request the
+        return. A hook that raises rearms the request: the next reading, one
+        driver state period later, tries again rather than leaving the
+        airframe without a return.
+        """
+        with self._lock:
+            hook = self._return_hook
+            airborne = self._airborne
+            if hook is None or airborne is None or self._return_requested:
+                return
+        try:
+            in_flight = bool(airborne())
+        except Exception as exc:  # noqa: BLE001 - an unreadable altitude is not a reason to act
+            logger.warning("Airborne state unavailable (%s); return not requested on this reading.", exc)
+            return
+        if not in_flight:
+            return
+        reason = self.critical_reason()
+        if reason is None:
+            return
+        with self._lock:
+            if self._return_requested:
+                return
+            self._return_requested = True
+        try:
+            hook(reason)
+        except Exception as exc:  # noqa: BLE001 - retried on the next reading
+            logger.error("Battery return request failed (%s); retrying on the next reading.", exc)
+            with self._lock:
+                self._return_requested = False
 
     def _raise_warning(self, percentage: float) -> None:
         """Log and emit ``mission.battery_warning`` once per flight."""
@@ -198,8 +285,8 @@ class BatterySupervisor:
 
     # ---------------------------------------------------------------- decision
 
-    def land_reason(self) -> Optional[str]:
-        """Failure reason for :meth:`FailsafeSupervisor.evaluate_system_health`.
+    def critical_reason(self) -> Optional[str]:
+        """Reason handed to the return hook.
 
         Returns
         -------
@@ -211,6 +298,6 @@ class BatterySupervisor:
         if percentage is None or percentage > self.land_pct:
             return None
         return (
-            f"Battery at {percentage:.0f}% <= land threshold {self.land_pct:.0f}%; "
-            "landing in place."
+            f"Battery at {percentage:.0f}% <= return threshold {self.land_pct:.0f}%; "
+            "returning to base."
         )
