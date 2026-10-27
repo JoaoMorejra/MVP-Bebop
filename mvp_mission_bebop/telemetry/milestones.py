@@ -92,6 +92,11 @@ MILESTONE_KEYS: Final[Tuple[str, ...]] = (
     #: ``mission.touchdown``; the station draws the forensic report from it.
     #: Not narrated.
     "mission.inspection_ready",
+    #: Critical charge in flight: the mission jumps to Stage 5 and flies the
+    #: return of the profile (``MissionContext.request_battery_return``),
+    #: ``{"battery_pct": float, "threshold_pct": float, "from_stage": int,
+    #: "mode": "simple|advanced"}``. Raised once per flight, before the jump.
+    "mission.battery_return",
 )
 
 

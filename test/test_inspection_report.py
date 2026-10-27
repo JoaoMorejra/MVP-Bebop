@@ -1,8 +1,9 @@
 """Forensic report engine: order rules, cross-flight memory and the victim line.
 
-The operator's ruling fixes police, SAMU and the vehicle as clearances; only the
-victim line follows the inference on the inspection frame. The properties below
-pin the order rules (the report opens with the vehicle or the victim, alternating
+Police, SAMU and the vehicle are clearances (the vehicle line always names the
+tow truck); only the victim line follows the inference on the inspection frame.
+The properties below pin the order rules (the report opens with the victim when
+one was detected and with the vehicle otherwise, SAMU and police alternating
 across flights), the memory (no wording repeats the previous flight's) and the
 rule the victim line exists for: without a completed inference, nothing is said
 about the victim.
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import unicodedata
 
 import pytest
@@ -21,13 +23,13 @@ from mvp_mission_bebop.telemetry import announcer
 from mvp_mission_bebop.telemetry.inspection_report import (
     FIXED_FINDINGS,
     HISTORY_FILENAME,
-    LEAD_TOPICS,
     TOPICS,
     VICTIM_FINDINGS,
     _decapitalise,
     build_inspection_report,
     check_topic_order,
     history_path_for,
+    lead_topics_for,
     load_history,
 )
 
@@ -66,19 +68,68 @@ def test_the_report_never_opens_with_a_dispatch_topic(status):
         assert set(topics[2:]) == {"samu", "police"}
 
 
-def test_the_lead_alternates_across_flights_with_persisted_history(tmp_path):
+def test_the_report_opens_with_the_victim_only_when_one_was_detected():
+    for seed in range(50):
+        detected = build_inspection_report("detected", rng=random.Random(seed))
+        assert [finding["topic"] for finding in detected[:2]] == ["victim", "vehicle"]
+        for status in ("not_detected", "unknown"):
+            report = build_inspection_report(status, rng=random.Random(seed))
+            assert [finding["topic"] for finding in report[:2]] == ["vehicle", "victim"]
+
+
+def test_lead_topics_for_follows_the_victim_status():
+    assert lead_topics_for(VictimStatus.DETECTED) == ("victim", "vehicle")
+    assert lead_topics_for(VictimStatus.NOT_DETECTED) == ("vehicle", "victim")
+    assert lead_topics_for(VictimStatus.UNKNOWN) == ("vehicle", "victim")
+    with pytest.raises(TypeError):
+        lead_topics_for("detected")
+
+
+def test_the_dispatch_order_alternates_across_flights_with_persisted_history(tmp_path):
     path = history_path_for(str(tmp_path))
-    leads = []
     dispatch = []
     for flight in range(8):
-        report = build_inspection_report("unknown", history_path=path, rng=random.Random(flight))
-        leads.append(report[0]["topic"])
-        dispatch.append(tuple(finding["topic"] for finding in report[2:]))
+        report = build_inspection_report("detected", history_path=path, rng=random.Random(flight))
+        tail = tuple(finding["topic"] for finding in report[2:])
+        assert set(tail) == {"samu", "police"}
+        dispatch.append(tail)
 
-    assert all(a != b for a, b in zip(leads, leads[1:])), leads
     assert all(a != b for a, b in zip(dispatch, dispatch[1:])), dispatch
-    assert set(leads) == set(LEAD_TOPICS)
     assert (tmp_path / HISTORY_FILENAME).exists()
+
+
+@pytest.mark.parametrize("status", STATUSES)
+def test_every_vehicle_card_names_the_tow_truck(status):
+    for seed in range(100):
+        vehicle = next(
+            finding for finding in build_inspection_report(status, rng=random.Random(seed)) if finding["topic"] == "vehicle"
+        )
+        assert re.search(r"guincho", vehicle["card"], re.IGNORECASE)
+        assert re.search(r"(danos|avarias) (estruturais )?aparentes|Integridade", vehicle["card"])
+        assert re.search(r"guincho", vehicle["speech"], re.IGNORECASE)
+        assert ".." not in vehicle["speech"]
+
+
+def test_a_stale_history_document_is_tolerated(tmp_path):
+    path = tmp_path / HISTORY_FILENAME
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "bmg.inspection_history.v1",
+                "history": {"finding.lead": [0, 1], "finding.vehicle": [9], "finding.victim.not_detected": [5, 7]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    previous = None
+    for flight in range(10):
+        report = build_inspection_report("not_detected", history_path=str(path), rng=random.Random(flight))
+        assert len(report) == 4
+        cards = _by_topic(report)
+        if previous is not None:
+            for topic in TOPICS:
+                assert cards[topic] != previous[topic], (flight, topic)
+        previous = cards
 
 
 @pytest.mark.parametrize("status", STATUSES)
@@ -99,9 +150,10 @@ def test_the_fixed_topics_are_identical_in_the_three_branches(tmp_path):
         fixed = [{t: c for t, c in _by_topic(report).items() if t != "victim"} for report in reports]
         orders = [[finding["topic"] for finding in report] for report in reports]
         assert fixed[0] == fixed[1] == fixed[2]
-        assert orders[0] == orders[1] == orders[2]
+        assert orders[1] == orders[2]
+        assert orders[0][2:] == orders[1][2:]
     for topic in ("police", "samu", "vehicle"):
-        assert len(FIXED_FINDINGS[topic]) == 4
+        assert len(FIXED_FINDINGS[topic]) == (5 if topic == "vehicle" else 4)
 
 
 @pytest.mark.parametrize("status", STATUSES)
@@ -173,7 +225,8 @@ def test_a_corrupt_history_reads_as_none_and_is_rewritten(tmp_path):
 
     document = json.loads(path.read_text(encoding="utf-8"))
     assert document["schema"] == "bmg.inspection_history.v1"
-    assert set(document["history"]) >= {"finding.lead", "finding.dispatch_order", "finding.victim.detected"}
+    assert set(document["history"]) >= {"finding.dispatch_order", "finding.victim.detected"}
+    assert "finding.lead" not in document["history"]
 
 
 def test_an_invalid_victim_status_is_refused():

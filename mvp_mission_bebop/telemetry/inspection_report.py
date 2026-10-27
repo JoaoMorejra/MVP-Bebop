@@ -1,8 +1,9 @@
 """Forensic report engine: four findings, the victim line decided by inference.
 
 The report clears four topics -- police, ambulance (SAMU), the victim and the
-vehicle. Police, SAMU and the vehicle are fixed clearances: their wordings are
-the long-standing pools and only the variant drawn changes. The victim line is
+vehicle. Police, SAMU and the vehicle are fixed clearances: only the variant
+drawn changes, and every vehicle wording states that a tow truck was called to
+clear the road. The victim line is
 the one finding that depends on evidence, and it is drawn from the pool of the
 inspection frame's :class:`~mvp_mission_bebop.perception.assessment.VictimStatus`:
 
@@ -11,9 +12,9 @@ inspection frame's :class:`~mvp_mission_bebop.perception.assessment.VictimStatus
 * ``unknown``: neutral. Without a completed inference nothing is stated about
   the victim -- neither presence, absence, consciousness nor injuries.
 
-Order: the report opens with the vehicle or the victim, alternating with the
-previous flight (the first flight draws), then the other of the two, then SAMU
-and police in an order that differs from the previous flight's. Wordings avoid
+Order: the report opens with the victim when one was detected and with the
+vehicle otherwise (``not_detected`` and ``unknown``), then the other of the two,
+then SAMU and police in an order that differs from the previous flight's. Wordings avoid
 the variants of the last :data:`HISTORY_WINDOW` flights, with the semantics of
 ``pickVariant`` in ``bebop_mission_control/src/lib/copilotPhrases.ts``. The
 station holds the same tables and algorithm in ``src/lib/forensics.ts``.
@@ -47,14 +48,14 @@ HISTORY_WINDOW: Final[int] = 5
 #: The four topics, in the canonical enumeration.
 TOPICS: Final[Tuple[str, ...]] = ("police", "samu", "victim", "vehicle")
 
-#: Topics that may open the report, as indexed by ``finding.lead``.
+#: Topics that may open the report.
 LEAD_TOPICS: Final[Tuple[str, str]] = ("vehicle", "victim")
 
 #: Orders of the dispatch topics, as indexed by ``finding.dispatch_order``.
 DISPATCH_ORDERS: Final[Tuple[Tuple[str, str], ...]] = (("samu", "police"), ("police", "samu"))
 
-#: Fixed clearances. Not to be edited: the operator's ruling keeps them as they
-#: were before the victim line became evidence-driven.
+#: Fixed clearances. Every vehicle wording states that a tow truck was called
+#: to clear the road, by order of the station's operator.
 FIXED_FINDINGS: Final[Dict[str, Tuple[str, ...]]] = {
     "police": (
         "Sem necessidade de polícia",
@@ -69,10 +70,11 @@ FIXED_FINDINGS: Final[Dict[str, Tuple[str, ...]]] = {
         "SAMU dispensado para a ocorrência",
     ),
     "vehicle": (
-        "Veículo não danificado",
-        "Sem danos estruturais aparentes no veículo",
-        "Integridade do automóvel preservada",
-        "Veículo sem avarias mecânicas",
+        "Veículo sem danos estruturais aparentes. Guincho acionado para desobstrução da via",
+        "Veículo sem danos estruturais aparentes, com guincho já acionado devido à obstrução da via",
+        "Sem danos estruturais aparentes no veículo. Guincho acionado para liberar a via",
+        "Integridade do automóvel preservada. Guincho acionado para desobstrução da via",
+        "Veículo sem avarias aparentes. Guincho já acionado para remover a obstrução da via",
     ),
 }
 
@@ -92,6 +94,7 @@ VICTIM_FINDINGS: Final[Dict[str, Tuple[str, ...]]] = {
         "Nenhum acidentado identificado na imagem",
         "Cena sem vítimas aparentes",
         "Ausência de vítimas visíveis na imagem",
+        "Nenhuma vítima visível no local",
     ),
     VictimStatus.UNKNOWN.value: (
         "Avaliação da vítima não incluída neste laudo preliminar",
@@ -274,6 +277,34 @@ def record_variant(history: History, key: str, index: int) -> History:
     return updated
 
 
+def lead_topics_for(victim_status: VictimStatus) -> Tuple[str, str]:
+    """First two topics of the report for a victim status.
+
+    Parameters
+    ----------
+    victim_status : VictimStatus
+        Status of the inspection frame's assessment.
+
+    Returns
+    -------
+    Tuple[str, str]
+        ``("victim", "vehicle")`` when a victim was detected; ``("vehicle",
+        "victim")`` for ``not_detected`` and for ``unknown``, where the
+        inference did not conclude and nothing is asserted about the victim
+        before the vehicle line.
+
+    Raises
+    ------
+    TypeError
+        If ``victim_status`` is not a :class:`VictimStatus`.
+    """
+    if not isinstance(victim_status, VictimStatus):
+        raise TypeError(f"victim_status must be a VictimStatus, got {type(victim_status).__name__}")
+    if victim_status is VictimStatus.DETECTED:
+        return ("victim", "vehicle")
+    return ("vehicle", "victim")
+
+
 def check_topic_order(topics: Sequence[str]) -> None:
     """Enforce the report order invariants.
 
@@ -297,9 +328,10 @@ def build_inspection_report(
 ) -> List[Dict[str, str]]:
     """Draw one report and record it in the history.
 
-    Draw order is lead, dispatch order, the fixed wordings, the connectors and
-    last the victim wording, so for one seed and one history the three
-    branches differ in the victim line only.
+    The opening topics follow the victim status and are not drawn. Draw order
+    is dispatch order, the fixed wordings, the connectors and last the victim
+    wording, so for one seed and one history the three branches differ in the
+    victim line (and the opening order it implies) only.
 
     Parameters
     ----------
@@ -326,13 +358,9 @@ def build_inspection_report(
     rng = rng if rng is not None else random.Random()
     history = load_history(history_path)
 
-    lead_index = pick_variant("finding.lead", len(LEAD_TOPICS), history, rng)
-    history = record_variant(history, "finding.lead", lead_index)
-    lead = LEAD_TOPICS[lead_index]
-    second = LEAD_TOPICS[1 - lead_index]
     dispatch_index = pick_variant("finding.dispatch_order", len(DISPATCH_ORDERS), history, rng)
     history = record_variant(history, "finding.dispatch_order", dispatch_index)
-    topics = [lead, second, *DISPATCH_ORDERS[dispatch_index]]
+    topics = [*lead_topics_for(status), *DISPATCH_ORDERS[dispatch_index]]
     check_topic_order(topics)
 
     cards: Dict[str, str] = {}

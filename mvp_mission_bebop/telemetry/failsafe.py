@@ -28,6 +28,11 @@ KINEMATIC_TOLERANCE: Final[float] = 1e-4
 
 
 
+#: Reason :meth:`FailsafeSupervisor.evaluate_system_health` returns once the
+#: failsafe is engaged. A step that hands it back to ``trigger_emergency_land``
+#: reports no new fault.
+FAILSAFE_ALREADY_ACTIVE_REASON: Final[str] = "Failsafe already active."
+
 #: Relative altitude above which the airframe is taken to be flying, metres.
 AIRBORNE_ALTITUDE_M: Final[float] = 0.25
 
@@ -87,11 +92,14 @@ class FailsafeSupervisor:
         self.odom_supervisor = odom_supervisor
         self.timeouts_cfg = timeouts_cfg
         self.kinematics_cfg = kinematics_cfg or FlightKinematicsConfig()
-        #: Onboard low-charge net. ``None`` disables the battery condition,
-        #: which is what every caller built before it existed gets.
+        #: Latest charge, read by the Stage 1 pre-arm gate. Not a health item:
+        #: the critical charge requests the return through the supervisor's
+        #: hook and never lands the aircraft from here. ``None`` without one.
         self.battery_supervisor = battery_supervisor
         self.last_valid_frame_timestamp: float = time.monotonic()
         self.failsafe_active: bool = False
+        #: Reason of the last alert raised by :meth:`trigger_emergency_land`.
+        self._alerted_reason: Optional[str] = None
 
         # Climb authority is a window, not a flag a caller can simply assert.
         # Stage 1 opens it for the duration of its ascent and it closes itself;
@@ -396,7 +404,12 @@ class FailsafeSupervisor:
             )
 
     def evaluate_system_health(self, *, check_video: bool = True) -> Tuple[bool, str]:
-        """Verify telemetry health, altitude ceiling, battery charge, and optical stream continuity.
+        """Verify telemetry health, altitude ceiling and optical stream continuity.
+
+        The battery charge is deliberately absent. A failure here ends in
+        :meth:`trigger_emergency_land`, a landing in place, and the critical
+        charge must bring the aircraft home instead: ``BatterySupervisor``
+        requests Stage 5 through its return hook.
 
         Parameters
         ----------
@@ -412,7 +425,7 @@ class FailsafeSupervisor:
             ``(True, "Nominal")`` or ``(False, reason)``.
         """
         if self.failsafe_active:
-            return False, "Failsafe already active."
+            return False, FAILSAFE_ALREADY_ACTIVE_REASON
 
         health = self.odom_supervisor.telemetry_health()
         if health is TelemetryHealth.NEVER_RECEIVED:
@@ -424,11 +437,6 @@ class FailsafeSupervisor:
             rel_alt = self.odom_supervisor.relative_altitude
             ceiling = self.odom_supervisor.altitude_ceiling
             return False, f"Altitude ceiling breached: {rel_alt:.2f} m > {ceiling:.2f} m."
-
-        if self.battery_supervisor is not None:
-            battery_reason = self.battery_supervisor.land_reason()
-            if battery_reason is not None:
-                return False, battery_reason
 
         if check_video:
             frame_age = time.monotonic() - self.last_valid_frame_timestamp
@@ -444,8 +452,34 @@ class FailsafeSupervisor:
         return isinstance(altitude, (int, float)) and math.isfinite(altitude) and altitude > AIRBORNE_ALTITUDE_M
 
     def trigger_emergency_land(self, reason: str) -> None:
-        """Execute immediate controlled safe landing. Never cuts motors abruptly."""
+        """Execute immediate controlled safe landing. Never cuts motors abruptly.
+
+        Every call re-asserts the halt and the landing, because the land topic
+        is best-effort with depth 1. The alert is raised once per fault: a
+        repeat of the reason already alerted, or
+        :data:`FAILSAFE_ALREADY_ACTIVE_REASON` (a step answering its health
+        check after another thread engaged the failsafe), raises none; a
+        different later fault alerts again.
+
+        Parameters
+        ----------
+        reason : str
+            Why the aircraft lands; logged, and spoken through
+            :func:`spoken_reason` when it is a new fault.
+        """
+        repeat = self.failsafe_active and (
+            reason == self._alerted_reason or reason == FAILSAFE_ALREADY_ACTIVE_REASON
+        )
+        if repeat:
+            logger.warning("Failsafe already engaged (%s); re-asserting the landing.", reason)
+            try:
+                self.actuator.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
+                self.actuator.land()
+            except Exception as exc:
+                logger.critical("Secondary exception during emergency landing execution: %s", exc)
+            return
         self.failsafe_active = True
+        self._alerted_reason = reason
         logger.critical("FAILSAFE ENGAGED: %s. Halting actuators and commanding landing.", reason)
 
         try:

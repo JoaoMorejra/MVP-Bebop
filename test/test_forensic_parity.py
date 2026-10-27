@@ -13,6 +13,7 @@ import os
 import re
 from typing import Dict, List
 
+from mvp_mission_bebop.perception.assessment import VictimStatus
 from mvp_mission_bebop.telemetry import inspection_report as engine
 
 _FORENSICS_TS = os.path.join(
@@ -74,7 +75,18 @@ def test_the_connectors_are_identical():
 
 def test_the_order_tables_are_identical():
     lead = _block("LEAD_TOPICS")
-    assert _strings(lead[lead.index("= [") :]) == list(engine.LEAD_TOPICS)
+    assert set(_strings(lead[lead.index("= [") :])) == set(engine.LEAD_TOPICS)
     dispatch = _block("DISPATCH_ORDERS")
     pairs = re.findall(r"\[('[a-z]+'), ('[a-z]+')\]", dispatch[dispatch.index("= [") :])
     assert [tuple(_strings(" ".join(pair))) for pair in pairs] == [tuple(order) for order in engine.DISPATCH_ORDERS]
+
+
+def test_the_lead_rule_is_identical():
+    source = _source()
+    body = re.search(r"export function leadTopicsFor\(.*?^}", source, re.MULTILINE | re.DOTALL)
+    assert body, "leadTopicsFor not found in forensics.ts"
+    victim_first = re.search(r"=== 'detected'\s*\?\s*\['victim', 'vehicle'\]\s*:\s*\['vehicle', 'victim'\]", body.group(0))
+    assert victim_first, "leadTopicsFor rule changed shape"
+    for status in VictimStatus:
+        expected = ("victim", "vehicle") if status is VictimStatus.DETECTED else ("vehicle", "victim")
+        assert engine.lead_topics_for(status) == expected
