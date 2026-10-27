@@ -69,7 +69,7 @@ Por decisão de escopo, os itens a seguir foram **adiados** e permanecem como ri
 1. Conferir que todos ao redor estão cientes da decolagem iminente.
 2. Posicionar o cursor sobre o dial central.
 3. **Pressionar e segurar** o dial por **1,2 segundos** até o anel de armamento completar 100% e o rótulo mudar de `"VOO REAL: motores serão armados"` para `"ARMANDO"`.
-4. Soltar o botão: a missão entrará em contagem regressiva sonora de 3 segundos, executando flat trim e referência de solo.
+4. Soltar o botão: a missão entra na contagem regressiva sonora, fixa em 10 segundos (não é parâmetro da estação), durante a qual executa a sequência de solo (flat trim e referência de solo). O aviso falado de afastamento soa 3,2 s antes do zero. É possível abortar a qualquer momento da contagem (3.5).
 5. Manter as mãos prontas sobre a tecla **Escape** ou o botão vermelho **ABORTAR MISSÃO**.
 
 ### 3.5 Procedimento de Aborto de Emergência
@@ -181,3 +181,82 @@ reação do firmware nem a manutenção de altitude na borda.
   `degraded`/`settled = false` se o alvo não for enquadrado.
 - [ ] **Stage 5:** busca do marcador voando para a **direita** (`vy < 0`, `|vy| = |rtl.reverse_cruise_velocity|`,
   regra E05); se o marcador for ultrapassado, o reenquadramento é um creep para a esquerda.
+
+---
+
+## 5. Feira Offline (Voz Pré-Sintetizada, Sem Rede na Estação)
+
+Na feira a estação não tem internet: o Wi-Fi do Bebop não tem rota. A voz oficial (Gemini Live, voz Orbit) só toca para frases cujo PCM já está no cache em disco (`~/.cache/bmg/speech`, ou `BMG_SPEECH_CACHE_DIR`). O cache **não está no Git**; é gerado com internet e transportado em `tar.gz`. Referência das frases e da operação do cache: `bebop_mission_control/docs/TABELA_DE_FALAS_COPILOTO.md`, seção "Operação do cache".
+
+### 5.1 Pré-síntese (máquina com internet, `SPEECH_API_KEY` exportada)
+Na raiz do repositório, após `source ~/ros2_ws/bin/nectar-activate`:
+- [ ] `python3 bebop_mission_control/streamer/precache_speech.py --dry-run`: contagem por categoria, sem rede e sem gravar. Na máquina de desenvolvimento hoje faltam 482 de 739 frases.
+- [ ] `python3 bebop_mission_control/streamer/precache_speech.py`: sintetiza o que falta (~2 s por frase; 482 frases ~ 16 min). Entradas curtas (< 0,25 s por palavra, turno cortado) são sobrescritas. Saída 2 sem chave ou sem rede.
+- [ ] `python3 bebop_mission_control/streamer/precache_speech.py --check`: **saída 0 obrigatória**. Saída 1 lista as faltantes e as curtas; repetir o passo anterior.
+- [ ] `python3 bebop_mission_control/streamer/precache_speech.py --pack ~/bmg-speech-feira.tar.gz`: recusa (saída 1) se houver entrada ausente ou curta.
+- Outro conjunto de parâmetros: `--parameters FILE` (lista JSON de `mission.parameters`) ou `BMG_MISSION_CONFIG` apontando para o `mission_config.json` desejado. A pré-síntese deve usar os mesmos parâmetros que serão voados.
+
+### 5.2 Instalação na máquina da feira
+- [ ] Copiar `~/bmg-speech-feira.tar.gz` para a máquina da feira.
+- [ ] `python3 bebop_mission_control/streamer/precache_speech.py --unpack ~/bmg-speech-feira.tar.gz`: recusa (saída 2) pacote de outra voz ou modelo.
+- [ ] `python3 bebop_mission_control/streamer/precache_speech.py --check` com os **mesmos** `SPEECH_VOICE` (Orbit) e `SPEECH_MODEL` da síntese: saída 0. A chave do cache contém frase, modo de prompt, voz e modelo; qualquer diferença invalida o cache inteiro.
+- [ ] `--prune` apenas lista entradas fora do manifesto atual (qualquer voz); remove só com `--yes` e recusa abaixo de metade de cobertura. Não usar na feira.
+
+### 5.3 Regra: parâmetros falados
+- [ ] **Não alterar altitude, velocidade nem limiares falados na feira sem repetir a pré-síntese (5.1 e 5.2).** Parâmetro alterado muda o texto da frase, que vira cache miss: a linha é descartada em milissegundos com `[SPEECH_MISS]` no log, sem síntese e sem travar a fila; os cards seguem na cadência própria e a voz fica ausente naquela frase.
+
+### 5.4 Opcional: evitar a sonda de alcançabilidade
+- [ ] Exportar `BMG_SPEECH_OFFLINE=1` no ambiente da estação: o daemon não sonda a rede (a primeira sonda custa até 1 s). `"0"` nunca assume offline; ausente ou `auto` sonda.
+- [ ] Medir na estação conectada ao Wi-Fi do Bebop: `time getent hosts generativelanguage.googleapis.com` (falha esperada, anotar o tempo).
+
+### 5.5 Ensaio offline em bancada (`--no-fly`)
+Desligar a rede com internet (`nmcli networking off` ou desconectar cabo/Wi-Fi); conectar apenas ao Wi-Fi do Bebop, se aplicável. No BMG marcar "bancada" (o `main.cjs` passa `--no-fly`; nunca armar motores). Critérios, lidos no log da missão (`<userData>/logs/mission_<AAAAMMDD_HHMMSS>.log`) e na tela:
+- [ ] Toda linha `[SPEECH]` com `source=cache`; nenhuma com `source=synth`, `stream` ou `prefetch`.
+- [ ] Zero `[SPEECH_MISS]` com os parâmetros pré-sintetizados.
+- [ ] Contagem da palavra banida igual a 0 no log e na tela: `grep -icE 'sini[s]tro' <log>`.
+- [ ] Laudo abre com **Veículo** (com guincho) quando não há vítima, e com **Vítima** primeiro quando detectada. Forçar os dois cenários com as imagens de `test/fixtures` quando existirem; sem forma de forçar `victim_detected`, cobrir pelo teste de componente e registrar a lacuna.
+- [ ] Sem o botão "Visualizar Laudo Pericial".
+- [ ] Rodapé do mapa com valores exatos: BASE FIXA `-23.648891, -46.718712`; Cidade `São Paulo`; Localização `Transamerica Expo Center`. Grade visível desde o primeiro quadro, sem tiles de rede.
+- [ ] Nenhuma tentativa de rede nos logs do daemon (sem `warm-up failed`).
+- [ ] **Comportamento de miss:** repetir com um parâmetro alterado (altitude ou velocidade) e observar `[SPEECH_MISS]` na frase afetada, linha pulada em milissegundos e cards na cadência própria. Restaurar o parâmetro e confirmar zero miss.
+
+---
+
+## 6. Mapa Offline (Tiles de Satélite Locais, Sem Rede na Estação)
+
+O mapa tático lê tiles de `bebop_mission_control/public/tiles/{z}/{x}/{y}.jpg` (rota `tileRoute.cjs`; tile ausente responde 404 sem corpo). Referência: `docs/PLANO_MAPA_OFFLINE_EXPOCENTER.md`, Task 6. Pipeline: `scripts/offline_tiles.py` (subcomandos `plan`, `raster`, `xyz`, `verify`; saída 0 sucesso, 1 cobertura incompleta, 2 erro de uso ou de rede).
+
+### 6.1 Estado
+- **A imagem ainda NÃO foi obtida.** Sem tiles em `public/tiles`, o mapa cai na grade local.
+- Origem escolhida: MapTiler `satellite-v2` (fonte usada antes), **condicionada a autorização escrita do MapTiler** para exportar e cachear tiles para uso offline. Sem a autorização, não baixar (termos do MapTiler Cloud).
+- Alternativas: ortofoto GeoSampa (comando `raster`; exige `sudo apt install gdal-bin python3-gdal`) ou ortomosaico próprio do Bebop.
+- A chave antiga foi removida do código e **precisa ser rotacionada no painel do MapTiler**. Usar chave nova somente via `BMG_TILE_KEY`; nunca versionar.
+
+### 6.2 Cobertura
+- Tiles z17 a z20 (padrão `--zooms 17-20`). A exibição vai de 17 a 22; z21 e z22 são sobrezoom do z20.
+- `--viewport-px` padrão 1280 (256 tiles). Para painel até 1920 px, usar `--viewport-px 1920` (700 tiles para z15-20 é só referência; para z17-20, rodar `plan` e registrar o número).
+- Limite: painel maior que `viewportPx` em qualquer eixo fica com bordas sem imagem.
+- [ ] `python3 scripts/offline_tiles.py plan [--viewport-px 1920]`: registrar a contagem por nível.
+
+### 6.3 Obtenção (máquina com internet, somente com a autorização de 6.1)
+- [ ] `export BMG_TILE_KEY=<chave nova>` (somente no ambiente; o `xyz` recusa chave fora desta variável).
+- [ ] Baixar (template https obrigatório, com `{z}/{x}/{y}` e `{key}`):
+  `python3 scripts/offline_tiles.py xyz --url-template 'https://api.maptiler.com/tiles/satellite-v2/{z}/{x}/{y}.jpg?key={key}' --source 'MapTiler satellite-v2' --license '<autorização escrita, data>' --attribution '© MapTiler © OpenStreetMap contributors' --rate 4 [--viewport-px 1920]`
+- [ ] `python3 scripts/offline_tiles.py verify`: **saída 0 obrigatória**.
+- [ ] `du -sh bebop_mission_control/public/tiles`: registrar o tamanho.
+- [ ] Abrir 3 tiles (um em z17, um em z19, um em z20) e confirmar que mostram o Expo Center, não placeholder.
+- Os tiles são versionados no Git (`public/tiles`, decisão D-B).
+- Via raster: `python3 scripts/offline_tiles.py raster --src <arquivo> [--srs <EPSG>] --source ... --license ... --attribution ...`.
+
+### 6.4 Verificação sem rede (ação do operador)
+Desligar a rota para a internet (`nmcli networking off` ou desconectar cabo/Wi-Fi). Executar `npm run dev` em `bebop_mission_control/` e repetir no app Electron empacotado.
+- [ ] Mapa de satélite visível desde o primeiro quadro.
+- [ ] Zoom por botões, roda e pinch de 17 a 22, sem quadrados pretos nem costuras.
+- [ ] Recentrar funciona.
+- [ ] Rodapé com valores exatos: BASE FIXA `-23.648891, -46.718712`; Cidade `São Paulo`; Localização `Transamerica Expo Center`.
+- [ ] Atribuição `© MapTiler © OpenStreetMap contributors` visível.
+- [ ] Painel estreito e painel largo sem borda vazia (até o `--viewport-px` usado).
+- [ ] Nenhuma requisição fora de `localhost` (aba Network).
+- [ ] Nenhum 404 de tile nas faixas permitidas (z17-z20 na cobertura).
+- [ ] Console sem erros.
+- [ ] **Cenário de falha:** renomear temporariamente `dist/tiles`; confirmar que a grade local aparece sem tela preta (o fallback dispara quando todos os tiles da tela falham, ou após 2 s sem nenhum carregado, e é terminal até remontar o componente); restaurar o diretório e recarregar.

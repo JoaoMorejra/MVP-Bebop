@@ -144,20 +144,16 @@
 ### Arquivos Alvo
 - `src/components/cockpit/TacticalMap.tsx`
 - `electron/main.cjs`
-- `bebop_mission_control/.env`
 
 ### Instruções de Implementação e Operação
 1. **Em `src/components/cockpit/TacticalMap.tsx`:**
-   - Mantenha o suporte a `VITE_MAP_API_KEY` (MapTiler Dataviz Dark) e `VITE_MAPBOX_TOKEN` (Mapbox Dark).
+   - Superado: o mapa tático usa apenas os tiles offline servidos de `public/tiles` (ver `docs/PLANO_MAPA_OFFLINE_EXPOCENTER.md`); não há chave de API.
    - Se os tiles online não carregarem (offline ou sem internet), exiba a **Grade Tática Local** com grade milimétrica, ponto de lançamento (RTL), anel de dispersão, escala métrica e posição relativa do drone em tempo real via odometria.
    - Caso as coordenadas do GPS sejam `(0, 0)`, use o centro operacional padrão `-19.8703, -43.9678`.
 2. **Em `electron/main.cjs`:**
    - Mantenha `ipwho.is` como provedor primário de geolocalização com fallback para evitar erros de rate limit.
 3. **Como Conectar e Ter Mapa Funcional (Instruções Operacionais):**
-   - **Passo 1 (Chave de API):** Crie uma conta gratuita em [MapTiler Cloud](https://cloud.maptiler.com/) e adicione sua chave no arquivo `bebop_mission_control/.env`:
-     ```env
-     VITE_MAP_API_KEY=sua_chave_maptiler_aqui
-     ```
+   - Superado: o mapa tático usa apenas os tiles offline servidos de `public/tiles` (ver `docs/PLANO_MAPA_OFFLINE_EXPOCENTER.md`); não há chave de API. Os passos abaixo são históricos.
    - **Passo 2 (Rede Dupla / Acesso Simultâneo à Internet):**
      * Conecte o Wi-Fi do computador ao Bebop 2 (`Bebop2-xxxxxx`).
      * Conecte um cabo Ethernet (ou tethering USB do celular) ao computador para manter internet ativa enquanto controla o drone pelo Wi-Fi. Dessa forma, os tiles de alta resolução carregarão 100% em tempo real.
