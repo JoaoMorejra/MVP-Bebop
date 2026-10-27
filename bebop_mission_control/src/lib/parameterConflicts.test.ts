@@ -73,7 +73,7 @@ describe('evaluateParameterConflicts', () => {
     expect(e10.message).toContain('1.30 m sobre o totem');
     const ids = (overrides: Record<string, unknown>) => evaluateParameterConflicts(caseDocument(overrides)).map((c) => c.id);
     expect(ids({ ...pad, 'kinematics.target_altitude_m': 1.3 })).not.toContain('E10');
-    expect(ids({ 'kinematics.target_altitude_m': 2.05 })).toContain('E10');
+    expect(ids({ 'kinematics.target_altitude_m': 3.05 })).toContain('E10');
     expect(ids({ 'platform.height_m': 1, 'platform.takeoff_from_ground': true, 'kinematics.target_altitude_m': 0.5 })).not.toContain('E10');
   });
 

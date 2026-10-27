@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { completeDocument, factoryDocument, validDocument } from './__fixtures__/missionDocument';
 import {
   BACKFILL_PATHS,
+  LAUNCH_COUNTDOWN_SEC,
   REQUIRED_LAUNCH_NUMBERS,
   advancedFieldErrors,
   applySchemaFields,
@@ -66,6 +67,16 @@ describe('launchBlockers', () => {
     ]) {
       expect(REQUIRED_LAUNCH_NUMBERS).toContain(path);
     }
+  });
+});
+
+describe('the fixed countdown at the launch gate', () => {
+  it('lets a document with the 10 s countdown through', () => {
+    expect(launchBlockers(validDocument({ 'kinematics.countdown_sec': 10 }))).not.toContain('kinematics.countdown_sec');
+  });
+
+  it.each([[-1], [31]])('still bounds a countdown of %s s to 0..30 s outside the sheet', (value) => {
+    expect(launchBlockers(validDocument({ 'kinematics.countdown_sec': value }))).toContain('kinematics.countdown_sec');
   });
 });
 
@@ -139,7 +150,7 @@ const forwardSpec = NUMBER_PARAMETERS.find((spec) => spec.path === 'kinematics.f
 
 describe('slider ranges', () => {
   it.each([
-    ['kinematics.target_altitude_m', 0.1, 2.0, 0.05, 2],
+    ['kinematics.target_altitude_m', 0.1, 3.0, 0.05, 2],
     ['kinematics.altitude_ceiling_margin_m', 0.0, 2.0, 0.05, 2],
     ['kinematics.forward_cruise_velocity', 0.01, 0.6, 0.01, 2],
     ['gimbal.search_tilt_deg', -45, 0, 1, 0],
@@ -151,7 +162,7 @@ describe('slider ranges', () => {
 
   it.each([
     ['kinematics.target_altitude_m', 0.1],
-    ['kinematics.target_altitude_m', 2.0],
+    ['kinematics.target_altitude_m', 3.0],
     ['kinematics.altitude_ceiling_margin_m', 0.0],
     ['kinematics.altitude_ceiling_margin_m', 2.0],
     ['kinematics.forward_cruise_velocity', 0.01],
@@ -166,7 +177,7 @@ describe('slider ranges', () => {
 
   it.each([
     ['kinematics.target_altitude_m', 0.09],
-    ['kinematics.target_altitude_m', 2.01],
+    ['kinematics.target_altitude_m', 3.01],
     ['kinematics.altitude_ceiling_margin_m', -0.01],
     ['kinematics.altitude_ceiling_margin_m', 2.01],
     ['kinematics.forward_cruise_velocity', 0.0],
@@ -212,6 +223,20 @@ describe('setLinkedPath', () => {
 });
 
 describe('reconcileCoupledPaths', () => {
+  it('fixes the launch countdown at 10 s, the window FlightKinematicsConfig.countdown_sec holds', () => {
+    expect(LAUNCH_COUNTDOWN_SEC).toBe(10);
+    for (const value of [3, 0, 30, undefined, Number.NaN]) {
+      const doc = reconcileCoupledPaths(validDocument({ 'kinematics.countdown_sec': value }));
+      expect(getPath(doc, 'kinematics.countdown_sec'), String(value)).toBe(10);
+    }
+  });
+
+  it('returns the same document when the countdown is already 10 s', () => {
+    const doc = reconcileCoupledPaths(validDocument());
+    expect(getPath(doc, 'kinematics.countdown_sec')).toBe(10);
+    expect(reconcileCoupledPaths(doc)).toBe(doc);
+  });
+
   it('couples a document stored with the old independent return cruise', () => {
     const doc = reconcileCoupledPaths(validDocument({ 'rtl.reverse_cruise_velocity': -0.1 }));
     expect(getPath(doc, 'rtl.reverse_cruise_velocity')).toBe(-0.2);
@@ -438,8 +463,8 @@ describe('fillMissing', () => {
 
 describe('normalizeForMode', () => {
   it('moves an altitude over the floor envelope to its bound', () => {
-    const next = normalizeForMode({ kinematics: { target_altitude_m: 3.0, altitude_ceiling_margin_m: 0.1 } });
-    expect(next.kinematics).toMatchObject({ target_altitude_m: 2, altitude_ceiling_margin_m: 0.1 });
+    const next = normalizeForMode({ kinematics: { target_altitude_m: 3.5, altitude_ceiling_margin_m: 0.1 } });
+    expect(next.kinematics).toMatchObject({ target_altitude_m: 3, altitude_ceiling_margin_m: 0.1 });
   });
 
   it('raises an altitude under the pad minimum to 1.30 m over a 1 m pad', () => {
@@ -482,7 +507,8 @@ describe('launch checks on the shared envelope', () => {
       const doc = setPath(base, 'mission_mode', mode);
       expect(launchBlockers(setPath(doc, 'kinematics.target_altitude_m', 1.25))).toContain('kinematics.target_altitude_m');
       expect(launchBlockers(setPath(doc, 'kinematics.target_altitude_m', 1.8))).not.toContain('kinematics.target_altitude_m');
-      expect(launchBlockers(setPath(doc, 'kinematics.target_altitude_m', 2.05))).toContain('kinematics.target_altitude_m');
+      expect(launchBlockers(setPath(doc, 'kinematics.target_altitude_m', 3.0))).not.toContain('kinematics.target_altitude_m');
+      expect(launchBlockers(setPath(doc, 'kinematics.target_altitude_m', 3.05))).toContain('kinematics.target_altitude_m');
     }
   });
 
@@ -540,8 +566,8 @@ describe('altitudeAdjustment', () => {
     expect(getPath(after, 'kinematics.target_altitude_m')).toBe(1.3);
     expect(altitudeAdjustment(before, after)).toBe('Cota ajustada para 1,30 m: mínimo sobre o totem.');
     expect(altitudeAdjustment(after, after)).toBeNull();
-    const high = { kinematics: { target_altitude_m: 2.4 } };
-    expect(altitudeAdjustment(high, normalizeForMode(high))).toBe('Cota ajustada para 2,00 m: máximo permitido.');
+    const high = { kinematics: { target_altitude_m: 3.4 } };
+    expect(altitudeAdjustment(high, normalizeForMode(high))).toBe('Cota ajustada para 3,00 m: máximo permitido.');
   });
 
   it('re-applies the envelope when the surface goes back to the pad top', () => {

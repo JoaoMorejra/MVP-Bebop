@@ -15,7 +15,7 @@
  * - Required topics receiving
  * - Odometry and video stream fresh
  * - Flying state === 0 (on ground)
- * - Battery known and >= max(failsafeThreshold + 10, 30)%
+ * - Battery known and above the operator threshold (failsafeThreshold, default 20%)
  * - Resident command bridge ready
  * - Backup ROS 2 CLI available
  * - Voice copilot ready (daemon alive, audio device open, online)
@@ -52,6 +52,23 @@
  * @property {string | null} blockedReason
  * @property {string | null} warning
  */
+
+const DEFAULT_BATTERY_THRESHOLD_PCT = 20;
+
+/**
+ * Takeoff is refused when the charge is unreadable or at or below the
+ * operator threshold, the same `<=` criterion `steps/takeoff.py` applies.
+ *
+ * @param {number | null | undefined} pct
+ * @param {number} threshold
+ * @returns {string | null}
+ */
+function batteryBlockedReason(pct, threshold) {
+  if (typeof pct !== 'number' || !Number.isFinite(pct) || pct <= threshold) {
+    return `Bateria insuficiente para voo real (${pct ?? 0}% <= limiar ${threshold}%)`;
+  }
+  return null;
+}
 
 /**
  * Evaluates full launch readiness verdict.
@@ -138,17 +155,16 @@ function evaluateLaunchReadiness(input) {
     };
   }
 
-  // 11. Battery known and >= max(failsafe + 10, 30)%
+  // 11. Battery known and above the operator threshold
   if (input.batteryKnown === false) {
     return { ready: false, blockedReason: 'Bateria da aeronave desconhecida', warning: null };
   }
-  const minBattery = Math.max((input.batteryFailsafeThreshold ?? 20) + 10, 30);
-  if (typeof input.batteryPct !== 'number' || input.batteryPct < minBattery) {
-    return {
-      ready: false,
-      blockedReason: `Bateria insuficiente para voo real (${input.batteryPct ?? 0}% < ${minBattery}%)`,
-      warning: null,
-    };
+  const batteryReason = batteryBlockedReason(
+    input.batteryPct,
+    input.batteryFailsafeThreshold ?? DEFAULT_BATTERY_THRESHOLD_PCT
+  );
+  if (batteryReason) {
+    return { ready: false, blockedReason: batteryReason, warning: null };
   }
 
   // 12. Resident command bridge ready

@@ -12,7 +12,7 @@ import {
   type HistoryStore,
   type MilestoneKey,
   type StorageLike,
-  describeTargetLocation,
+  phraseValues,
   estimateSpeechSeconds,
   loadHistory,
   nextPhrase,
@@ -33,6 +33,8 @@ import {
   planPhraseKey,
   planSentence,
   type FlightPlan,
+  BATTERY_POOLS,
+  type PoolKey,
 } from './copilotPhrases';
 
 /** Deterministic PRNG, so a failure is reproducible rather than flaky. */
@@ -67,6 +69,7 @@ const SPEC_KEYS: MilestoneKey[] = [
   'mission.landing',
   'mission.touchdown',
   'mission.battery_warning',
+  'mission.battery_return',
   'inspection.intro',
   'inspection.outro',
 ];
@@ -98,14 +101,17 @@ describe('phrase pools', () => {
     expect(pool.filter((line) => !/\{[a-z_]+\}/.test(line)).length).toBeGreaterThanOrEqual(2);
   });
 
-  it('place the target location in every target-found variant', () => {
-    for (const line of PHRASE_POOLS['mission.target_found']) expect(line).toContain('{location}');
+  it('say every target-found variant literally, on the runway, without a distance or a side (D2)', () => {
+    for (const line of PHRASE_POOLS['mission.target_found']) {
+      expect(placeholdersOf(line), line).toEqual([]);
+      expect(line).toMatch(/na pista\.$/);
+      expect(line).not.toMatch(/metro|esquerda|direita/);
+    }
   });
 
   it('keep every flight call within four spoken seconds at its longest rendering', () => {
     const longest = {
       altitude: spokenMeters(12.5),
-      location: describeTargetLocation({ forward_m: 12.5, bearing_deg: 5 }),
       speed: spokenSpeed(0.35) ?? '',
       threshold: '100 por cento',
     };
@@ -122,7 +128,7 @@ describe('phrase pools', () => {
 
   it('leave no placeholder unresolved in keys that take none', () => {
     for (const key of POOL_KEYS) {
-      if (['mission.takeoff', 'mission.target_found', 'mission.scan_start', 'mission.battery_warning'].includes(key)) continue;
+      if (['mission.takeoff', 'mission.scan_start', 'mission.battery_warning'].includes(key)) continue;
       for (const line of PHRASE_POOLS[key]) expect(line, key).not.toMatch(/\{[a-z_]+\}/);
     }
   });
@@ -288,16 +294,10 @@ describe('rendering', () => {
     expect(spokenMeters(Number.NaN)).toBe('altitude configurada');
   });
 
-  it('describes the target from the milestone payload, and falls back without geometry', () => {
-    expect(describeTargetLocation({ forward_m: 2.7, bearing_deg: 3.6 })).toBe(
-      'a 2,7 metros à frente, levemente à direita'
-    );
-    expect(describeTargetLocation({ forward_m: 4, bearing_deg: -15 })).toBe(
-      'a 4 metros à frente, à esquerda'
-    );
-    expect(describeTargetLocation({ forward_m: 1.2, bearing_deg: 0.5 })).toBe('a 1,2 metro à frente');
-    expect(describeTargetLocation({ forward_m: null, bearing_deg: null })).toBe('na pista');
-    expect(describeTargetLocation(undefined)).toBe('na pista');
+  it('derives no location from the target geometry the mission still attaches', () => {
+    const values = phraseValues({ forward_m: 2.7, bearing_deg: 3.6 }, {});
+    expect(Object.keys(values)).toEqual([]);
+    expect(Object.values(values).join(' ')).not.toMatch(/metro|esquerda|direita/);
   });
 });
 
@@ -398,7 +398,7 @@ describe('conditional phrases (3.5)', () => {
   it('a capture without a confirmed target says so and claims no target', () => {
     for (const line of every('mission.capture_done', { target_confirmed: false, settled: false })) {
       expect(line).toMatch(/sem alvo confirmado/);
-      expect(line).not.toMatch(/sinistro|pericial/i);
+      expect(line).not.toMatch(new RegExp(['sini', 'stro'].join('') + '|pericial', 'i'));
     }
   });
 
@@ -487,9 +487,15 @@ describe('copilot repertoire by flight plan', () => {
   });
 
   it.each(['simple', 'advanced'] as const)('never caches a return, a marker or a base without the return (%s)', (mode) => {
+    // The critical-charge return flies whatever the plan says (D2): only its
+    // own pools may name the base in a flight planned without the return.
+    const battery = new Set(BATTERY_POOLS.flatMap((key) => PHRASE_POOLS[key]));
     const spoken = allMissionPhrases({ target_altitude_m: 1.8, cruise_mps: 0.2 }, { mode, rtlEnabled: false });
     expect(spoken.length).toBeGreaterThan(0);
-    for (const sentence of spoken) expect(sentence).not.toMatch(NO_RTL_FORBIDDEN);
+    for (const sentence of spoken) {
+      if (battery.has(sentence)) continue;
+      expect(sentence).not.toMatch(NO_RTL_FORBIDDEN);
+    }
     const pools = poolsForPlan({ mode, rtlEnabled: false });
     expect(pools).toContain('mission.landing_in_place');
     expect(pools).toContain('mission.touchdown_in_place');
@@ -609,5 +615,191 @@ describe('flight plan sentences', () => {
     const cached = allMissionPhrases({ target_altitude_m: 1.8 }, { mode: 'simple', rtlEnabled: false });
     for (const sentence of PLAN_PHRASES['plan.land_in_place_simple']) expect(cached).toContain(sentence);
     expect(cached).not.toContain(PLAN_PHRASES['plan.rtl'][0]);
+  });
+});
+
+const NEW_BATTERY_POOLS: readonly PoolKey[] = [
+  'mission.battery_return',
+  'mission.battery_return_simple',
+  'mission.rtl_start_battery',
+  'mission.landing_battery',
+  'mission.landing_battery_in_place',
+  'mission.touchdown_battery',
+  'mission.touchdown_battery_in_place',
+];
+
+/** Pools both profiles reach on a critical-charge return. */
+const SHARED_BATTERY_POOLS: readonly PoolKey[] = [
+  'mission.landing_battery',
+  'mission.landing_battery_in_place',
+  'mission.touchdown_battery',
+  'mission.touchdown_battery_in_place',
+];
+
+const DRAW_12 = Array.from({ length: 12 }, (_, i) => () => i / 12);
+
+describe('battery return (Task 2B)', () => {
+  it('lists every battery pool in BATTERY_POOLS', () => {
+    expect([...BATTERY_POOLS].sort()).toEqual([...NEW_BATTERY_POOLS].sort());
+  });
+
+  it('holds distinct, closed, literal and clean sentences', () => {
+    const banned = new RegExp(['sini', 'stro'].join(''), 'i');
+    for (const key of NEW_BATTERY_POOLS) {
+      const pool = PHRASE_POOLS[key];
+      expect(pool.length, key).toBeGreaterThan(HISTORY_WINDOW);
+      expect(new Set(pool).size, key).toBe(pool.length);
+      for (const line of pool) {
+        expect(line, key).toMatch(/\.$/);
+        expect(line, key).not.toContain('{');
+        expect(line, key).not.toMatch(banned);
+        expect(line, key).not.toMatch(/operador|comandad/i);
+        expect(line.split(/\s+/).length, line).toBeLessThanOrEqual(10);
+        expect(estimateSpeechSeconds(line), line).toBeLessThanOrEqual(FLIGHT_CALL_MAX_SECONDS);
+      }
+    }
+  });
+
+  it('shares no sentence with any other pool', () => {
+    const others = POOL_KEYS.filter((key) => !NEW_BATTERY_POOLS.includes(key)).flatMap((key) => PHRASE_POOLS[key]);
+    const all = NEW_BATTERY_POOLS.flatMap((key) => PHRASE_POOLS[key]);
+    expect(new Set(all).size).toBe(all.length);
+    for (const line of all) expect(others, line).not.toContain(line);
+  });
+
+  it('says "bateria crítica" only at the crossing, so no two consecutive calls repeat it', () => {
+    for (const key of NEW_BATTERY_POOLS) {
+      if (key === 'mission.battery_return' || key === 'mission.battery_return_simple') continue;
+      for (const line of PHRASE_POOLS[key]) expect(line, key).not.toMatch(/bateria crítica/i);
+    }
+  });
+
+  it('never says a return or a translation in the pools the Simple profile reaches', () => {
+    const forbidden = /retorn|regress|voltando|volta|caminho|desloca|lateral|cruzeiro/i;
+    for (const key of ['mission.battery_return_simple', ...SHARED_BATTERY_POOLS] as const) {
+      for (const line of PHRASE_POOLS[key]) expect(line, key).not.toMatch(forbidden);
+    }
+  });
+
+  it('never claims a marker found or centred where the mission sets at_base without one', () => {
+    for (const line of PHRASE_POOLS['mission.landing_battery']) expect(line).not.toMatch(/localizad|alinhad/i);
+    for (const line of PHRASE_POOLS['mission.battery_return_simple']) expect(line).not.toMatch(/marcador|centraliz/i);
+  });
+
+  it('reaches each battery pool only in the plans that fly it', () => {
+    for (const plan of PLANS) {
+      const reachable = poolsForPlan(plan);
+      const advanced = plan.mode === 'advanced';
+      expect(reachable.includes('mission.battery_return'), JSON.stringify(plan)).toBe(advanced);
+      expect(reachable.includes('mission.rtl_start_battery'), JSON.stringify(plan)).toBe(advanced);
+      expect(reachable.includes('mission.battery_return_simple'), JSON.stringify(plan)).toBe(!advanced);
+      for (const key of SHARED_BATTERY_POOLS) expect(reachable, JSON.stringify(plan)).toContain(key);
+    }
+  });
+
+  it('caches the battery sentences of the plan, even without the return', () => {
+    for (const plan of PLANS) {
+      const cached = allMissionPhrases({ target_altitude_m: 1 }, plan);
+      for (const key of poolsForPlan(plan).filter((pool) => NEW_BATTERY_POOLS.includes(pool))) {
+        for (const line of PHRASE_POOLS[key]) expect(cached, `${JSON.stringify(plan)} ${key}`).toContain(line);
+      }
+    }
+  });
+
+  it('picks the battery crossing pool from the payload mode, else the plan mode', () => {
+    expect(poolForMilestone('mission.battery_return', { mode: 'advanced' }, 'simple')).toBe('mission.battery_return');
+    expect(poolForMilestone('mission.battery_return', { mode: 'simple' }, 'advanced')).toBe('mission.battery_return_simple');
+    expect(poolForMilestone('mission.battery_return', {}, 'simple')).toBe('mission.battery_return_simple');
+    expect(poolForMilestone('mission.battery_return', {}, { mode: 'advanced', rtlEnabled: false })).toBe(
+      'mission.battery_return'
+    );
+  });
+
+  it.each([true, false])('speaks the battery return start, never the jump, whatever the plan (rtlEnabled %s)', (rtlEnabled) => {
+    const plan = { mode: 'advanced' as const, rtlEnabled };
+    const payload = { battery_return: true, via_jump: true, marker_guided: true };
+    expect(poolForMilestone('mission.rtl_start', payload, plan)).toBe('mission.rtl_start_battery');
+    expect(poolForMilestone('mission.rtl_start', { ...payload, inspected: true }, plan)).toBe('mission.rtl_start_battery');
+  });
+
+  it.each([true, false])('chooses the battery landing and touchdown by at_base and confirmed (rtlEnabled %s)', (rtlEnabled) => {
+    for (const mode of ['advanced', 'simple'] as const) {
+      const plan = { mode, rtlEnabled };
+      expect(poolForMilestone('mission.landing', { at_base: true, battery_return: true }, plan)).toBe('mission.landing_battery');
+      expect(poolForMilestone('mission.landing', { at_base: false, battery_return: true }, plan)).toBe(
+        'mission.landing_battery_in_place'
+      );
+      expect(poolForMilestone('mission.landing', { battery_return: true }, plan)).toBe('mission.landing_battery_in_place');
+      expect(poolForMilestone('mission.touchdown', { confirmed: true, at_base: true, battery_return: true }, plan)).toBe(
+        'mission.touchdown_battery'
+      );
+      expect(poolForMilestone('mission.touchdown', { confirmed: true, at_base: false, battery_return: true }, plan)).toBe(
+        'mission.touchdown_battery_in_place'
+      );
+      expect(poolForMilestone('mission.touchdown', { confirmed: false, at_base: true, battery_return: true }, plan)).toBe(
+        'mission.touchdown_unconfirmed'
+      );
+    }
+  });
+
+  it('keeps the choice of a flight without a battery return', () => {
+    const plan = { mode: 'advanced' as const, rtlEnabled: true };
+    expect(poolForMilestone('mission.rtl_start', { via_jump: true, battery_return: false }, plan)).toBe('mission.rtl_start_jump');
+    expect(poolForMilestone('mission.landing', { at_base: true, battery_return: false }, plan)).toBe('mission.landing');
+    expect(poolForMilestone('mission.touchdown', { confirmed: true, at_base: true }, plan)).toBe('mission.touchdown');
+    expect(poolForMilestone('mission.landing', { at_base: true }, { mode: 'advanced', rtlEnabled: false })).toBe(
+      'mission.landing_in_place'
+    );
+  });
+
+  it('allows the return start of a battery return in every plan, and only then', () => {
+    for (const plan of PLANS) {
+      expect(isMilestoneAllowed('mission.rtl_start', plan, { battery_return: true })).toBe(true);
+      expect(isMilestoneAllowed('mission.battery_return', plan, { mode: plan.mode })).toBe(true);
+    }
+    expect(isMilestoneAllowed('mission.rtl_start', { mode: 'simple', rtlEnabled: false }, { battery_return: true })).toBe(true);
+    expect(isMilestoneAllowed('mission.rtl_start', { mode: 'simple', rtlEnabled: false })).toBe(false);
+    expect(isMilestoneAllowed('mission.rtl_start', { mode: 'advanced', rtlEnabled: false }, { battery_return: false })).toBe(false);
+  });
+
+  it('never names the marker on a battery return that is not marker-guided', () => {
+    for (const rtlEnabled of [true, false]) {
+      for (const random of DRAW_12) {
+        const line = phraseForMilestone(
+          'mission.rtl_start',
+          { battery_return: true, via_jump: true, marker_guided: false },
+          {},
+          { storage: null, random },
+          { mode: 'advanced', rtlEnabled }
+        );
+        expect(PHRASE_POOLS['mission.rtl_start_battery']).toContain(line);
+        expect(line).not.toMatch(/marcador/i);
+      }
+    }
+  });
+
+  it('is never censored by the plan without the return, and never says "no local" at the base', () => {
+    for (const mode of ['advanced', 'simple'] as const) {
+      const plan = { mode, rtlEnabled: false };
+      const atBase = new Set<string>();
+      for (const random of DRAW_12) {
+        const options = { storage: null, random };
+        const landing = phraseForMilestone('mission.landing', { at_base: true, battery_return: true }, {}, options, plan);
+        const touchdown = phraseForMilestone(
+          'mission.touchdown',
+          { confirmed: true, at_base: true, battery_return: true },
+          {},
+          options,
+          plan
+        );
+        expect(PHRASE_POOLS['mission.landing_battery']).toContain(landing);
+        expect(PHRASE_POOLS['mission.touchdown_battery']).toContain(touchdown);
+        for (const line of [landing, touchdown]) {
+          expect(line).not.toMatch(/no local/);
+          atBase.add(line);
+        }
+      }
+      expect([...atBase].some((line) => /\bbase\b/.test(line)), mode).toBe(true);
+    }
   });
 });

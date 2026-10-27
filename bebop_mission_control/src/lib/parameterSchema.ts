@@ -31,7 +31,7 @@ import {
   TAKEOFF_FROM_GROUND_PATH,
   altitudeSliderRange,
   ceilingFloorFrame,
-  launchesFromGround,
+  marginUnlocked,
   type AltitudeRange,
 } from './altitudeEnvelope';
 import { MISSION_MODE_PATH, inactivePaths, type MissionMode } from './missionMode';
@@ -85,12 +85,12 @@ export interface ParameterGroup {
 }
 
 /**
- * Why the ceiling margin is locked: on the pad top the mission ignores it and
- * flies a fixed ceiling (D2, `estimation/ceiling_schedule.py`), stated over the
- * floor.
+ * Why the ceiling margin is locked: on the pad top at or below
+ * `TOTEM_MARGIN_UNLOCK_ABOVE_M` the mission ignores it and flies a fixed
+ * ceiling (D2, `estimation/ceiling_schedule.py`), stated over the floor.
  */
 function ceilingMarginLock(doc: unknown): string | null {
-  if (launchesFromGround(doc)) return null;
+  if (marginUnlocked(doc)) return null;
   const ceiling = ceilingFloorFrame(doc);
   const figure = ceiling === null ? '' : `: ${ceiling.toFixed(2).replace('.', ',')} m sobre o piso`;
   return `Teto fixo do perfil de totem${figure}`;
@@ -109,7 +109,7 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         label: 'Altitude de Voo',
         hint: 'Cota sobre o piso. Decolando do totem, o mínimo é a altura do totem mais 0,30 m.',
         min: 0.1,
-        max: 2,
+        max: 3,
         rangeFor: altitudeSliderRange,
         step: 0.05,
         unit: 'm',
@@ -202,18 +202,18 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
   {
     id: 'timeouts',
     title: 'Limites de Tempo',
-    summary: 'Quanto tempo a busca e o retorno podem durar, e a contagem antes da decolagem',
+    summary: 'Quanto tempo a busca e o retorno podem durar',
     summaries: {
-      simple: 'Quanto tempo a busca por giro pode durar, e a contagem antes da decolagem',
+      simple: 'Quanto tempo a busca por giro pode durar',
     },
     items: [
       {
         kind: 'number',
         path: 'timeouts.search_timeout_sec',
         label: 'Timeout de Procura/Varredura',
-        hint: 'Sem sinistro confirmado neste tempo, a varredura encerra e a aeronave retorna.',
+        hint: 'Sem ocorrência confirmada neste tempo, a varredura encerra e a aeronave retorna.',
         hints: {
-          simple: 'Tempo máximo girando em busca do sinistro. Sem alvo confirmado neste tempo, a aeronave fotografa a referência e pousa.',
+          simple: 'Tempo máximo girando em busca da ocorrência. Sem alvo confirmado neste tempo, a aeronave fotografa a referência e pousa.',
         },
         min: 5,
         max: 180,
@@ -242,17 +242,6 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         unit: 's',
         precision: 0,
         modes: ['advanced'],
-      },
-      {
-        kind: 'number',
-        path: 'kinematics.countdown_sec',
-        label: 'Contagem Regressiva',
-        hint: 'Janela entre o lançamento e a decolagem. Zero decola sem contagem.',
-        min: 0,
-        max: 30,
-        step: 1,
-        unit: 's',
-        precision: 0,
       },
     ],
   },

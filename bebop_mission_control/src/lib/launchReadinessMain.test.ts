@@ -130,18 +130,52 @@ describe('R4 / R8 Launch Readiness in main.cjs', () => {
       expect(missionSpawn()).toBeUndefined();
     });
 
-    it('blocks if battery is below safe threshold', async () => {
-      await setHealthyTelemetry();
-      await main.handlers['bmg:test-set-telemetry']({}, { battery_pct: 25 });
+    describe('battery threshold from battery.land_pct', () => {
+      const launchWith = async (batteryPct: number, landPct?: number) => {
+        await setHealthyTelemetry();
+        await main.handlers['bmg:test-set-telemetry']({}, { battery_pct: batteryPct });
+        const doc = completeDocument() as Record<string, unknown>;
+        if (landPct !== undefined) doc.battery = { ...((doc.battery as object) ?? {}), land_pct: landPct };
+        return (await main.handlers['bmg:start-mission']({}, {
+          noFly: false,
+          paramsJson: JSON.stringify(doc),
+        })) as { success: boolean; error?: string };
+      };
 
-      const res = (await main.handlers['bmg:start-mission']({}, {
-        noFly: false,
-        paramsJson: JSON.stringify(completeDocument()),
-      })) as { success: boolean; error: string };
+      it('launches at 25% with no threshold in the document (default 20)', async () => {
+        expect((await launchWith(25)).success).toBe(true);
+      });
 
-      expect(res.success).toBe(false);
-      expect(res.error).toMatch(/Bateria insuficiente para voo real \(25% < 30%\)/);
-      expect(missionSpawn()).toBeUndefined();
+      it('blocks at 15% with the default threshold', async () => {
+        const res = await launchWith(15);
+        expect(res.success).toBe(false);
+        expect(res.error).toBe('Bateria insuficiente para voo real (15% <= limiar 20%)');
+        expect(missionSpawn()).toBeUndefined();
+      });
+
+      it('blocks 28% against a land_pct of 30', async () => {
+        const res = await launchWith(28, 30);
+        expect(res.success).toBe(false);
+        expect(res.error).toBe('Bateria insuficiente para voo real (28% <= limiar 30%)');
+      });
+
+      it('launches 25% against a land_pct of 10', async () => {
+        expect((await launchWith(25, 10)).success).toBe(true);
+      });
+
+      it('respects a land_pct of 0 instead of falling back to 20', async () => {
+        expect((await launchWith(5, 0)).success).toBe(true);
+      });
+
+      it('readiness query reads the same threshold from the document', async () => {
+        await setHealthyTelemetry();
+        await main.handlers['bmg:test-set-telemetry']({}, { battery_pct: 25 });
+        const doc = { ...completeDocument(), battery: { land_pct: 30 } };
+        const verdict = (await main.handlers['bmg:get-launch-readiness']({}, {
+          paramsJson: JSON.stringify(doc),
+        })) as { ready: boolean; blockedReason: string | null };
+        expect(verdict.blockedReason).toBe('Bateria insuficiente para voo real (25% <= limiar 30%)');
+      });
     });
 
     it('does not block on a calibration flag in telemetry', async () => {
@@ -231,6 +265,129 @@ describe('R4 / R8 Launch Readiness in main.cjs', () => {
       expect(successes).toHaveLength(1);
       expect(failures).toHaveLength(1);
       expect(failures[0].message).toBe('Uma missão já está em andamento.');
+    });
+  });
+
+  describe('copilot voice served from the phrase cache', () => {
+    const speechSpawn = (): Spawned | undefined => main.spawned.find((child) => child.args.includes('--serve'));
+
+    async function startSpeechDaemon(): Promise<Spawned> {
+      await main.handlers['bmg:test-set-speech-state']({}, { ready: false, active: false });
+      const res = (await main.handlers['bmg:cache-speech']({}, ['Pouso confirmado na base.'])) as { success: boolean };
+      expect(res.success).toBe(true);
+      const daemon = speechSpawn();
+      expect(daemon).toBeDefined();
+      return daemon!;
+    }
+
+    function emitSpeechEvent(daemon: Spawned, event: Record<string, unknown>) {
+      daemon.child.stdout.emit('data', `BMG_SPEECH:${JSON.stringify(event)}\n`);
+    }
+
+    async function copilotLog(): Promise<string> {
+      const history = (await main.handlers['bmg:get-log-history']()) as { mission: Array<{ text: string }> };
+      return history.mission.map((entry) => entry.text).join('');
+    }
+
+    afterEach(async () => {
+      await main.handlers['bmg:test-set-speech-state']({}, { ready: false, active: false });
+      // Marked closed so the shared teardown does not emit `close`, whose
+      // handler would respawn the daemon 500 ms later into the next test.
+      const daemon = speechSpawn();
+      if (daemon) daemon.child.closed = true;
+    });
+
+    it('launches when the daemon reports voice ready from the cache alone', async () => {
+      const daemon = await startSpeechDaemon();
+      await setHealthyTelemetry();
+      emitSpeechEvent(daemon, {
+        event: 'ready',
+        voice: 'Orbit',
+        model: 'gemini-live',
+        synthesis: false,
+        playback: true,
+        voice_ready: true,
+        cache_entries: 120,
+        offline: true,
+        detail: 'pronto (voz em cache, sem rede)',
+      });
+
+      const res = (await main.handlers['bmg:start-mission']({}, {
+        noFly: false,
+        paramsJson: JSON.stringify(completeDocument()),
+      })) as { success: boolean };
+
+      expect(res.success).toBe(true);
+      const log = await copilotLog();
+      expect(log).toContain('voz em cache, sem rede');
+      expect(log).not.toContain('[copiloto] sem voz');
+    });
+
+    it('says the network is down on a synthesis-ready line without changing the gate', async () => {
+      const daemon = await startSpeechDaemon();
+      await setHealthyTelemetry();
+      emitSpeechEvent(daemon, {
+        event: 'ready',
+        voice: 'Orbit',
+        model: 'gemini-live',
+        synthesis: true,
+        playback: true,
+        voice_ready: true,
+        cache_entries: 0,
+        offline: true,
+        detail: 'pronto',
+      });
+
+      const res = (await main.handlers['bmg:start-mission']({}, {
+        noFly: false,
+        paramsJson: JSON.stringify(completeDocument()),
+      })) as { success: boolean };
+
+      expect(res.success).toBe(true);
+      expect(await copilotLog()).toContain('[copiloto] pronto (voz Orbit, modelo gemini-live, sem rede)');
+    });
+
+    it('blocks when the daemon reports no voice at all', async () => {
+      const daemon = await startSpeechDaemon();
+      await setHealthyTelemetry();
+      emitSpeechEvent(daemon, {
+        event: 'ready',
+        synthesis: false,
+        playback: true,
+        voice_ready: false,
+        cache_entries: 0,
+        offline: true,
+        detail: 'sem chave de API (SPEECH_API_KEY / GEMINI_API_KEY)',
+      });
+
+      const res = (await main.handlers['bmg:start-mission']({}, {
+        noFly: false,
+        paramsJson: JSON.stringify(completeDocument()),
+      })) as { success: boolean; error: string };
+
+      expect(res.success).toBe(false);
+      expect(res.error).toBe('Voz do copiloto indisponível ou offline');
+    });
+
+    it('falls back to synthesis and playback for a daemon without voice_ready', async () => {
+      const daemon = await startSpeechDaemon();
+      await setHealthyTelemetry();
+      emitSpeechEvent(daemon, { event: 'ready', synthesis: false, playback: true, detail: 'sem chave de API' });
+
+      const res = (await main.handlers['bmg:start-mission']({}, {
+        noFly: false,
+        paramsJson: JSON.stringify(completeDocument()),
+      })) as { success: boolean; error: string };
+
+      expect(res.success).toBe(false);
+      expect(res.error).toBe('Voz do copiloto indisponível ou offline');
+    });
+
+    it('logs how many lines will be skipped when the cache is incomplete offline', async () => {
+      const daemon = await startSpeechDaemon();
+      emitSpeechEvent(daemon, { event: 'cache', scheduled: 0, requested: 10, missing: 3, offline: true });
+
+      expect(await copilotLog()).toContain('[copiloto] sem rede: 3 de 10 falas fora do cache serão puladas.');
     });
   });
 });

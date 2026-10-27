@@ -57,10 +57,10 @@ describe('operation rules do not depend on the mission mode', () => {
     expect(preflightLocked(state, true)).toBe(LOCKED_WITH_PROCESS[state]);
   });
 
-  it('asks for the stage 5 jump from stages 2 to 4 and lands in place from stage 1, for every mode', () => {
-    for (const stage of [2, 3, 4]) expect(failsafeAction(stage, true)).toBe('rtl');
+  it('asks for the stage 5 jump from stages 1 to 4 and lands in place only without a mission, for every mode', () => {
+    for (const stage of [1, 2, 3, 4]) expect(failsafeAction(stage, true)).toBe('rtl');
     expect(failsafeAction(5, true)).toBe('none');
-    expect(failsafeAction(1, true)).toBe('land');
+    expect(failsafeAction(1, false)).toBe('land');
     expect(failsafeAction(3, false)).toBe('land');
   });
 

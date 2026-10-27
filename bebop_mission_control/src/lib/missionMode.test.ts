@@ -60,7 +60,7 @@ describe('parameter filtering by mode', () => {
     expect(shown).not.toContain('rtl.timeout_sec');
     expect(shown).not.toContain('yaw_pattern.scan_vyaw');
     expect(shown).toContain('timeouts.search_timeout_sec');
-    expect(shown).toContain('kinematics.countdown_sec');
+    expect(shown).not.toContain('kinematics.countdown_sec');
     expect(shown).toContain('kinematics.forward_cruise_velocity');
     expect(everyField.filter((p) => !shown.includes(p)).sort()).toEqual(
       ['rtl.timeout_sec', 'yaw_pattern.scan_vyaw'].sort()
@@ -75,7 +75,7 @@ describe('parameter filtering by mode', () => {
     expect(shown).toContain('gimbal.search_tilt_deg');
     expect(shown).toContain('gimbal.nadir_tilt_deg');
     expect(shown).toContain('timeouts.search_timeout_sec');
-    expect(shown).toContain('kinematics.countdown_sec');
+    expect(shown).not.toContain('kinematics.countdown_sec');
   });
 
   it('keeps the ceiling margin on the sheet of both modes, locked on the pad top', () => {
@@ -86,11 +86,11 @@ describe('parameter filtering by mode', () => {
     expect(paths('advanced')).toContain('kinematics.altitude_ceiling_margin_m');
   });
 
-  it('offers the same altitude slider in every mode, 0.10 to 2.00 m in 0.05 m steps over the floor', () => {
+  it('offers the same altitude slider in every mode, 0.10 to 3.00 m in 0.05 m steps over the floor', () => {
     const altitude = (mode: Parameters<typeof groupsForMode>[0], doc?: unknown) =>
       groupsForMode(mode, doc).flatMap((g) => g.items).find((i) => i.path === 'kinematics.target_altitude_m')!;
     for (const mode of ['simple', 'advanced'] as const) {
-      expect(altitude(mode)).toMatchObject({ min: 0.1, max: 2, step: 0.05, precision: 2 });
+      expect(altitude(mode)).toMatchObject({ min: 0.1, max: 3, step: 0.05, precision: 2 });
     }
   });
 
@@ -99,8 +99,17 @@ describe('parameter filtering by mode', () => {
       const altitude = groupsForMode(mode, { platform: { height_m: 1 } })
         .flatMap((g) => g.items)
         .find((i) => i.path === 'kinematics.target_altitude_m')!;
-      expect(altitude).toMatchObject({ min: 1.3, max: 2 });
+      expect(altitude).toMatchObject({ min: 1.3, max: 3 });
     }
+  });
+
+  it('caps the slider at 3.00 m under a 3.2 m venue and at 2.40 m under a 2.5 m one', () => {
+    const altitude = (venue: number) => {
+      const doc = { platform: { height_m: 1, venue_ceiling_agl_m: venue } };
+      return groupsForMode('advanced', doc).flatMap((g) => g.items).find((i) => i.path === 'kinematics.target_altitude_m')!;
+    };
+    expect(altitude(3.2)).toMatchObject({ min: 1.3, max: 3 });
+    expect(altitude(2.5)).toMatchObject({ min: 1.3, max: 2.4 });
   });
 
   it('marks the ceiling margin inactive on the pad top, in both modes', () => {
@@ -122,6 +131,26 @@ describe('parameter filtering by mode', () => {
     expect(margin(tall).disabledReason?.(tall)).toBe('Teto fixo do perfil de totem: 2,60 m sobre o piso');
     const ground = { platform: { height_m: 1, takeoff_from_ground: true } };
     expect(margin(ground).disabledReason?.(ground)).toBeNull();
+    const atUnlock = { platform: { height_m: 1 }, kinematics: { target_altitude_m: 2.0 } };
+    expect(margin(atUnlock).disabledReason?.(atUnlock)).toBe('Teto fixo do perfil de totem: 2,60 m sobre o piso');
+  });
+
+  it('unlocks the margin on the pad top above 2.0 m over the floor, in both modes', () => {
+    const high = { platform: { height_m: 1, venue_ceiling_agl_m: 3.2 }, kinematics: { target_altitude_m: 2.5 } };
+    const margin = groupsForMode('advanced', high).flatMap((g) => g.items).find((i) => i.path === 'kinematics.altitude_ceiling_margin_m')!;
+    expect(margin.disabledReason?.(high)).toBeNull();
+    for (const mode of ['simple', 'advanced'] as const) {
+      expect(isPathActive(mode, 'kinematics.altitude_ceiling_margin_m', high)).toBe(true);
+      expect(inactivePaths(mode, high).has('kinematics.altitude_ceiling_margin_m')).toBe(false);
+    }
+  });
+
+  it('no longer offers the countdown, nor mentions it in any group', () => {
+    expect(PARAMETER_GROUPS.flatMap((g) => g.items.map((i) => i.path))).not.toContain('kinematics.countdown_sec');
+    for (const group of PARAMETER_GROUPS) {
+      const texts = [group.summary, ...Object.values(group.summaries ?? {})];
+      for (const text of texts) expect(text, group.id).not.toMatch(/contagem/i);
+    }
   });
 
   it('keeps the three group cards in every mode', () => {

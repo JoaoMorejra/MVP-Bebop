@@ -3,13 +3,16 @@
  *
  * Four findings, one per question an adjuster has to clear before a claim can
  * be closed without sending anyone to the scene: police, ambulance, the
- * casualty, the vehicle. Police, SAMU and the vehicle are fixed clearances; the
+ * casualty, the vehicle. Police, SAMU and the vehicle are fixed clearances, the
+ * vehicle one always naming the tow truck called to clear the road; the
  * casualty line follows the victim assessment of the inspection frame
  * (`mission.inspection_ready`) and is neutral when no inference concluded.
  * Each exists in several wordings and the report is drawn per flight with the
  * copilot's cross-flight memory (`copilotPhrases`): no topic is read with the
- * wording it had on the previous flight, the report opens with the vehicle or
- * the casualty, alternating, and never with a dispatch topic.
+ * wording it had on the previous flight. The report opens with the casualty
+ * when one was detected and with the vehicle otherwise (see
+ * {@link leadTopicsFor}), then SAMU and police, whose order alternates from
+ * one flight to the next.
  *
  * The same tables exist in `mvp_mission_bebop/telemetry/inspection_report.py`
  * for the mission process to narrate on its own. This copy is the authority whenever
@@ -34,9 +37,9 @@ export interface Finding {
 }
 
 /**
- * The fixed clearances. Not to be edited: the operator's ruling keeps police,
- * SAMU and the vehicle as they were before the victim line became
- * evidence-driven. Mirrored by `FIXED_FINDINGS` in `telemetry/inspection_report.py`.
+ * The fixed clearances. Every vehicle wording states that a tow truck was
+ * called to clear the road, by order of the station's operator. Mirrored by
+ * `FIXED_FINDINGS` in `telemetry/inspection_report.py`.
  */
 export const FIXED_WORDINGS: Readonly<Record<'police' | 'samu' | 'vehicle', readonly string[]>> = {
   police: [
@@ -52,10 +55,11 @@ export const FIXED_WORDINGS: Readonly<Record<'police' | 'samu' | 'vehicle', read
     'SAMU dispensado para a ocorrência',
   ],
   vehicle: [
-    'Veículo não danificado',
-    'Sem danos estruturais aparentes no veículo',
-    'Integridade do automóvel preservada',
-    'Veículo sem avarias mecânicas',
+    'Veículo sem danos estruturais aparentes. Guincho acionado para desobstrução da via',
+    'Veículo sem danos estruturais aparentes, com guincho já acionado devido à obstrução da via',
+    'Sem danos estruturais aparentes no veículo. Guincho acionado para liberar a via',
+    'Integridade do automóvel preservada. Guincho acionado para desobstrução da via',
+    'Veículo sem avarias aparentes. Guincho já acionado para remover a obstrução da via',
   ],
 };
 
@@ -78,6 +82,7 @@ export const VICTIM_WORDINGS: Readonly<Record<VictimStatus, readonly string[]>> 
     'Nenhum acidentado identificado na imagem',
     'Cena sem vítimas aparentes',
     'Ausência de vítimas visíveis na imagem',
+    'Nenhuma vítima visível no local',
   ],
   unknown: [
     'Avaliação da vítima não incluída neste laudo preliminar',
@@ -87,8 +92,17 @@ export const VICTIM_WORDINGS: Readonly<Record<VictimStatus, readonly string[]>> 
   ],
 };
 
-/** Topics that may open the report, as indexed by `finding.lead`. */
+/** Topics that may open the report. */
 export const LEAD_TOPICS: readonly ['vehicle', 'victim'] = ['vehicle', 'victim'];
+
+/**
+ * The first two topics of the report: the victim leads when one was detected;
+ * with none detected, or an inference that did not conclude (`unknown`), the
+ * vehicle leads and nothing is asserted about the victim before it.
+ */
+export function leadTopicsFor(status: VictimStatus): readonly ['vehicle', 'victim'] | readonly ['victim', 'vehicle'] {
+  return status === 'detected' ? ['victim', 'vehicle'] : ['vehicle', 'victim'];
+}
 
 /** Orders of the dispatch topics, as indexed by `finding.dispatch_order`. */
 export const DISPATCH_ORDERS: readonly (readonly ['samu', 'police'] | readonly ['police', 'samu'])[] = [
@@ -169,10 +183,9 @@ export function checkTopicOrder(topics: readonly FindingTopic[]): void {
 /**
  * Draw one report and remember it.
  *
- * The report opens with the vehicle or the victim, the opposite of the
- * previous flight (the first flight draws), then the other of the two, then
- * SAMU and police in the order the previous flight did not use. Police, SAMU
- * and the vehicle draw from their fixed pools; the victim line from the pool
+ * The report opens with the victim when one was detected and with the vehicle
+ * otherwise, then the other of the two, then SAMU and police in the order the
+ * previous flight did not use. Police, SAMU and the vehicle draw from their fixed pools; the victim line from the pool
  * of the assessment's victim status, `unknown` without one. Every wording and
  * connector avoids its recent variants (`pickVariant`). The choices are
  * recorded when drawn, once per flight, in the copilot history document. With
@@ -190,8 +203,6 @@ export function buildForensicReport(
   const status = victimStatusOf(options.assessment ?? null);
   let history = storage === undefined ? loadHistory() : loadHistory(storage);
 
-  const lead = pickVariant('finding.lead', LEAD_TOPICS, history, options.random);
-  history = recordVariant(history, 'finding.lead', lead.index);
   const dispatch = pickVariant(
     'finding.dispatch_order',
     DISPATCH_ORDERS.map((order) => order.join(',')),
@@ -199,7 +210,7 @@ export function buildForensicReport(
     options.random
   );
   history = recordVariant(history, 'finding.dispatch_order', dispatch.index);
-  const topics: FindingTopic[] = [LEAD_TOPICS[lead.index], LEAD_TOPICS[1 - lead.index], ...DISPATCH_ORDERS[dispatch.index]];
+  const topics: FindingTopic[] = [...leadTopicsFor(status), ...DISPATCH_ORDERS[dispatch.index]];
   checkTopicOrder(topics);
 
   const cards: Partial<Record<FindingTopic, string>> = {};

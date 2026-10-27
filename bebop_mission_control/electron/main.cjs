@@ -12,6 +12,7 @@ const {
 const { createTerminalHost } = require('./terminal.cjs');
 const { deferBenchSpawn } = require('./benchCountdown.cjs');
 const { readSiteAnchorFile } = require('./siteAnchor.cjs');
+const { serveTile } = require('./tileRoute.cjs');
 const {
   createBridgeGate,
   createShutdownSequence,
@@ -298,6 +299,12 @@ function createStaticServer() {
         }
         res.writeHead(404);
         return res.end();
+      }
+
+      // Tiles are matched on the undecoded path (see tileRoute.cjs) and never
+      // fall back to index.html: a 200 HTML body would be drawn as a tile.
+      if (reqPath.startsWith('/tiles/')) {
+        return serveTile(DIST_DIR, req.url.split('?')[0], res);
       }
 
       if (reqPath === '/' || reqPath === '') reqPath = '/index.html';
@@ -879,11 +886,9 @@ function createWindow(port) {
     callback(permission === 'geolocation' || permission === 'media');
   });
 
-  // Nothing leaves the cockpit: the inspection report is shown in its own
-  // sandboxed frame (`ForensicPanel`'s ReportModal), never in another window or
-  // the system browser. A child window would also inherit the preload, and with
-  // it the whole bridge (terminal included), for HTML written by an external
-  // agent.
+  // Nothing leaves the cockpit: the inspection report lives in the in-app
+  // cards, never in another window or the system browser. A child window would
+  // also inherit the preload, and with it the whole bridge (terminal included).
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     console.warn('[BMG] Refused window.open:', url);
     return { action: 'deny' };
@@ -939,28 +944,10 @@ function createWindow(port) {
  */
 function watchMissionDirectory() {
   const pendingCaptures = new Map();
-  const pendingReports = new Map();
   try {
     if (!fs.existsSync(MISSION_DIR)) return;
     fs.watch(MISSION_DIR, (_eventType, filename) => {
       if (!filename) return;
-
-      if (isReportFilename(filename)) {
-        // The inference agent is not known to write atomically: wait for the
-        // event burst to settle and for a non-empty file before announcing.
-        clearTimeout(pendingReports.get(filename));
-        pendingReports.set(filename, setTimeout(() => {
-          pendingReports.delete(filename);
-          const reportPath = path.join(MISSION_DIR, filename);
-          if (!fs.existsSync(reportPath) || fs.statSync(reportPath).size === 0) return;
-          send('bmg:report-ready', {
-            filename,
-            url: `/evidence/${filename}`,
-            occurrenceId: reportOccurrenceId(filename),
-          });
-        }, 400));
-        return;
-      }
 
       if (!filename.startsWith('accident_raw_') && !filename.startsWith('accident_inspected_')) return;
 
@@ -1015,20 +1002,6 @@ const SIDECAR_WAIT_ATTEMPTS = 5;
 
 /** Identifiers the inference agent accepts: `OC_YYYYMMDD_HHMMSS` or a Central id. */
 const OCCURRENCE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
-/** The agent's report for a capture without a valid identifier. */
-const REPORT_WITHOUT_IDENTIFIER = 'relatorio_inspecao_sem_identificador.html';
-
-/** `relatorio_<occurrence_id>.html`, the inference agent's report. */
-function isReportFilename(filename) {
-  return filename.startsWith('relatorio_') && filename.endsWith('.html');
-}
-
-/** The occurrence id a report filename names, or undefined for the agent's fallback name. */
-function reportOccurrenceId(filename) {
-  if (filename === REPORT_WITHOUT_IDENTIFIER) return undefined;
-  const id = filename.slice('relatorio_'.length, -'.html'.length);
-  return OCCURRENCE_ID_PATTERN.test(id) ? id : undefined;
-}
 
 function isCoordinate(latitude, longitude) {
   return (
@@ -1847,28 +1820,6 @@ ipcMain.handle('bmg:get-env-info', async () => {
 
 ipcMain.handle('bmg:get-telemetry', async () => latestTelemetry);
 
-/**
- * The served URL of the inference agent's report, or null while none is on disk.
- * The report for `occurrenceId` wins; otherwise the most recent one present.
- */
-ipcMain.handle('bmg:get-report-url', async (_event, occurrenceId) => {
-  try {
-    if (!fs.existsSync(MISSION_DIR)) return null;
-    if (typeof occurrenceId === 'string' && OCCURRENCE_ID_PATTERN.test(occurrenceId)) {
-      const specific = `relatorio_${occurrenceId}.html`;
-      if (fs.existsSync(path.join(MISSION_DIR, specific))) return `/evidence/${specific}`;
-    }
-    const reports = fs
-      .readdirSync(MISSION_DIR)
-      .filter(isReportFilename)
-      .map((name) => ({ name, mtime: fs.statSync(path.join(MISSION_DIR, name)).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime);
-    return reports.length > 0 ? `/evidence/${reports[0].name}` : null;
-  } catch (_err) {
-    return null;
-  }
-});
-
 ipcMain.handle('bmg:get-stream-status', async () => fetchStreamStatus());
 
 ipcMain.handle('bmg:get-log-history', async () => ({ mission: logs.mission, driver: logs.driver }));
@@ -1970,14 +1921,33 @@ function ingestSpeechLine(line) {
       // here is the difference between "the copilot is quiet" being a mystery
       // and it being a line in Diagnóstico naming the missing piece.
       pushVoiceLevel();
-      const ok = Boolean(event.synthesis && event.playback);
+      // `voice_ready` also counts a voice the phrase cache alone can serve (no
+      // network or no key); a daemon that predates it is judged as before.
+      const ok = Boolean(event.voice_ready ?? Boolean(event.synthesis && event.playback));
+      const cacheOnly = ok && !(event.synthesis && event.playback);
       latestSpeechState = { ready: ok, detail: event.detail || (ok ? 'pronto' : 'sem voz') };
       recordLog('mission', {
         type: ok ? 'stdout' : 'stderr',
-        text: ok
-          ? `[copiloto] pronto (voz ${event.voice}, modelo ${event.model})\n`
-          : `[copiloto] sem voz: ${event.detail}. A apresentação segue em silêncio, na cadência própria.\n`,
+        text: !ok
+          ? `[copiloto] sem voz: ${event.detail}. A apresentação segue em silêncio, na cadência própria.\n`
+          : cacheOnly
+            ? `[copiloto] ${event.detail || 'pronto (voz em cache, sem rede)'}: voz ${event.voice}, ${Number(event.cache_entries) || 0} falas em cache\n`
+            : `[copiloto] pronto (voz ${event.voice}, modelo ${event.model}${event.offline ? ', sem rede' : ''})\n`,
       });
+    } else if (event.event === 'cache' && typeof event.missing === 'number') {
+      const missing = event.missing;
+      const requested = Number(event.requested) || 0;
+      if (event.offline && missing > 0) {
+        recordLog('mission', {
+          type: 'stderr',
+          text: `[copiloto] sem rede: ${missing} de ${requested} falas fora do cache serão puladas.\n`,
+        });
+      } else {
+        recordLog('mission', {
+          type: 'stdout',
+          text: `[copiloto] cache de voz: ${requested - missing} de ${requested} falas prontas, ${Number(event.scheduled) || 0} em síntese.\n`,
+        });
+      }
     }
   } catch (err) {
     recordLog('mission', { type: 'stderr', text: `[copiloto] evento ilegível: ${trimmed}\n` });
@@ -2380,8 +2350,11 @@ function startLocationRefresh() {
   if (site) {
     recordLog('driver', {
       type: 'stdout',
-      text: `[geo] base fixa configurada: ${site.name} (${site.latitude.toFixed(5)}, ${site.longitude.toFixed(5)})\n`,
+      text: `[geo] base fixa configurada: ${site.name} (${site.latitude.toFixed(5)}, ${site.longitude.toFixed(5)}); sem consulta de rede\n`,
     });
+    // The fixed base outranks every automatic source (`bmg:get-host-location`),
+    // so the public-address lookup would only add outbound traffic.
+    return;
   }
   // Resolved at start-up, while the station is most likely still on a network
   // with internet, and refreshed so a station carried to a new site catches up.
@@ -2605,6 +2578,28 @@ function refreshStandby() {
   if (stored.success) missionStandby.ensure(stored.params, driverUp());
 }
 
+const DEFAULT_FAILSAFE_THRESHOLD_PCT = 20;
+
+/**
+ * Operator battery threshold for the launch gate. `battery.land_pct` of the
+ * launch document is the single source (the value `launchParamsJson` injects
+ * from `failsafe.thresholdPct`); `options.failsafeThreshold` and then the
+ * default apply only when the document carries none. 0 is a valid threshold.
+ *
+ * @param {unknown} doc
+ * @param {{ failsafeThreshold?: unknown }} [options]
+ * @returns {number}
+ */
+function resolveFailsafeThreshold(doc, options = {}) {
+  const fromDoc = doc && typeof doc === 'object' ? doc.battery?.land_pct : undefined;
+  for (const candidate of [fromDoc, options.failsafeThreshold]) {
+    if (candidate === null || candidate === undefined || candidate === '') continue;
+    const value = Number(candidate);
+    if (Number.isFinite(value)) return value;
+  }
+  return DEFAULT_FAILSAFE_THRESHOLD_PCT;
+}
+
 /**
  * The parameter document of a launch, or null when it is not a JSON object.
  *
@@ -2707,7 +2702,7 @@ async function startMissionProcess(options = {}) {
       const odomInfo = latestTelemetry.topics?.['/bebop/odom'];
       const odomFresh = Boolean(odomInfo && odomInfo.receiving && (odomInfo.age_sec ?? 0) < 2.0);
       const videoFresh = Boolean(linkReadiness.stream?.live);
-      const failsafeThreshold = Number(doc.failsafe?.return_threshold_percent) || 20;
+      const failsafeThreshold = resolveFailsafeThreshold(doc, options);
 
       let ros2CliAvailable = true;
       try {
@@ -2904,8 +2899,8 @@ ipcMain.handle('bmg:get-launch-readiness', async (_event, options = {}) => {
   const odomInfo = latestTelemetry.topics?.['/bebop/odom'];
   const odomFresh = Boolean(odomInfo && odomInfo.receiving && (odomInfo.age_sec ?? 0) < 2.0);
   const videoFresh = Boolean(linkReadiness.stream?.live);
-  const failsafeThreshold = Number(options.failsafeThreshold) || 20;
   const doc = options.paramsJson ? parseLaunchDocument(options.paramsJson) : true;
+  const failsafeThreshold = resolveFailsafeThreshold(doc, options);
 
   let ros2CliAvailable = true;
   try {

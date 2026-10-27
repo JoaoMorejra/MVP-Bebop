@@ -61,6 +61,15 @@ export const MAX_LIFTED_CEILING = 0.95;
 export const CEILING_CLEARANCE = 0.05;
 
 /**
+ * Launch countdown, seconds. Not an operator parameter: mirror of
+ * `FlightKinematicsConfig.countdown_sec` (`mvp_mission_bebop/parameters.py`),
+ * pinned in every document by {@link reconcileCoupledPaths} so the overlay and
+ * the mission count the same window.
+ */
+export const LAUNCH_COUNTDOWN_SEC = 10;
+const COUNTDOWN_PATH = 'kinematics.countdown_sec';
+
+/**
  * Numbers a launch refuses to go without: every numeric field the parameter
  * sheet edits, and every one the station used to pass as its own CLI flag. The
  * sheet's booleans are not numbers: they are {@link REQUIRED_LAUNCH_BOOLEANS}.
@@ -71,7 +80,7 @@ export const REQUIRED_LAUNCH_NUMBERS: readonly string[] = Array.from(
     'kinematics.target_altitude_m',
     'kinematics.forward_cruise_velocity',
     'kinematics.hover_duration_sec',
-    'kinematics.countdown_sec',
+    COUNTDOWN_PATH,
     'timeouts.search_timeout_sec',
     'rtl.max_speed',
     'rtl.arrival_radius_m',
@@ -101,6 +110,7 @@ const EXTRA_BOUNDS: Readonly<Record<string, Bounds>> = {
   'rtl.max_speed': { low: 0, high: Number.POSITIVE_INFINITY, lowExclusive: true },
   'rtl.arrival_radius_m': { low: 0, high: Number.POSITIVE_INFINITY, lowExclusive: true },
   'kinematics.hover_duration_sec': { low: 0, high: Number.POSITIVE_INFINITY, lowExclusive: true },
+  [COUNTDOWN_PATH]: { low: 0, high: 30 },
   [REVERSE_PATH]: { low: -FORWARD_SPEC.max, high: -FORWARD_SPEC.min },
   [CEILING_PATH]: { low: 0, high: 1, lowExclusive: true, highExclusive: true },
   [MARKER_ID_PATH]: { low: 0, high: Number.POSITIVE_INFINITY },
@@ -343,6 +353,7 @@ export function reconcileCoupledPaths<T extends Doc>(doc: T): T {
     const lifted = Math.min(MAX_LIFTED_CEILING, ceilToFiveHundredths(Math.abs(forward) + CEILING_CLEARANCE));
     if (lifted > ceiling) next = setPath(next, CEILING_PATH, lifted);
   }
+  if (getPath(next, COUNTDOWN_PATH) !== LAUNCH_COUNTDOWN_SEC) next = setPath(next, COUNTDOWN_PATH, LAUNCH_COUNTDOWN_SEC);
   return next;
 }
 

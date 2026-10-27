@@ -17,7 +17,15 @@
  * drops the conflicts a mode never flies into, and the backend mirror stays
  * mode-agnostic.
  */
-import { ALTITUDE_MAX_M, ALTITUDE_MIN_M, VENUE_HEADROOM_M, launchesFromGround, padClearanceM, padHeightM } from './altitudeEnvelope';
+import {
+  ALTITUDE_MAX_M,
+  ALTITUDE_MIN_M,
+  VENUE_HEADROOM_M,
+  launchesFromGround,
+  marginUnlocked,
+  padClearanceM,
+  padHeightM,
+} from './altitudeEnvelope';
 import { isPathActive, readMissionMode } from './missionMode';
 import { markerCount } from './parameterSchema';
 import { getPath } from './paths';
@@ -208,7 +216,7 @@ const RULES: readonly Rule[] = [
     evaluate: (read, doc) => {
       const m = read(P.margin);
       const band = read(P.climbBand);
-      if (!launchesFromGround(doc) || m === null || band === null || m >= band - EPS) return null;
+      if (!marginUnlocked(doc) || m === null || band === null || m >= band - EPS) return null;
       return {
         paths: [P.margin],
         message: `Margem de ${m2(m)} menor que a banda de chegada da subida (${m2(band)}): o teto dispara em voo nominal.`,
@@ -355,7 +363,7 @@ const RULES: readonly Rule[] = [
     evaluate: (read, doc, fired) => {
       const m = read(P.margin);
       const band = noiseBand(read);
-      if (!launchesFromGround(doc) || fired.has('E04') || m === null || band === null || m >= band - EPS) return null;
+      if (!marginUnlocked(doc) || fired.has('E04') || m === null || band === null || m >= band - EPS) return null;
       return {
         paths: [P.margin],
         message: `Margem de ${m2(m)} abaixo do ruído de sonar e barômetro (${m2(band)}): risco de pouso de emergência por teto.`,

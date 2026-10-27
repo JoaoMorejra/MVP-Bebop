@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   ZOOM_STEP,
@@ -101,7 +103,8 @@ describe('manual zoom', () => {
 
   it('zooms one level per doubling of the pinch spread', () => {
     expect(pinchZoom(17, 100, 200)).toBeCloseTo(18, 6);
-    expect(pinchZoom(17, 100, 50)).toBeCloseTo(16, 6);
+    expect(pinchZoom(19, 100, 50)).toBeCloseTo(18, 6);
+    expect(pinchZoom(MIN_DISPLAY_ZOOM + 0.5, 100, 25)).toBe(MIN_DISPLAY_ZOOM);
     expect(pinchZoom(17, 0, 50)).toBe(17);
     expect(pinchZoom(21.5, 100, 800)).toBe(MAX_DISPLAY_ZOOM);
   });
@@ -149,5 +152,20 @@ describe('fixedView', () => {
     const b = fixedView(size, anchor, null, 20);
     expect(b.centre).toEqual(a.centre);
     expect(b.zoom).toBe(a.zoom);
+  });
+});
+
+describe('display zoom range', () => {
+  it('opens no wider than the shallowest level of the offline tile set (z16)', () => {
+    expect(MIN_DISPLAY_ZOOM).toBe(16);
+  });
+});
+
+const MANIFEST = resolve(__dirname, '../../public/tiles/manifest.json');
+
+describe.skipIf(!existsSync(MANIFEST))('display zoom range against public/tiles/manifest.json (skipped: no tiles in this clone)', () => {
+  it('starts at the manifest minZoom', () => {
+    const manifest = JSON.parse(readFileSync(MANIFEST, 'utf-8')) as { minZoom: number };
+    expect(MIN_DISPLAY_ZOOM).toBe(manifest.minZoom);
   });
 });

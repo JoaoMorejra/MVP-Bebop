@@ -15,9 +15,15 @@ const write = (name: string, body: unknown) => {
 describe('readSiteAnchorFile', () => {
   it('reads the shipped demonstration site', () => {
     const site = readSiteAnchorFile(resolve(__dirname, '../../config/site-anchor.json'));
-    expect(site).toMatchObject({ name: 'Transamerica Expo Center' });
+    expect(site).toMatchObject({ name: 'Transamerica Expo Center', city: 'São Paulo' });
     expect(site!.latitude).toBeCloseTo(-23.64889, 4);
     expect(site!.longitude).toBeCloseTo(-46.71871, 4);
+  });
+
+  it('has no basemap switch', () => {
+    const shipped = JSON.parse(readFileSync(resolve(__dirname, '../../config/site-anchor.json'), 'utf-8'));
+    expect(shipped).not.toHaveProperty('basemap');
+    expect(MAP_ANCHOR).not.toHaveProperty('basemap');
   });
 
   it('sits inside the venue as OpenStreetMap bounds it', () => {
@@ -46,6 +52,7 @@ describe('readSiteAnchorFile', () => {
       longitude: -40,
       accuracyM: 25,
       name: 'local configurado',
+      city: null,
     });
   });
 });
@@ -53,7 +60,13 @@ describe('readSiteAnchorFile', () => {
 describe('MAP_ANCHOR', () => {
   it('is the shipped site file, to the digit', () => {
     const shipped = JSON.parse(readFileSync(resolve(__dirname, '../../config/site-anchor.json'), 'utf-8'));
-    expect(MAP_ANCHOR).toEqual({ latitude: shipped.latitude, longitude: shipped.longitude, name: shipped.name });
+    expect(MAP_ANCHOR).toEqual({
+      latitude: shipped.latitude,
+      longitude: shipped.longitude,
+      name: shipped.name,
+      city: shipped.city,
+    });
+    expect(MAP_ANCHOR.city).toBe('São Paulo');
     expect(MAP_ANCHOR.latitude).toBe(-23.6488913);
     expect(MAP_ANCHOR.longitude).toBe(-46.7187124);
   });

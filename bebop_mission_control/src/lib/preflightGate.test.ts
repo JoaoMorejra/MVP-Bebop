@@ -9,6 +9,8 @@ const ready: PreflightGateInput = {
   flightReady: true,
   missingTopics: [],
   stale: false,
+  batteryKnown: true,
+  batteryPct: 85,
 };
 
 describe('preflightBlockedReason', () => {
@@ -46,12 +48,18 @@ describe('preflightBlockedReason', () => {
     expect(preflightBlockedReason({ ...ready, flyingState: 0 })).toBeNull();
   });
 
-  it('blocks real flight when battery is unknown or below threshold', () => {
+  it('blocks real flight only when battery is unknown or at or below the operator threshold', () => {
+    const gate = (batteryPct: number, batteryFailsafeThreshold?: number) =>
+      preflightBlockedReason({ ...ready, batteryKnown: true, batteryPct, batteryFailsafeThreshold });
     expect(preflightBlockedReason({ ...ready, batteryKnown: false })).toBe('Bateria da aeronave desconhecida');
-    expect(preflightBlockedReason({ ...ready, batteryKnown: true, batteryPct: 25, batteryFailsafeThreshold: 20 })).toBe(
-      'Bateria insuficiente para voo real (25% < 30%)'
-    );
-    expect(preflightBlockedReason({ ...ready, batteryKnown: true, batteryPct: 40, batteryFailsafeThreshold: 20 })).toBeNull();
+    expect(gate(28, 20)).toBeNull();
+    expect(gate(20, 20)).toBe('Bateria insuficiente para voo real (20% <= limiar 20%)');
+    expect(gate(21, 20)).toBeNull();
+    expect(gate(5, 0)).toBeNull();
+    expect(gate(0, 0)).toBe('Bateria insuficiente para voo real (0% <= limiar 0%)');
+    expect(gate(100, 100)).toBe('Bateria insuficiente para voo real (100% <= limiar 100%)');
+    expect(gate(20)).toBe('Bateria insuficiente para voo real (20% <= limiar 20%)');
+    expect(gate(21)).toBeNull();
   });
 
   it('blocks real flight when command bridge is not ready', () => {

@@ -10,4 +10,5 @@ export const MAP_ANCHOR = {
   latitude: -23.6488913,
   longitude: -46.7187124,
   name: 'Transamerica Expo Center',
+  city: 'São Paulo',
 } as const;

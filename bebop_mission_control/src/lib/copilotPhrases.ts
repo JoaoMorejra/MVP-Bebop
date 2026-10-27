@@ -33,6 +33,7 @@ export type MilestoneKey =
   | 'mission.landing'
   | 'mission.touchdown'
   | 'mission.battery_warning'
+  | 'mission.battery_return'
   | 'inspection.intro'
   | 'inspection.outro';
 
@@ -53,7 +54,13 @@ export type PoolKey =
   | 'mission.approaching_direct'
   | 'mission.takeoff_native'
   | 'mission.scan_start_yaw'
-  | 'mission.approaching_yaw';
+  | 'mission.approaching_yaw'
+  | 'mission.battery_return_simple'
+  | 'mission.rtl_start_battery'
+  | 'mission.landing_battery'
+  | 'mission.landing_battery_in_place'
+  | 'mission.touchdown_battery'
+  | 'mission.touchdown_battery_in_place';
 
 /** Pools holding one dictated sentence rather than variants. */
 export const FIXED_POOLS: readonly PoolKey[] = ['mission.touchdown_unconfirmed'];
@@ -90,15 +97,15 @@ export const HISTORY_STORAGE_KEY = 'bmg.copilot-history.v1';
 
 /**
  * Choices the forensic report remembers across flights: the wording used for
- * each fixed topic and for the victim line of each victim status, the opening
- * topic (`finding.lead`: vehicle or victim) and the order of the dispatch
- * topics (`finding.dispatch_order`), and the connectors.
+ * each fixed topic and for the victim line of each victim status, the order of
+ * the dispatch topics (`finding.dispatch_order`) and the connectors.
  *
- * `finding.victim` and `finding.order` of earlier builds are retired: the
- * victim pools and the order rules changed, so their indices no longer mean
- * anything. The document keeps its storage key because its shape is
- * unchanged and {@link loadHistory} drops keys this build does not know; the
- * fixed topics keep their pools, so their recorded indices stay valid.
+ * `finding.victim`, `finding.order` and `finding.lead` of earlier builds are
+ * retired: the opening topic is now decided by the victim status, not drawn.
+ * The document keeps its storage key because its shape is unchanged and
+ * {@link loadHistory} drops keys this build does not know. Indices recorded
+ * for a pool that changed size are disregarded when out of range and merely
+ * exclude another variant when in range, so a stale document never throws.
  */
 export type FindingHistoryKey =
   | 'finding.police'
@@ -107,7 +114,6 @@ export type FindingHistoryKey =
   | 'finding.victim.detected'
   | 'finding.victim.not_detected'
   | 'finding.victim.unknown'
-  | 'finding.lead'
   | 'finding.dispatch_order'
   | 'finding.opener'
   | 'finding.linker'
@@ -123,7 +129,6 @@ const FINDING_HISTORY_KEYS: readonly FindingHistoryKey[] = [
   'finding.victim.detected',
   'finding.victim.not_detected',
   'finding.victim.unknown',
-  'finding.lead',
   'finding.dispatch_order',
   'finding.opener',
   'finding.linker',
@@ -170,24 +175,24 @@ export const PHRASE_POOLS: Readonly<Record<PoolKey, readonly string[]>> = {
     'Varredura linear iniciada. Buscando ocorrências na pista.',
     'Iniciando varredura da pista. Visão computacional ativa.',
     'Deslocamento de busca iniciado. Monitorando a área.',
-    'Varredura em andamento. Procurando sinistro ao longo da pista.',
+    'Varredura em andamento. Procurando ocorrência ao longo da pista.',
     'Busca iniciada. Detector de objetos em operação.',
     'Iniciando busca retilínea. Câmera apontada para a pista.',
     'Varredura iniciada a {speed}.',
     'Busca em curso a {speed}.',
   ],
   'mission.target_found': [
-    'Sinistro detectado {location}.',
-    'Alvo identificado {location}.',
-    'Ocorrência localizada {location}.',
-    'Detecção confirmada {location}.',
-    'Sinistro avistado {location}.',
-    'Alvo avistado {location}.',
+    'Ocorrência identificada na pista.',
+    'Alvo identificado na pista.',
+    'Ocorrência localizada na pista.',
+    'Detecção confirmada na pista.',
+    'Acidente avistado na pista.',
+    'Alvo avistado na pista.',
   ],
   'mission.approaching': [
     'Iniciando aproximação controlada ao alvo.',
     'Aproximação em curso. Guiagem visual engajada.',
-    'Deslocando até o sinistro sob controle visual.',
+    'Deslocando até a ocorrência sob controle visual.',
     'Aproximação iniciada. Centralizando o alvo na câmera.',
     'Guiagem visual ativa. Aproximando do local da ocorrência.',
     'Em aproximação ao alvo. Velocidade reduzida.',
@@ -196,7 +201,7 @@ export const PHRASE_POOLS: Readonly<Record<PoolKey, readonly string[]>> = {
     'Registro fotográfico concluído. Imagem enviada para inspeção.',
     'Evidência capturada. Foto encaminhada para análise.',
     'Captura concluída. Imagem disponível para inspeção.',
-    'Foto do sinistro registrada. Enviando para inspeção.',
+    'Registro fotográfico da ocorrência concluído. Processando evidência.',
     'Registro pericial concluído. Imagem enviada à estação.',
     'Evidência fotográfica armazenada. Pronta para inspeção.',
   ],
@@ -209,10 +214,10 @@ export const PHRASE_POOLS: Readonly<Record<PoolKey, readonly string[]>> = {
     'Referência visual salva, sem alvo confirmado.',
   ],
   'mission.approaching_direct': [
-    'Iniciando aproximação controlada ao alvo.',
-    'Em aproximação ao alvo. Velocidade reduzida.',
+    'Aproximação controlada ao alvo iniciada.',
+    'Aproximando do alvo em velocidade reduzida.',
     'Aproximação ao alvo em curso.',
-    'Deslocando até o sinistro.',
+    'Deslocando até a ocorrência.',
     'Aproximação iniciada. Aeronave a caminho do alvo.',
     'Aproximando do local da ocorrência.',
   ],
@@ -228,16 +233,16 @@ export const PHRASE_POOLS: Readonly<Record<PoolKey, readonly string[]>> = {
     'Varredura por rotação iniciada. Buscando ocorrências ao redor da aeronave.',
     'Girando sobre o próprio eixo. Visão computacional ativa.',
     'Busca angular iniciada. Detector de objetos em operação.',
-    'Varredura em andamento. Procurando sinistro em torno da aeronave.',
+    'Varredura em andamento. Procurando ocorrência em torno da aeronave.',
     'Busca por giro iniciada. Câmera ativa.',
     'Rotação de busca iniciada. Monitorando a área.',
   ],
   'mission.approaching_yaw': [
     'Alvo na imagem. Centralizando por rotação.',
     'Centralização angular do alvo iniciada.',
-    'Alinhando a aeronave ao sinistro por giro.',
+    'Alinhando a aeronave à ocorrência por giro.',
     'Guiagem visual ativa. Alinhando o alvo ao centro da câmera.',
-    'Centralizando o sinistro no quadro apenas por giro.',
+    'Centralizando a ocorrência no quadro apenas por giro.',
     'Ajuste de rotação em curso. Alvo sendo centralizado.',
   ],
   'mission.rtl_start_jump': [
@@ -249,18 +254,18 @@ export const PHRASE_POOLS: Readonly<Record<PoolKey, readonly string[]>> = {
     'Retorno à base comandado. Buscando marcador de pouso.',
   ],
   'mission.rtl_start_no_target': [
-    'Iniciando retorno à base.',
-    'Retorno à base iniciado. Navegando para o ponto de lançamento.',
-    'Retornando ao ponto de decolagem. Buscando marcador de pouso.',
-    'Retorno autônomo engajado. Rota de volta à base.',
+    'Retorno à base em andamento.',
+    'Navegando de volta ao ponto de lançamento.',
+    'Voltando ao ponto de decolagem. Procurando o marcador de pouso.',
+    'Retorno autônomo ativo. Voltando para a base.',
     'Busca encerrada. Retornando à base.',
     'Regressando ao ponto de lançamento.',
   ],
   'mission.landing_in_place': [
     'Iniciando pouso no local. Mantenham a área livre.',
     'Pouso no ponto atual. Área deve estar desobstruída.',
-    'Aeronave em descida final para pouso.',
-    'Descida para pouso iniciada.',
+    'Descida final para pouso no ponto atual.',
+    'Pouso no local iniciado. Descendo.',
     'Preparando pouso no local. Atenção à área.',
     'Pouso fora do ponto de lançamento iniciado.',
   ],
@@ -307,8 +312,70 @@ export const PHRASE_POOLS: Readonly<Record<PoolKey, readonly string[]>> = {
     'Pouso confirmado. Aeronave em solo.',
   ],
   'mission.touchdown_unconfirmed': ['Pouso comandado. Confirmação de toque indisponível. Verifique visualmente.'],
+  // The critical-charge return (`mission.battery_return` and the return
+  // milestones flagged `battery_return`). "Bateria crítica" is said only at
+  // the crossing, so no two consecutive calls repeat it; the Simple crossing
+  // and the landing and touchdown pools, which the Simple profile reaches,
+  // never say a return or a translation: that profile lands over its marker
+  // without moving.
+  'mission.battery_return': [
+    'Bateria crítica. Missão interrompida. Retornando à base para pouso.',
+    'Limite de bateria atingido. Voltando à base.',
+    'Bateria crítica. Interrompendo a operação. Retorno à base engajado.',
+    'Carga no limite de segurança. Retornando à base para pousar.',
+    'Bateria crítica. Etapa abortada. Voltando à base.',
+    'Bateria no limite. Missão interrompida, retornando à base.',
+  ],
+  'mission.battery_return_simple': [
+    'Bateria crítica. Missão interrompida. Pouso na base iniciado.',
+    'Limite de bateria atingido. Pousando sobre a base.',
+    'Bateria crítica. Preparando o pouso sobre a base.',
+    'Carga no limite de segurança. Pousando sobre a base.',
+    'Bateria crítica. Etapa abortada. Pouso sobre a base.',
+    'Bateria no limite. Missão interrompida, pouso na base.',
+  ],
+  'mission.rtl_start_battery': [
+    'Retorno por bateria engajado. Buscando o marcador de pouso.',
+    'Rota de volta à base por limite de bateria.',
+    'Regressando ao ponto de lançamento. Bateria no limite.',
+    'Retorno à base em curso por limite de bateria.',
+    'Voltando à base para pouso. Procurando o marcador.',
+    'A caminho da base. Buscando o marcador de pouso.',
+  ],
+  'mission.landing_battery': [
+    'Pouso por bateria iniciado na base. Mantenham a área livre.',
+    'Bateria no limite. Iniciando descida na base.',
+    'Descida final na base por limite de bateria.',
+    'Pousando sobre a base. Carga no limite de segurança.',
+    'Pouso de segurança iniciado na base.',
+    'Descendo para pouso na base. Área livre, por favor.',
+  ],
+  'mission.landing_battery_in_place': [
+    'Marcador da base não localizado. Pouso no local.',
+    'Base não localizada. Pousando no local por bateria.',
+    'Pouso de segurança no ponto atual. Mantenham a área livre.',
+    'Pouso no local por limite de bateria. Atenção à área.',
+    'Sem marcador à vista. Pouso de segurança no local.',
+    'Carga no limite. Iniciando pouso no ponto atual.',
+  ],
+  'mission.touchdown_battery': [
+    'Pouso confirmado na base. Missão encerrada por bateria.',
+    'Aeronave em solo na base. Pouso por bateria concluído.',
+    'Toque no solo confirmado na base, por limite de bateria.',
+    'Pouso seguro na base concluído. Carga no limite.',
+    'Aeronave pousada na base. Missão encerrada por bateria.',
+    'Toque confirmado na base. Pouso de segurança concluído.',
+  ],
+  'mission.touchdown_battery_in_place': [
+    'Pouso confirmado no local. Missão encerrada por bateria.',
+    'Aeronave em solo no local. Pouso por bateria concluído.',
+    'Toque no solo confirmado no local, por limite de bateria.',
+    'Pouso seguro no local concluído. Carga no limite.',
+    'Aeronave pousada no ponto atual. Missão encerrada por bateria.',
+    'Toque confirmado no local. Pouso de segurança concluído.',
+  ],
   'inspection.intro': [
-    'Inspeção do sinistro concluída. Apresentando laudo preliminar.',
+    'Inspeção da ocorrência concluída. Apresentando laudo preliminar.',
     'Aeronave em solo. Apresentando os achados da inspeção.',
     'Análise da ocorrência concluída. Seguem os pontos do laudo.',
     'Laudo preliminar disponível. Apresentando os resultados.',
@@ -338,6 +405,7 @@ export const MILESTONE_KEYS: readonly MilestoneKey[] = [
   'mission.landing',
   'mission.touchdown',
   'mission.battery_warning',
+  'mission.battery_return',
   'inspection.intro',
   'inspection.outro',
 ];
@@ -366,6 +434,29 @@ const SIMPLE_ONLY_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>([
   'mission.scan_start_yaw',
   'mission.approaching_yaw',
 ]);
+
+/**
+ * Pools of the critical-charge return, each with the profiles that fly it.
+ * The battery forces the return whatever the plan says (D2), so none depends
+ * on `rtl.enabled`: the Advanced profile searches laterally for the marker,
+ * the Simple one centres over it without translating, and both land.
+ */
+const BATTERY_POOL_MODES: Readonly<Partial<Record<PoolKey, readonly MissionMode[]>>> = {
+  'mission.battery_return': ['advanced'],
+  'mission.battery_return_simple': ['simple'],
+  'mission.rtl_start_battery': ['advanced'],
+  'mission.landing_battery': ['advanced', 'simple'],
+  'mission.landing_battery_in_place': ['advanced', 'simple'],
+  'mission.touchdown_battery': ['advanced', 'simple'],
+  'mission.touchdown_battery_in_place': ['advanced', 'simple'],
+};
+
+/** Every pool of the critical-charge return. */
+export const BATTERY_POOLS: readonly PoolKey[] = Object.keys(BATTERY_POOL_MODES) as PoolKey[];
+
+function isBatteryPool(key: PoolKey): boolean {
+  return BATTERY_POOL_MODES[key] !== undefined;
+}
 
 /** Landing pools that name the base: a flight without the return lands where it stands. */
 const BASE_LANDING_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>(['mission.landing', 'mission.touchdown']);
@@ -408,6 +499,8 @@ const RETURN_WORDING = /\bbase\b|retorn|regress|marcador|rota de volta/i;
 export function poolsForPlan(plan: PlanLike): readonly PoolKey[] {
   const { mode, rtlEnabled } = toPlan(plan);
   return POOL_KEYS.filter((key) => {
+    const batteryModes = BATTERY_POOL_MODES[key];
+    if (batteryModes) return batteryModes.includes(mode);
     if ((mode !== 'advanced' || !rtlEnabled) && RETURN_POOLS.has(key)) return false;
     if (!rtlEnabled && BASE_LANDING_POOLS.has(key)) return false;
     if (mode === 'simple' && TRANSLATION_POOLS.has(key)) return false;
@@ -420,11 +513,18 @@ export function poolsForPlan(plan: PlanLike): readonly PoolKey[] {
 /**
  * Whether the station may speak `key` in `plan`. The mission withholds the
  * return milestone outside the Advanced profile with the return; this is the
- * station's own guard.
+ * station's own guard. A return the battery forced (`battery_return: true`)
+ * flies regardless of the plan, so its start is always spoken.
  */
-export function isMilestoneAllowed(key: MilestoneKey, plan: PlanLike): boolean {
+export function isMilestoneAllowed(
+  key: MilestoneKey,
+  plan: PlanLike,
+  payload?: Readonly<Record<string, unknown>>
+): boolean {
+  if (key !== 'mission.rtl_start') return true;
+  if (payload?.battery_return === true) return true;
   const { mode, rtlEnabled } = toPlan(plan);
-  return !(key === 'mission.rtl_start' && (mode !== 'advanced' || !rtlEnabled));
+  return mode === 'advanced' && rtlEnabled;
 }
 
 /**
@@ -452,6 +552,23 @@ export function poolForMilestone(
   // Every flag is read as "did not happen" unless the mission says it did:
   // a wording that claims an event the payload does not confirm is the defect
   // these pools exist to prevent.
+  if (key === 'mission.battery_return') {
+    const reported = payload.mode === 'simple' || payload.mode === 'advanced' ? payload.mode : mode;
+    return reported === 'simple' ? 'mission.battery_return_simple' : 'mission.battery_return';
+  }
+  if (payload.battery_return === true) {
+    switch (key) {
+      case 'mission.rtl_start':
+        return 'mission.rtl_start_battery';
+      case 'mission.landing':
+        return payload.at_base === true ? 'mission.landing_battery' : 'mission.landing_battery_in_place';
+      case 'mission.touchdown':
+        if (payload.confirmed !== true) return 'mission.touchdown_unconfirmed';
+        return payload.at_base === true ? 'mission.touchdown_battery' : 'mission.touchdown_battery_in_place';
+      default:
+        break;
+    }
+  }
   switch (key) {
     case 'mission.touchdown':
       if (payload.confirmed !== true) return 'mission.touchdown_unconfirmed';
@@ -473,9 +590,17 @@ export function poolForMilestone(
 /**
  * Variants a payload or the plan rules out within its pool: the landing marker
  * is only mentioned on a return the mission reported as marker-guided, and a
- * flight without the return never names the base, the return or the marker.
+ * flight without the return never names the base, the return or the marker,
+ * unless the battery forced the return (`pool` is a battery pool).
  */
-function vetoFor(key: MilestoneKey, payload: Readonly<Record<string, unknown>>, plan: FlightPlan): (text: string) => boolean {
+function vetoFor(
+  key: MilestoneKey,
+  pool: PoolKey,
+  payload: Readonly<Record<string, unknown>>,
+  plan: FlightPlan
+): (text: string) => boolean {
+  if (pool === 'mission.rtl_start_battery' && payload.marker_guided !== true) return (text) => /marcador/i.test(text);
+  if (isBatteryPool(pool)) return () => false;
   if (!plan.rtlEnabled) return (text) => RETURN_WORDING.test(text);
   if (key === 'mission.rtl_start' && payload.marker_guided !== true) return (text) => /marcador/i.test(text);
   return () => false;
@@ -689,15 +814,15 @@ const finite = (value: unknown): number | null =>
  * Every number comes from the mission: the milestone's own payload first, then
  * the `mission.parameters` document the mission launched with. Nothing is
  * defaulted here; a value neither carries is absent, and the variants that
- * need it are not eligible.
+ * need it are not eligible. The target geometry the mission attaches to
+ * `mission.target_found` is not spoken: the detection call names the runway
+ * only, so every sentence it can say is known before the flight.
  */
 export function phraseValues(
   payload: Readonly<Record<string, unknown>>,
   parameters: MissionParametersPayload
 ): Record<string, string> {
-  const values: Record<string, string> = {
-    location: describeTargetLocation(payload as TargetFix),
-  };
+  const values: Record<string, string> = {};
   const altitude = finite(payload.altitude_m) ?? finite(parameters.target_altitude_m);
   if (altitude !== null) values.altitude = spokenMeters(altitude);
   // The battery warning cites its configured threshold, never the reading
@@ -708,37 +833,6 @@ export function phraseValues(
   const spokenCruise = speed === null ? null : spokenSpeed(speed);
   if (spokenCruise) values.speed = spokenCruise;
   return values;
-}
-
-/** The subset of the `mission.target_found` payload the phrase uses. */
-export interface TargetFix {
-  forward_m?: number | null;
-  bearing_deg?: number | null;
-}
-
-/** Bearing inside which the target is called dead ahead, in degrees. */
-const AHEAD_DEG = 2;
-/** Bearing beyond which the target is called to one side rather than slightly to it. */
-const ASIDE_DEG = 10;
-
-/**
- * Where the target lies, as a phrase that completes "Sinistro detectado ...".
- *
- * Built from the pinhole projection the mission attaches to the milestone.
- * Positive bearing is to the right of the nose. Without a range the phrase
- * falls back to the runway itself rather than inventing a distance.
- */
-export function describeTargetLocation(fix: TargetFix | null | undefined): string {
-  const forward = fix?.forward_m;
-  if (typeof forward !== 'number' || !Number.isFinite(forward) || forward <= 0) return 'na pista';
-
-  let phrase = `a ${spokenMeters(forward)} à frente`;
-  const bearing = fix?.bearing_deg;
-  if (typeof bearing === 'number' && Number.isFinite(bearing) && Math.abs(bearing) >= AHEAD_DEG) {
-    const side = bearing > 0 ? 'à direita' : 'à esquerda';
-    phrase += Math.abs(bearing) < ASIDE_DEG ? `, levemente ${side}` : `, ${side}`;
-  }
-  return phrase;
 }
 
 /**
@@ -757,35 +851,31 @@ export function phraseForMilestone(
   plan: PlanLike = 'advanced'
 ): string {
   const resolved = toPlan(plan);
-  return nextPhrase(poolForMilestone(key, payload, resolved), phraseValues(payload, parameters), {
+  const pool = poolForMilestone(key, payload, resolved);
+  return nextPhrase(pool, phraseValues(payload, parameters), {
     ...options,
-    veto: vetoFor(key, payload, resolved),
+    veto: vetoFor(key, pool, payload, resolved),
   });
 }
-
-/** Pools whose sentence carries a flight estimate and cannot be known before the flight. */
-const FLIGHT_ESTIMATE_POOLS: ReadonlySet<PoolKey> = new Set<PoolKey>(['mission.target_found']);
 
 /**
  * Every sentence the flight narration can say for a mission launched with
  * `parameters` (D2: the numbers are known before takeoff), for the copilot's
  * on-disk phrase cache, limited to the pools `plan` can reach and, without the
- * return, to sentences that name neither the base, the return nor the marker;
- * the plan sentences of `plan` ({@link PLAN_PHRASES}) are included.
- * Variants whose placeholder has no value are left out; `mission.target_found`
- * is left out because its range is estimated in flight.
+ * return, to sentences that name neither the base, the return nor the marker,
+ * the critical-charge return excepted (D2); the plan sentences of `plan` ({@link PLAN_PHRASES}) are included.
+ * Variants whose placeholder has no value are left out: the battery warning
+ * cites a threshold only its milestone carries (`spokenCatalog.ts` renders it).
  */
 export function allMissionPhrases(parameters: MissionParametersPayload, plan: PlanLike = 'advanced'): string[] {
   const resolved = toPlan(plan);
   const values = phraseValues({}, parameters);
-  delete values.location;
   const out = new Set<string>();
   for (const key of poolsForPlan(resolved)) {
-    if (FLIGHT_ESTIMATE_POOLS.has(key)) continue;
     for (const variant of PHRASE_POOLS[key]) {
       const rendered = renderPhrase(variant, values);
       if (/\{[a-z_]+\}/.test(rendered)) continue;
-      if (!resolved.rtlEnabled && RETURN_WORDING.test(rendered)) continue;
+      if (!resolved.rtlEnabled && !isBatteryPool(key) && RETURN_WORDING.test(rendered)) continue;
       out.add(rendered);
     }
   }
@@ -833,7 +923,24 @@ export function planSentence(plan: PlanLike, random: () => number = Math.random)
 }
 
 /** Said when an alert arrives without a sentence of its own. */
-const ALERT_FALLBACK = 'Alerta de voo recebido. Verifique a aeronave.';
+export const ALERT_FALLBACK = 'Alerta de voo recebido. Verifique a aeronave.';
+
+/**
+ * Said once when the aircraft's telemetry stops reaching the station during a
+ * flight (`useLinkLossNarration`). Approved as written (D5); the station cannot
+ * know where the aircraft is, so every variant sends the operator to the eye.
+ */
+export const LINK_LOSS_SENTENCES: readonly string[] = [
+  'Enlace com a aeronave perdido. Verifique a aeronave visualmente.',
+  'Telemetria interrompida. Confirme a posição da aeronave a olho.',
+  'Sem dados da aeronave. Mantenha contato visual e prepare o pouso manual.',
+];
+
+/** One link-loss sentence; `random` in `[0, 1)` picks the variant. */
+export function linkLossSentence(random: () => number = Math.random): string {
+  const draw = Math.floor(random() * LINK_LOSS_SENTENCES.length);
+  return LINK_LOSS_SENTENCES[Math.min(LINK_LOSS_SENTENCES.length - 1, Math.max(0, draw))];
+}
 
 /**
  * Alert of a launch document the mission refused before commanding anything,

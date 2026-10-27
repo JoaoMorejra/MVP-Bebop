@@ -133,24 +133,18 @@ describe('evaluateLaunchReadiness', () => {
       expect(verdict.blockedReason).toBe('Bateria da aeronave desconhecida');
     });
 
-    it('blocks if battery is below max(failsafe + 10, 30)%', () => {
-      // failsafe 20 -> min is 30%
-      const low1 = evaluateLaunchReadiness({
-        ...healthyRealFlightInput,
-        batteryPct: 29,
-        batteryFailsafeThreshold: 20,
-      });
-      expect(low1.ready).toBe(false);
-      expect(low1.blockedReason).toBe('Bateria insuficiente para voo real (29% < 30%)');
-
-      // failsafe 25 -> min is 35%
-      const low2 = evaluateLaunchReadiness({
-        ...healthyRealFlightInput,
-        batteryPct: 34,
-        batteryFailsafeThreshold: 25,
-      });
-      expect(low2.ready).toBe(false);
-      expect(low2.blockedReason).toBe('Bateria insuficiente para voo real (34% < 35%)');
+    it('blocks only when battery is at or below the operator threshold', () => {
+      const verdictFor = (batteryPct: number, batteryFailsafeThreshold?: number) =>
+        evaluateLaunchReadiness({ ...healthyRealFlightInput, batteryPct, batteryFailsafeThreshold });
+      expect(verdictFor(28, 20).ready).toBe(true);
+      const atLimit = verdictFor(20, 20);
+      expect(atLimit.ready).toBe(false);
+      expect(atLimit.blockedReason).toBe('Bateria insuficiente para voo real (20% <= limiar 20%)');
+      expect(verdictFor(21, 20).ready).toBe(true);
+      expect(verdictFor(5, 0).ready).toBe(true);
+      expect(verdictFor(100, 100).blockedReason).toBe('Bateria insuficiente para voo real (100% <= limiar 100%)');
+      expect(verdictFor(20, undefined).blockedReason).toBe('Bateria insuficiente para voo real (20% <= limiar 20%)');
+      expect(verdictFor(21, undefined).ready).toBe(true);
     });
 
     it('blocks if resident command bridge is not ready', () => {

@@ -7,8 +7,8 @@ const fs = require('fs');
  * has no provider in a stock Electron build, and the host's fallback is the
  * city of its public address, kilometres off. Without an aircraft GPS fix the
  * map needs a known point, and at a planned venue that point is known in
- * advance. When enabled it is the anchor ahead of every automatic source; only
- * the aircraft's own GPS outranks it.
+ * advance. When enabled it is the anchor ahead of every automatic
+ * source; only the aircraft's own GPS outranks it.
  */
 function readSiteAnchorFile(file) {
   try {
@@ -23,6 +23,7 @@ function readSiteAnchorFile(file) {
       longitude,
       accuracyM: Number(data.accuracyM) > 0 ? Number(data.accuracyM) : 25,
       name: typeof data.name === 'string' && data.name.trim() ? data.name.trim() : 'local configurado',
+      city: typeof data.city === 'string' && data.city.trim() ? data.city.trim() : null,
     };
   } catch {
     return null;

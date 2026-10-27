@@ -240,17 +240,10 @@ export interface InferencePackage {
   pending: TelemetryPending[];
   /** False when no image reached disk. */
   ready: boolean;
-  /** `relatorio_<occurrence_id>.html`, or the agent's name for a report without one. */
+  /** Name the inference agent gives its report for this occurrence, kept for the package contract. */
   expected_report: string;
   /** The coordinates are the fixed demonstration site (`MAP_ANCHOR`, `lib/siteAnchor.ts`). */
   position: { source: 'site'; site: string };
-}
-
-/** `bmg:report-ready`: the inference agent wrote `relatorio_<occurrence_id>.html`. */
-export interface ReportReadyEvent {
-  filename: string;
-  url: string;
-  occurrenceId?: string;
 }
 
 /** `YYYYMMDD_HHMMSS` of an evidence filename (`accident_raw_<ts>.png`), or null. */
@@ -636,8 +629,6 @@ export interface BmgAPI {
   getStreamStatus: () => Promise<StreamStatus>;
   getDiagnostics: () => Promise<DiagnosticsReport>;
   getLogHistory: () => Promise<{ mission: LogLine[]; driver: LogLine[] }>;
-  /** Served URL of the report for `occurrenceId`, else the newest report on disk, else null. */
-  getReportUrl: (occurrenceId?: string) => Promise<string | null>;
 
   /** Open an interactive bash on a PTY, sized to the terminal on screen. */
   terminalSpawn: (options?: { cols?: number; rows?: number }) => Promise<TerminalSpawnResult>;
@@ -650,7 +641,6 @@ export interface BmgAPI {
   onStepChange: (cb: (step: MissionStepEvent) => void) => () => void;
   onMilestone: (cb: (event: MilestoneEvent) => void) => () => void;
   onRawEvidenceReady: (cb: (evidence: RawEvidence) => void) => () => void;
-  onReportReady: (cb: (event: ReportReadyEvent) => void) => () => void;
   onMissionLog: (cb: (log: LogLine) => void) => () => void;
   onDriverLog: (cb: (log: LogLine) => void) => () => void;
   onMissionExit: (cb: (event: MissionExitEvent) => void) => () => void;

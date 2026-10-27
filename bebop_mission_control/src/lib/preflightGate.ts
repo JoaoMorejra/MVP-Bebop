@@ -29,6 +29,19 @@ const PARAMS_REASON: Record<Exclude<PreflightGateInput['paramsStatus'], 'ready'>
   error: 'Parâmetros indisponíveis',
 };
 
+const DEFAULT_BATTERY_THRESHOLD_PCT = 20;
+
+/**
+ * Takeoff is refused when the charge is unreadable or at or below the
+ * operator threshold, the same `<=` criterion `steps/takeoff.py` applies.
+ */
+function batteryBlockedReason(pct: number | null | undefined, threshold: number): string | null {
+  if (typeof pct !== 'number' || !Number.isFinite(pct) || pct <= threshold) {
+    return `Bateria insuficiente para voo real (${pct ?? 0}% <= limiar ${threshold}%)`;
+  }
+  return null;
+}
+
 export function preflightBlockedReason(input: PreflightGateInput): string | null {
   if (input.paramsStatus !== 'ready') return PARAMS_REASON[input.paramsStatus];
   if (!input.driverRunning) return 'Driver ROS 2 fora do ar';
@@ -43,13 +56,14 @@ export function preflightBlockedReason(input: PreflightGateInput): string | null
   if (typeof input.flyingState === 'number' && input.flyingState !== 0) {
     return `Aeronave não está em solo (flying_state ${input.flyingState})`;
   }
-  const minBattery = Math.max((input.batteryFailsafeThreshold ?? 20) + 10, 30);
   if (input.batteryKnown === false) {
     return 'Bateria da aeronave desconhecida';
   }
-  if (typeof input.batteryPct === 'number' && input.batteryPct < minBattery) {
-    return `Bateria insuficiente para voo real (${input.batteryPct}% < ${minBattery}%)`;
-  }
+  const batteryReason = batteryBlockedReason(
+    input.batteryPct,
+    input.batteryFailsafeThreshold ?? DEFAULT_BATTERY_THRESHOLD_PCT
+  );
+  if (batteryReason) return batteryReason;
   if (input.bridgeReady === false) {
     return 'Ponte de comando não está pronta';
   }

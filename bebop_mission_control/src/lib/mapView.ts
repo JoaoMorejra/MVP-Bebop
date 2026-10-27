@@ -9,8 +9,11 @@
 /** Web Mercator ground resolution at zoom 0 on the equator, metres per pixel. */
 const EQUATOR_MPP_Z0 = 156543.03392;
 
-/** Wide enough for a long survey leg. */
-export const MIN_DISPLAY_ZOOM = 15;
+/**
+ * The shallowest level of the offline tile set (`minZoom` of
+ * `public/tiles/manifest.json`): wider than that there is no imagery to draw.
+ */
+export const MIN_DISPLAY_ZOOM = 16;
 /** Close enough that a one-metre move is several marker widths. */
 export const MAX_DISPLAY_ZOOM = 22;
 

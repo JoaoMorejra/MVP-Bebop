@@ -76,8 +76,6 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   getStreamStatus: () => ipcRenderer.invoke('bmg:get-stream-status'),
   getDiagnostics: () => ipcRenderer.invoke('bmg:get-diagnostics'),
   getLogHistory: () => ipcRenderer.invoke('bmg:get-log-history'),
-  // The visual inference agent's report (`relatorio_<occurrence_id>.html`).
-  getReportUrl: (occurrenceId) => ipcRenderer.invoke('bmg:get-report-url', occurrenceId),
 
   // Diagnostics terminal: an interactive bash on a PTY, in the mission's own
   // environment. Output streams on `bmg:terminal-data`; `bmg:terminal-exit`
@@ -93,7 +91,6 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   // Flight-script milestones, from mission.py stdout and from the launch itself.
   onMilestone: subscribe('bmg:milestone'),
   onRawEvidenceReady: subscribe('bmg:raw-evidence-ready'),
-  onReportReady: subscribe('bmg:report-ready'),
   onMissionLog: subscribe('bmg:mission-log'),
   onDriverLog: subscribe('bmg:driver-log'),
   onMissionExit: subscribe('bmg:mission-exit'),

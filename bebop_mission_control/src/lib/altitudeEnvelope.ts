@@ -16,7 +16,7 @@
 import { getPath } from './paths';
 
 export const ALTITUDE_MIN_M = 0.1;
-export const ALTITUDE_MAX_M = 2.0;
+export const ALTITUDE_MAX_M = 3.0;
 export const ALTITUDE_STEP_M = 0.05;
 /** Least height kept above the pad top; the factory `kinematics.takeoff_settle_min_altitude_m`. */
 export const PAD_CLEARANCE_M = 0.3;
@@ -25,6 +25,8 @@ export const VENUE_HEADROOM_M = 0.1;
 export const NATIVE_HOVER_HEIGHT_M = 1.0;
 /** Fixed headroom of the pad-top ceiling; `estimation/ceiling_schedule.TOTEM_CEILING_HEADROOM_M` (D2). */
 export const TOTEM_CEILING_HEADROOM_M = 0.6;
+/** Altitude over the floor above which the pad top applies the operator margin; `launch_envelope.TOTEM_MARGIN_UNLOCK_ABOVE_M`. */
+export const TOTEM_MARGIN_UNLOCK_ABOVE_M = 2.0;
 
 export const ALTITUDE_PATH = 'kinematics.target_altitude_m';
 export const PLATFORM_HEIGHT_PATH = 'platform.height_m';
@@ -55,6 +57,18 @@ export function padHeightM(doc: unknown): number {
 /** Whether the airframe takes off from the floor: the flag set, or no pad configured. */
 export function launchesFromGround(doc: unknown): boolean {
   return getPath(doc, TAKEOFF_FROM_GROUND_PATH) === true || padHeightM(doc) <= 0;
+}
+
+/**
+ * Whether the ceiling applies `kinematics.altitude_ceiling_margin_m` rather than
+ * {@link TOTEM_CEILING_HEADROOM_M}: from the floor, and on the pad top above
+ * {@link TOTEM_MARGIN_UNLOCK_ABOVE_M}. A target that is not a finite number keeps
+ * the pad top locked. Mirror of `launch_envelope.margin_unlocked`.
+ */
+export function marginUnlocked(doc: unknown): boolean {
+  if (launchesFromGround(doc)) return true;
+  const target = getPath(doc, ALTITUDE_PATH);
+  return finite(target) && target > TOTEM_MARGIN_UNLOCK_ABOVE_M + TOLERANCE_M;
 }
 
 /** `max(PAD_CLEARANCE_M, kinematics.takeoff_settle_min_altitude_m)`. */
@@ -118,25 +132,30 @@ export function clampAltitude(doc: unknown, value: number): number {
 
 /**
  * The nominal altitude ceiling of `doc`, in metres over the floor; `null` when
- * the altitude (or, from the floor, the margin) is not a finite number.
+ * the altitude (or, with {@link marginUnlocked}, the margin) is not a finite
+ * number.
  *
  * Mirror of `estimation/ceiling_schedule.CeilingSchedule` after its takeoff
  * transient, restated over the floor: from the floor `target + margin`; on the
- * pad top `pad + max(target - pad, NATIVE_HOVER_HEIGHT_M) +
- * TOTEM_CEILING_HEADROOM_M`, the margin ignored (D2). A known venue ceiling
- * caps both.
+ * pad top `pad + max(target - pad, NATIVE_HOVER_HEIGHT_M) + m`, with `m` the
+ * margin above {@link TOTEM_MARGIN_UNLOCK_ABOVE_M} and
+ * {@link TOTEM_CEILING_HEADROOM_M} at or below it (D2). A known venue ceiling
+ * caps every branch.
  */
 export function ceilingFloorFrame(doc: unknown): number | null {
   const target = getPath(doc, ALTITUDE_PATH);
   if (!finite(target)) return null;
+  let margin: unknown = TOTEM_CEILING_HEADROOM_M;
+  if (marginUnlocked(doc)) {
+    margin = getPath(doc, MARGIN_PATH);
+    if (!finite(margin)) return null;
+  }
   let ceiling: number;
   if (launchesFromGround(doc)) {
-    const margin = getPath(doc, MARGIN_PATH);
-    if (!finite(margin)) return null;
-    ceiling = target + margin;
+    ceiling = target + (margin as number);
   } else {
     const pad = padHeightM(doc);
-    ceiling = pad + Math.max(target - pad, NATIVE_HOVER_HEIGHT_M) + TOTEM_CEILING_HEADROOM_M;
+    ceiling = pad + Math.max(target - pad, NATIVE_HOVER_HEIGHT_M) + (margin as number);
   }
   const venue = getPath(doc, VENUE_CEILING_PATH);
   return finite(venue) ? Math.min(ceiling, venue) : ceiling;

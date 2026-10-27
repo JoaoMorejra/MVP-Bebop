@@ -10,7 +10,7 @@
  * stored documents and keys that name it are migrated on load
  * (`launchDocument.ts:migrateLegacyMode`, `parameterModes.ts:migrateLegacyIntermediate`).
  */
-import { launchesFromGround } from './altitudeEnvelope';
+import { marginUnlocked } from './altitudeEnvelope';
 import { getPath } from './paths';
 
 export type MissionMode = 'simple' | 'advanced';
@@ -98,8 +98,8 @@ export function readRtlEnabled(doc: unknown): boolean {
 export function inactivePaths(mode: MissionMode, doc?: unknown): ReadonlySet<string> {
   const paths = new Set(INACTIVE_BY_MODE[mode]);
   if (!readRtlEnabled(doc)) for (const path of RETURN_PATHS) paths.add(path);
-  // On the pad top the ceiling is fixed and the margin is not read (D2).
-  if (!launchesFromGround(doc)) paths.add('kinematics.altitude_ceiling_margin_m');
+  // On the pad top at or below 2.0 m the ceiling is fixed and the margin is not read (D2).
+  if (!marginUnlocked(doc)) paths.add('kinematics.altitude_ceiling_margin_m');
   return paths;
 }
 

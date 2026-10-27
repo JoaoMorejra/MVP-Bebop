@@ -121,16 +121,16 @@ describe('switchModeDocument', () => {
   });
 
   it('moves a copied altitude into the envelope and keeps the margin the operator set', () => {
-    const margin = setPath(setPath(advanced, 'kinematics.altitude_ceiling_margin_m', 0.35), 'kinematics.target_altitude_m', 2.4);
+    const margin = setPath(setPath(advanced, 'kinematics.altitude_ceiling_margin_m', 0.35), 'kinematics.target_altitude_m', 3.4);
     const { doc } = switchModeDocument({ working: margin, from: 'advanced', to: 'simple', stored: null });
-    expect(getPath(doc, 'kinematics.target_altitude_m')).toBe(2);
+    expect(getPath(doc, 'kinematics.target_altitude_m')).toBe(3);
     expect(getPath(doc, 'kinematics.altitude_ceiling_margin_m')).toBe(0.35);
   });
 
   it('takes the pad from the document being switched when it moves the altitude', () => {
-    const padded = setPath(setPath(advanced, 'platform.height_m', 1), 'kinematics.target_altitude_m', 2.4);
+    const padded = setPath(setPath(advanced, 'platform.height_m', 1), 'kinematics.target_altitude_m', 3.4);
     const { doc } = switchModeDocument({ working: padded, from: 'advanced', to: 'simple', stored: null });
-    expect(getPath(doc, 'kinematics.target_altitude_m')).toBe(2);
+    expect(getPath(doc, 'kinematics.target_altitude_m')).toBe(3);
     const low = setPath(padded, 'kinematics.target_altitude_m', 1.2);
     const moved = switchModeDocument({ working: low, from: 'advanced', to: 'simple', stored: null });
     expect(getPath(moved.doc, 'kinematics.target_altitude_m')).toBe(1.3);

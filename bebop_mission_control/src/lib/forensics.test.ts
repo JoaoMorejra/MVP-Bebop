@@ -93,20 +93,72 @@ describe('buildForensicReport', () => {
     }
   });
 
-  it('alternates the opening topic and the dispatch order across flights', () => {
+  it('opens with the victim when one was detected', () => {
+    for (let seed = 0; seed < 50; seed++) {
+      const report = buildForensicReport({ assessment: assessment('detected'), storage: null, random: seeded(seed) });
+      expect(report.map((finding) => finding.topic).slice(0, 2)).toEqual(['victim', 'vehicle']);
+    }
+  });
+
+  it('opens with the vehicle when none was detected or the inference is unknown', () => {
+    for (const status of ['not_detected', 'unknown'] as const) {
+      for (let seed = 0; seed < 50; seed++) {
+        const report = buildForensicReport({ assessment: assessment(status), storage: null, random: seeded(seed) });
+        expect(report.map((finding) => finding.topic).slice(0, 2)).toEqual(['vehicle', 'victim']);
+      }
+    }
+  });
+
+  it('closes with SAMU and police, alternating flight to flight', () => {
     const storage = memoryStorage();
     const random = seeded(3);
-    const leads: string[] = [];
     const dispatch: string[] = [];
     for (let flight = 0; flight < 8; flight++) {
-      const report = buildForensicReport({ assessment: assessment('detected'), storage, random });
-      leads.push(report[0].topic);
-      dispatch.push(report.slice(2).map((finding) => finding.topic).join(','));
+      const tail = buildForensicReport({ assessment: assessment('detected'), storage, random })
+        .slice(2)
+        .map((finding) => finding.topic);
+      expect(new Set(tail)).toEqual(new Set(['samu', 'police']));
+      dispatch.push(tail.join(','));
     }
-    for (let flight = 1; flight < 8; flight++) {
-      expect(leads[flight]).not.toBe(leads[flight - 1]);
-      expect(dispatch[flight]).not.toBe(dispatch[flight - 1]);
+    for (let flight = 1; flight < 8; flight++) expect(dispatch[flight]).not.toBe(dispatch[flight - 1]);
+  });
+
+  it('every vehicle card names the tow truck', () => {
+    for (const status of STATUSES) {
+      for (let seed = 0; seed < 100; seed++) {
+        const vehicle = buildForensicReport({ assessment: assessment(status), storage: null, random: seeded(seed) }).find(
+          (finding) => finding.topic === 'vehicle'
+        )!;
+        expect(vehicle.card).toMatch(/guincho/i);
+        expect(vehicle.card).toMatch(/(danos|avarias) (estruturais )?aparentes|Integridade/);
+        expect(vehicle.speech).toMatch(/guincho/i);
+        expect(vehicle.speech).not.toMatch(/\.\./);
+      }
     }
+    for (const wording of FIXED_WORDINGS.vehicle) expect(wording).toMatch(/guincho/i);
+  });
+
+  it('tolerates a stale history document', () => {
+    const storage = memoryStorage();
+    storage.setItem(
+      HISTORY_STORAGE_KEY,
+      JSON.stringify({
+        'finding.lead': [0, 1],
+        'finding.vehicle': [9],
+        'finding.victim.not_detected': [5, 7],
+        'finding.dispatch_order': [0],
+      })
+    );
+    const random = seeded(11);
+    let previous: Record<string, string> | null = null;
+    for (let flight = 0; flight < 10; flight++) {
+      const report = buildForensicReport({ assessment: assessment('not_detected'), storage, random });
+      expect(report).toHaveLength(4);
+      const cards = cardsOf(report);
+      if (previous) for (const topic of TOPICS) expect(cards[topic]).not.toBe(previous[topic]);
+      previous = cards;
+    }
+    expect(Object.keys(JSON.parse(storage.data.get(HISTORY_STORAGE_KEY)!))).not.toContain('finding.lead');
   });
 
   it('opens with an opener, closes with a closer, and never links twice the same way', () => {
@@ -151,7 +203,7 @@ describe('buildForensicReport', () => {
         expect(FIXED_WORDINGS.vehicle).toContain(cards.vehicle);
       }
     }
-    expect([FIXED_WORDINGS.police.length, FIXED_WORDINGS.samu.length, FIXED_WORDINGS.vehicle.length]).toEqual([4, 4, 4]);
+    expect([FIXED_WORDINGS.police.length, FIXED_WORDINGS.samu.length, FIXED_WORDINGS.vehicle.length]).toEqual([4, 4, 5]);
   });
 
   it.each(STATUSES)('reads the victim line from the %s pool', (status) => {
@@ -187,7 +239,6 @@ describe('buildForensicReport', () => {
       [
         'finding.closer',
         'finding.dispatch_order',
-        'finding.lead',
         'finding.linker',
         'finding.opener',
         'finding.police',
@@ -244,6 +295,18 @@ describe('drawForensicScript', () => {
 });
 
 describe('allFindingSentences', () => {
+  it('enumerates every sentence', () => {
+    const sentences = allFindingSentences();
+    expect(sentences.length).toBe((4 + 4 + 5 + 5 + 6 + 4) * 19);
+    for (const status of STATUSES) {
+      for (let seed = 0; seed < 100; seed++) {
+        for (const finding of buildForensicReport({ assessment: assessment(status), storage: null, random: seeded(seed) })) {
+          expect(sentences).toContain(finding.speech);
+        }
+      }
+    }
+  });
+
   it('covers every victim wording of the three branches', () => {
     const sentences = allFindingSentences();
     for (const status of STATUSES) {
