@@ -512,5 +512,5 @@ def test_an_unconfirmed_touchdown_is_reported_as_such(milestones):
 
     payload = milestones[-1][1]
     assert milestones[-1][0] == "mission.touchdown"
-    assert payload == {"confirmed": False, "at_base": True, "method": "unconfirmed"}
+    assert payload == {"confirmed": False, "at_base": True, "method": "unconfirmed", "battery_return": False}
     assert ctx.blackboard.touchdown_confirmed is False

@@ -8,6 +8,8 @@ edge-guard allowance:
 
     floor (ground) : c_n = z* + m
     pad top (totem): c_n = max(z*, H_fw) + m_T        (D2; m is ignored)
+    pad top, target over the floor above TOTEM_MARGIN_UNLOCK_ABOVE_M:
+                     c_n = max(z*, H_fw) + m
     edge guard     : c_n += a   while the guard is active
     venue          : c   = min(c_n, V - h_p)          (always)
 
@@ -15,8 +17,8 @@ The firmware ends its launch profile about ``H_fw`` above the launch surface
 whatever the target, so a ceiling tied to ``z*`` alone tripped right after the
 takeoff whenever ``z* + m`` sat close to ``H_fw`` (field symptom A). Between
 :meth:`CeilingSchedule.arm` and :meth:`CeilingSchedule.release` the ceiling is
-a ratchet instead, with ``m_e`` the effective margin (``m`` on the floor,
-``m_T`` on the pad top):
+a ratchet instead, with ``m_e`` the effective margin (``m`` on the floor and
+on the pad top above the unlock altitude, ``m_T`` otherwise):
 
     arm()      : c_t <- max(c_n, H_fw + m_e)
     update(z)  : c_t <- min(c_t, max(c_n, z + m_e))   (non-increasing)
@@ -39,11 +41,13 @@ import enum
 import math
 from typing import Any, Final, Optional
 
+from mvp_mission_bebop.launch_envelope import TOTEM_MARGIN_UNLOCK_ABOVE_M
 from mvp_mission_bebop.mission_mode import NATIVE_HOVER_HEIGHT_M
 
 #: Fixed headroom above ``max(z*, H_fw)`` on the pad top, in metres (D2). The
-#: operator margin does not apply there: with it, a target close to the native
-#: height left the end of the native profile a few centimetres under the
+#: operator margin does not apply there while the target over the floor is at
+#: or below :data:`TOTEM_MARGIN_UNLOCK_ABOVE_M`: with it, a target close to the
+#: native height left the end of the native profile a few centimetres under the
 #: ceiling. With the defaults the pad-top ceiling is 1.60 m above the pad,
 #: capped by the venue ceiling.
 TOTEM_CEILING_HEADROOM_M: Final[float] = 0.60
@@ -112,11 +116,23 @@ class CeilingSchedule:
         return float(self.kinematics_cfg.target_altitude_m) - self.pad_height_m
 
     @property
+    def margin_unlocked(self) -> bool:
+        """Whether the operator margin applies: from the floor, or a target over the floor above the unlock altitude.
+
+        Mirrors ``launch_envelope.margin_unlocked`` on the resolved pad. A
+        target that is not a finite number keeps the pad top locked.
+        """
+        if not self.on_pad_top:
+            return True
+        target = getattr(self.kinematics_cfg, "target_altitude_m", None)
+        return _finite(target) and target > TOTEM_MARGIN_UNLOCK_ABOVE_M + 1e-9
+
+    @property
     def effective_margin_m(self) -> float:
-        """``m_e``: the operator margin from the floor, the fixed headroom on the pad top."""
-        if self.on_pad_top:
-            return TOTEM_CEILING_HEADROOM_M
-        return float(self.kinematics_cfg.altitude_ceiling_margin_m)
+        """``m_e``: the operator margin when :attr:`margin_unlocked`, the fixed headroom otherwise."""
+        if self.margin_unlocked:
+            return float(self.kinematics_cfg.altitude_ceiling_margin_m)
+        return TOTEM_CEILING_HEADROOM_M
 
     @property
     def venue_limit_m(self) -> float:
@@ -129,7 +145,7 @@ class CeilingSchedule:
     def nominal_m(self, guard_active: bool = False) -> float:
         """``c_n``, before the venue cap."""
         if self.on_pad_top:
-            ceiling = max(self.target_m, self.native_height_m) + TOTEM_CEILING_HEADROOM_M
+            ceiling = max(self.target_m, self.native_height_m) + self.effective_margin_m
         else:
             ceiling = self.target_m + float(self.kinematics_cfg.altitude_ceiling_margin_m)
         if guard_active:

@@ -66,6 +66,10 @@ class MissionBlackboard:
     #: Set once the takeoff stage has climbed and stabilised. Stages 2-4
     #: presuppose it when the run includes Stage 1.
     takeoff_complete: bool = False
+    #: Set by ``MissionContext.request_battery_return`` before the jump on a
+    #: critical charge. Stage 5 then flies the return of the profile even with
+    #: ``rtl.enabled = false``, and its milestones carry the flag.
+    battery_return: bool = False
     #: Heading at the end of Stage 1, radians (``OdometrySnapshot.yaw``). The
     #: Simple profile restores it at the end of Stage 4. ``None`` until Stage 1
     #: completes (a partial run that skips Stage 1 records it on first use).

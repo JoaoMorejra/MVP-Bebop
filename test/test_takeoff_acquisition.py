@@ -2,9 +2,9 @@
 
 The firmware ends its launch profile about one metre above the launch surface
 and ignores the altitude it is given. On the pad top the target in the control
-frame is ``target_altitude_m - platform.height_m``, always within
-``[0.30, 1.00]`` (D1), so the correction there is a descent; from the floor it
-can be a climb.
+frame is ``target_altitude_m - platform.height_m``, within ``[0.30, 2.00]`` on a
+1 m pad: at or below the native height the correction is a descent or a hold,
+above it a climb, as from the floor.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 import time
 import types
 
-import numpy as np
 import pytest
 
 from mvp_mission_bebop.actuators import simulator as simulator_module
@@ -149,14 +148,100 @@ def test_both_profiles_acquire_the_altitude(monkeypatch, mode):
     assert calls == ["acquire"]
 
 
-def test_on_the_pad_top_every_accepted_target_is_at_or_below_the_native_height():
-    """The climb branch only ever runs from the floor (D1 keeps z* in [0.30, 1.00] on a 1 m pad)."""
-    params = pad_params(1.8, 1.0)
+@pytest.mark.parametrize("target_floor", [1.3, 1.8, 2.0, 2.05, 2.5, 2.7, 3.0])
+def test_on_the_pad_top_every_accepted_target_is_acquired_under_the_effective_ceiling(monkeypatch, target_floor):
+    """Above the native height the pad top climbs; at or below it, it descends or holds."""
+    params = pad_params(target_floor, 1.0)
+    params.platform.venue_ceiling_agl_m = 3.2
     low, high = altitude_envelope(params)
-    for target in np.arange(low, high + 1e-9, 0.05):
-        params.kinematics.target_altitude_m = float(target)
-        relative = params.relative_target_altitude_m
-        assert 0.30 - 1e-9 <= relative <= FIRMWARE_HOVER_ALTITUDE_M + 1e-9
+    assert low - 1e-9 <= target_floor <= high + 1e-9
+    ctx, _ = hovering_context(monkeypatch, params)
+    commanded = recorded_vz(monkeypatch, ctx)
+    relative = params.relative_target_altitude_m
+
+    status = TakeoffStep()._acquire_altitude(ctx)
+
+    altitude = ctx.odom_supervisor.snapshot().relative_altitude
+    assert status is StepStatus.SUCCESS
+    assert not ctx.failsafe.failsafe_active, "a ceiling breach or a health fault landed the airframe"
+    assert altitude <= ctx.odom_supervisor.altitude_ceiling
+    vz = [vz for _vx, _vy, vz, _vyaw in commanded]
+    if relative > FIRMWARE_HOVER_ALTITUDE_M + params.kinematics.climb_deadband_m:
+        assert max(vz) > 0.0
+        assert altitude == pytest.approx(relative, abs=params.kinematics.climb_deadband_m)
+    else:
+        assert all(v <= 0.0 for v in vz)
+        assert altitude == pytest.approx(relative, abs=params.governor.deadband_m + 0.02)
+
+
+def commanded_takeoff_altitude(params: MissionParameters) -> float:
+    odom = OdometrySupervisor(params.kinematics, params.timeouts, params.calibration, params.platform)
+    drone = StubDrone()
+    ctx = ClimbContext(params, drone, odom, None)
+    assert TakeoffStep()._command_takeoff(ctx) is StepStatus.SUCCESS
+    (altitude,) = [call[1] for call in drone.calls if call[0] == "takeoff"]
+    return altitude
+
+
+@pytest.mark.parametrize(
+    "target_floor, pad, expected", [(1.8, 1.0, 0.8), (2.5, 1.0, 1.5), (3.0, 1.0, 2.0), (1.8, 0.0, 1.8), (3.0, 0.0, 2.0)]
+)
+def test_the_takeoff_command_carries_the_relative_target_capped_at_the_plateau(target_floor, pad, expected):
+    params = pad_params(target_floor, pad)
+    params.platform.venue_ceiling_agl_m = 3.2
+    assert takeoff_module.TAKEOFF_PLATEAU_M == 2.0
+    assert commanded_takeoff_altitude(params) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("target_floor, pad", [(2.5, 1.0), (3.0, 1.0), (3.0, 0.0)])
+def test_the_pad_top_and_floor_climbs_ramp_under_the_authorized_rate(monkeypatch, target_floor, pad):
+    params = pad_params(target_floor, pad)
+    params.platform.venue_ceiling_agl_m = 3.2
+    ctx, _ = hovering_context(monkeypatch, params)
+    commanded = recorded_vz(monkeypatch, ctx)
+
+    assert TakeoffStep()._acquire_altitude(ctx) is StepStatus.SUCCESS
+
+    vz = [vz for _vx, _vy, vz, _vyaw in commanded]
+    limit = params.kinematics.max_climb_speed_mps
+    assert max(vz) > 0.0
+    assert all(0.0 <= v <= limit + 1e-6 for v in vz)
+    assert vz[0] < 0.5 * limit, "the jerk-limited profile must ramp, not step, to the climb rate"
+    assert vz[-1] == 0.0
+    assert not ctx.failsafe.failsafe_active
+    assert ctx.odom_supervisor.snapshot().relative_altitude == pytest.approx(
+        params.relative_target_altitude_m, abs=params.kinematics.climb_deadband_m
+    )
+
+
+def climb_deadline_sec(monkeypatch, target_floor: float, pad: float) -> float:
+    """The duration the ascent sizes its deadline to, at the factory climb rate of 0.25 m/s."""
+    params = pad_params(target_floor, pad)
+    params.platform.venue_ceiling_agl_m = 3.2
+    params.kinematics.max_climb_speed_mps = 0.25
+    ctx, _ = hovering_context(monkeypatch, params)
+    durations = []
+
+    class RecordingDeadline(takeoff_module.Deadline):
+        def __init__(self, duration_sec, **kwargs):
+            durations.append(duration_sec)
+            super().__init__(duration_sec, **kwargs)
+
+    monkeypatch.setattr(takeoff_module, "Deadline", RecordingDeadline)
+    ctx.emergency_event.set()
+    assert TakeoffStep()._acquire_altitude(ctx) is StepStatus.ABORTED
+    (duration,) = durations
+    return duration
+
+
+def test_a_2_0_m_climb_sizes_its_deadline_to_the_gap(monkeypatch):
+    """1.5 * 2.0 / 0.25 + 4.0 = 16 s, past the 15 s climb timeout."""
+    assert climb_deadline_sec(monkeypatch, 3.0, 0.0) == pytest.approx(16.0, abs=0.05)
+
+
+@pytest.mark.parametrize("target_floor, pad", [(1.8, 0.0), (2.5, 1.0), (3.0, 1.0)])
+def test_a_short_climb_keeps_the_climb_timeout(monkeypatch, target_floor, pad):
+    assert climb_deadline_sec(monkeypatch, target_floor, pad) == pytest.approx(15.0)
 
 
 @pytest.mark.parametrize(

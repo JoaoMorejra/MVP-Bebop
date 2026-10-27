@@ -47,8 +47,11 @@ def test_the_fixture_covers_the_grid():
     for mode in ("simple", "advanced"):
         for surface in ("platform", "ground"):
             for rtl in ("true", "false"):
-                for altitude in ("0.05", "0.1", "0.35", "1", "1.25", "1.3", "1.8", "2", "2.05"):
+                for altitude in ("0.05", "0.1", "0.35", "1", "1.25", "1.3", "1.8", "2", "2.05", "2.4", "2.5", "3", "3.05"):
                     assert f"{mode}/{surface}/rtl={rtl}/{altitude}" in names
+            for venue in ("none", "3.2"):
+                for altitude in ("1.8", "2", "2.05", "2.4", "2.5", "3", "3.05"):
+                    assert f"{mode}/{surface}/venue={venue}/{altitude}" in names
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case["name"] for case in CASES])

@@ -137,7 +137,7 @@ def test_the_cold_start_refusal_exits_78_after_reporting():
     "overrides, field",
     [
         ({"kinematics.target_altitude_m": 0.5}, "kinematics.target_altitude_m"),
-        ({"kinematics.target_altitude_m": 2.4}, "kinematics.target_altitude_m"),
+        ({"kinematics.target_altitude_m": 2.45}, "kinematics.target_altitude_m"),
         ({"mission_mode": "expert"}, "mission_mode"),
         ({"platform.height_m": -1.0}, "platform.height_m"),
     ],

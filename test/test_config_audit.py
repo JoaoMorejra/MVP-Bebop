@@ -106,6 +106,28 @@ def test_the_ceiling_margin_floor_is_the_climb_band_plus_twice_the_settle_sigma(
     assert paths(audit_safe_envelopes(params, accepting)) == ["kinematics.altitude_ceiling_margin_m"]
 
 
+def pad_top(target: float, margin: float, venue=None) -> MissionParameters:
+    params = MissionParameters()
+    params.kinematics.target_altitude_m = target
+    params.kinematics.altitude_ceiling_margin_m = margin
+    params.platform.height_m = 1.0
+    params.platform.takeoff_from_ground = False
+    params.platform.venue_ceiling_agl_m = venue
+    return params
+
+
+def test_the_pad_top_margin_is_judged_once_unlocked_above_2_0_m():
+    assert "kinematics.altitude_ceiling_margin_m" in paths(audit_safe_envelopes(pad_top(2.5, 0.1), accepting))
+    assert "kinematics.altitude_ceiling_margin_m" not in paths(audit_safe_envelopes(pad_top(2.0, 0.1), accepting))
+
+
+def test_a_3_0_m_pad_top_target_under_a_3_2_m_venue_is_reported_as_expected():
+    """Target 3.0 on a 1.0 m pad: the ceiling is cut at 2.2 m relative, 0.2 m over the target (D4)."""
+    found = paths(audit_safe_envelopes(pad_top(3.0, 0.6, venue=3.2), accepting))
+    assert "platform.venue_ceiling_agl_m" in found
+    assert "platform.venue_ceiling_agl_m" not in paths(audit_safe_envelopes(pad_top(2.0, 0.6, venue=3.2), accepting))
+
+
 def test_a_horizontal_ceiling_below_the_cruise_is_still_reported():
     params = MissionParameters()
     params.kinematics.forward_cruise_velocity = 0.60

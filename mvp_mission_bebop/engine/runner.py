@@ -11,6 +11,7 @@ import nectar
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.engine.exit_codes import EXIT_ABORTED_LANDED, mission_exit_code
 from mvp_mission_bebop.engine.signals import EmergencyHandler
+from mvp_mission_bebop.engine.stage_gate import stage_lock
 from mvp_mission_bebop.mission_mode import spoken_stage_five_name
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus
 
@@ -32,6 +33,13 @@ _SPOKEN_STAGE_NAMES: Final[Dict[int, str]] = {
     2: "Varredura",
     3: "Aproximação",
     4: "Inspeção",
+}
+
+#: Suffix of the jump marker line, by ``MissionContext.requested_stage_source``.
+#: The ``--- [STEP N: name] ---`` part the station matches is unchanged.
+_JUMP_SOURCE_LABELS: Final[Dict[str, str]] = {
+    "station": "(salto comandado pela estação)",
+    "battery": "(retorno forçado por bateria crítica)",
 }
 
 #: First stage that presupposes a confirmed target. A run entering it without
@@ -127,8 +135,22 @@ class MissionRunner:
                 step = self.steps[index]
                 alerts_before = self._alerts_raised()
                 # Read by the stage gate (engine.stage_gate) from the executor
-                # thread that receives the station's goto requests.
-                self.ctx.current_stage = self.stage_numbers[index]
+                # thread that receives the station's goto requests; named under
+                # the same lock the gate decides under. A request for this very
+                # stage that passed the gate before it was named (the 4 -> 5
+                # boundary) is already satisfied; left pending it would
+                # interrupt the stage at once and restart it.
+                with stage_lock(self.ctx):
+                    self.ctx.current_stage = self.stage_numbers[index]
+                    # A Stage 5 re-entered after an operator jump chooses its
+                    # branch again; a stale commitment would refuse to force it.
+                    self.ctx.return_branch_committed = False
+                    dropped = self._drop_jump_to(self.stage_numbers[index])
+                if dropped:
+                    logger.info(
+                        "Stage %d requested while it was about to start; request already satisfied.",
+                        self.stage_numbers[index],
+                    )
                 # Read by the steps whose narration presupposes the stage before
                 # (``mission.rtl_start``: "inspeção concluída").
                 self.ctx.entered_by_jump = entered_by_jump
@@ -199,12 +221,21 @@ class MissionRunner:
         has nowhere to jump to, and a request naming a stage it does not carry is
         dropped rather than silently redirected to a different one.
         """
-        if not self.ctx.stage_jump_event.is_set():
-            return None
-
-        requested = self.ctx.requested_stage
-        self.ctx.stage_jump_event.clear()
-        self.ctx.requested_stage = None
+        with stage_lock(self.ctx):
+            if not self.ctx.stage_jump_event.is_set():
+                return None
+            requested = self.ctx.requested_stage
+            source = getattr(self.ctx, "requested_stage_source", None)
+            if requested in self.stage_numbers:
+                # Named before the event is cleared, so a duplicate request for
+                # the same stage meets the gate with that stage already current.
+                self.ctx.current_stage = requested
+                # Stage 5 is current from here, before the naming block; a
+                # stale commitment would leave a critical request unforced.
+                if requested == 5:
+                    self.ctx.return_branch_committed = False
+            self.ctx.stage_jump_event.clear()
+            self.ctx.requested_stage = None
 
         if requested is None:
             return None
@@ -218,11 +249,26 @@ class MissionRunner:
 
         index = self.stage_numbers.index(requested)
         logger.info(
-            "--- [STEP %d: %s] --- (salto comandado pela estação)",
+            "--- [STEP %d: %s] --- %s",
             requested,
             self.steps[index].name,
+            _JUMP_SOURCE_LABELS.get(source or "station", _JUMP_SOURCE_LABELS["station"]),
         )
         return index
+
+    def _drop_jump_to(self, stage: int) -> bool:
+        """Discard a pending jump to ``stage``, the stage about to run. Caller holds the stage lock.
+
+        Returns
+        -------
+        bool
+            Whether a pending request was discarded.
+        """
+        if not self.ctx.stage_jump_event.is_set() or self.ctx.requested_stage != stage:
+            return False
+        self.ctx.stage_jump_event.clear()
+        self.ctx.requested_stage = None
+        return True
 
     # ------------------------------------------------------------ termination
 

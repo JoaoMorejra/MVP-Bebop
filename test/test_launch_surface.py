@@ -97,9 +97,9 @@ def test_the_surface_exists_only_in_memory_after_the_persisted_snapshot():
 
 def test_the_ground_flag_selects_the_floor_envelope_with_the_physical_pad_kept():
     params = flight("advanced", 0.5, ground=True)
-    assert altitude_envelope(params) == pytest.approx((0.10, 2.00))
+    assert altitude_envelope(params) == pytest.approx((0.10, 2.40))
     params.platform.takeoff_from_ground = False
-    assert altitude_envelope(params) == pytest.approx((1.30, 2.00))
+    assert altitude_envelope(params) == pytest.approx((1.30, 2.40))
 
 
 @pytest.mark.parametrize("value", ["true", 1, 0, None])

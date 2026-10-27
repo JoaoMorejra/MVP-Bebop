@@ -45,6 +45,22 @@ _SETTLE_POLL_SEC: Final[float] = 0.01
 #: odometry samples at the driver's 5 Hz.
 _DESCENT_SETTLE_WINDOW_SEC: Final[float] = 1.0
 
+#: Highest altitude handed to ``drone.takeoff``, metres above the launch
+#: surface. Informative only: the SDK logs the argument, the driver sends a bare
+#: ``takeOff()`` and the firmware ends its launch profile near
+#: ``NATIVE_HOVER_HEIGHT_M`` whatever it is told. The gap above that height is
+#: closed by :meth:`TakeoffStep._acquire_altitude`.
+TAKEOFF_PLATEAU_M: Final[float] = 2.0
+
+#: Factor applied to the nominal climb time ``gap / max_climb_speed_mps`` when
+#: sizing the ascent deadline: the jerk-limited ramp-up and the braking tail
+#: stretch the climb past the cruise-only estimate.
+_CLIMB_DEADLINE_FACTOR: Final[float] = 1.5
+
+#: Fixed allowance added to the ascent deadline, seconds: the vertical
+#: settlement window and the odometry lag at the driver's 5 Hz.
+_CLIMB_DEADLINE_SLACK_SEC: Final[float] = 4.0
+
 
 class _NoPerception:
     """Stand-in for a context without a perception pipeline."""
@@ -295,13 +311,13 @@ class TakeoffStep(BaseStep):
     # ---------------------------------------------------------------- pre-arm
 
     def _check_prearm_battery(self, ctx: MissionContext) -> bool:
-        """Refuse to launch on a charge already at the in-flight land threshold.
+        """Refuse to launch on a charge already at the in-flight return threshold.
 
-        The same ``battery.land_pct`` the failsafe lands on, not a second
-        limit: a takeoff at or below it would be answered by a landing on the
-        first health check after liftoff. Without a fresh reading the launch
-        proceeds, as the in-flight net does -- a charge the aircraft has not
-        reported is not a reading to act on.
+        The same ``battery.land_pct`` at which the airborne mission returns to
+        base, not a second limit: a takeoff at or below it would be answered by
+        the battery return right after liftoff. Without a fresh reading the
+        launch proceeds, as the in-flight net does -- a charge the aircraft has
+        not reported is not a reading to act on.
         """
         battery = getattr(ctx.failsafe, "battery_supervisor", None)
         if battery is None:
@@ -321,7 +337,7 @@ class TakeoffStep(BaseStep):
 
         logger.critical(
             "Battery at %.0f%% is at or below the %.0f%% land threshold. Refusing to launch: "
-            "the in-flight battery net would land the aircraft immediately after liftoff.",
+            "the in-flight battery net would send the aircraft back to base right after liftoff.",
             percentage,
             battery.land_pct,
         )
@@ -498,16 +514,20 @@ class TakeoffStep(BaseStep):
 
         The altitude argument is accepted by the SDK and ignored by the Bebop
         firmware, which runs its own launch profile. It is passed through for
-        API fidelity and used here only for logging and the ceiling.
-        ``t_takeoff_cmd`` is stamped before the call: ``BebopDrone.takeoff``
-        sleeps 3 s after publishing.
+        API fidelity as ``min(relative target, TAKEOFF_PLATEAU_M)`` and used
+        here only for logging; a target above the native height is reached by
+        :meth:`_acquire_altitude`. ``t_takeoff_cmd`` is stamped before the
+        call: ``BebopDrone.takeoff`` sleeps 3 s after publishing.
         """
-        target_altitude = ctx.params.relative_target_altitude_m
+        relative_target = ctx.params.relative_target_altitude_m
+        target_altitude = min(relative_target, TAKEOFF_PLATEAU_M)
         _ceiling_transition(ctx, "arm_ceiling_transient")
         logger.info(
-            "Issuing takeoff (nominal altitude %.2f m above the launch point, ceiling %.2f m during "
-            "the native profile). Note: the Bebop firmware selects its own launch altitude.",
+            "Issuing takeoff (plateau %.2f m of a %.2f m target above the launch point, ceiling %.2f m "
+            "during the native profile). Note: the Bebop firmware selects its own launch altitude; "
+            "the ascent closes the rest.",
             target_altitude,
+            relative_target,
             ctx.odom_supervisor.altitude_ceiling,
         )
 
@@ -546,6 +566,13 @@ class TakeoffStep(BaseStep):
         no_fly = getattr(ctx.drone, "no_fly", getattr(ctx.params, "no_fly", True))
         if not no_fly:
             confirmed = self._wait_for_takeoff_confirmation(ctx, self._t_takeoff_cmd)
+            if not confirmed and ctx.interrupted():
+                # An abort or a stage jump (the critical-charge return, from
+                # the climb) is not an unconfirmed takeoff: the abort lands
+                # through its own handler, the jump flies Stage 5. A landing
+                # here would put the aircraft down under either.
+                logger.warning("Takeoff confirmation interrupted by an abort or a stage jump.")
+                return StepStatus.ABORTED
             if not confirmed:
                 logger.critical("Takeoff confirmation timed out (R1). Landing aircraft.")
                 ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
@@ -582,7 +609,8 @@ class TakeoffStep(BaseStep):
         -------
         bool
             True if confirmed within ``timeouts.takeoff_confirm_timeout_sec``;
-            False on timeout or abort.
+            False on timeout or on an interrupt, which the caller tells apart
+            with ``ctx.interrupted()``.
         """
         timeout_sec = ctx.params.timeouts.takeoff_confirm_timeout_sec
         deadline = Deadline(timeout_sec)
@@ -750,8 +778,7 @@ class TakeoffStep(BaseStep):
         Both profiles fly it. Above the target band (``governor.deadband_m``)
         the airframe descends under the altitude governor
         (:meth:`_descend_to_target`); below ``climb_deadband_m`` it climbs as
-        described next. On the pad top the target is at or below the native
-        height (D1), so only a flight from the floor can climb.
+        described next, from the floor and from the pad top alike.
 
         The Bebop ends its launch profile at its own factory height, around one
         metre, and ignores the altitude the SDK was given. Every mission
@@ -769,6 +796,11 @@ class TakeoffStep(BaseStep):
 
         A mission whose target is at or below the achieved hover height skips
         the manoeuvre entirely, which is the default configuration.
+
+        The loop is bounded by ``max(climb_timeout_sec, 1.5 * gap /
+        max_climb_speed_mps + 4.0)``, with the gap measured once before the
+        climb: a 2.0 m climb at 0.25 m/s gets 16 s, a short one keeps
+        ``climb_timeout_sec``.
         """
         kinematics = ctx.params.kinematics
         target = ctx.params.relative_target_altitude_m
@@ -828,7 +860,12 @@ class TakeoffStep(BaseStep):
         )
 
         rate = LoopRate(kinematics.control_loop_hz)
-        deadline = Deadline(kinematics.climb_timeout_sec)
+        climb_timeout = max(
+            kinematics.climb_timeout_sec,
+            _CLIMB_DEADLINE_FACTOR * (target - altitude) / kinematics.max_climb_speed_mps
+            + _CLIMB_DEADLINE_SLACK_SEC,
+        )
+        deadline = Deadline(climb_timeout)
         converged = False
 
         # Progress telemetry so the operator can see the climb is alive.
@@ -931,7 +968,7 @@ class TakeoffStep(BaseStep):
                         snapshot.vz,
                         report.reason,
                         elapsed,
-                        kinematics.climb_timeout_sec,
+                        climb_timeout,
                     )
 
                 # -- altitude stall detection --------------------------------
@@ -964,7 +1001,7 @@ class TakeoffStep(BaseStep):
             logger.warning(
                 "Ascent did not converge within %.1f s: holding %.2f m against a %.2f m "
                 "target. The mission continues at the altitude actually achieved.",
-                kinematics.climb_timeout_sec,
+                climb_timeout,
                 altitude,
                 target,
             )

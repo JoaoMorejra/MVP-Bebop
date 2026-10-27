@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Final, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -32,8 +32,10 @@ from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.blackboard import EvidenceRecord, MissionBlackboard
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
 from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
+from mvp_mission_bebop.engine.stage_gate import refuse_stage_request, stage_lock
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
+from mvp_mission_bebop.mission_mode import DEFAULT_MODE, parse_mission_mode
 from mvp_mission_bebop.parameters import MissionParameters
 from mvp_mission_bebop.perception.summary import encode_detection_summary
 from mvp_mission_bebop.perception.worker import (
@@ -49,9 +51,21 @@ from mvp_mission_bebop.telemetry.inference_package import (
     drone_occurrence_id,
     format_utc,
 )
+from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.picture_ack import PictureAckTracker
 
 logger = logging.getLogger("MissionContext")
+
+#: The return stage, ``ClosedLoopRTLStep``.
+RETURN_STAGE: Final[int] = 5
+
+#: Who asked for a stage jump: the ground station's ``goto_stage`` or the
+#: critical-charge return. The runner names it on the jump marker line.
+STAGE_REQUEST_SOURCES: Final[Tuple[str, ...]] = ("station", "battery")
+
+#: Stages of a full run. ``mission.py`` overwrites :attr:`MissionContext.stage_numbers`
+#: with the selection of a partial one.
+FULL_RUN_STAGES: Final[Tuple[int, ...]] = (1, 2, 3, 4, 5)
 
 
 class MissionContext:
@@ -124,8 +138,19 @@ class MissionContext:
         self.stage_jump_event = threading.Event()
         #: Stage number requested with ``stage_jump_event``, 1-5.
         self.requested_stage: Optional[int] = None
+        #: Origin of ``requested_stage``, one of :data:`STAGE_REQUEST_SOURCES`.
+        self.requested_stage_source: Optional[str] = None
+        #: Serializes the stage gate and its jump request (executor threads)
+        #: against the runner naming the next stage (``engine.stage_gate.stage_lock``).
+        self.stage_lock: threading.RLock = threading.RLock()
+        #: Set by Stage 5 once it has read ``blackboard.battery_return`` and
+        #: chosen its branch; a critical charge after that changes nothing.
+        self.return_branch_committed: bool = False
         #: Stage number the runner is executing; ``None`` before the first.
         self.current_stage: Optional[int] = None
+        #: Stages this run holds, as the runner numbers them. Read by the
+        #: critical-charge return, which goes through the station's stage gate.
+        self.stage_numbers: Tuple[int, ...] = FULL_RUN_STAGES
         #: Last ``/bebop/states/flying_state`` from the aircraft, or ``None``.
         self.flying_state: Optional[int] = None
         #: Monotonic takeoff instant of a launch from standby (click plus the
@@ -182,10 +207,191 @@ class MissionContext:
         """
         return self.emergency_event.is_set() or self.stage_jump_event.is_set()
 
-    def request_stage(self, stage: int) -> None:
-        """Ask the runner to continue at ``stage`` (1-5) once this step unwinds."""
+    def request_stage(self, stage: int, *, source: str = "station") -> None:
+        """Ask the runner to continue at ``stage`` (1-5) once this step unwinds.
+
+        Parameters
+        ----------
+        stage : int
+            Stage number, as the runner numbers them.
+        source : str
+            Who asked, one of :data:`STAGE_REQUEST_SOURCES`; ``"station"`` by
+            default, the ground station's ``goto_stage``.
+
+        Raises
+        ------
+        TypeError
+            If ``source`` is not a string.
+        ValueError
+            If ``source`` is not one of :data:`STAGE_REQUEST_SOURCES`.
+        """
+        if not isinstance(source, str):
+            raise TypeError(f"source must be a string, got {type(source).__name__}")
+        if source not in STAGE_REQUEST_SOURCES:
+            raise ValueError(f"source must be one of {STAGE_REQUEST_SOURCES}, got {source!r}")
+        self.requested_stage_source = source
         self.requested_stage = stage
         self.stage_jump_event.set()
+
+    def request_battery_return(self, reason: str, *, source: str = "battery") -> bool:
+        """Jump to Stage 5 on a critical charge, marking the return as forced.
+
+        Goes through the same gate as the station's ``goto_stage``
+        (:func:`~mvp_mission_bebop.engine.stage_gate.refuse_stage_request`),
+        which accepts Stage 5 from any stage, the climb included.
+        ``blackboard.battery_return`` is set before the jump, so the Stage 5
+        that runs next flies the return of the profile even with
+        ``rtl.enabled = false``. Runs on the executor thread that delivered the
+        battery reading, as the station's request does. The gate, the flag and
+        the jump request are decided under :attr:`stage_lock`, the lock the
+        runner holds while it names the next stage, so a request can never
+        land between the runner naming Stage 5 and Stage 5 reading the flag;
+        the log and the milestone follow outside it.
+
+        Parameters
+        ----------
+        reason : str
+            ``BatterySupervisor.critical_reason``, for the log.
+        source : str
+            Who asked, one of :data:`STAGE_REQUEST_SOURCES`: ``"battery"``
+            for the supervisor's hook, ``"station"`` for a ``goto_stage 5``
+            that arrived on a critical charge (``engine.stage_gate``).
+
+        Returns
+        -------
+        bool
+            ``True`` when the return was requested; when a jump to Stage 5
+            is already pending (no second request, no second milestone);
+            when the forced return had been left by an operator jump and no
+            jump to Stage 5 is pending (requested again, no second
+            milestone); when Stage 5 is named but has not
+            chosen its branch yet (marked forced, not restarted); and when
+            Stage 5 has chosen its branch (nothing changes, nothing is
+            narrated, nothing restarts). ``False`` when the gate refuses,
+            which for Stage 5 means this run does not hold it (a partial
+            ``--stages`` run); nothing is marked or emitted then.
+
+        Raises
+        ------
+        TypeError
+            If ``reason`` or ``source`` is not a string.
+        ValueError
+            If ``source`` is not one of :data:`STAGE_REQUEST_SOURCES`.
+        """
+        if not isinstance(reason, str):
+            raise TypeError(f"reason must be a string, got {type(reason).__name__}")
+        if not isinstance(source, str):
+            raise TypeError(f"source must be a string, got {type(source).__name__}")
+        if source not in STAGE_REQUEST_SOURCES:
+            raise ValueError(f"source must be one of {STAGE_REQUEST_SOURCES}, got {source!r}")
+
+        refusal: Optional[str] = None
+        with stage_lock(self):
+            from_stage = self.current_stage
+            if from_stage == RETURN_STAGE:
+                if self.return_branch_committed:
+                    outcome = "committed"
+                elif self.blackboard.battery_return:
+                    outcome = "duplicate"
+                else:
+                    self.blackboard.battery_return = True
+                    outcome = "forced"
+            else:
+                refusal = refuse_stage_request(
+                    RETURN_STAGE,
+                    stage_numbers=self.stage_numbers,
+                    current_stage=from_stage,
+                    takeoff_committed=bool(getattr(self.blackboard, "takeoff_committed", False)),
+                    takeoff_complete=bool(getattr(self.blackboard, "takeoff_complete", False)),
+                    airborne=False,
+                )
+                if refusal is not None:
+                    outcome = "refused"
+                elif self.blackboard.battery_return and (
+                    self.stage_jump_event.is_set() and self.requested_stage == RETURN_STAGE
+                ):
+                    outcome = "duplicate"
+                elif self.blackboard.battery_return:
+                    # The forced return was left by an operator jump; the hook
+                    # is one-shot, so the return is requested again, unnarrated.
+                    self.request_stage(RETURN_STAGE, source=source)
+                    outcome = "re-requested"
+                else:
+                    self.blackboard.battery_return = True
+                    self.request_stage(RETURN_STAGE, source=source)
+                    outcome = "requested"
+
+        if outcome == "refused":
+            logger.warning("[BATTERY] return refused: %s (%s).", refusal, reason)
+            return False
+        if outcome == "committed":
+            logger.warning("[BATTERY] %s Stage 5 has already chosen its branch; not restarted.", reason)
+            return True
+        if outcome == "duplicate":
+            logger.info("[BATTERY] return already requested (%s); request from %s ignored.", reason, source)
+            return True
+        if outcome == "re-requested":
+            logger.warning("[BATTERY] return requested again by %s: %s", source, reason)
+            return True
+        logger.warning("[BATTERY] return forced: %s", reason)
+        emit_milestone("mission.battery_return", self._battery_return_payload(from_stage))
+        return True
+
+    def request_battery_return_or_land(self, reason: str) -> bool:
+        """The battery return hook: :meth:`request_battery_return`, else land.
+
+        The landing in place is reached only when the gate refuses, which
+        happens only when this run does not hold Stage 5; it is the one case in
+        which the critical charge lands the aircraft directly.
+
+        Parameters
+        ----------
+        reason : str
+            ``BatterySupervisor.critical_reason``.
+
+        Returns
+        -------
+        bool
+            ``True`` when the return was requested or is already running;
+            ``False`` when the emergency landing was commanded instead.
+        """
+        if self.request_battery_return(reason):
+            return True
+        landing_reason = self._battery_landing_reason()
+        logger.critical("[BATTERY] %s Stages in this run: %s.", landing_reason, list(self.stage_numbers))
+        self.failsafe.trigger_emergency_land(landing_reason)
+        return False
+
+    def _battery_landing_reason(self) -> str:
+        """Failsafe reason for the refused return; it says landing, not returning.
+
+        Starts with ``"Battery at"``, the prefix the failsafe maps to its
+        spoken clause (``telemetry.failsafe.spoken_reason``).
+        """
+        battery = getattr(self.failsafe, "battery_supervisor", None)
+        percentage = battery.current_percentage() if battery is not None else None
+        threshold = getattr(battery, "land_pct", None)
+        if percentage is None or threshold is None:
+            charge = "Battery at the return threshold"
+        else:
+            charge = f"Battery at {percentage:.0f}% <= return threshold {threshold:.0f}%"
+        return f"{charge}; stage {RETURN_STAGE} is not in this run, landing in place."
+
+    def _battery_return_payload(self, from_stage: Optional[int]) -> Dict[str, Any]:
+        """``mission.battery_return`` payload; the mode selects the station's phrase pool."""
+        battery = getattr(self.failsafe, "battery_supervisor", None)
+        percentage = battery.current_percentage() if battery is not None else None
+        threshold = getattr(battery, "land_pct", None)
+        try:
+            mode = parse_mission_mode(getattr(self.params, "mission_mode", None))
+        except (TypeError, ValueError):
+            mode = DEFAULT_MODE
+        return {
+            "battery_pct": None if percentage is None else round(float(percentage), 1),
+            "threshold_pct": None if threshold is None else round(float(threshold), 1),
+            "from_stage": from_stage,
+            "mode": mode.value,
+        }
 
     @property
     def motion_tracker(self) -> Optional["DeadReckoningTracker"]:

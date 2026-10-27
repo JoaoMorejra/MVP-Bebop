@@ -304,3 +304,79 @@ def test_an_odometry_without_a_platform_report_grants_no_boost():
     with failsafe.altitude_hold_window(0.10):
         assert failsafe.guard_hold_boost() == 0.0
         assert failsafe.clamp_kinematics(0.30, 0.0)[0] == pytest.approx(0.10)
+
+
+# ------------------------------------------------- battery is not a health item
+
+
+def test_a_critical_battery_is_not_a_health_failure():
+    """The critical charge requests the return (``BatterySupervisor`` hook); it never lands here."""
+    from mvp_mission_bebop.parameters import BatteryConfig
+    from mvp_mission_bebop.telemetry.battery import BatterySupervisor
+
+    kinematics_cfg = FlightKinematicsConfig(target_altitude_m=1.0)
+    timeouts_cfg = TimeoutsConfig()
+    odom_sup = OdometrySupervisor(kinematics_cfg, timeouts_cfg)
+    odom_sup.inject_synthetic_sample(x=0.0, y=0.0, z=1.0)
+    battery = BatterySupervisor(BatteryConfig(land_pct=20.0))
+    actuator = DummyActuator()
+    failsafe = FailsafeSupervisor(actuator, odom_sup, timeouts_cfg, kinematics_cfg, battery_supervisor=battery)
+    failsafe.notify_frame_received()
+
+    battery.inject_synthetic_reading(5.0)
+
+    assert battery.critical_reason() is not None
+    assert failsafe.evaluate_system_health() == (True, "Nominal")
+    assert failsafe.failsafe_active is False
+    assert actuator.landed is False and actuator.velocities == []
+
+
+def test_the_other_health_items_still_land_through_the_failsafe():
+    kinematics_cfg = FlightKinematicsConfig(target_altitude_m=1.0)
+    timeouts_cfg = TimeoutsConfig()
+    odom_sup = OdometrySupervisor(kinematics_cfg, timeouts_cfg)
+    actuator = DummyActuator()
+    failsafe = FailsafeSupervisor(actuator, odom_sup, timeouts_cfg, kinematics_cfg)
+
+    healthy, reason = failsafe.evaluate_system_health()
+
+    assert healthy is False and reason.startswith("No odometry has ever been received")
+    failsafe.trigger_emergency_land(reason)
+    assert actuator.landed is True
+
+
+def test_a_second_trigger_re_asserts_the_landing_without_a_second_alert(monkeypatch):
+    from mvp_mission_bebop.telemetry import announcer
+
+    spoken = []
+    monkeypatch.setattr(announcer, "announce_sync", lambda *args, **kwargs: spoken.append(kwargs.get("details")))
+    kinematics_cfg = FlightKinematicsConfig(target_altitude_m=1.0)
+    timeouts_cfg = TimeoutsConfig()
+    odom_sup = OdometrySupervisor(kinematics_cfg, timeouts_cfg)
+    actuator = DummyActuator()
+    failsafe = FailsafeSupervisor(actuator, odom_sup, timeouts_cfg, kinematics_cfg)
+
+    failsafe.trigger_emergency_land("Battery at 18% <= return threshold 20%; stage 5 is not in this run, landing in place.")
+    failsafe.trigger_emergency_land("Failsafe already active.")
+
+    assert len(spoken) == 1
+    assert len(actuator.velocities) == 2 and actuator.landed is True
+
+
+def test_a_different_later_fault_still_alerts(monkeypatch):
+    from mvp_mission_bebop.telemetry import announcer
+
+    spoken = []
+    monkeypatch.setattr(announcer, "announce_sync", lambda *args, **kwargs: spoken.append(kwargs.get("details")))
+    kinematics_cfg = FlightKinematicsConfig(target_altitude_m=1.0)
+    timeouts_cfg = TimeoutsConfig()
+    actuator = DummyActuator()
+    failsafe = FailsafeSupervisor(actuator, OdometrySupervisor(kinematics_cfg, timeouts_cfg), timeouts_cfg, kinematics_cfg)
+
+    failsafe.trigger_emergency_land("Camera stream loss: frame age 3.0 s > 2.0 s.")
+    failsafe.trigger_emergency_land("Camera stream loss: frame age 3.0 s > 2.0 s.")
+    failsafe.trigger_emergency_land("Failsafe already active.")
+    failsafe.trigger_emergency_land("Altitude ceiling breached: 3.10 m > 3.00 m.")
+
+    assert [details["erro"] for details in spoken] == ["perda do vídeo da câmera", "teto de altitude excedido"]
+    assert len(actuator.velocities) == 4

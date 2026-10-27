@@ -1250,16 +1250,17 @@ class TimeoutsConfig:
 
 @dataclass
 class BatteryConfig:
-    """Onboard battery safety net, independent of the ground station.
+    """Critical-charge return, owned by the mission process.
 
-    The station owns the battery failsafe and its RTL-versus-land decision
-    (``bebop_mission_control/src/lib/batteryFailsafe.ts``). This section exists
-    for the runs it is not in command of -- a headless CLI bench routine, a
-    crashed GUI, a dropped IPC bridge -- where the mission process itself lands
-    the aircraft where it is. See :mod:`mvp_mission_bebop.telemetry.battery`.
+    At ``land_pct`` the airborne mission jumps to Stage 5 and flies the return
+    of the active profile, even with ``rtl.enabled = false``; it never lands in
+    place because of the charge. The ground station's trigger
+    (``bebop_mission_control/src/lib/batteryFailsafe.ts``) is redundancy. The
+    same figure gates the Stage 1 launch. See
+    :mod:`mvp_mission_bebop.telemetry.battery`.
     """
 
-    #: Charge, in percent, at or below which the mission lands in place.
+    #: Charge, in percent, at or below which the airborne mission returns to base.
     #:
     #: Sent by the station at launch as ``battery.land_pct`` in the
     #: ``--params-json`` payload, carrying the operator's battery-flyout
@@ -1538,7 +1539,7 @@ class MissionParameters:
 
     @property
     def battery_land_pct(self) -> float:
-        """Charge, in percent, at which the mission lands in place.
+        """Charge, in percent, at which the airborne mission returns to base.
 
         Read-only view of ``battery.land_pct``, the nested path the station
         writes. Not a dataclass field, so it never appears in :meth:`to_dict`

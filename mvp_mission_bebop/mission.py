@@ -21,7 +21,8 @@ import numpy as np
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import Float32, Int32, String, UInt8, UInt32
+from geometry_msgs.msg import Vector3
+from std_msgs.msg import Float32, Float32MultiArray, Int32, String, UInt8, UInt32
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 
 import nectar
@@ -55,7 +56,7 @@ from mvp_mission_bebop.engine.launch import (
 from mvp_mission_bebop.engine.process_reaper import install_exit_reaper
 from mvp_mission_bebop.engine.runner import MissionRunner
 from mvp_mission_bebop.engine.startup_timing import StartupTimer, process_age_ms
-from mvp_mission_bebop.engine.stage_gate import StageRequestHandler
+from mvp_mission_bebop.engine.stage_gate import StageRequestHandler, is_airborne
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
 from mvp_mission_bebop.launch_envelope import launches_from_ground, validate_launch_envelope
@@ -94,6 +95,11 @@ from mvp_mission_bebop.telemetry.battery import (
 )
 from mvp_mission_bebop.telemetry.bench import BenchTelemetryPublisher
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
+from mvp_mission_bebop.telemetry.gimbal import (
+    LIMITS_TOPIC_SUFFIX,
+    ORIENTATION_TOPIC_SUFFIX,
+    GimbalStateMonitor,
+)
 from mvp_mission_bebop.telemetry.milestones import emit_alert, emit_milestone
 from mvp_mission_bebop.telemetry.mission_parameters import spoken_parameters
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
@@ -123,7 +129,7 @@ def parse_arguments(default_params: MissionParameters) -> argparse.Namespace:
         "--height",
         type=float,
         default=None,
-        help="Target takeoff altitude and safety ceiling (default: %(default)s m).",
+        help="Altura de operação sobre o piso, em metros (limites em launch_envelope.py).",
     )
     parser.add_argument(
         "--velocity",
@@ -1003,10 +1009,29 @@ def main() -> None:
         QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
     )
     logger.info(
-        "Battery net on %s: land in place at <= %.0f%%, warning at <= %.0f%%.",
+        "Battery net on %s: return to base at <= %.0f%%, warning at <= %.0f%%.",
         battery_topic,
         params.battery_land_pct,
         BATTERY_WARNING_PCT,
+    )
+
+    # What the aircraft reports for its camera, so the return leg can tell a gimbal
+    # that stopped short from a marker that is not in view. Transient-local like
+    # the battery topic: the limits are published once per connection.
+    gimbal_monitor = GimbalStateMonitor()
+    gimbal_namespace = f"/{params.network.namespace.strip('/')}"
+    camera_state_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    telemetry_node.create_subscription(
+        Vector3,
+        f"{gimbal_namespace}/{ORIENTATION_TOPIC_SUFFIX}",
+        gimbal_monitor.orientation_callback,
+        camera_state_qos,
+    )
+    telemetry_node.create_subscription(
+        Float32MultiArray,
+        f"{gimbal_namespace}/{LIMITS_TOPIC_SUFFIX}",
+        gimbal_monitor.limits_callback,
+        camera_state_qos,
     )
 
     flying_state_data: Dict[str, Any] = {"state": None, "timestamp": 0.0}
@@ -1219,6 +1244,7 @@ def main() -> None:
     )
     ctx.flying_state = flying_state_data["state"]
     ctx.flying_state_timestamp = flying_state_data["timestamp"]
+    ctx.gimbal_monitor = gimbal_monitor
     ctx_holder[0] = ctx
 
     # Inference off the control thread. The worker idles until a stage engages
@@ -1361,6 +1387,18 @@ def main() -> None:
     stage_topic = f"/{params.network.namespace.strip('/')}/mission/goto_stage"
     telemetry_node.create_subscription(Int32, stage_topic, _on_stage_request, 10)
     logger.info("Stage control listening on %s", stage_topic)
+
+    # The critical-charge return rides the same gate as the station's request:
+    # the battery callback runs on the executor and jumps the runner to Stage 5.
+    ctx.stage_numbers = tuple(stage_numbers)
+
+    if params.no_fly:
+        logger.info("[NO-FLY BENCHTOP] Battery return hook not armed; no charge triggers a jump.")
+    else:
+        battery_supervisor.set_return_hook(
+            ctx.request_battery_return_or_land,
+            lambda: is_airborne(lambda: odom_supervisor.snapshot().relative_altitude),
+        )
 
     # Registration is explicit rather than a constructor side effect, so the
     # runner can be constructed in a test off the main thread.

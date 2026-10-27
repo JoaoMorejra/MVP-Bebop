@@ -669,7 +669,7 @@
     {
       "name": "e10_above_the_maximum",
       "overrides": {
-        "kinematics.target_altitude_m": 2.05
+        "kinematics.target_altitude_m": 3.05
       },
       "expect": {
         "errors": [
@@ -727,6 +727,51 @@
         "warnings": []
       },
       "note": "the margin is ignored on the pad top (D2)"
+    },
+    {
+      "name": "e04_w02_silent_on_the_pad_top_at_2_0_m",
+      "overrides": {
+        "platform.height_m": 1.0,
+        "platform.takeoff_from_ground": false,
+        "kinematics.target_altitude_m": 2.0,
+        "kinematics.altitude_ceiling_margin_m": 0.04
+      },
+      "expect": {
+        "errors": [],
+        "warnings": []
+      },
+      "note": "at or below 2.0 m over the floor the pad-top margin stays locked"
+    },
+    {
+      "name": "e04_on_the_pad_top_above_2_0_m",
+      "overrides": {
+        "platform.height_m": 1.0,
+        "platform.takeoff_from_ground": false,
+        "kinematics.target_altitude_m": 2.5,
+        "kinematics.altitude_ceiling_margin_m": 0.04
+      },
+      "expect": {
+        "errors": [
+          "E04"
+        ],
+        "warnings": []
+      },
+      "note": "above 2.0 m over the floor the pad top applies the operator margin"
+    },
+    {
+      "name": "w02_on_the_pad_top_above_2_0_m",
+      "overrides": {
+        "platform.height_m": 1.0,
+        "platform.takeoff_from_ground": false,
+        "kinematics.target_altitude_m": 2.5,
+        "kinematics.altitude_ceiling_margin_m": 0.1
+      },
+      "expect": {
+        "errors": [],
+        "warnings": [
+          "W02"
+        ]
+      }
     }
   ]
 }

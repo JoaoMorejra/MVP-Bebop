@@ -23,7 +23,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Final, List, Mapping, Optional, Set, Tuple
 
-from mvp_mission_bebop.launch_envelope import ALTITUDE_MAX_M, ALTITUDE_MIN_M, PAD_CLEARANCE_M, VENUE_HEADROOM_M
+from mvp_mission_bebop.launch_envelope import (
+    ALTITUDE_MAX_M,
+    ALTITUDE_MIN_M,
+    PAD_CLEARANCE_M,
+    TOTEM_MARGIN_UNLOCK_ABOVE_M,
+    VENUE_HEADROOM_M,
+)
 
 #: Height at which the Bebop 2 firmware ends its takeoff, in metres. The
 #: airframe ignores the altitude it is handed and stabilizes here
@@ -210,6 +216,13 @@ class _Evaluation:
         pad = self.read(_PAD)
         return pad is None or pad <= 0.0
 
+    def margin_unlocked(self) -> bool:
+        """Whether the ceiling applies the operator margin (``launch_envelope.margin_unlocked``)."""
+        if self.from_ground():
+            return True
+        h = self.read(_ALTITUDE)
+        return h is not None and h > TOTEM_MARGIN_UNLOCK_ABOVE_M + _EPS
+
     def envelope(self) -> Tuple[float, float]:
         """``launch_envelope.altitude_envelope`` over the document, without the venue cap."""
         if self.from_ground():
@@ -258,7 +271,7 @@ class _Evaluation:
 
     def e04(self) -> Finding:
         m, band = self.read(_MARGIN), self.read(_CLIMB_BAND)
-        if not self.from_ground() or m is None or band is None or m >= band - _EPS:
+        if not self.margin_unlocked() or m is None or band is None or m >= band - _EPS:
             return None
         return (
             (_MARGIN,),
@@ -359,7 +372,7 @@ class _Evaluation:
 
     def w02(self) -> Finding:
         m, band = self.read(_MARGIN), self.noise_band()
-        if not self.from_ground() or "E04" in self.fired or m is None or band is None or m >= band - _EPS:
+        if not self.margin_unlocked() or "E04" in self.fired or m is None or band is None or m >= band - _EPS:
             return None
         return ((_MARGIN,), f"Margem de {_m2(m)} abaixo do ruído de sonar e barômetro ({_m2(band)}).", f"Margem de pelo menos {_m2(band)}.")
 

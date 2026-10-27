@@ -38,10 +38,46 @@ def test_from_the_floor_the_ceiling_is_target_plus_margin():
     assert ceiling.value() == pytest.approx(2.2)
 
 
-def test_on_the_pad_top_the_ceiling_is_fixed_and_ignores_the_margin():
+@pytest.mark.parametrize("target", [1.8, 2.0])
+def test_on_the_pad_top_the_ceiling_is_fixed_and_ignores_the_margin(target):
     for margin in (0.0, 0.4, 2.0):
-        ceiling, _ = schedule(1.8, pad=1.0, margin=margin)
-        assert ceiling.value() == pytest.approx(max(0.8, H_FW) + TOTEM_CEILING_HEADROOM_M)
+        ceiling, _ = schedule(target, pad=1.0, margin=margin)
+        assert not ceiling.margin_unlocked
+        assert ceiling.effective_margin_m == pytest.approx(TOTEM_CEILING_HEADROOM_M)
+        assert ceiling.value() == pytest.approx(max(target - 1.0, H_FW) + TOTEM_CEILING_HEADROOM_M)
+
+
+@pytest.mark.parametrize(
+    "target, margin, expected",
+    [(2.05, 0.4, 1.45), (2.5, 0.6, 2.1), (3.0, 0.6, 2.6), (2.5, 0.0, 1.5)],
+)
+def test_on_the_pad_top_above_2_0_m_the_ceiling_applies_the_operator_margin(target, margin, expected):
+    ceiling, _ = schedule(target, pad=1.0, margin=margin)
+    assert ceiling.margin_unlocked
+    assert ceiling.effective_margin_m == pytest.approx(margin)
+    assert ceiling.value() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("target", [2.7, 3.0])
+def test_a_3_2_m_venue_cuts_the_unlocked_pad_top_ceiling_at_2_2_m(target):
+    ceiling, _ = schedule(target, pad=1.0, margin=0.6, venue=3.2)
+    assert ceiling.venue_limit_m == pytest.approx(2.2)
+    assert ceiling.value() == pytest.approx(2.2)
+
+
+def test_the_floor_ignores_the_unlock_altitude():
+    for target in (1.8, 2.5, 3.0):
+        ceiling, _ = schedule(target, margin=0.4)
+        assert ceiling.margin_unlocked
+        assert ceiling.value() == pytest.approx(target + 0.4)
+
+
+def test_the_unlocked_pad_top_arms_the_transient_with_the_operator_margin():
+    ceiling, _ = schedule(2.5, pad=1.0, margin=0.30)
+    ceiling.arm()
+    ceiling.end_native_profile()
+    assert ceiling.value() >= H_FW + 0.30 - 1e-9
+    assert ceiling.value() == pytest.approx(max(1.5 + 0.30, H_FW + 0.30))
 
 
 def test_d2_defaults_put_the_pad_top_ceiling_at_the_venue():

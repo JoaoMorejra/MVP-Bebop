@@ -32,8 +32,10 @@ from typing import Any, Final, Tuple
 
 #: Lowest operating altitude over the floor on any surface, in metres.
 ALTITUDE_MIN_M: Final[float] = 0.10
-#: Highest operating altitude over the floor on any surface, in metres.
-ALTITUDE_MAX_M: Final[float] = 2.00
+#: Highest operating altitude over the floor on any surface, in metres. From
+#: the pad top the flight climbs past the native hover height of the firmware
+#: under ``TakeoffStep._acquire_altitude``; a known venue ceiling lowers it.
+ALTITUDE_MAX_M: Final[float] = 3.00
 #: Resolution of the altitude slider of the station, in metres.
 ALTITUDE_STEP_M: Final[float] = 0.05
 #: Least height kept above the pad top, in metres. The rotor wash recirculates
@@ -42,6 +44,11 @@ ALTITUDE_STEP_M: Final[float] = 0.05
 PAD_CLEARANCE_M: Final[float] = 0.30
 #: Least distance kept under a known venue ceiling, in metres.
 VENUE_HEADROOM_M: Final[float] = 0.10
+#: Operating altitude over the floor above which the pad top applies the
+#: operator margin ``kinematics.altitude_ceiling_margin_m`` instead of the fixed
+#: totem headroom, in metres. At or below it the relative target never exceeds
+#: the native hover height and the fixed headroom covers the firmware profile.
+TOTEM_MARGIN_UNLOCK_ABOVE_M: Final[float] = 2.00
 
 #: Comparison slack, in metres. Absorbs the binary representation of sums such
 #: as ``1.0 + 0.3`` so a value the slider offers is never refused by rounding.
@@ -135,10 +142,10 @@ def altitude_envelope(params: Any) -> Tuple[float, float]:
     tuple of float
         ``(minimum, maximum)`` in metres, both inclusive. On the pad top the
         minimum is ``height_m + pad_clearance_m(params)``, on the floor
-        :data:`ALTITUDE_MIN_M`. The maximum is :data:`ALTITUDE_MAX_M`, lowered
-        to ``venue_ceiling_agl_m - VENUE_HEADROOM_M`` when the venue ceiling is
-        known. The range is empty (minimum above maximum) when a low venue
-        leaves no room above the pad.
+        :data:`ALTITUDE_MIN_M`. The maximum is :data:`ALTITUDE_MAX_M` (3.0 m) on
+        both surfaces, lowered to ``venue_ceiling_agl_m - VENUE_HEADROOM_M`` when
+        the venue ceiling is known. The range is empty (minimum above maximum)
+        when a low venue leaves no room above the pad.
     """
     if launches_from_ground(params):
         minimum = ALTITUDE_MIN_M
@@ -149,6 +156,28 @@ def altitude_envelope(params: Any) -> Tuple[float, float]:
     if _finite_number(venue):
         maximum = min(maximum, float(venue) - VENUE_HEADROOM_M)
     return minimum, maximum
+
+
+def margin_unlocked(params: Any) -> bool:
+    """Whether the ceiling applies the operator margin rather than the fixed totem headroom.
+
+    Parameters
+    ----------
+    params : MissionParameters
+        Read only.
+
+    Returns
+    -------
+    bool
+        True on the floor (:func:`launches_from_ground`), and on the pad top
+        when ``kinematics.target_altitude_m`` exceeds
+        :data:`TOTEM_MARGIN_UNLOCK_ABOVE_M`. A target that is not a finite
+        number keeps the pad top locked.
+    """
+    if launches_from_ground(params):
+        return True
+    altitude = getattr(params.kinematics, "target_altitude_m", None)
+    return _finite_number(altitude) and altitude > TOTEM_MARGIN_UNLOCK_ABOVE_M + _TOLERANCE_M
 
 
 def validate_launch_envelope(params: Any) -> None:

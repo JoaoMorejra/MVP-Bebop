@@ -87,6 +87,7 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
     RTLPhase,
 )
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
+from mvp_mission_bebop.engine.stage_gate import stage_lock
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
 from mvp_mission_bebop.mission_mode import MissionMode, stage_five_name
 from mvp_mission_bebop.perception.intrinsics import (
@@ -163,6 +164,23 @@ _PRINCIPAL_POINT_TOLERANCE_RATIO: Final[float] = 0.10
 #: acknowledges ``land()`` -- and the landing is burst-asserted for that reason.
 #: The same argument applies here, at the cost of one publish per second.
 _TILT_REASSERT_SEC: Final[float] = 1.0
+
+#: Longest wait, in seconds, for the aircraft to report the commanded return tilt
+#: before the leg goes on. The ARSDK saturates a tilt at the limits the drone
+#: reports and sends each setpoint in a burst of ten packets, so a camera can
+#: stop short of ``rtl.camera_tilt_deg`` without any error; at -40 deg it looks
+#: at the horizon and never sees the pad marker. Reported orientation, not the
+#: command, is what the wait trusts.
+_GIMBAL_SETTLE_TIMEOUT_SEC: Final[float] = 3.0
+
+#: Seconds between checks (and re-sends) of the commanded tilt during that wait.
+_GIMBAL_CHECK_PERIOD_SEC: Final[float] = 0.25
+
+#: Distance from ``rtl.camera_tilt_deg`` that still counts as the commanded
+#: attitude, in degrees. The marker sits about 17 deg off the optical axis at
+#: -80 deg and the vertical half field of view is near 29 deg, so a few degrees
+#: of tilt error costs no visibility; tens of degrees do.
+_GIMBAL_TOLERANCE_DEG: Final[float] = 3.0
 
 #: Frame-grab budget while centering, in seconds. Deliberately tighter. This is
 #: a closed loop whose phase margin is set by its cadence, and a one-second
@@ -249,7 +267,21 @@ class ArucoMarkerSensor:
     this cycle", which the control law already knows how to fly.
     """
 
-    __slots__ = ("_detector", "_target_id", "_annotate", "_failures", "_backend", "_object_points")
+    __slots__ = (
+        "_detector",
+        "_target_id",
+        "_annotate",
+        "_failures",
+        "_backend",
+        "_object_points",
+        "_frames",
+        "_no_frame",
+        "_no_detection",
+        "_wrong_ids",
+        "_degenerate",
+        "_accepted",
+        "_last_error",
+    )
 
     #: Pose paths this class knows how to drive. See the class docstring.
     BACKENDS: Final[FrozenSet[str]] = frozenset({"sdk", "solvepnp"})
@@ -270,6 +302,13 @@ class ArucoMarkerSensor:
         #: recognised rather than merely reported.
         self._annotate = bool(annotate)
         self._failures = 0
+        self._frames = 0
+        self._no_frame = 0
+        self._no_detection = 0
+        self._wrong_ids: Dict[int, int] = {}
+        self._degenerate = 0
+        self._accepted = 0
+        self._last_error: Optional[str] = None
 
         # ``None`` -- the flight default -- selects from what the runtime
         # actually provides. An explicit value is for diagnostics and for tests
@@ -325,7 +364,9 @@ class ArucoMarkerSensor:
             frame this cycle -- is answered with ``None``, so the caller has one
             code path for "no image" and "no marker".
         """
+        self._frames += 1
         if frame is None:
+            self._no_frame += 1
             return None
 
         try:
@@ -337,11 +378,64 @@ class ArucoMarkerSensor:
                 marker_id, translation, yaw = self._pose_via_solvepnp(frame)
         except Exception as exc:  # noqa: BLE001 - perception never ends a flight
             self._failures += 1
+            self._last_error = type(exc).__name__
             logger.debug("ArUco detection failed on this frame: %s", exc)
             return None
 
-        return MarkerObservation.from_pose_estimate(
+        observation = MarkerObservation.from_pose_estimate(
             marker_id, translation, yaw, expected_id=self._target_id
+        )
+        if observation is not None:
+            self._accepted += 1
+        elif marker_id is None or translation is None:
+            self._no_detection += 1
+        else:
+            seen = self._identity_of(marker_id)
+            if seen is not None and seen != self._target_id:
+                self._wrong_ids[seen] = self._wrong_ids.get(seen, 0) + 1
+            else:
+                self._degenerate += 1
+        return observation
+
+    @staticmethod
+    def _identity_of(marker_id: object) -> Optional[int]:
+        """The marker id as an int, or ``None`` when the detector returned something else."""
+        try:
+            return int(np.ravel(np.asarray(marker_id))[0])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Why frames produced no sighting, for the post-phase log.
+
+        Returns
+        -------
+        Dict[str, Any]
+            ``frames`` offered; ``no_frame`` (the grab returned nothing);
+            ``no_detection`` (a frame with no marker in it); ``wrong_ids``
+            (marker id -> frames, a marker of the dictionary that is not the
+            pad); ``degenerate`` (the right id with an unusable pose);
+            ``accepted``; ``errors`` (detector exceptions) and ``last_error``
+            (the exception type, or ``None``).
+        """
+        return {
+            "frames": self._frames,
+            "no_frame": self._no_frame,
+            "no_detection": self._no_detection,
+            "wrong_ids": dict(self._wrong_ids),
+            "degenerate": self._degenerate,
+            "accepted": self._accepted,
+            "errors": self._failures,
+            "last_error": self._last_error,
+        }
+
+    def diagnostics_line(self) -> str:
+        """:meth:`diagnostics` as one log line."""
+        d = self.diagnostics()
+        return (
+            f"frames {d['frames']}, no frame {d['no_frame']}, nothing detected {d['no_detection']}, "
+            f"wrong ids {d['wrong_ids']}, degenerate pose {d['degenerate']}, accepted {d['accepted']}, "
+            f"errors {d['errors']}" + (f" ({d['last_error']})" if d["last_error"] else "")
         )
 
     def overlay_geometry(self, frame: Optional[np.ndarray]) -> List[Dict[str, Any]]:
@@ -457,7 +551,10 @@ class ClosedLoopRTLStep(BaseStep):
     rtl_enabled : bool
         ``rtl.enabled`` of the flight, keyword-only; selects the stage name
         (``mission_mode.stage_five_name``). Which branch :meth:`execute` flies
-        is read from ``ctx.params.rtl.enabled``, the same value at the launch.
+        is read from ``ctx.params.rtl.enabled``, the same value at the launch,
+        and from ``ctx.blackboard.battery_return``: a critical-charge return
+        (``MissionContext.request_battery_return``) flies the return of the
+        profile whatever ``rtl.enabled`` says, under the return's stage name.
     """
 
     def __init__(
@@ -499,6 +596,14 @@ class ClosedLoopRTLStep(BaseStep):
         either would mean this step competing for the airframe with the mechanism
         that just took it away. Both halt translation on the way out.
         """
+        # Read and committed under the stage lock: a critical charge decided
+        # before this point flies the return, one decided after it changes
+        # nothing (``MissionContext.request_battery_return``).
+        with stage_lock(ctx):
+            forced = bool(getattr(ctx.blackboard, "battery_return", False))
+            ctx.return_branch_committed = True
+        if forced:
+            self.name = f"STEP 5: {stage_five_name(self._mode, True)}"
         logger.info("--- [%s] ---", self.name)
 
         rtl_cfg = ctx.params.rtl
@@ -510,9 +615,17 @@ class ClosedLoopRTLStep(BaseStep):
 
         # Without the return the marker sensor is never built and nothing
         # names the base: the profile does not matter, both land in place.
-        # The battery failsafe jumps here and inherits the same branch.
-        if not rtl_cfg.enabled:
+        # The critical-charge return is the exception: it flies the return of
+        # the profile even when the flight planned to land at the inspection.
+        if not rtl_cfg.enabled and not forced:
             return self._land_in_place(ctx, guidance)
+        if forced and not rtl_cfg.enabled:
+            logger.warning(
+                "Battery return: flying the %s return although rtl.enabled = false.",
+                self._mode.value,
+            )
+        if forced:
+            self._announce_battery_return(self._mode.value)
 
         # The centering law is constructed here, before anything flies, and not
         # at the point it is first needed. Its constructor validates the
@@ -546,12 +659,14 @@ class ClosedLoopRTLStep(BaseStep):
                     ctx.blackboard.target_confirmed and evidence is not None and evidence.captured
                 ),
                 "marker_guided": sensor is not None,
+                "battery_return": forced,
             },
         )
-        self._announce(
-            "Iniciando Retorno à Base via ArUco",
-            "iniciando retorno à base de lançamento por marcador ArUco",
-        )
+        if not forced:
+            self._announce(
+                "Iniciando Retorno à Base via ArUco",
+                "iniciando retorno à base de lançamento por marcador ArUco",
+            )
         self._engage_return_attitude(ctx)
 
         if sensor is None:
@@ -650,6 +765,58 @@ class ClosedLoopRTLStep(BaseStep):
             _TILT_REASSERT_SEC,
         )
         self._assert_tilt(ctx)
+        self._confirm_gimbal(ctx, tilt)
+
+    def _confirm_gimbal(self, ctx: MissionContext, tilt: float) -> None:
+        """Wait for the aircraft to report ``tilt`` and say what the camera did.
+
+        Never ends the flight: a camera that stops short, or a driver that does
+        not publish the camera state, is logged and the return leg goes on, as
+        it did before the readback existed. The difference is that the log now
+        separates "the gimbal never got there" from "the marker was not in view".
+        """
+        monitor = getattr(ctx, "gimbal_monitor", None)
+        if monitor is None:
+            return
+        limits = monitor.tilt_limits()
+        if limits is not None:
+            logger.info(
+                "Return attitude: the aircraft reports tilt limits %.1f to %.1f deg.", limits[0], limits[1]
+            )
+        outcome = monitor.wait_for_tilt(
+            tilt,
+            _GIMBAL_TOLERANCE_DEG,
+            _GIMBAL_SETTLE_TIMEOUT_SEC,
+            lambda: self._assert_tilt(ctx),
+            ctx.interrupted,
+            period=_GIMBAL_CHECK_PERIOD_SEC,
+        )
+        message = outcome.describe(tilt)
+        if outcome.reached:
+            logger.info("Return attitude: %s.", message)
+            return
+        if outcome.interrupted:
+            logger.info("Return attitude: %s.", message)
+            return
+        if not outcome.telemetry:
+            logger.warning(
+                "Return attitude: %s. The driver publishes no CameraState orientation, so a gimbal "
+                "that stopped short would look like a marker that is not there.",
+                message,
+            )
+        elif limits is not None and tilt < limits[0] - 0.5:
+            logger.warning(
+                "Return attitude: %s. The commanded tilt is below the aircraft's reported limit of "
+                "%.1f deg, which saturates it: set rtl.camera_tilt_deg at or above that limit.",
+                message,
+                limits[0],
+            )
+        else:
+            logger.warning(
+                "Return attitude: %s. The camera is not pointing at the pad, so the marker "
+                "search is likely to see nothing.",
+                message,
+            )
 
     def _land_in_place(self, ctx: MissionContext, guidance: RTLGuidanceController) -> StepStatus:
         """Without the return (``rtl.enabled`` false): land where the inspection ended.
@@ -1119,6 +1286,7 @@ class ClosedLoopRTLStep(BaseStep):
                 "The detector raised on %d frames during the search; verify the video link.",
                 sensor.failures,
             )
+        self._log_detector_summary(sensor, "search")
         return _PhaseOutcome.EXHAUSTED
 
     def _cruise_rightward(
@@ -1310,7 +1478,21 @@ class ClosedLoopRTLStep(BaseStep):
             f"{command.radial_error_m:.3f}" if command is not None else "unknown",
             "in view" if command is not None and command.tracking else "not in view",
         )
+        self._log_detector_summary(sensor, "centering")
         return _PhaseOutcome.EXHAUSTED
+
+    @staticmethod
+    def _log_detector_summary(sensor: Any, phase: str) -> None:
+        """State why the marker was never sighted, when the sensor can say.
+
+        ``marker absent`` in the control log covers a missing frame, an empty
+        frame, a marker of another id, a mirrored pose and a detector exception.
+        This line separates them, so an exhausted window can be told apart as a
+        video fault, a camera that is not looking at the pad, or a wrong tag.
+        """
+        describe = getattr(sensor, "diagnostics_line", None)
+        if callable(describe):
+            logger.warning("Marker detector during %s: %s.", phase, describe())
 
     def _transmit_centering(
         self, ctx: MissionContext, command: CenteringCommand, dt: float
@@ -1690,11 +1872,13 @@ class ClosedLoopRTLStep(BaseStep):
         )
         # Raised before the first land command, not on confirmed contact: the
         # narration is an advance warning to the people around the pad.
+        battery_return = bool(getattr(ctx.blackboard, "battery_return", False))
         emit_milestone(
             "mission.landing",
             {
                 "altitude_m": round(ctx.odom_supervisor.snapshot().relative_altitude, 2),
                 "at_base": at_base,
+                "battery_return": battery_return,
             },
         )
         self._assert_land(ctx, rtl_cfg.land_burst_count)
@@ -1817,7 +2001,13 @@ class ClosedLoopRTLStep(BaseStep):
         ctx.blackboard.touchdown_confirmed = confirmed
         final = ctx.odom_supervisor.snapshot()
         emit_milestone(
-            "mission.touchdown", {"confirmed": confirmed, "at_base": at_base, "method": method}
+            "mission.touchdown",
+            {
+                "confirmed": confirmed,
+                "at_base": at_base,
+                "method": method,
+                "battery_return": battery_return,
+            },
         )
 
         if confirmed:
@@ -2030,6 +2220,26 @@ class ClosedLoopRTLStep(BaseStep):
         except Exception as exc:  # noqa: BLE001 - perception never ends a flight
             logger.debug("Frame acquisition failed: %s", exc)
             return None
+
+    @staticmethod
+    def _announce_battery_return(mode: str) -> None:
+        """Announce the forced return in the wording of ``mode``, ignoring any failure.
+
+        Under the ground station the announcement is dropped (it is narration,
+        not an alert) and the station speaks ``mission.battery_return``
+        instead, so the crossing is heard once.
+
+        Parameters
+        ----------
+        mode : str
+            ``MissionMode.value`` of the flight, sent as ``details["modo"]``.
+        """
+        try:
+            from mvp_mission_bebop.telemetry.announcer import BATTERY_RETURN_ACTION, announce_sync
+
+            announce_sync(BATTERY_RETURN_ACTION, details={"modo": mode}, wait=False)
+        except Exception as exc:  # noqa: BLE001 - audio is never flight-critical
+            logger.debug("Announcement dispatch failed: %s", exc)
 
     @staticmethod
     def _announce(action: str, detail: str) -> None:

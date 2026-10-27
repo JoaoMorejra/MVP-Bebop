@@ -160,8 +160,8 @@ def audit_safe_envelopes(
     )
     # The floor is a sum of two decimal constants: compare with a tolerance so
     # a margin set exactly at it is not reported for binary rounding alone. On
-    # the pad top the margin is not read (D2).
-    if not schedule.on_pad_top and (margin is None or margin < margin_floor - 1e-9):
+    # the pad top the margin is read only above the unlock altitude (D2).
+    if schedule.margin_unlocked and (margin is None or margin < margin_floor - 1e-9):
         diverge(
             "kinematics.altitude_ceiling_margin_m",
             kinematics.altitude_ceiling_margin_m,
@@ -303,11 +303,12 @@ def _audit_platform(
             )
         elif target is not None and _real(kinematics.altitude_ceiling_margin_m) is not None:
             # The nominal ceiling over the floor, in the frame the venue is
-            # stated in. On the pad top the ceiling is fixed and capped by the
-            # venue by design (D2), so only a launch from the floor is judged.
+            # stated in. On the pad top at or below the unlock altitude the
+            # ceiling is fixed and capped by the venue by design (D2), so only a
+            # ceiling that applies the operator margin is judged.
             schedule = CeilingSchedule(kinematics, platform)
             ceiling_floor = schedule.nominal_m() + schedule.pad_height_m
-            if not schedule.on_pad_top and ceiling_floor >= venue_value - VENUE_CEILING_CLEARANCE_M:
+            if schedule.margin_unlocked and ceiling_floor >= venue_value - VENUE_CEILING_CLEARANCE_M:
                 diverge(
                     "platform.venue_ceiling_agl_m",
                     venue,

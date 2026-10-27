@@ -653,8 +653,9 @@ def test_the_step_matcher_is_the_one_the_gcs_ships():
 
 #: Pool keys of the synchronisation table (spec section 4) that the mission
 #: process raises, plus ``mission.battery_warning`` from the onboard battery net
-#: (``telemetry.battery``). ``mission.start`` belongs to the GCS; the countdown
-#: is the mission's (``TakeoffStep._countdown``).
+#: (``telemetry.battery``) and ``mission.battery_return`` from the critical-charge
+#: return (``MissionContext.request_battery_return``). ``mission.start`` belongs
+#: to the GCS; the countdown is the mission's (``TakeoffStep._countdown``).
 SPEC_MILESTONE_KEYS = (
     "mission.countdown",
     "mission.countdown_3",
@@ -671,6 +672,7 @@ SPEC_MILESTONE_KEYS = (
     "mission.parameters",
     "mission.flat_trim",
     "mission.inspection_ready",
+    "mission.battery_return",
 )
 
 

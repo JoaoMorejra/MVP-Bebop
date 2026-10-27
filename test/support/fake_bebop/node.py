@@ -67,6 +67,9 @@ class TopicContract(NamedTuple):
     depth: int
 
 
+#: [tilt_min, tilt_max, pan_min, pan_max] the emulated camera reports, degrees.
+CAMERA_LIMITS_DEG: Final[Tuple[float, float, float, float]] = (-83.0, 17.0, -35.0, 35.0)
+
 DRIVER_CONTRACT: Final[Tuple[TopicContract, ...]] = (
     TopicContract("sub", "takeoff", "std_msgs/msg/Empty", "reliable", "volatile", 1),
     TopicContract("sub", "land", "std_msgs/msg/Empty", "reliable", "volatile", 1),
@@ -85,6 +88,12 @@ DRIVER_CONTRACT: Final[Tuple[TopicContract, ...]] = (
     TopicContract("pub", "states/wifi_rssi", "std_msgs/msg/Int16", "reliable", "transient_local", 1),
     TopicContract("pub", "states/flying_state", "std_msgs/msg/UInt8", "reliable", "transient_local", 1),
     TopicContract("pub", "states/altitude", "std_msgs/msg/Float32", "reliable", "transient_local", 1),
+    TopicContract(
+        "pub", "states/ardrone3/CameraState/OrientationV2", "geometry_msgs/msg/Vector3", "reliable", "transient_local", 1
+    ),
+    TopicContract(
+        "pub", "states/ardrone3/CameraState/Limits", "std_msgs/msg/Float32MultiArray", "reliable", "transient_local", 1
+    ),
     TopicContract("pub", "states/gps", "sensor_msgs/msg/NavSatFix", "reliable", "transient_local", 1),
     TopicContract("pub", "states/picture_event", "std_msgs/msg/String", "reliable", "volatile", 10),
     TopicContract("pub", "states/flat_trim", "std_msgs/msg/UInt32", "reliable", "transient_local", 1),
@@ -287,12 +296,13 @@ class FakeBebopDriver:
         from geometry_msgs.msg import Twist, Vector3
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import BatteryState, CameraInfo, CompressedImage, Image, NavSatFix
-        from std_msgs.msg import Bool, Empty, Float32, Int16, String, UInt8, UInt32
+        from std_msgs.msg import Bool, Empty, Float32, Float32MultiArray, Int16, String, UInt8, UInt32
 
         return {
             "Twist": Twist, "Vector3": Vector3, "Odometry": Odometry, "BatteryState": BatteryState,
             "CameraInfo": CameraInfo, "CompressedImage": CompressedImage, "Image": Image, "NavSatFix": NavSatFix,
-            "Bool": Bool, "Empty": Empty, "Float32": Float32, "Int16": Int16, "String": String,
+            "Bool": Bool, "Empty": Empty, "Float32": Float32, "Float32MultiArray": Float32MultiArray,
+            "Int16": Int16, "String": String,
             "UInt8": UInt8, "UInt32": UInt32,
         }
 
@@ -458,6 +468,7 @@ class FakeBebopDriver:
             battery = int(round(self.plant.battery_pct))
             altitude = float(self.plant.firmware_altitude)
             sequence = self.plant.flat_trim_sequence
+            tilt, pan = self._tilt, self._pan
             if battery != self._battery_report[0]:
                 self._battery_report = (battery, now)
         self._publishers["states/link"].publish(m["Bool"](data=True))
@@ -478,6 +489,13 @@ class FakeBebopDriver:
         self._publishers["states/flying_state"].publish(m["UInt8"](data=state))
         self.log.write("pub", mono=now, topic="states/flying_state", value=state)
         self._publishers["states/altitude"].publish(m["Float32"](data=altitude))
+
+        # The emulated gimbal follows its command at once; the real one saturates
+        # at the limits the aircraft reports (CameraSettingsChanged).
+        self._publishers["states/ardrone3/CameraState/OrientationV2"].publish(m["Vector3"](x=tilt, y=pan, z=0.0))
+        self._publishers["states/ardrone3/CameraState/Limits"].publish(
+            m["Float32MultiArray"](data=list(CAMERA_LIMITS_DEG))
+        )
 
         gps = m["NavSatFix"]()
         gps.header.stamp = self._stamp(now)
