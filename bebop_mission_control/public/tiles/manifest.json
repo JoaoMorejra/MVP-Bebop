@@ -1,0 +1,15 @@
+{
+  "schema": "bmg.tiles.v1",
+  "source": "GeoSampa PMSP, WMS raster, camada MOSAICO_ORTO_RGB_10CM_20CM (ortofoto 10 a 20 cm)",
+  "license": "Acesso sem restricoes segundo o metadado GeoSampa; direitos da Prefeitura de Sao Paulo, atribuicao mantida",
+  "attribution": "© Prefeitura de São Paulo · GeoSampa",
+  "anchor": {
+    "lat": -23.6488913,
+    "lng": -46.7187124
+  },
+  "minZoom": 16,
+  "maxZoom": 20,
+  "viewportPx": 1280,
+  "count": 320,
+  "bytes": 4492907
+}
