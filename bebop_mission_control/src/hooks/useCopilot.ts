@@ -1,31 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AnnouncePriority } from '../types/bmg';
 import type { ForensicScript } from '../lib/forensics';
-import { allFindingSentences, findingGapMs } from '../lib/forensics';
+import { findingGapMs } from '../lib/forensics';
 import {
   alertSentence,
   isMilestoneKey,
-  allMissionPhrases,
+  linkLossSentence,
   phraseForMilestone,
   takeLaunchPhrase,
   isMilestoneAllowed,
   type MissionParametersPayload,
 } from '../lib/copilotPhrases';
-import { batteryCalls } from '../lib/batteryReturn';
+import { buildSpeechManifest } from '../lib/spokenCatalog';
 import { parseMissionMode, type MissionMode } from '../lib/missionMode';
-
-/** Alert sentences the station itself composes; the rest come from the mission. */
-const FIXED_ALERT_SENTENCES: readonly string[] = [
-  'Missão abortada. Pouso imediato comandado.',
-  'Missão abortada.',
-  ...Object.values(batteryCalls('advanced')),
-  ...Object.values(batteryCalls('simple')),
-  ...Object.values(batteryCalls('advanced', false)),
-  'Falha na decolagem: decolagem não confirmada pela aeronave.',
-  'Falha na decolagem.',
-  'Falha de segurança.',
-  'Falha na etapa.',
-];
 
 const MILESTONE_STAGE: Record<string, number> = {
   'mission.start': 1,
@@ -244,6 +231,8 @@ export function useFlightNarration(
   const missionMode = useRef<MissionMode | null>(null);
   /** The return plan the mission echoed on `mission.mode`; true until it says otherwise. */
   const rtlEnabled = useRef(true);
+  /** Set by `mission.battery_return` until the next `mission.start` (D9). */
+  const batteryReturnActive = useRef(false);
 
   useEffect(() => {
     if (!bridge) return;
@@ -263,16 +252,14 @@ export function useFlightNarration(
         parameters.current = event.payload ?? {};
         // Everything this mission can say is known now (D1, D2): have it
         // synthesized to disk while the aircraft is still on the ground.
-        void bridge
-          .cacheSpeech?.([
-            ...allMissionPhrases(parameters.current, {
-              mode: missionMode.current ?? 'advanced',
-              rtlEnabled: rtlEnabled.current,
-            }),
-            ...allFindingSentences(),
-            ...FIXED_ALERT_SENTENCES,
-          ])
-          .catch(() => undefined);
+        const plan = { mode: missionMode.current ?? 'advanced', rtlEnabled: rtlEnabled.current };
+        try {
+          void bridge
+            .cacheSpeech?.(buildSpeechManifest([{ parameters: parameters.current, plan }]).map((entry) => entry.text))
+            .catch(() => undefined);
+        } catch (error) {
+          console.warn('[BMG] cache de falas não aquecido:', error);
+        }
         return;
       }
       if (!enabledRef.current || !isMilestoneKey(event.key)) return;
@@ -283,13 +270,23 @@ export function useFlightNarration(
         parameters.current = {};
         missionMode.current = null;
         rtlEnabled.current = true;
+        batteryReturnActive.current = false;
       }
       if (key === 'mission.scan_start' && !spoken.current.has('mission.takeoff')) return;
+      // "Missão segue" would contradict the return already under way (D9).
+      if (key === 'mission.battery_warning' && batteryReturnActive.current) return;
       const plan = { mode: missionMode.current ?? 'advanced', rtlEnabled: rtlEnabled.current };
-      if (!isMilestoneAllowed(key, plan)) return;
+      const payload = event.payload ?? {};
+      if (!isMilestoneAllowed(key, plan, payload)) return;
       if (spoken.current.has(key)) return;
       spoken.current.add(key);
-      const payload = event.payload ?? {};
+      if (key === 'mission.battery_return') {
+        // The crossing is the only voice of the threshold (D8): it cuts the
+        // narration still queued, which describes a flight that has ended.
+        batteryReturnActive.current = true;
+        queue.preempt(key, () => phraseForMilestone(key, payload, parameters.current, {}, plan), 'URGENT');
+        return;
+      }
       // A launch line drawn ahead (`reserveLaunchPhrase`) is spoken as drawn,
       // so the audio synthesized for it at the click is the audio played.
       const launchLine = takeLaunchPhrase(key);
@@ -314,6 +311,58 @@ export function useFlightNarration(
     if (flightKey === null) queue.reset();
   }, [flightKey, queue]);
 
+}
+
+/** Queue label of the link-loss call. */
+const LINK_LOSS_LABEL = 'link.lost';
+
+/**
+ * How long the telemetry must stay fresh before a new loss is called again, ms.
+ *
+ * The main process restarts a telemetry bridge that dies, with backoff, and
+ * its watchdog reads 3 s of bridge silence as a disconnected aircraft
+ * (`electron/main.cjs`), so `stale` can flip off and on within seconds while
+ * the link is still down. A recovery shorter than this is the same loss.
+ */
+export const LINK_REARM_DWELL_MS = 3000;
+
+/**
+ * Say once that the aircraft's telemetry stopped reaching the station.
+ *
+ * Edge-triggered on `linkLost`: one call when it turns true, none while it
+ * stays true, and re-armed only after it has been false for
+ * {@link LINK_REARM_DWELL_MS} without interruption, so a flapping link is
+ * called once per loss rather than once per flap. The call preempts the
+ * narration at `URGENT`, as a mission alert does, and is never `LAND`: the
+ * station cannot command a landing it can no longer reach.
+ *
+ * `linkLost` is the caller's verdict. The cockpit passes the stale telemetry
+ * of `useTelemetry` (no current `/bebop/odom` from the aircraft, or the bridge
+ * silent) while a real flight is running; `useFinishLock`'s `link_lost` is not
+ * used, since it is only reached after the mission process has exited.
+ */
+export function useLinkLossNarration(
+  queue: NarrationQueue,
+  linkLost: boolean,
+  random: () => number = Math.random
+): void {
+  const armed = useRef(true);
+  const randomRef = useRef(random);
+  randomRef.current = random;
+
+  useEffect(() => {
+    if (!linkLost) {
+      if (armed.current) return;
+      const timer = window.setTimeout(() => {
+        armed.current = true;
+      }, LINK_REARM_DWELL_MS);
+      return () => window.clearTimeout(timer);
+    }
+    if (!armed.current) return;
+    armed.current = false;
+    const sentence = linkLossSentence(randomRef.current);
+    queue.preempt(LINK_LOSS_LABEL, () => sentence, 'URGENT');
+  }, [linkLost, queue]);
 }
 
 /**

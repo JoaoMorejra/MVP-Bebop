@@ -183,8 +183,8 @@ describe('useMissionParameters', () => {
   it('saves a combination that only warns, and clears the attempt', async () => {
     await mount({ success: true, params: validDocument() }, { success: true, params: validDocument() });
     bridge.saveParameters.mockClear();
-    act(() => latest.edit('kinematics.countdown_sec', 4));
-    expect(latest.conflicts.map((c) => [c.id, c.severity])).toEqual([['W10', 'warning']]);
+    act(() => latest.edit('kinematics.altitude_ceiling_margin_m', 0.1));
+    expect(latest.conflicts.map((c) => [c.id, c.severity])).toEqual([['W02', 'warning']]);
     let saved: boolean | undefined;
     await act(async () => {
       saved = await latest.save();

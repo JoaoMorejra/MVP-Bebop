@@ -117,6 +117,7 @@ vi.mock('./hooks/useCopilot', () => ({
   useCopilot: () => hoisted.stable.copilot,
   useFlightNarration: () => undefined,
   useForensicNarration: () => hoisted.stable.forensic,
+  useLinkLossNarration: () => undefined,
   useNarrationQueue: () => hoisted.stable.narration,
 }));
 vi.mock('./hooks/useVoiceLevel', () => ({ useVoiceLevel: () => hoisted.stable.voice }));
@@ -304,27 +305,31 @@ describe('launchParamsJson', () => {
     const doc = { rtl: { timeout_sec: 60 }, battery: { other: 1 } };
     const sent = JSON.parse(launchParamsJson(doc, 15));
 
-    expect(sent).toEqual({ rtl: { timeout_sec: 60 }, battery: { other: 1, land_pct: 15 } });
+    expect(sent).toEqual({ rtl: { timeout_sec: 60 }, battery: { other: 1, land_pct: 15 }, kinematics: { countdown_sec: 10 } });
     expect(doc.battery).toEqual({ other: 1 });
   });
 
   it('builds a document when there is none', () => {
-    expect(JSON.parse(launchParamsJson(null, 20))).toEqual({ battery: { land_pct: 20 } });
+    expect(JSON.parse(launchParamsJson(null, 20))).toEqual({ battery: { land_pct: 20 }, kinematics: { countdown_sec: 10 } });
   });
 });
 
 describe('the parameter document as the only source of a launch', () => {
   const sent = (options: Record<string, unknown> | undefined) => JSON.parse(String(options?.paramsJson));
 
-  it('sends no per-field option and the countdown literally, zero included', async () => {
+  it('sends no per-field option and the countdown fixed at 10 s, whatever the stored document says', async () => {
+    const stored = { ...hoisted.doc, kinematics: { ...hoisted.doc.kinematics, countdown_sec: 3 } };
+    hoisted.stable.params.working = stored;
+    hoisted.stable.params.committed = stored;
     await mount();
     await act(async () => {
       await call('preflight', 'onLaunch');
     });
     const options = hoisted.launch.mock.calls[0][0];
     expect(Object.keys(options).sort()).toEqual(['countdown', 'launchAtMs', 'noFly', 'paramsJson']);
-    expect(options.countdown).toBe(0);
-    expect(sent(options).kinematics.countdown_sec).toBe(0);
+    expect(options.countdown).toBe(10);
+    expect(sent(options).kinematics.countdown_sec).toBe(10);
+    expect(hoisted.props.countdown?.seconds).toBe(10);
   });
 
   it('couples a document stored with an independent return cruise and saves it before launching', async () => {

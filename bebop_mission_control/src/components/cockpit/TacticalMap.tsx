@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Building2, Crosshair, LocateFixed, MapPin, Minus, Plus } from 'lucide-react';
 import type { TrackPoint } from '../../types/mission';
-import { useReverseGeocode } from '../../hooks/useReverseGeocode';
 import { fromEnu, niceGridStep } from '../../lib/geo';
 import {
   MAX_DISPLAY_ZOOM,
@@ -9,6 +8,7 @@ import {
   ZOOM_STEP,
   clampDisplayZoom,
   fixedView,
+  type FixedView,
   pinchZoom,
   wheelZoom,
 } from '../../lib/mapView';
@@ -30,23 +30,13 @@ interface TacticalMapProps {
 const TILE_SIZE = 256;
 
 /**
- * Tile sources, in the order they are tried.
+ * A raster tile source.
  *
- * Satellite imagery only, darkened in CSS into the station's palette. Every
- * street basemap this map could reach bakes street and place names into the
- * raster, where no CSS can remove them: MapTiler `dataviz-dark` and
- * `backdrop-dark` on the station's key, Mapbox `dark-v11`, OSM's standard
- * tiles, and Esri's dark gray base; CartoDB's label-free variant now answers
- * without a key with an "API KEY REQUIRED" watermark and a 200, which no error
- * handler can catch. Imagery carries no labels at all. Without a source that
- * answers, the panel falls back to the offline tactical grid.
- *
- * Each entry lists its subdomains. A tile is requested from the shard its own
- * coordinates select, which is what keeps a viewport's worth of tiles from
- * queueing behind one host's connection limit — the cause of the black squares
- * an operator sees as a half-drawn map.
+ * Satellite imagery only, darkened in CSS into the station's palette: every
+ * street basemap bakes street and place names into the raster, where no CSS
+ * can remove them, and imagery carries no labels at all.
  */
-interface TileSource {
+export interface TileSource {
   id: string;
   url: (s: string, z: number, x: number, y: number) => string;
   subdomains: readonly string[];
@@ -56,11 +46,11 @@ interface TileSource {
   attribution: string;
 }
 
-const MAP_API_KEY =
-  import.meta.env.VITE_MAP_API_KEY ||
-  import.meta.env.VITE_MAPBOX_TOKEN ||
-  import.meta.env.VITE_MAPTILER_KEY ||
-  'gfppK5Nhedqq438PCaw7';
+/**
+ * Credit the imagery's licence requires on the map. Equal to the
+ * `attribution` of `public/tiles/manifest.json`.
+ */
+export const TILE_ATTRIBUTION = '© Prefeitura de São Paulo · GeoSampa';
 
 /**
  * Imagery toned down until the overlay reads over it: dimmed, most of its
@@ -68,48 +58,36 @@ const MAP_API_KEY =
  */
 const IMAGERY_FILTER = 'brightness(0.5) saturate(0.35) contrast(1.15)';
 
-const TILE_SOURCES: readonly TileSource[] = (() => {
-  const sources: TileSource[] = [];
+/**
+ * The site's imagery, pre-rendered to `public/tiles` and served from disk by
+ * the station itself: same origin, no key, nothing leaves the machine. The
+ * aircraft's Wi-Fi has no route to the internet, so a remote source is never
+ * tried. `maxZoom` is the manifest's deepest level.
+ */
+export const TILE_SOURCES: readonly TileSource[] = [
+  {
+    id: 'local-satellite',
+    url: (_s: string, z: number, x: number, y: number) => `/tiles/${z}/${x}/${y}.jpg`,
+    subdomains: ['a'],
+    maxZoom: 20,
+    filter: IMAGERY_FILTER,
+    attribution: TILE_ATTRIBUTION,
+  },
+];
 
-  if (MAP_API_KEY.startsWith('pk.')) {
-    sources.push({
-      id: 'mapbox-satellite',
-      url: (_s: string, z: number, x: number, y: number) =>
-        `https://api.mapbox.com/v4/mapbox.satellite/${z}/${x}/${y}.jpg?access_token=${MAP_API_KEY}`,
-      subdomains: ['a'],
-      maxZoom: 19,
-      filter: IMAGERY_FILTER,
-      attribution: '© Mapbox · © Maxar',
-    });
-  } else if (MAP_API_KEY) {
-    // satellite-v2 advertises zoom 22, but its tiles shrink past 20 where the
-    // imagery is upsampled; overzooming locally past 20 costs nothing.
-    sources.push({
-      id: 'maptiler-satellite',
-      url: (_s: string, z: number, x: number, y: number) =>
-        `https://api.maptiler.com/tiles/satellite-v2/${z}/${x}/${y}.jpg?key=${MAP_API_KEY}`,
-      subdomains: ['a'],
-      maxZoom: 20,
-      filter: IMAGERY_FILTER,
-      attribution: '© MapTiler · © OpenStreetMap',
-    });
-  }
-
-  return sources;
-})();
-
-/** Failures within one source before the next is tried. */
-const SOURCE_FAILURE_BUDGET = 6;
 /**
  * Drawn size of the aircraft marker relative to its geometry. The marker is
  * what the operator's eye goes to first, across the room from the station.
  */
 const MARKER_SCALE = 1.45;
 
-/** Without a single tile loaded in this long, the basemap is treated as offline. */
-const TILE_LOAD_TIMEOUT_MS = 8000;
-/** How often an offline map probes for the tiles coming back. */
-const TILE_PROBE_INTERVAL_MS = 45000;
+/**
+ * Without a single tile loaded in this long, the basemap is given up for the
+ * grid. Tiles come from the local disk in milliseconds; silence this long
+ * means the tile tree is missing, not slow. The fallback is terminal until the
+ * panel remounts: no zoom change requests tiles again.
+ */
+const TILE_LOAD_TIMEOUT_MS = 2000;
 
 type GeoSource = 'site';
 
@@ -135,11 +113,11 @@ const ANCHOR = { lat: MAP_ANCHOR.latitude, lng: MAP_ANCHOR.longitude, source: 's
  * the operator's position nor the bridge's base re-anchor it, so nothing a
  * fix or a cache does in flight makes the map jump.
  *
- * The aircraft's Wi-Fi has no route to the internet, so the tiles are expected
- * to fail in the field. The panel does not wait on them: the tactical grid is
- * drawn underneath until a tile actually arrives, a load that has produced
- * nothing within a few seconds is declared offline, and an offline map keeps
- * probing quietly so the basemap returns on its own when a route does.
+ * The tiles are the site's imagery stored with the station and served from
+ * disk, so the map needs no network at all. The tactical grid is drawn
+ * underneath until a tile actually arrives; a clone without the tile tree
+ * (every tile failing, or none answering within a couple of seconds) falls
+ * back to the grid for good, with no further requests.
  */
 export const TacticalMap: React.FC<TacticalMapProps> = ({
   track,
@@ -151,9 +129,10 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const uid = useId().replace(/:/g, '');
   const [size, setSize] = useState({ width: 640, height: 320 });
   const [tilesOk, setTilesOk] = useState<boolean | null>(null);
-  /** Index into `TILE_SOURCES`; advanced when the current source keeps failing. */
-  const [sourceIndex, setSourceIndex] = useState(0);
-  const failures = React.useRef(0);
+  /** Keys of the tiles that failed; only those of the grid on screen count. */
+  const failedTiles = useRef(new Set<string>());
+  /** Keys of the grid on screen, read by the error handler. */
+  const gridKeys = useRef(new Set<string>());
   const hostRef = React.useRef<HTMLDivElement | null>(null);
   /**
    * The operator's zoom, in display-zoom levels; null for the default framing.
@@ -162,36 +141,28 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
    */
   const [manualZoom, setManualZoom] = useState<number | null>(null);
 
-  const source = TILE_SOURCES[Math.min(sourceIndex, TILE_SOURCES.length - 1)];
+  const source = TILE_SOURCES[0];
 
   /**
    * One tile failed.
    *
-   * A handful of failures is a source that is not answering, not a network that
-   * is down: the next source is tried before the basemap is given up on, and
-   * only after the list is exhausted does the panel fall back to the local
-   * chart. A tile that fails after another has already loaded is left alone —
-   * the map is working, and one missing square is not worth restarting the
-   * whole grid over.
+   * Only every tile of the grid on screen failing, with none loaded, is a
+   * clone without the tile tree: the panel then falls back to the local
+   * chart. A margin ring outside the stored coverage fails first, since the
+   * browser fetches in row order; while any tile of the grid may still load,
+   * the basemap is kept. A tile that fails after another has already loaded is
+   * left alone — the map is working, and one square missing at the edge of
+   * the stored coverage is not worth dropping the whole basemap over.
    */
-  const onTileError = React.useCallback(() => {
-    setTilesOk((previous) => {
-      if (previous === true) return previous;
-      failures.current += 1;
-      if (failures.current < SOURCE_FAILURE_BUDGET) return previous;
-      failures.current = 0;
-      let exhausted = false;
-      setSourceIndex((index) => {
-        if (index + 1 < TILE_SOURCES.length) return index + 1;
-        exhausted = true;
-        return index;
-      });
-      return exhausted ? false : previous;
-    });
+  const onTileError = React.useCallback((key: string) => {
+    const grid = gridKeys.current;
+    if (!grid.has(key)) return;
+    failedTiles.current.add(key);
+    for (const tile of grid) if (!failedTiles.current.has(tile)) return;
+    setTilesOk((previous) => (previous === null ? false : previous));
   }, []);
 
   const onTileLoad = React.useCallback(() => {
-    failures.current = 0;
     setTilesOk(true);
   }, []);
 
@@ -216,17 +187,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const aircraft = useMemo(() => fromEnu(droneEast, droneNorth, ANCHOR.lat, ANCHOR.lng), [droneEast, droneNorth]);
   const basemapUsable = tilesOk !== false;
 
-  // A load that never answers — DNS hanging on a network with no route — is
-  // an offline map, not one that is about to appear.
   useEffect(() => {
     if (tilesOk !== null) return;
     const id = window.setTimeout(() => {
       setTilesOk((previous) => (previous === null ? false : previous));
     }, TILE_LOAD_TIMEOUT_MS);
     return () => window.clearTimeout(id);
-  }, [tilesOk, sourceIndex]);
-
-  const place = useReverseGeocode(aircraft.lat, aircraft.lng, tilesOk === true);
+  }, [tilesOk]);
 
   /**
    * Both layers are centred on the base at a fixed scale: the tiles are laid
@@ -283,59 +250,8 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     if (pointers.current.size < 2) pinch.current = null;
   };
 
-  // Offline, probe one tile now and then; the first that loads brings the
-  // basemap back without a flicker through a half-loaded grid.
-  useEffect(() => {
-    if (tilesOk !== false) return;
-    const id = window.setInterval(() => {
-      const probe = new Image();
-      const tx = Math.floor(view.centre.x);
-      const ty = Math.floor(view.centre.y);
-      const first = TILE_SOURCES[0];
-      probe.onload = () => {
-        failures.current = 0;
-        setSourceIndex(0);
-        setTilesOk(null);
-      };
-      const z = view.tile.z;
-      const url = first.url(first.subdomains[0], z, tx, ty);
-      probe.src = `${url}${url.includes('?') ? '&' : '?'}probe=${Date.now()}`;
-    }, TILE_PROBE_INTERVAL_MS);
-    return () => window.clearInterval(id);
-  }, [tilesOk, view.centre.x, view.centre.y, view.tile.z]);
-
-  // Tile grid covering the viewport, centred on the base.
-  const tiles = useMemo(() => {
-    if (!basemapUsable) return [];
-    const { centre, tile, tileSize } = view;
-    const cols = Math.ceil(size.width / tileSize) + 2;
-    const rows = Math.ceil(size.height / tileSize) + 2;
-    const originX = Math.floor(centre.x) - Math.floor(cols / 2);
-    const originY = Math.floor(centre.y) - Math.floor(rows / 2);
-    const n = 2 ** tile.z;
-
-    const out: { key: string; url: string; left: number; top: number; size: number }[] = [];
-    for (let row = 0; row < rows; row++) {
-      for (let col = 0; col < cols; col++) {
-        const tx = originX + col;
-        const ty = originY + row;
-        if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
-        // Shard by tile coordinate rather than at random, so the same tile
-        // keeps the same host across re-renders and stays in the browser cache.
-        const shard = source.subdomains[Math.abs(tx + ty) % source.subdomains.length];
-        out.push({
-          // The zoom is part of the identity: a tile at z18 and one at z19
-          // share coordinates only by coincidence.
-          key: `${source.id}-${tile.z}-${tx}-${ty}`,
-          url: source.url(shard, tile.z, tx, ty),
-          left: view.cx + (tx - centre.x) * tileSize,
-          top: view.cy + (ty - centre.y) * tileSize,
-          size: tileSize,
-        });
-      }
-    }
-    return out;
-  }, [view, size, basemapUsable, source]);
+  const tiles = useMemo(() => (basemapUsable ? tileGrid(view, size, source) : []), [view, size, basemapUsable, source]);
+  gridKeys.current = useMemo(() => new Set(tiles.map((tile) => tile.key)), [tiles]);
 
   const toPath = (points: TrackPoint[]) =>
     points
@@ -348,7 +264,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const homeX = view.sx(0);
   const homeY = view.sy(0);
   const distance = Math.hypot(droneEast, droneNorth);
-  const basemapState = tilesOk === true ? 'mapa online' : tilesOk === null ? 'carregando mapa' : 'grade offline';
+  const basemapState = tilesOk === true ? 'mapa local' : tilesOk === null ? 'carregando mapa' : 'grade offline';
   const mapStatus = [`${GEO_LABEL[geo.source]} (${MAP_ANCHOR.name})`, basemapState, `${distance.toFixed(1)} m da base`].join(
     ' · '
   );
@@ -376,7 +292,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
 
       <div
         ref={hostRef}
-        className="relative min-h-0 flex-1 touch-none overflow-hidden bg-hull-deep"
+        className="relative min-h-0 flex-1 touch-none overflow-clip bg-hull-deep"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerEnd}
@@ -395,13 +311,13 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
                 loading="eager"
                 draggable={false}
                 onLoad={onTileLoad}
-                onError={onTileError}
-                className="absolute select-none"
+                onError={() => onTileError(tile.key)}
+                className="absolute max-w-none select-none"
                 style={{
                   left: tile.left,
                   top: tile.top,
-                  width: tile.size,
-                  height: tile.size,
+                  width: tile.width,
+                  height: tile.height,
                   filter: source.filter,
                 }}
               />
@@ -580,20 +496,77 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       </div>
 
       {/* The coordinates, and where that is on the ground. */}
-      <div className="flex h-9 shrink-0 items-center gap-4 border-t border-strut-soft px-3">
-        <span className="flex min-w-0 shrink-0 items-center gap-1.5" title={GEO_LABEL[geo.source]}>
-          <MapPin size={11} strokeWidth={2} className="text-frost" />
-          <span className="font-cond text-3xs tracking-wide text-haze-deep">BASE FIXA</span>
-          <span className="tnum font-mono text-2xs text-frost">
-            {`${aircraft.lat.toFixed(6)}, ${aircraft.lng.toFixed(6)}`}
+      <div className="flex min-h-9 shrink-0 flex-wrap items-center gap-x-4 gap-y-0.5 border-t border-strut-soft px-3 py-1">
+        <span className="flex min-w-0 max-w-full items-center gap-1.5" title={GEO_LABEL[geo.source]}>
+          <MapPin size={11} strokeWidth={2} className="shrink-0 text-frost" />
+          <span className="shrink-0 font-cond text-3xs tracking-wide text-haze-deep">BASE FIXA:</span>{' '}
+          <span className="tnum truncate font-mono text-2xs text-frost">
+            {`${MAP_ANCHOR.latitude.toFixed(6)}, ${MAP_ANCHOR.longitude.toFixed(6)}`}
           </span>
         </span>
-        <GeoField icon={<Building2 size={11} strokeWidth={2} />} label="Cidade" value={place.city ?? MAP_ANCHOR.name} />
-
+        <GeoField icon={<Building2 size={11} strokeWidth={2} />} label="Cidade" value={MAP_ANCHOR.city} />
+        <GeoField icon={<MapPin size={11} strokeWidth={2} />} label="Localização" value={MAP_ANCHOR.name} />
       </div>
     </div>
   );
 };
+
+/** One tile of the basemap, placed in panel pixels. */
+export interface PlacedTile {
+  key: string;
+  url: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * The tile grid covering a panel of `size`, centred on the base.
+ *
+ * `scripts/offline_tiles.py` (`map_loop_tiles`) mirrors the column, row and
+ * origin arithmetic to plan the stored tile set; a change here must be made
+ * there too. Edges are rounded to whole pixels and each tile spans to where
+ * the next one starts: an overzoomed tile is a fractional number of pixels
+ * wide, and fractional edges leave hairline seams between neighbours.
+ */
+export function tileGrid(
+  view: Pick<FixedView, 'centre' | 'tile' | 'tileSize' | 'cx' | 'cy'>,
+  size: { width: number; height: number },
+  source: TileSource
+): PlacedTile[] {
+  const { centre, tile, tileSize } = view;
+  const cols = Math.ceil(size.width / tileSize) + 2;
+  const rows = Math.ceil(size.height / tileSize) + 2;
+  const originX = Math.floor(centre.x) - Math.floor(cols / 2);
+  const originY = Math.floor(centre.y) - Math.floor(rows / 2);
+  const n = 2 ** tile.z;
+  const edgeX = (tx: number) => Math.round(view.cx + (tx - centre.x) * tileSize);
+  const edgeY = (ty: number) => Math.round(view.cy + (ty - centre.y) * tileSize);
+
+  const out: PlacedTile[] = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const tx = originX + col;
+      const ty = originY + row;
+      if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
+      const shard = source.subdomains[Math.abs(tx + ty) % source.subdomains.length];
+      const left = edgeX(tx);
+      const top = edgeY(ty);
+      out.push({
+        // The zoom is part of the identity: a tile at z18 and one at z19
+        // share coordinates only by coincidence.
+        key: `${source.id}-${tile.z}-${tx}-${ty}`,
+        url: source.url(shard, tile.z, tx, ty),
+        left,
+        top,
+        width: edgeX(tx + 1) - left,
+        height: edgeY(ty + 1) - top,
+      });
+    }
+  }
+  return out;
+}
 
 /** North at the top, the four cardinals, and the aircraft's heading as a needle. */
 const TacticalCompass: React.FC<{ x: number; y: number; heading: number; stale: boolean }> = ({
@@ -824,10 +797,10 @@ const GeoField: React.FC<{ icon?: React.ReactNode; label: string; value: string 
   label,
   value,
 }) => (
-  <span className="flex min-w-0 items-center gap-1.5" title={value ?? 'não resolvido'}>
+  <span className="flex min-w-0 max-w-full items-center gap-1.5" title={value ?? 'não resolvido'}>
     {icon ? <span className="shrink-0 text-haze">{icon}</span> : null}
-    <span className="shrink-0 font-cond text-3xs tracking-wide text-haze-deep">{label}</span>
-    <span className={cn('truncate text-2xs', value ? 'text-frost' : 'text-haze-deep')}>
+    <span className="shrink-0 font-cond text-3xs tracking-wide text-haze-deep">{`${label}:`}</span>{' '}
+    <span className={cn('min-w-0 truncate text-2xs', value ? 'text-frost' : 'text-haze-deep')}>
       {value ?? '—'}
     </span>
   </span>

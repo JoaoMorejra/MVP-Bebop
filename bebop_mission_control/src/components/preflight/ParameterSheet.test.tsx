@@ -78,15 +78,16 @@ describe('ParameterSheet defaults', () => {
     expect(container.querySelector('[data-missing-value="kinematics.target_altitude_m"]')).not.toBeNull();
   });
 
-  it('lists the countdown with the other figures', () => {
+  it('no longer lists the countdown: the window is fixed at 10 s', () => {
     render(completeDocument(), completeDocument());
-    expect(container.textContent).toContain('Contagem Regressiva');
+    expect(container.textContent).not.toContain('Contagem Regressiva');
+    expect(container.querySelector('[data-parameter="kinematics.countdown_sec"]')).toBeNull();
   });
 });
 
 describe('ParameterSheet slider ranges', () => {
   it.each([
-    ['kinematics.target_altitude_m', '0.1', '2'],
+    ['kinematics.target_altitude_m', '0.1', '3'],
     ['kinematics.altitude_ceiling_margin_m', '0', '2'],
     ['kinematics.forward_cruise_velocity', '0.01', '0.6'],
     ['gimbal.search_tilt_deg', '-45', '0'],
@@ -327,7 +328,7 @@ describe('ParameterSheet by mission mode', () => {
     expect(text()).not.toContain('Timeout de Retorno e Pouso ArUco');
     expect(text()).not.toContain('Velocidade de Giro');
     expect(text()).toContain('Timeout de Procura/Varredura');
-    expect(text()).toContain('Contagem Regressiva');
+    expect(text()).not.toContain('Contagem Regressiva');
     expect(text()).toContain('Velocidade de Deslocamento');
     expect(text()).toContain('Gimbal & Câmera');
     expect(text()).toContain('Modo: Avançado');
@@ -341,7 +342,7 @@ describe('ParameterSheet by mission mode', () => {
     expect(text()).toContain('Inclinação Inicial de Varredura');
     expect(text()).toContain('Ângulo da Câmera Apontada para Baixo');
     expect(text()).toContain('Timeout de Procura/Varredura');
-    expect(text()).toContain('Contagem Regressiva');
+    expect(text()).not.toContain('Contagem Regressiva');
     expect(text()).toContain('Modo: Simples');
     expect(text()).toContain('Margem do Teto de Altitude');
   });
@@ -422,6 +423,16 @@ describe('ParameterSheet launch surface and return plan', () => {
       expect(margin.getAttribute('data-locked')).toBe('true');
       expect(margin.textContent).toContain('Teto fixo do perfil de totem: 2,50 m sobre o piso');
       expect((margin.querySelector('input[type="range"]') as HTMLInputElement).disabled).toBe(true);
+    }
+  });
+
+  it('unlocks the margin on the pad top above 2.0 m over the floor, in both modes', () => {
+    for (const mode of ['simple', 'advanced']) {
+      render(pad({ mission_mode: mode, 'kinematics.target_altitude_m': 2.5, 'platform.venue_ceiling_agl_m': 3.2 }), completeDocument());
+      const margin = card('kinematics.altitude_ceiling_margin_m')!;
+      expect(margin.getAttribute('data-locked')).toBeNull();
+      expect(margin.textContent).not.toContain('Teto fixo do perfil de totem');
+      expect((margin.querySelector('input[type="range"]') as HTMLInputElement).disabled).toBe(false);
     }
   });
 

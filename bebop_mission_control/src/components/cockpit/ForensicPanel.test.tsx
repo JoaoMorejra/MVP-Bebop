@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ForensicPanel } from './ForensicPanel';
 import { isAirborne } from '../../lib/flightState';
 import { FINISH_HOLD_MS, FINISH_REASONS, type FinishLockResult } from '../../lib/finishLock';
-import type { Finding } from '../../lib/forensics';
-import type { RawEvidence, ReportReadyEvent } from '../../types/bmg';
+import { TOPIC_LABEL, buildForensicReport, type Finding, type FindingTopic } from '../../lib/forensics';
+import type { InspectionAssessment, RawEvidence } from '../../types/bmg';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -216,149 +216,88 @@ describe('the report waiting for the victim assessment', () => {
   });
 });
 
-describe('Visualizar Laudo Pericial', () => {
-  const REPORT: Finding[] = (['police', 'samu', 'victim', 'vehicle'] as const).map((topic) => ({
-    topic,
-    card: topic,
-    speech: topic,
-  }));
+describe('the report inside the cockpit', () => {
   const LATEST: RawEvidence = {
     filename: 'accident_raw_20261020_113500.png',
     url: '/evidence/accident_raw_20261020_113500.png',
     timestamp: 0,
     occurrenceId: 'OC_20261020_143500',
   };
-  const REPORT_URL = '/evidence/relatorio_OC_20261020_143500.html';
 
-  let reportListener: ((event: ReportReadyEvent) => void) | null;
-  let getReportUrl: Mock<[string?], Promise<string | null>>;
-
-  beforeEach(() => {
-    reportListener = null;
-    getReportUrl = vi.fn<[string?], Promise<string | null>>(async () => null);
-    (window as unknown as { bmgAPI: unknown }).bmgAPI = {
-      getReportUrl,
-      onReportReady: (cb: (event: ReportReadyEvent) => void) => {
-        reportListener = cb;
-        return () => {
-          reportListener = null;
-        };
-      },
+  function assessment(detected: boolean): InspectionAssessment {
+    return {
+      schema: 'bmg.inspection.v1',
+      capture_stamp: '20261020_113500',
+      status: 'complete',
+      reason: null,
+      victim_detected: detected,
+      victim_count: detected ? 1 : 0,
+      victim_confidence: detected ? 0.62 : null,
+      victim_boxes: detected ? [[100, 100, 160, 220]] : [],
+      frame: [856, 480],
+      inference_ms: 212.3,
+      model: 'yolov8n.pt',
+      imgsz: 640,
+      conf: 0.35,
+      completed_at_utc: '2026-10-20T13:15:01+00:00',
     };
-  });
+  }
 
-  afterEach(() => {
-    delete (window as unknown as { bmgAPI?: unknown }).bmgAPI;
-  });
-
-  async function renderReport(revealed: number, latest: RawEvidence = LATEST) {
+  async function renderReport(report: Finding[], revealed: number) {
     await act(async () =>
       root.render(
         <ForensicPanel
-          latest={latest}
+          latest={LATEST}
           count={1}
           stage={5}
           missionOver
           landed
-          report={REPORT}
+          report={report}
           reportRevealed={revealed}
           onFinish={vi.fn()}
           lock={GROUNDED}
         />
       )
     );
-    return container.querySelector('[data-testid="open-report"]') as HTMLButtonElement | null;
   }
 
-  it('stays hidden until the copilot has read all four findings', async () => {
-    expect(await renderReport(3)).toBeNull();
-    expect(await renderReport(4)).not.toBeNull();
+  const cardTopics = (): FindingTopic[] =>
+    Array.from(container.querySelectorAll('ul > li'))
+      .map((item) => (Object.keys(TOPIC_LABEL) as FindingTopic[]).find((topic) => item.textContent?.includes(TOPIC_LABEL[topic])))
+      .filter((topic): topic is FindingTopic => topic !== undefined);
+
+  afterEach(() => {
+    delete (window as unknown as { bmgAPI?: unknown }).bmgAPI;
   });
 
-  it('asks the host for this occurrence and waits while the report is not on disk', async () => {
-    const button = await renderReport(4);
-    expect(getReportUrl).toHaveBeenCalledWith('OC_20261020_143500');
-    act(() => button!.click());
-    expect(container.querySelector('[data-testid="report-occurrence-id"]')?.textContent).toBe(
-      'OC_20261020_143500'
+  it('offers no HTML report entry point after the last finding', async () => {
+    const report = buildForensicReport({ storage: null });
+    await renderReport(report, report.length);
+    expect(container.querySelector('[data-testid="open-report"]')).toBeNull();
+    expect(container.textContent).not.toMatch(/Visualizar Laudo Pericial/);
+  });
+
+  it('never asks the host for an HTML report', async () => {
+    const removed = [['get', 'ReportUrl'].join(''), ['on', 'ReportReady'].join('')];
+    const spies = removed.map(() => vi.fn(async () => null));
+    (window as unknown as { bmgAPI: unknown }).bmgAPI = Object.fromEntries(
+      removed.map((name, index) => [name, spies[index]])
     );
-    expect(container.querySelector('[data-testid="report-waiting"]')).not.toBeNull();
-    expect(container.querySelector('iframe')).toBeNull();
+    const report = buildForensicReport({ storage: null });
+    await renderReport(report, report.length);
+    spies.forEach((spy) => expect(spy).not.toHaveBeenCalled());
   });
 
-  it('shows the report once announced, in a frame that cannot reach the bridge', async () => {
-    const button = await renderReport(4);
-    act(() => button!.click());
-    act(() => reportListener!({ filename: 'relatorio_OC_20261020_143500.html', url: REPORT_URL, occurrenceId: 'OC_20261020_143500' }));
-    const frame = container.querySelector('iframe') as HTMLIFrameElement;
-    expect(frame.getAttribute('src')).toBe(REPORT_URL);
-    expect(frame.getAttribute('sandbox')).not.toContain('allow-same-origin');
-  });
-
-  it('ignores a polled report from another occurrence', async () => {
-    getReportUrl.mockResolvedValue('/evidence/relatorio_OC_20260101_000000.html');
-    const button = await renderReport(4);
-    act(() => button!.click());
-    expect(container.querySelector('iframe')).toBeNull();
-  });
-
-  it('ignores an announced report for another occurrence', async () => {
-    const button = await renderReport(4);
-    act(() => button!.click());
-    act(() =>
-      reportListener!({
-        filename: 'relatorio_OC_20260101_000000.html',
-        url: '/evidence/relatorio_OC_20260101_000000.html',
-        occurrenceId: 'OC_20260101_000000',
-      })
-    );
-    expect(container.querySelector('iframe')).toBeNull();
-  });
-
-  it('opens only inside the cockpit and expands within the window', async () => {
-    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
-    const button = await renderReport(4);
-    act(() => button!.click());
-    act(() => reportListener!({ filename: 'relatorio_OC_20261020_143500.html', url: REPORT_URL }));
-    const buttons = Array.from(container.querySelectorAll('[role="dialog"] button'));
-    expect(buttons.some((b) => /nova aba/i.test(b.getAttribute('aria-label') ?? ''))).toBe(false);
-
-    const expand = container.querySelector('[data-testid="report-expand"]') as HTMLButtonElement;
-    act(() => expand.click());
-    expect(container.querySelector('[data-report-size]')?.getAttribute('data-report-size')).toBe('expanded');
-    expect(container.querySelector('iframe')?.getAttribute('src')).toBe(REPORT_URL);
-    expect(open).not.toHaveBeenCalled();
-    open.mockRestore();
-  });
-
-  it('follows the report name recorded in the inspection package', async () => {
-    const latest: RawEvidence = {
-      ...LATEST,
-      occurrenceId: undefined,
-      inferencePackage: {
-        schema: 't4h.drone-inspection/1',
-        open_conversation: { data: {} },
-        message: { type: 'image', image: null, caption: '{}' },
-        caption: {},
-        pending: [{ campo: 'occurrence_id', motivo: 'ausente' }],
-        ready: false,
-        expected_report: 'relatorio_inspecao_sem_identificador.html',
-        position: { source: 'site', site: 'Transamerica Expo Center' },
-      },
-    };
-    const button = await renderReport(4, latest);
-    expect(getReportUrl).toHaveBeenCalledWith(undefined);
-    act(() => button!.click());
-    expect(container.querySelector('[data-testid="report-occurrence-id"]')?.textContent).toBe('sem identificador');
-    const url = '/evidence/relatorio_inspecao_sem_identificador.html';
-    act(() => reportListener!({ filename: 'relatorio_inspecao_sem_identificador.html', url }));
-    expect(container.querySelector('iframe')?.getAttribute('src')).toBe(url);
-  });
-
-  it('closes on Escape', async () => {
-    const button = await renderReport(4);
-    act(() => button!.click());
-    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })));
-    expect(container.querySelector('[role="dialog"]')).toBeNull();
+  it.each([
+    ['B: victim first, detected', true, ['victim', 'vehicle']],
+    ['A: vehicle first, not detected', false, ['vehicle', 'victim']],
+  ] as const)('shows the four cards in the drawn order (%s)', async (_label, detected, lead) => {
+    const report = buildForensicReport({ assessment: assessment(detected), storage: null });
+    await renderReport(report, report.length);
+    const topics = cardTopics();
+    expect(topics).toHaveLength(4);
+    expect(topics).toEqual(report.map((finding) => finding.topic));
+    expect(topics.slice(0, 2)).toEqual(lead);
+    expect(new Set(topics.slice(2))).toEqual(new Set(['samu', 'police']));
   });
 });

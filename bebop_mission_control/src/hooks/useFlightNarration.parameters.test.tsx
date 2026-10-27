@@ -5,6 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useFlightNarration, useNarrationQueue, type Copilot } from './useCopilot';
 import { PHRASE_POOLS, renderPhrase, spokenSpeed } from '../lib/copilotPhrases';
 import { NarrationQueue } from '../lib/narrationQueue';
+import { buildSpeechManifest } from '../lib/spokenCatalog';
+
+vi.mock('../lib/spokenCatalog', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/spokenCatalog')>();
+  return { ...actual, buildSpeechManifest: vi.fn(actual.buildSpeechManifest) };
+});
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -16,11 +22,13 @@ let emit: (event: Milestone) => void = () => undefined;
 let container: HTMLDivElement;
 let root: Root;
 const spoken: string[] = [];
+const priorities: Array<string | undefined> = [];
 const cached: string[][] = [];
 
 const copilot: Copilot = {
-  say: async (text) => {
+  say: async (text, priority) => {
     spoken.push(text);
+    priorities.push(priority);
     return true;
   },
   prepare: () => undefined,
@@ -53,6 +61,7 @@ async function settle() {
 beforeEach(() => {
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   spoken.length = 0;
+  priorities.length = 0;
   cached.length = 0;
   (window as unknown as { bmgAPI: unknown }).bmgAPI = {
     onMilestone: (listener: (event: Milestone) => void) => {
@@ -135,7 +144,26 @@ describe('phrase cache warm-up (3.9)', () => {
     expect(texts).toContain('Decolagem autorizada. Subindo para 2,3 metros.');
     expect(texts.some((line) => line.startsWith('Para começar,'))).toBe(true);
     expect(texts).toContain('Missão abortada. Pouso imediato comandado.');
-    expect(texts).toContain('Bateria crítica. Retornando à base para pouso.');
+    expect(texts).toContain('Bateria crítica. Pouso de emergência iniciado.');
+  });
+});
+
+describe('phrase cache warm-up failure', () => {
+  it('skips the warm-up when the manifest cannot be built and keeps handling milestones', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.mocked(buildSpeechManifest).mockImplementationOnce(() => {
+      throw new Error('attribution gap');
+    });
+    try {
+      emit(milestone('mission.start'));
+      expect(() => emit(milestone('mission.parameters', { target_altitude_m: 2.3 }))).not.toThrow();
+      emit(milestone('mission.takeoff', {}));
+      await settle();
+      expect(cached).toEqual([]);
+      expect(spoken.some((line) => line.includes('2,3 metros'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -186,5 +214,72 @@ describe('copilot repertoire by mission mode', () => {
     } finally {
       enqueue.mockRestore();
     }
+  });
+});
+
+describe('battery return narration (Task 2B)', () => {
+  const inPool = (key: keyof typeof PHRASE_POOLS, line: string | undefined) =>
+    line !== undefined && PHRASE_POOLS[key].includes(line);
+
+  it('Advanced: the crossing preempts at URGENT, the warning is silent, each phase speaks its battery pool', async () => {
+    emit(milestone('mission.start'));
+    emit(milestone('mission.mode', { mode: 'advanced', rtl_enabled: true }));
+    await settle();
+    spoken.length = 0;
+    priorities.length = 0;
+
+    emit(milestone('mission.battery_return', { battery_pct: 19, threshold_pct: 20, from_stage: 2, mode: 'advanced' }));
+    await settle();
+    emit(milestone('mission.battery_warning', { battery_pct: 9, threshold_pct: 10 }));
+    emit(milestone('mission.rtl_start', { battery_return: true, via_jump: true, marker_guided: true, inspected: false }));
+    emit(milestone('mission.landing', { at_base: true, battery_return: true }));
+    emit(milestone('mission.touchdown', { confirmed: true, at_base: true, battery_return: true }));
+    await settle();
+
+    expect(spoken).toHaveLength(4);
+    expect(inPool('mission.battery_return', spoken[0]), spoken[0]).toBe(true);
+    expect(priorities[0]).toBe('URGENT');
+    expect(inPool('mission.rtl_start_battery', spoken[1]), spoken[1]).toBe(true);
+    expect(inPool('mission.landing_battery', spoken[2]), spoken[2]).toBe(true);
+    expect(inPool('mission.touchdown_battery', spoken[3]), spoken[3]).toBe(true);
+    for (const line of spoken) expect(PHRASE_POOLS['mission.battery_warning']).not.toContain(line);
+  });
+
+  it('Simple without the return: crossing, landing on the base and touchdown, never "no local"', async () => {
+    emit(milestone('mission.start'));
+    emit(milestone('mission.mode', { mode: 'simple', rtl_enabled: false }));
+    await settle();
+    spoken.length = 0;
+    priorities.length = 0;
+
+    emit(milestone('mission.battery_return', { battery_pct: 19, threshold_pct: 20, from_stage: 3, mode: 'simple' }));
+    await settle();
+    emit(milestone('mission.battery_warning', { battery_pct: 9, threshold_pct: 10 }));
+    emit(milestone('mission.landing', { at_base: true, battery_return: true }));
+    emit(milestone('mission.touchdown', { confirmed: true, at_base: true, battery_return: true }));
+    await settle();
+
+    expect(spoken).toHaveLength(3);
+    expect(inPool('mission.battery_return_simple', spoken[0]), spoken[0]).toBe(true);
+    expect(priorities[0]).toBe('URGENT');
+    expect(inPool('mission.landing_battery', spoken[1]), spoken[1]).toBe(true);
+    expect(inPool('mission.touchdown_battery', spoken[2]), spoken[2]).toBe(true);
+    for (const line of spoken) expect(line).not.toMatch(/no local/);
+  });
+
+  it('speaks the crossing once per flight, and mission.start re-arms the battery warning', async () => {
+    emit(milestone('mission.start'));
+    emit(milestone('mission.battery_return', { mode: 'advanced' }));
+    emit(milestone('mission.battery_return', { mode: 'advanced' }));
+    await settle();
+    expect(spoken.filter((line) => inPool('mission.battery_return', line))).toHaveLength(1);
+
+    emit(milestone('mission.start'));
+    await settle();
+    spoken.length = 0;
+    emit(milestone('mission.battery_warning', { battery_pct: 9, threshold_pct: 10 }));
+    await settle();
+    expect(spoken).toHaveLength(1);
+    expect(spoken[0]).toMatch(/[Bb]ateria|carga/);
   });
 });

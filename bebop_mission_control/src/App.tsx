@@ -4,6 +4,7 @@ import type { BatteryFailsafe } from './types/bmg';
 import {
   RTL_ACK_TIMEOUT_MS,
   RTL_STAGE,
+  batteryTriggerArmed,
   clampThreshold,
   failsafeAction,
   launchParamsJson,
@@ -27,6 +28,7 @@ import {
   useCopilot,
   useFlightNarration,
   useForensicNarration,
+  useLinkLossNarration,
   useNarrationQueue,
 } from './hooks/useCopilot';
 import { useVoiceLevel } from './hooks/useVoiceLevel';
@@ -45,7 +47,7 @@ import { useMissionCountdown } from './hooks/useMissionCountdown';
 import { useModeEcho, type LaunchPlan } from './hooks/useModeEcho';
 import { launchesFromGround } from './lib/altitudeEnvelope';
 import { useLandProgress } from './hooks/useLandProgress';
-import { runCriticalBatteryReturn } from './lib/batteryReturn';
+import { landOnCriticalBattery, runCriticalBatteryReturn, type BatteryReturnHooks } from './lib/batteryReturn';
 
 /** The station is two tabs; these open over whichever one is current. */
 type Overlay = 'none' | 'diagnostics';
@@ -133,6 +135,8 @@ export const App: React.FC = () => {
   const [failsafe, setFailsafe] = useState<BatteryFailsafe>(loadFailsafe);
   const [failsafeTriggered, setFailsafeTriggered] = useState(false);
   const failsafeFiredRef = useRef(false);
+  /** The mission announced this flight's forced return (`mission.battery_return`). */
+  const batteryReturnAckRef = useRef(false);
 
   const bridge = useBridge();
   const { telemetry, track, stale, resetTrack } = useTelemetry();
@@ -173,6 +177,7 @@ export const App: React.FC = () => {
   const landed = over && mission.exitCode === 0;
 
   useFlightNarration(narration, true, mission.startedAt);
+  useLinkLossNarration(narration, mission.state === 'running' && !benchMode && benchStage === null && stale);
 
   useEffect(() => {
     if (mission.latestCapture) setReportDismissed(false);
@@ -273,15 +278,17 @@ export const App: React.FC = () => {
       setLaunchedMode(readMissionMode(doc));
       setLaunchedRtl(readRtlEnabled(doc));
       setLaunchedSurface(launchesFromGround(doc) ? 'ground' : 'platform');
-      // A real parameter rather than a UI flourish: the mission reads the same
-      // `kinematics.countdown_sec` from the document, so the overlay and the
-      // aircraft count the same window. Zero means no countdown.
+      // No longer an operator parameter: the window is fixed at
+      // LAUNCH_COUNTDOWN_SEC and pinned in the document, which the mission
+      // reads as `kinematics.countdown_sec`, so the overlay and the aircraft
+      // count the same window.
       const seconds = launchCountdownSec(doc) ?? 0;
 
       resetTrack();
       setLaunchError(null);
       setReportDismissed(false);
       failsafeFiredRef.current = false;
+      batteryReturnAckRef.current = false;
       setFailsafeTriggered(false);
       setPendingStage(null);
       setCountdownSeconds(seconds);
@@ -494,26 +501,39 @@ export const App: React.FC = () => {
   }, []);
 
   /**
-   * Battery failsafe: land on its own at the configured charge.
+   * Battery failsafe: at the configured charge, bring the aircraft home.
    *
-   * Armed only for a real flight — a mission that is up with the motors live,
-   * or an airframe the aircraft itself reports as in the air. A bench run
-   * never lands anything, and a charge the aircraft has not reported is not a
-   * reading to act on. It fires once per flight: the landing it commands is
-   * the same path as the abort button, and repeating it every telemetry frame
-   * would only restart that path while the aircraft is already coming down.
+   * Armed only while the aircraft itself reports hovering or flying
+   * (`batteryTriggerArmed`); the mission owns the climb and the descent. On the
+   * ground and at spin-up nothing fires and nothing latches, the countdown
+   * included: the pre-arm gate refuses the launch there, and a stage 5
+   * requested before takeoff would be flown on the ground. A bench run never
+   * leaves the ground,
+   * and a charge the aircraft has not reported is not a reading to act on. It
+   * fires once per flight: repeating it every telemetry frame would only
+   * restart a return or a landing already under way.
    */
-  const inFlight =
-    ((running && !benchMode && benchStage === null) ||
-      isAirborne(telemetry.flying_state)) &&
-    Boolean(telemetry.connected);
+  const airborneNow = isAirborne(telemetry.flying_state);
+  const inFlight = batteryTriggerArmed(telemetry.flying_state) && Boolean(telemetry.connected);
 
   // Read inside the return watchdog, which outlives the render that armed it.
   const stageRef = useRef(mission.stage);
   stageRef.current = mission.stage;
+  const runningRef = useRef(running);
+  runningRef.current = running;
+  const airborneRef = useRef(airborneNow);
+  airborneRef.current = airborneNow;
   const landRef = useRef(land);
   landRef.current = land;
   const rtlWatchdogRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!bridge?.onMilestone) return;
+    return bridge.onMilestone((event) => {
+      if (event.key === 'mission.start') batteryReturnAckRef.current = false;
+      else if (event.key === 'mission.battery_return') batteryReturnAckRef.current = true;
+    });
+  }, [bridge]);
 
   const clearRtlWatchdog = useCallback(() => {
     if (rtlWatchdogRef.current !== null) window.clearTimeout(rtlWatchdogRef.current);
@@ -525,27 +545,62 @@ export const App: React.FC = () => {
   /**
    * Bring the aircraft home on a critical charge (`lib/batteryFailsafe.ts`).
    *
-   * The return is asked for, not assumed: a jump the mission refuses or never
-   * reports within {@link RTL_ACK_TIMEOUT_MS} lands the aircraft where it is,
-   * the landing this failsafe always made before it could fly a return.
+   * The mission jumps to stage 5 on its own at the same charge; this request
+   * is the redundancy, and a duplicate is refused there without effect. The
+   * return counts as acknowledged when the mission reports stage 5 or the
+   * `mission.battery_return` milestone, whichever comes first: a jump held
+   * behind a blocking stage-4 capture announces itself before its
+   * `[STEP 5: ...]`. Without either within {@link RTL_ACK_TIMEOUT_MS} the jump
+   * is asked once more; the aircraft lands where it is only when the mission
+   * is gone, or a request the host could not deliver, or the second request,
+   * is followed by a window in silence. A mission found gone at a window's end
+   * is landed even after acknowledging. Every landing here requires the
+   * aircraft still in the air, and the station speaks only in that landing.
    */
   const returnOnCriticalBattery = useCallback(async () => {
-    const planned = failsafeAction(stageRef.current, running);
-    const action = planned === 'rtl' && !bridge ? 'land' : planned;
-    const taken = await runCriticalBatteryReturn(action, {
+    const acknowledged = () => stageRef.current === RTL_STAGE || batteryReturnAckRef.current;
+    const armWindow = (onExpiry: () => void) => {
+      clearRtlWatchdog();
+      rtlWatchdogRef.current = window.setTimeout(() => {
+        rtlWatchdogRef.current = null;
+        onExpiry();
+      }, RTL_ACK_TIMEOUT_MS);
+    };
+    const hooks: BatteryReturnHooks = {
       say: (label, text) => narration.preempt(label, () => text, 'URGENT'),
       gotoStage: () => (bridge ? bridge.gotoStage(RTL_STAGE) : Promise.resolve({ success: false })),
       land: () => landRef.current(),
-    },
-    launchedMode ?? readMissionMode(params.working ?? params.committed),
-    launchedRtl ?? readRtlEnabled(params.working ?? params.committed));
+      graceWindow: () =>
+        runningRef.current
+          ? new Promise<boolean>((resolve) => {
+              armWindow(() => resolve(!airborneRef.current || (runningRef.current && acknowledged())));
+            })
+          : Promise.resolve(false),
+    };
+    const planned = running && acknowledged() ? 'none' : failsafeAction(stageRef.current, running);
+    const action = planned === 'rtl' && !bridge ? 'land' : planned;
+    const taken = await runCriticalBatteryReturn(action, hooks);
     if (taken !== 'rtl') return;
-    clearRtlWatchdog();
-    rtlWatchdogRef.current = window.setTimeout(() => {
-      rtlWatchdogRef.current = null;
-      if (stageRef.current !== RTL_STAGE) void landRef.current();
-    }, RTL_ACK_TIMEOUT_MS);
-  }, [bridge, clearRtlWatchdog, launchedMode, launchedRtl, narration, params.committed, params.working, running]);
+
+    const watch = (retry: boolean) =>
+      armWindow(() => {
+        if (!airborneRef.current) return;
+        if (!runningRef.current) {
+          void landOnCriticalBattery(hooks);
+          return;
+        }
+        if (acknowledged()) return;
+        if (!retry) {
+          void landOnCriticalBattery(hooks);
+          return;
+        }
+        void hooks
+          .gotoStage()
+          .catch(() => ({ success: false }))
+          .then(() => watch(false));
+      });
+    watch(true);
+  }, [bridge, clearRtlWatchdog, narration, running]);
 
   useEffect(() => {
     if (!failsafe.enabled || !inFlight || failsafeFiredRef.current) return;
@@ -597,10 +652,12 @@ export const App: React.FC = () => {
     setLaunchedSurface(null);
     setCounting(false);
     failsafeFiredRef.current = false;
+    clearRtlWatchdog();
+    batteryReturnAckRef.current = false;
     setFailsafeTriggered(false);
     setOverlay('none');
     setScreen('preflight');
-  }, [bridge, camera, mission, narration, resetTrack]);
+  }, [bridge, camera, clearRtlWatchdog, mission, narration, resetTrack]);
 
   /**
    * "Finalizar Missão", guarded: a double click ends the cycle once, and the

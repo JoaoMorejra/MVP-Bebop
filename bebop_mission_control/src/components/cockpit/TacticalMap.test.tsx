@@ -1,18 +1,23 @@
 // @vitest-environment jsdom
 import React, { act } from 'react';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TrackPoint } from '../../types/mission';
+import { MAX_DISPLAY_ZOOM, MIN_DISPLAY_ZOOM, ZOOM_STEP } from '../../lib/mapView';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
 }
 
-vi.mock('../../hooks/useReverseGeocode', () => ({ useReverseGeocode: () => ({ city: null }) }));
 const operatorLocation = vi.fn();
 vi.mock('../../hooks/useOperatorLocation', () => ({ useOperatorLocation: operatorLocation }));
 
-const { TacticalMap } = await import('./TacticalMap');
+const { TacticalMap, TILE_ATTRIBUTION, TILE_SOURCES } = await import('./TacticalMap');
+
+const MANIFEST = resolve(__dirname, '../../../public/tiles/manifest.json');
+const HAS_MANIFEST = existsSync(MANIFEST);
 
 let container: HTMLDivElement;
 let root: Root;
@@ -29,6 +34,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   act(() => root.unmount());
   container.remove();
 });
@@ -89,5 +97,239 @@ describe('TacticalMap anchored at the site', () => {
     expect(container.textContent).toContain('-23.648891, -46.718712');
     expect(container.textContent).toContain('Transamerica Expo Center');
     expect(container.querySelector('[data-coarse-base]')).toBeNull();
+  });
+
+  it('footer shows the fixed base, city and location', () => {
+    render([point(0, 0)]);
+    const text = (container.textContent ?? '').replace(/\s+/g, ' ');
+    expect(text).toContain('BASE FIXA: -23.648891, -46.718712');
+    expect(text).toContain('Cidade: São Paulo');
+    expect(text).toContain('Localização: Transamerica Expo Center');
+  });
+
+  it('does not move the base coordinates with the aircraft', () => {
+    const coordinates = () => (container.textContent ?? '').match(/-?\d+\.\d{6}, -?\d+\.\d{6}/)?.[0];
+    render([point(0, 0)]);
+    const before = coordinates();
+    render([point(0, 0), point(120, -80)]);
+    expect(before).toBe('-23.648891, -46.718712');
+    expect(coordinates()).toBe(before);
+  });
+
+  it('requests tiles on first render', () => {
+    render([point(0, 0)]);
+    expect(container.querySelectorAll('img').length).toBeGreaterThan(0);
+  });
+});
+
+const tileImages = () => Array.from(container.querySelectorAll('img'));
+const mapStatus = () => container.querySelector('.sr-only')?.textContent ?? '';
+const gridShown = () => /GRADE TÁTICA LOCAL/.test(container.textContent ?? '');
+const button = (label: string) => container.querySelector(`[aria-label="${label}"]`) as HTMLButtonElement;
+const click = (label: string) => act(() => button(label).click());
+const fire = (target: EventTarget, event: Event) => act(() => void target.dispatchEvent(event));
+const tileZooms = () => tileImages().map((img) => Number(new URL(img.src).pathname.split('/')[2]));
+const host = () => container.querySelector('.touch-none') as HTMLDivElement;
+
+function pointer(type: string, pointerId: number, clientX: number): Event {
+  const event = new MouseEvent(type, { bubbles: true, clientX, clientY: 100 });
+  Object.defineProperty(event, 'pointerId', { value: pointerId });
+  return event;
+}
+
+/** Network-shaped calls the map could make outside its own tile grid. */
+function watchRequests() {
+  const fetchSpy = vi.fn();
+  let images = 0;
+  const NativeImage = globalThis.Image;
+  vi.stubGlobal('fetch', fetchSpy);
+  vi.stubGlobal(
+    'Image',
+    class extends NativeImage {
+      constructor(width?: number, height?: number) {
+        super(width, height);
+        images += 1;
+      }
+    }
+  );
+  return { fetchSpy, images: () => images };
+}
+
+function zoomTo(display: number) {
+  while (!button('Afastar o mapa').disabled) click('Afastar o mapa');
+  for (let zoom = MIN_DISPLAY_ZOOM; zoom < display; zoom += ZOOM_STEP) click('Aproximar o mapa');
+}
+
+const px = (value: string) => Number(value.replace('px', ''));
+
+describe('TacticalMap local tile source', () => {
+  it('draws only same-origin tile URLs', () => {
+    const { fetchSpy, images } = watchRequests();
+    render([point(0, 0)]);
+    expect(tileImages().length).toBeGreaterThan(0);
+    for (const img of tileImages()) {
+      expect(img.src).toMatch(/^http:\/\/localhost(:\d+)?\/tiles\/\d+\/\d+\/\d+\.jpg$/);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(images()).toBe(0);
+  });
+
+  it('has exactly one source, the local satellite tree up to z20', () => {
+    expect(TILE_SOURCES).toHaveLength(1);
+    expect(TILE_SOURCES[0]).toMatchObject({ id: 'local-satellite', maxZoom: 20, attribution: TILE_ATTRIBUTION });
+    expect(TILE_SOURCES[0].url('a', 18, 97012, 148812)).toBe('/tiles/18/97012/148812.jpg');
+  });
+
+  it('keeps the satellite layer and hides the grid once a tile loads', () => {
+    render([point(0, 0)]);
+    expect(mapStatus()).toContain('carregando mapa');
+    fire(tileImages()[0], new Event('load'));
+    expect(gridShown()).toBe(false);
+    expect(tileImages().length).toBeGreaterThan(0);
+    expect(mapStatus()).toContain('mapa local');
+    expect(container.textContent).toContain(TILE_ATTRIBUTION);
+  });
+
+  it('falls back to the grid when every tile fails, and requests nothing after', () => {
+    vi.useFakeTimers();
+    const { fetchSpy, images } = watchRequests();
+    render([point(0, 0)]);
+    for (const img of tileImages()) fire(img, new Event('error'));
+    expect(gridShown()).toBe(true);
+    expect(tileImages()).toHaveLength(0);
+    expect(mapStatus()).toContain('grade offline');
+
+    act(() => void vi.advanceTimersByTime(120_000));
+    click('Aproximar o mapa');
+    expect(tileImages()).toHaveLength(0);
+    expect(images()).toBe(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('drops to the grid when no tile answers within the load timeout', () => {
+    vi.useFakeTimers();
+    render([point(0, 0)]);
+    act(() => void vi.advanceTimersByTime(1999));
+    expect(tileImages().length).toBeGreaterThan(0);
+    act(() => void vi.advanceTimersByTime(1));
+    expect(tileImages()).toHaveLength(0);
+    expect(gridShown()).toBe(true);
+    expect(mapStatus()).toContain('grade offline');
+  });
+
+  it('ignores a failing tile after another loaded', () => {
+    render([point(0, 0)]);
+    const [first, ...rest] = tileImages();
+    fire(first, new Event('load'));
+    for (const img of rest) fire(img, new Event('error'));
+    expect(tileImages().length).toBe(rest.length + 1);
+    expect(gridShown()).toBe(false);
+    expect(mapStatus()).toContain('mapa local');
+  });
+
+  it('keeps the imagery when every tile but one fails and that one loads', () => {
+    render([point(0, 0)]);
+    const images = tileImages();
+    const last = images[images.length - 1];
+    for (const img of images.slice(0, -1)) fire(img, new Event('error'));
+    expect(tileImages()).toHaveLength(images.length);
+    expect(mapStatus()).toContain('carregando mapa');
+    fire(last, new Event('load'));
+    expect(gridShown()).toBe(false);
+    expect(tileImages()).toHaveLength(images.length);
+    expect(mapStatus()).toContain('mapa local');
+  });
+});
+
+describe('TacticalMap zoom', () => {
+  it('zoom in and out change the scale and respect the limits', () => {
+    render([point(0, 0)]);
+    const initial = scaleLabel();
+    click('Aproximar o mapa');
+    expect(scaleLabel()).not.toBe(initial);
+    click('Afastar o mapa');
+    expect(scaleLabel()).toBe(initial);
+
+    while (!button('Afastar o mapa').disabled) click('Afastar o mapa');
+    expect(Math.min(...tileZooms())).toBe(MIN_DISPLAY_ZOOM);
+    while (!button('Aproximar o mapa').disabled) click('Aproximar o mapa');
+    expect(new Set(tileZooms())).toEqual(new Set([20]));
+
+    click('Voltar ao enquadramento padrão');
+    expect(scaleLabel()).toBe(initial);
+  });
+
+  it('does not cap overzoomed tiles at the panel width', () => {
+    render([point(0, 0)]);
+    while (!button('Aproximar o mapa').disabled) click('Aproximar o mapa');
+    const widest = Math.max(...tileImages().map((img) => px(img.style.width)));
+    expect(widest).toBeGreaterThan(640);
+    for (const img of tileImages()) {
+      expect(img.className).toMatch(/\bmax-w-none\b/);
+      expect(img.style.width).toBe(img.style.height);
+    }
+  });
+
+  it('wheel and pinch zoom', () => {
+    render([point(0, 0)]);
+    const initial = scaleLabel();
+    fire(host(), new WheelEvent('wheel', { deltaY: -100, bubbles: true, cancelable: true }));
+    const wheeled = scaleLabel();
+    expect(wheeled).not.toBe(initial);
+    fire(host(), new WheelEvent('wheel', { deltaY: 100, bubbles: true, cancelable: true }));
+    expect(scaleLabel()).toBe(initial);
+
+    fire(host(), pointer('pointerdown', 1, 100));
+    fire(host(), pointer('pointerdown', 2, 200));
+    fire(host(), pointer('pointermove', 2, 300));
+    fire(host(), pointer('pointerup', 1, 100));
+    fire(host(), pointer('pointerup', 2, 300));
+    expect(scaleLabel()).not.toBe(initial);
+  });
+
+  it('overzooms z20 without seams: integer positions, each tile ending where the next begins', () => {
+    for (const display of [21, 21.5, MAX_DISPLAY_ZOOM]) {
+      render([point(0, 0)]);
+      zoomTo(display);
+      expect(new Set(tileZooms())).toEqual(new Set([20]));
+      const boxes = tileImages().map((img) => ({
+        left: px(img.style.left),
+        top: px(img.style.top),
+        width: px(img.style.width),
+        height: px(img.style.height),
+      }));
+      for (const box of boxes) {
+        for (const value of Object.values(box)) expect(Number.isInteger(value)).toBe(true);
+      }
+      const rows = new Map<number, typeof boxes>();
+      const cols = new Map<number, typeof boxes>();
+      for (const box of boxes) {
+        rows.set(box.top, [...(rows.get(box.top) ?? []), box]);
+        cols.set(box.left, [...(cols.get(box.left) ?? []), box]);
+      }
+      expect(rows.size).toBeGreaterThan(1);
+      expect(cols.size).toBeGreaterThan(1);
+      for (const row of rows.values()) {
+        row.sort((a, b) => a.left - b.left);
+        for (let i = 0; i + 1 < row.length; i++) expect(row[i + 1].left - row[i].left).toBe(row[i].width);
+      }
+      for (const col of cols.values()) {
+        col.sort((a, b) => a.top - b.top);
+        for (let i = 0; i + 1 < col.length; i++) expect(col[i + 1].top - col[i].top).toBe(col[i].height);
+      }
+      click('Voltar ao enquadramento padrão');
+    }
+  });
+});
+
+describe.skipIf(!HAS_MANIFEST)('TacticalMap against public/tiles/manifest.json (skipped: no tiles in this clone)', () => {
+  const manifest = () => JSON.parse(readFileSync(MANIFEST, 'utf-8')) as { attribution: string; maxZoom: number };
+
+  it('credits the imagery with the manifest attribution', () => {
+    expect(TILE_ATTRIBUTION).toBe(manifest().attribution);
+  });
+
+  it('serves up to the manifest maxZoom', () => {
+    expect(TILE_SOURCES[0].maxZoom).toBe(manifest().maxZoom);
   });
 });

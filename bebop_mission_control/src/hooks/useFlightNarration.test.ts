@@ -274,14 +274,17 @@ describe('phraseForMilestone', () => {
     }
   });
 
-  it('places the target from the payload geometry', () => {
-    const line = phraseForMilestone(
-      'mission.target_found',
-      { forward_m: 2.7, bearing_deg: -12 },
-      {},
-      noStorage
-    );
-    expect(line).toContain('a 2,7 metros à frente, à esquerda');
+  it('ignores the payload geometry in the detection call, which always ends on the runway', () => {
+    for (let draw = 0; draw < 12; draw += 1) {
+      const line = phraseForMilestone(
+        'mission.target_found',
+        { forward_m: 2.7, bearing_deg: -12 },
+        {},
+        { storage: null, random: () => draw / 12 }
+      );
+      expect(line).toMatch(/na pista\.$/);
+      expect(line).not.toMatch(/metro|esquerda|direita|\d/);
+    }
   });
 
   it('never leaves a placeholder in the spoken line', () => {

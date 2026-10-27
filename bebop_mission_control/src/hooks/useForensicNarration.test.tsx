@@ -15,7 +15,11 @@ declare global {
 }
 
 const REPORT: Finding[] = [
-  { topic: 'vehicle', card: 'Veículo não danificado', speech: 'Para começar, veículo não danificado.' },
+  {
+    topic: 'vehicle',
+    card: 'Veículo sem danos estruturais aparentes. Guincho acionado para desobstrução da via',
+    speech: 'Para começar, veículo sem danos estruturais aparentes. Guincho acionado para desobstrução da via.',
+  },
   {
     topic: 'victim',
     card: 'Vítima consciente e sem ferimentos aparentes',
@@ -299,20 +303,22 @@ describe('useForensicReport', () => {
     expect(flow.state?.script?.victimStatus).toBe('unknown');
   });
 
-  it('alternates the opening topic from one flight to the next', async () => {
+  it('opens with the victim every flight and alternates SAMU and police', async () => {
     const queue = new NarrationQueue(async () => false, () => undefined);
     const leads: string[] = [];
+    const tails: string[] = [];
     for (let flight = 0; flight < 4; flight++) {
       const capture = { ...CAPTURE, timestamp: flight };
       await act(async () => root.render(<Flow queue={queue} capture={null} assessment={null} grounded={false} />));
       await act(async () =>
         root.render(<Flow queue={queue} capture={capture} assessment={assessmentFor('detected')} grounded={false} />)
       );
-      leads.push(flow.state?.script?.findings[0].topic as string);
+      const findings = flow.state?.script?.findings ?? [];
+      leads.push(findings.slice(0, 2).map((finding) => finding.topic).join(','));
+      tails.push(findings.slice(2).map((finding) => finding.topic).join(','));
     }
-    expect(leads[0]).not.toBe(leads[1]);
-    expect(leads[1]).not.toBe(leads[2]);
-    expect(leads[2]).not.toBe(leads[3]);
+    expect(new Set(leads)).toEqual(new Set(['victim,vehicle']));
+    for (let flight = 1; flight < 4; flight++) expect(tails[flight]).not.toBe(tails[flight - 1]);
   });
 
   it('shows on the card exactly the words it speaks', async () => {
