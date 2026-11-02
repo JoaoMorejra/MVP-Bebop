@@ -47,13 +47,14 @@ fi
 
 # Check and launch application
 if [ -d "$APP_DIR" ]; then
-    # dist/ is gitignored, so a pull that advances src/ or electron/ leaves the
-    # previous bundle in place; rebuild whenever any bundle input is newer.
+    # dist/ is gitignored, so a pull that advances src/, electron/ or public/
+    # leaves the previous bundle in place; rebuild whenever any bundle input is
+    # newer. public/ holds the films and images Vite copies into dist/.
     DIST_INDEX="$APP_DIR/dist/index.html"
     if [ ! -f "$DIST_INDEX" ]; then
         echo "[BMG] Initializing production build in $APP_DIR..."
         (cd "$APP_DIR" && npm run build)
-    elif [ -n "$(find "$APP_DIR/src" "$APP_DIR/electron" -type f -newer "$DIST_INDEX" -print -quit 2>/dev/null)" ]; then
+    elif [ -n "$(find "$APP_DIR/src" "$APP_DIR/electron" "$APP_DIR/public" -type f -newer "$DIST_INDEX" -print -quit 2>/dev/null)" ]; then
         echo "[BMG] Sources newer than dist/, rebuilding in $APP_DIR..."
         (cd "$APP_DIR" && npm run build)
     fi
