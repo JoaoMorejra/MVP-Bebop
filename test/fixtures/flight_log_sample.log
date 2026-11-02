@@ -1,0 +1,52 @@
+2026-10-26 16:04:31 [INFO] [OdometrySupervisor] [ALT_PROBE t=4071.78 s=na state=unknown z_rel=0.280 z_est=0.280 fw_alt=0.013 vz=0.781 guard=0]
+2026-10-26 16:04:32 [INFO] [OdometrySupervisor] [ALT_PROBE t=4072.97 s=na state=unknown z_rel=0.854 z_est=0.854 fw_alt=0.833 vz=0.100 guard=0]
+2026-10-26 16:04:34 [INFO] [OdometrySupervisor] [ALT_PROBE t=4074.22 s=na state=unknown z_rel=0.947 z_est=0.947 fw_alt=0.919 vz=0.050 guard=0]
+2026-10-26 16:04:34 [INFO] [Step1Takeoff] Closing a 0.20 m altitude deficit: 0.95 m -> 1.15 m at up to 0.25 m/s (ceiling 1.75 m).
+2026-10-26 16:04:35 [INFO] [OdometrySupervisor] [ALT_PROBE t=4075.35 s=na state=unknown z_rel=1.112 z_est=1.112 fw_alt=0.991 vz=0.254 guard=0]
+2026-10-26 16:04:36 [INFO] [Step1Takeoff] Ascent progress: alt=1.27 m, remaining=-0.12 m, cmd_vz=0.014, odom_vz=0.116, settle=[excursion 0.124m > 0.100m] (2.1/15.0 s)
+2026-10-26 16:04:36 [INFO] [OdometrySupervisor] [ALT_PROBE t=4076.42 s=na state=unknown z_rel=1.281 z_est=1.281 fw_alt=1.182 vz=0.049 guard=0]
+2026-10-26 16:04:37 [INFO] [OdometrySupervisor] [ALT_PROBE t=4077.59 s=na state=unknown z_rel=1.319 z_est=1.319 fw_alt=1.267 vz=0.024 guard=0]
+2026-10-26 16:04:38 [INFO] [Step1Takeoff] Ascent progress: alt=1.32 m, remaining=-0.17 m, cmd_vz=0.000, odom_vz=0.008, settle=[excursion 0.172m > 0.100m] (4.1/15.0 s)
+2026-10-26 16:04:38 [INFO] [OdometrySupervisor] [ALT_PROBE t=4078.65 s=na state=unknown z_rel=1.326 z_est=1.326 fw_alt=1.286 vz=0.011 guard=0]
+2026-10-26 16:04:39 [INFO] [OdometrySupervisor] [ALT_PROBE t=4079.84 s=na state=unknown z_rel=1.330 z_est=1.330 fw_alt=1.276 vz=-0.023 guard=0]
+2026-10-26 16:04:40 [INFO] [Step1Takeoff] Ascent progress: alt=1.32 m, remaining=-0.17 m, cmd_vz=0.000, odom_vz=-0.018, settle=[excursion 0.187m > 0.100m] (6.2/15.0 s)
+2026-10-26 16:04:40 [INFO] [OdometrySupervisor] [ALT_PROBE t=4081.02 s=na state=unknown z_rel=1.327 z_est=1.327 fw_alt=1.239 vz=0.025 guard=0]
+2026-10-26 16:04:42 [INFO] [OdometrySupervisor] [ALT_PROBE t=4082.27 s=na state=unknown z_rel=1.330 z_est=1.330 fw_alt=1.273 vz=-0.018 guard=0]
+2026-10-26 16:04:42 [INFO] [Step1Takeoff] Ascent progress: alt=1.33 m, remaining=-0.18 m, cmd_vz=0.000, odom_vz=-0.018, settle=[excursion 0.184m > 0.100m] (8.2/15.0 s)
+2026-10-26 16:04:43 [INFO] [OdometrySupervisor] [ALT_PROBE t=4083.48 s=na state=unknown z_rel=1.322 z_est=1.322 fw_alt=1.264 vz=-0.017 guard=0]
+2026-10-26 16:04:44 [INFO] [Step1Takeoff] Ascent progress: alt=1.31 m, remaining=-0.16 m, cmd_vz=0.000, odom_vz=0.003, settle=[excursion 0.174m > 0.100m] (10.2/15.0 s)
+2026-10-26 16:04:44 [INFO] [OdometrySupervisor] [ALT_PROBE t=4084.65 s=na state=unknown z_rel=1.318 z_est=1.318 fw_alt=1.229 vz=0.004 guard=0]
+2026-10-26 16:04:45 [INFO] [OdometrySupervisor] [ALT_PROBE t=4085.85 s=na state=unknown z_rel=1.319 z_est=1.319 fw_alt=1.230 vz=0.008 guard=0]
+2026-10-26 16:04:46 [INFO] [Step1Takeoff] Ascent progress: alt=1.32 m, remaining=-0.17 m, cmd_vz=0.000, odom_vz=0.011, settle=[excursion 0.172m > 0.100m] (12.3/15.0 s)
+2026-10-26 16:04:46 [INFO] [OdometrySupervisor] [ALT_PROBE t=4087.03 s=na state=unknown z_rel=1.323 z_est=1.323 fw_alt=1.225 vz=0.001 guard=0]
+2026-10-26 16:04:47 [INFO] [OdometrySupervisor] [ALT_PROBE t=4088.08 s=na state=unknown z_rel=1.328 z_est=1.328 fw_alt=1.243 vz=-0.000 guard=0]
+2026-10-26 16:04:48 [INFO] [Step1Takeoff] Ascent progress: alt=1.33 m, remaining=-0.18 m, cmd_vz=0.000, odom_vz=-0.004, settle=[excursion 0.181m > 0.100m] (14.3/15.0 s)
+2026-10-26 16:04:48 [INFO] [OdometrySupervisor] [ALT_PROBE t=4089.08 s=na state=unknown z_rel=1.330 z_est=1.330 fw_alt=1.223 vz=0.006 guard=0]
+2026-10-26 16:04:49 [WARNING] [Step1Takeoff] Ascent did not converge within 15.0 s: holding 1.33 m against a 1.15 m target. The mission continues at the altitude actually achieved.
+2026-10-26 16:04:50 [INFO] [OdometrySupervisor] [ALT_PROBE t=4090.33 s=0.004 state=unknown z_rel=1.136 z_est=1.136 fw_alt=1.167 vz=-0.227 guard=0]
+2026-10-26 16:04:50 [INFO] [Step2Search] Search loop cadence: 22 cycles at 15.0 Hz target, 0 overruns (0.0%).
+2026-10-26 16:04:51 [INFO] [OdometrySupervisor] [ALT_PROBE t=4091.52 s=0.005 state=unknown z_rel=1.101 z_est=1.101 fw_alt=0.959 vz=0.013 guard=0]
+2026-10-26 16:04:52 [INFO] [OdometrySupervisor] [ALT_PROBE t=4092.71 s=0.001 state=unknown z_rel=1.081 z_est=1.081 fw_alt=0.950 vz=-0.006 guard=0]
+2026-10-26 16:04:53 [INFO] [OdometrySupervisor] [ALT_PROBE t=4093.90 s=0.007 state=unknown z_rel=1.097 z_est=1.097 fw_alt=0.935 vz=0.019 guard=0]
+2026-10-26 16:04:53 [INFO] [Step3Tracking] Servo loop cadence: 44 cycles at 15.0 Hz target, 0 overruns (0.0%).
+2026-10-26 16:04:54 [INFO] [Step4Inspection] Framing loop cadence: 8 cycles at 15.0 Hz target, 0 overruns (0.0%).
+2026-10-26 16:04:54 [INFO] [OdometrySupervisor] [ALT_PROBE t=4095.08 s=0.006 state=unknown z_rel=1.107 z_est=1.107 fw_alt=0.970 vz=0.010 guard=0]
+2026-10-26 16:04:55 [INFO] [OdometrySupervisor] [ALT_PROBE t=4096.13 s=0.003 state=unknown z_rel=1.117 z_est=1.117 fw_alt=0.984 vz=-0.003 guard=0]
+2026-10-26 16:04:57 [INFO] [OdometrySupervisor] [ALT_PROBE t=4097.39 s=0.007 state=unknown z_rel=1.113 z_est=1.113 fw_alt=0.969 vz=-0.010 guard=0]
+2026-10-26 16:04:58 [INFO] [OdometrySupervisor] [ALT_PROBE t=4098.51 s=0.010 state=unknown z_rel=1.113 z_est=1.113 fw_alt=0.962 vz=-0.009 guard=0]
+2026-10-26 16:04:59 [INFO] [OdometrySupervisor] [ALT_PROBE t=4099.76 s=0.005 state=unknown z_rel=1.132 z_est=1.132 fw_alt=0.957 vz=0.036 guard=0]
+2026-10-26 16:05:00 [INFO] [OdometrySupervisor] [ALT_PROBE t=4100.95 s=0.000 state=unknown z_rel=1.150 z_est=1.150 fw_alt=0.976 vz=0.016 guard=0]
+2026-10-26 16:05:01 [INFO] [OdometrySupervisor] [ALT_PROBE t=4102.14 s=0.014 state=unknown z_rel=1.157 z_est=1.157 fw_alt=0.969 vz=0.014 guard=0]
+2026-10-26 16:05:02 [INFO] [Step4Inspection] Hover loop cadence: 102 cycles at 15.0 Hz target, 0 overruns (0.0%).
+2026-10-26 16:05:02 [INFO] [OdometrySupervisor] [ALT_PROBE t=4103.16 s=0.012 state=unknown z_rel=1.151 z_est=1.151 fw_alt=0.985 vz=-0.013 guard=0]
+2026-10-26 16:05:04 [INFO] [OdometrySupervisor] [ALT_PROBE t=4104.39 s=0.021 state=unknown z_rel=1.162 z_est=1.162 fw_alt=0.961 vz=-0.001 guard=0]
+2026-10-26 16:05:04 [INFO] [Step4Inspection] Heading loop cadence: 29 cycles at 15.0 Hz target, 0 overruns (0.0%).
+2026-10-26 16:05:05 [INFO] [OdometrySupervisor] [ALT_PROBE t=4105.57 s=-0.002 state=unknown z_rel=1.153 z_est=1.153 fw_alt=0.986 vz=-0.031 guard=0]
+2026-10-26 16:05:06 [INFO] [OdometrySupervisor] [ALT_PROBE t=4106.76 s=-0.000 state=unknown z_rel=1.137 z_est=1.137 fw_alt=0.942 vz=0.010 guard=0]
+2026-10-26 16:05:07 [INFO] [OdometrySupervisor] [ALT_PROBE t=4107.81 s=0.004 state=unknown z_rel=1.161 z_est=1.161 fw_alt=0.947 vz=0.014 guard=0]
+2026-10-26 16:05:08 [INFO] [OdometrySupervisor] [ALT_PROBE t=4109.01 s=-0.012 state=unknown z_rel=1.146 z_est=1.146 fw_alt=0.968 vz=-0.019 guard=0]
+2026-10-26 16:05:10 [INFO] [OdometrySupervisor] [ALT_PROBE t=4110.21 s=-0.057 state=unknown z_rel=1.155 z_est=1.155 fw_alt=0.966 vz=-0.001 guard=0]
+2026-10-26 16:05:10 [INFO] [Step5RTL] Centred over marker 8 after 3.0 s: radial error 0.110 m at 0.025 m/s. Authorizing the terminal landing.
+2026-10-26 16:05:11 [INFO] [OdometrySupervisor] [ALT_PROBE t=4111.45 s=-0.100 state=unknown z_rel=0.933 z_est=0.933 fw_alt=0.967 vz=-0.922 guard=0]
+2026-10-26 16:05:12 [INFO] [OdometrySupervisor] [ALT_PROBE t=4112.63 s=-0.113 state=unknown z_rel=0.353 z_est=0.353 fw_alt=0.000 vz=-0.000 guard=0]
+2026-10-26 16:05:13 [INFO] [Step5RTL] Touchdown confirmed: altitude 0.35 m, speed 0.000 m/s.
