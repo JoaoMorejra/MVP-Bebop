@@ -20,6 +20,15 @@ export interface EnqueueOptions {
   fallbackMs?: number;
   /** Called once the item ends, with whether the sentence was heard. Not called for a cut item. */
   onDone?: (heard: boolean) => void;
+  /** Called once, just before the sentence is handed to the voice. Not called for an item dropped before its turn. */
+  onStart?: () => void;
+  /**
+   * Called once when the sentence begins to sound, with how long it lasts in
+   * ms (`null` when the voice does not know). A sentence that is not heard
+   * calls it as its fallback beat starts, with that beat, so whatever it paces
+   * runs over the beat instead. Not called for a cut item.
+   */
+  onAudio?: (durationMs: number | null) => void;
 }
 
 interface Item {
@@ -33,6 +42,8 @@ interface Item {
   minMs: number;
   fallbackMs: number;
   onDone?: (heard: boolean) => void;
+  onStart?: () => void;
+  onAudio?: (durationMs: number | null) => void;
   /** Cut while playing; its `onDone` must not run. */
   cancelled: boolean;
   /** The line, once composed: early when it was prepared ahead of its turn. */
@@ -83,7 +94,11 @@ export class NarrationQueue {
    *   silence per line. Without it, lines are composed when reached.
    */
   constructor(
-    private readonly speak: (text: string, priority?: AnnouncePriority) => Promise<boolean>,
+    private readonly speak: (
+      text: string,
+      priority?: AnnouncePriority,
+      onAudio?: (durationMs: number | null) => void
+    ) => Promise<boolean>,
     private readonly interrupt: () => void = () => undefined,
     private readonly prepare?: (text: string) => void
   ) {}
@@ -104,6 +119,8 @@ export class NarrationQueue {
       minMs: Math.max(0, options.minMs ?? 0),
       fallbackMs: Math.max(0, options.fallbackMs ?? 0),
       onDone: options.onDone,
+      onStart: options.onStart,
+      onAudio: options.onAudio,
       cancelled: false,
     });
     if (this.current && this.items.length <= PREPARE_AHEAD) this.prepareNext();
@@ -254,13 +271,32 @@ export class NarrationQueue {
         }
         if (!text.trim()) continue;
         this.current = item;
+        if (item.onStart) {
+          try {
+            item.onStart();
+          } catch {
+            // A presentation callback must not stop the voice.
+          }
+        }
         this.prepareNext();
         let heard = false;
         const started = Date.now();
+        let sounded = false;
+        const sound = (durationMs: number | null) => {
+          if (sounded || item.cancelled || !item.onAudio) return;
+          sounded = true;
+          try {
+            item.onAudio(durationMs);
+          } catch {
+            // A presentation callback must not stop the voice.
+          }
+        };
         try {
-          heard = (await Promise.all([this.say(text, item.priority), this.beat(item.minMs)]))[0];
+          heard = (await Promise.all([this.say(text, item.priority, sound), this.beat(item.minMs)]))[0];
           if (!heard && !item.cancelled && item.fallbackMs > 0) {
-            await this.beat(item.fallbackMs - (Date.now() - started));
+            const beat = item.fallbackMs - (Date.now() - started);
+            sound(Math.max(0, beat));
+            await this.beat(beat);
           }
         } finally {
           this.current = null;
@@ -280,9 +316,13 @@ export class NarrationQueue {
   }
 
   /** `speak`, with a voice that throws or rejects read as a line not heard. */
-  private say(text: string, priority: AnnouncePriority): Promise<boolean> {
+  private say(
+    text: string,
+    priority: AnnouncePriority,
+    onAudio?: (durationMs: number | null) => void
+  ): Promise<boolean> {
     try {
-      return this.speak(text, priority).catch(() => false);
+      return this.speak(text, priority, onAudio).catch(() => false);
     } catch {
       return Promise.resolve(false);
     }

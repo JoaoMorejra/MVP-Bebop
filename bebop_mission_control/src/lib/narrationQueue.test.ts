@@ -94,3 +94,96 @@ describe('pruneEarlierStages', () => {
     expect(queue.labels()).toEqual(['stage3_a']);
   });
 });
+
+describe('onStart', () => {
+  it('onStart runs before speak is called and once per item', async () => {
+    const events: string[] = [];
+    const queue = new NarrationQueue(async (text) => {
+      events.push(`speak:${text}`);
+      return true;
+    });
+    queue.enqueue('a', () => 'um', { onStart: () => events.push('start:a') });
+    queue.enqueue('b', () => 'dois', { onStart: () => events.push('start:b') });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(events).toEqual(['start:a', 'speak:um', 'start:b', 'speak:dois']);
+  });
+
+  it('onStart is not called for an item cancelled before its turn', async () => {
+    const started: string[] = [];
+    let finish: (heard: boolean) => void = () => undefined;
+    const queue = new NarrationQueue(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finish = resolve;
+        })
+    );
+    queue.enqueue('a', () => 'um', { onStart: () => started.push('a') });
+    queue.enqueue('b', () => 'dois', { onStart: () => started.push('b') });
+    await vi.advanceTimersByTimeAsync(10);
+    queue.reset();
+    finish(true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(started).toEqual(['a']);
+  });
+
+  it('a throwing onStart does not stop the line', async () => {
+    const spoken: string[] = [];
+    const queue = new NarrationQueue(async (text) => {
+      spoken.push(text);
+      return true;
+    });
+    queue.enqueue('a', () => 'um', {
+      onStart: () => {
+        throw new Error('presentation');
+      },
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(spoken).toEqual(['um']);
+  });
+
+  it('items without onStart behave as before', async () => {
+    const done: boolean[] = [];
+    const queue = new NarrationQueue(async () => true);
+    queue.enqueue('a', () => 'um', { onDone: (heard) => done.push(heard) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(done).toEqual([true]);
+  });
+});
+
+describe('onAudio', () => {
+  it('passes on when the voice begins to sound and for how long', async () => {
+    const sounded: Array<[number, number | null]> = [];
+    const queue = new NarrationQueue(
+      (_text, _priority, onAudio) =>
+        new Promise<boolean>((resolve) => {
+          setTimeout(() => onAudio?.(2400), 150);
+          setTimeout(() => resolve(true), 2550);
+        })
+    );
+    const t0 = Date.now();
+    queue.enqueue('a', () => 'um', { fallbackMs: 1800, onAudio: (ms) => sounded.push([Date.now() - t0, ms]) });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(sounded).toEqual([[150, 2400]]);
+  });
+
+  it('runs over the fallback beat when the line is not heard', async () => {
+    const sounded: Array<[number, number | null]> = [];
+    const queue = new NarrationQueue(async () => false);
+    const t0 = Date.now();
+    queue.enqueue('a', () => 'um', { fallbackMs: 1800, onAudio: (ms) => sounded.push([Date.now() - t0, ms]) });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(sounded).toEqual([[0, 1800]]);
+  });
+
+  it('is called once even if the voice reports twice', async () => {
+    const sounded: Array<number | null> = [];
+    const queue = new NarrationQueue(async (_text, _priority, onAudio) => {
+      onAudio?.(900);
+      onAudio?.(950);
+      return true;
+    });
+    queue.enqueue('a', () => 'um', { onAudio: (ms) => sounded.push(ms) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sounded).toEqual([900]);
+  });
+});

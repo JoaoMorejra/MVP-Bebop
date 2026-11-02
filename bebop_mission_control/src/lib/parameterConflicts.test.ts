@@ -153,8 +153,8 @@ describe('evaluateParameterConflicts', () => {
 
 describe('launchBlockers with conflicts', () => {
   it('names the paths of an error conflict and not those of a warning', () => {
-    expect(launchBlockers(caseDocument({ 'gimbal.search_tilt_deg': -30, 'gimbal.nadir_tilt_deg': -10 }))).toEqual(
-      expect.arrayContaining(['gimbal.nadir_tilt_deg', 'gimbal.search_tilt_deg'])
+    expect(launchBlockers(caseDocument({ 'rtl.reverse_cruise_velocity': -0.1 }))).toEqual(
+      expect.arrayContaining(['kinematics.forward_cruise_velocity', 'rtl.reverse_cruise_velocity'])
     );
     expect(launchBlockers(caseDocument({ 'kinematics.countdown_sec': 4 }))).toEqual([]);
   });

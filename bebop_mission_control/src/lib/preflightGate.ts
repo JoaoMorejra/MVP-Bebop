@@ -20,6 +20,8 @@ export interface PreflightGateInput {
   batteryPct?: number | null;
   batteryKnown?: boolean;
   batteryFailsafeThreshold?: number;
+  /** The operator's battery failsafe switch; off, the charge gates nothing. Default on. */
+  batteryFailsafeEnabled?: boolean;
   bridgeReady?: boolean;
 }
 
@@ -42,30 +44,74 @@ function batteryBlockedReason(pct: number | null | undefined, threshold: number)
   return null;
 }
 
-export function preflightBlockedReason(input: PreflightGateInput): string | null {
-  if (input.paramsStatus !== 'ready') return PARAMS_REASON[input.paramsStatus];
-  if (!input.driverRunning) return 'Driver ROS 2 fora do ar';
+/** One label per blocking reason, short enough for the centre of the launch dial. */
+export type PreflightBlockCode =
+  | 'params'
+  | 'driver'
+  | 'link'
+  | 'topics'
+  | 'odometry'
+  | 'airborne'
+  | 'battery-unknown'
+  | 'battery-low'
+  | 'bridge';
+
+const SHORT_REASON: Record<PreflightBlockCode, string> = {
+  params: 'Parâmetros',
+  driver: 'Sem driver',
+  link: 'Sem enlace',
+  topics: 'Sem tópicos',
+  odometry: 'Sem odometria',
+  airborne: 'Fora do solo',
+  'battery-unknown': 'Bateria?',
+  'battery-low': 'Bateria baixa',
+  bridge: 'Sem ponte',
+};
+
+/** The first gate that blocks, in the order of the checks, with its long reason. */
+function firstBlock(input: PreflightGateInput): { code: PreflightBlockCode; reason: string } | null {
+  if (input.paramsStatus !== 'ready') return { code: 'params', reason: PARAMS_REASON[input.paramsStatus] };
+  if (!input.driverRunning) return { code: 'driver', reason: 'Driver ROS 2 fora do ar' };
   if (input.benchMode) return null;
-  if (!input.connected) return 'Conecte-se à rede da aeronave para liberar o comando';
+  if (!input.connected) return { code: 'link', reason: 'Conecte-se à rede da aeronave para liberar o comando' };
   if (!input.flightReady) {
-    return input.missingTopics.length
-      ? `Tópicos sem tráfego: ${input.missingTopics.join(', ')}`
-      : 'Validando tópicos da aeronave';
+    return {
+      code: 'topics',
+      reason: input.missingTopics.length
+        ? `Tópicos sem tráfego: ${input.missingTopics.join(', ')}`
+        : 'Validando tópicos da aeronave',
+    };
   }
-  if (input.stale) return 'Sem odometria recente';
+  if (input.stale) return { code: 'odometry', reason: 'Sem odometria recente' };
   if (typeof input.flyingState === 'number' && input.flyingState !== 0) {
-    return `Aeronave não está em solo (flying_state ${input.flyingState})`;
+    return { code: 'airborne', reason: `Aeronave não está em solo (flying_state ${input.flyingState})` };
   }
-  if (input.batteryKnown === false) {
-    return 'Bateria da aeronave desconhecida';
+  if (input.batteryFailsafeEnabled !== false) {
+    if (input.batteryKnown === false) {
+      return { code: 'battery-unknown', reason: 'Bateria da aeronave desconhecida' };
+    }
+    const batteryReason = batteryBlockedReason(
+      input.batteryPct,
+      input.batteryFailsafeThreshold ?? DEFAULT_BATTERY_THRESHOLD_PCT
+    );
+    if (batteryReason) return { code: 'battery-low', reason: batteryReason };
   }
-  const batteryReason = batteryBlockedReason(
-    input.batteryPct,
-    input.batteryFailsafeThreshold ?? DEFAULT_BATTERY_THRESHOLD_PCT
-  );
-  if (batteryReason) return batteryReason;
   if (input.bridgeReady === false) {
-    return 'Ponte de comando não está pronta';
+    return { code: 'bridge', reason: 'Ponte de comando não está pronta' };
   }
   return null;
+}
+
+export function preflightBlockedCode(input: PreflightGateInput): PreflightBlockCode | null {
+  return firstBlock(input)?.code ?? null;
+}
+
+export function preflightBlockedReason(input: PreflightGateInput): string | null {
+  return firstBlock(input)?.reason ?? null;
+}
+
+/** The same decision as {@link preflightBlockedReason}, as a label of at most 18 characters. */
+export function preflightBlockedShort(input: PreflightGateInput): string | null {
+  const block = firstBlock(input);
+  return block ? SHORT_REASON[block.code] : null;
 }

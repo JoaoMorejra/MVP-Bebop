@@ -147,6 +147,19 @@ describe('evaluateLaunchReadiness', () => {
       expect(verdictFor(21, undefined).ready).toBe(true);
     });
 
+    it('does not gate on the charge with the battery failsafe off', () => {
+      const off = { ...healthyRealFlightInput, batteryFailsafeEnabled: false };
+      expect(evaluateLaunchReadiness({ ...off, batteryKnown: false }).ready).toBe(true);
+      expect(evaluateLaunchReadiness({ ...off, batteryPct: 5, batteryFailsafeThreshold: 20 }).ready).toBe(true);
+      const on = evaluateLaunchReadiness({
+        ...healthyRealFlightInput,
+        batteryFailsafeEnabled: true,
+        batteryPct: 20,
+        batteryFailsafeThreshold: 20,
+      });
+      expect(on.blockedReason).toBe('Bateria insuficiente para voo real (20% <= limiar 20%)');
+    });
+
     it('blocks if resident command bridge is not ready', () => {
       const verdict = evaluateLaunchReadiness({ ...healthyRealFlightInput, commandBridgeReady: false });
       expect(verdict.ready).toBe(false);

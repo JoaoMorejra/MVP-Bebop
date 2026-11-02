@@ -152,6 +152,50 @@ export function tileZoom(display: number, maxZoom: number): { z: number; scale: 
 
 const KM = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 1 });
 
+/** Length the scale bar aims at, in screen pixels. */
+export const SCALE_BAR_TARGET_PX = 96;
+
+const SCALE_CM = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 0 });
+const SCALE_M_SHORT = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 1 });
+const SCALE_M = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 0 });
+const SCALE_KM = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 2 });
+
+/** `value` rounded to two significant figures. */
+function twoSignificant(value: number): number {
+  const magnitude = 10 ** (Math.floor(Math.log10(value)) - 1);
+  return Math.round(value / magnitude) * magnitude;
+}
+
+/**
+ * The scale bar at `pxPerMetre`: the ground length of a bar of about
+ * `targetPx`, rounded to two significant figures, and the bar's real length.
+ *
+ * Not the 1-2-5 steps of {@link niceGridStep}: with a zoom step of half a
+ * level (a factor of 1.41) consecutive levels often fall on the same step,
+ * and the legend repeated while the map visibly changed scale. Two significant
+ * figures move by at most 10 % between neighbours, so every half or quarter
+ * step reads differently and the bar stays within 10 % of the target. Below
+ * 10 m the label keeps its one decimal for the same reason.
+ *
+ * A scale that is not a positive finite number returns an empty bar.
+ */
+export function scaleBar(
+  pxPerMetre: number,
+  targetPx: number = SCALE_BAR_TARGET_PX
+): { metres: number; px: number; label: string } {
+  if (!Number.isFinite(pxPerMetre) || pxPerMetre <= 0 || !Number.isFinite(targetPx) || targetPx <= 0) {
+    return { metres: 0, px: 0, label: '—' };
+  }
+  const metres = twoSignificant(targetPx / pxPerMetre);
+  const px = metres * pxPerMetre;
+  let label: string;
+  if (metres < 1) label = `${SCALE_CM.format(metres * 100)} cm`;
+  else if (metres < 10) label = `${SCALE_M_SHORT.format(metres)} m`;
+  else if (metres < 1000) label = `${SCALE_M.format(metres)} m`;
+  else label = `${SCALE_KM.format(metres / 1000)} km`;
+  return { metres, px, label };
+}
+
 export function formatAccuracy(metres: number): string {
   if (!Number.isFinite(metres)) return '±?';
   return metres >= 1000 ? `±${KM.format(metres / 1000)} km` : `±${Math.round(metres)} m`;

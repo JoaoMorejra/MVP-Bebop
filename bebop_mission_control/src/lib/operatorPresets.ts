@@ -138,6 +138,33 @@ export function deletePreset(presets: readonly OperatorPreset[], id: string): Op
   return presets.filter((preset) => preset.id !== id);
 }
 
+/** Name of the single favourite a mode keeps (D8). */
+export const FAVORITE_NAME = 'Favorito';
+
+/**
+ * The most recently saved of `presets`, or `null` for an empty list; a tie
+ * goes to the earlier item. A legacy list of several favourites reads as its
+ * latest one until the operator saves the single favourite over it.
+ */
+export function latestPreset(presets: readonly OperatorPreset[]): OperatorPreset | null {
+  let latest: OperatorPreset | null = null;
+  let latestMs = Number.NEGATIVE_INFINITY;
+  for (const preset of presets) {
+    const parsed = Date.parse(preset.savedAt);
+    const ms = Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+    if (latest === null || ms > latestMs) {
+      latest = preset;
+      latestMs = ms;
+    }
+  }
+  return latest;
+}
+
+/** The favourite list of a mode reduced to one item, {@link FAVORITE_NAME}, holding the mode-owned values of `doc`. */
+export function singleFavorite(doc: unknown, id: string, now: Date = new Date()): OperatorPreset[] {
+  return [{ id, name: FAVORITE_NAME, savedAt: now.toISOString(), values: presetValues(doc) }];
+}
+
 /**
  * `doc` with the values of `preset`: mirrors follow their source, the altitude
  * is moved into the envelope of the launch surface and the coupled cruise

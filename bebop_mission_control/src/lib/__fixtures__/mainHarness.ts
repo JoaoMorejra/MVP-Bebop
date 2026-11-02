@@ -81,6 +81,14 @@ export function loadMain(overrides: Record<string, string> = {}) {
     if (request === 'child_process' && parent?.filename === MAIN) {
       return {
         ...realChild,
+        execFileSync: (cmd: string, args: string[], opts: unknown) => {
+          if (cmd === 'pgrep') {
+            const err = new Error('No processes found') as Error & { status: number };
+            err.status = 1;
+            throw err;
+          }
+          return realChild.execFileSync(cmd, args, opts);
+        },
         spawn: (cmd: string, args: string[], opts: { env: Record<string, string> }) => {
           const child = fakeChild();
           spawned.push({ cmd, args, env: opts?.env ?? {}, child });

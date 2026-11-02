@@ -145,12 +145,16 @@ export const CLOSERS = [
   'Por último,',
 ] as const;
 
-/** The label under each card, so the topic is legible without reading the wording. */
+/**
+ * The title of each card, so the topic is legible without reading the
+ * wording. None repeats a wording of its own topic ("Segurança pública" was
+ * one of the police clearances).
+ */
 export const TOPIC_LABEL: Record<FindingTopic, string> = {
-  police: 'Autoridade policial',
-  samu: 'Socorro médico',
-  victim: 'Estado do acidentado',
-  vehicle: 'Integridade do veículo',
+  police: 'Apoio policial',
+  samu: 'Resgate médico · SAMU',
+  victim: 'Avaliação da vítima',
+  vehicle: 'Análise do veículo',
 };
 
 /**

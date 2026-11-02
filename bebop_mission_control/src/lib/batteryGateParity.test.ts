@@ -52,3 +52,65 @@ describe('battery gate parity between preflightGate.ts and launchReadiness.cjs',
     expect(verdict.blockedReason).toBe(gate);
   });
 });
+
+/**
+ * The same `<=` rule as `steps/takeoff.py:_check_prearm_battery`, restated
+ * here because vitest cannot import Python: switched off, nothing is refused;
+ * on, a known charge at or below the threshold is. An unknown charge is
+ * refused by the station gates and let through by the onboard gate, which
+ * acts only on a reading (`test/test_prearm_battery_gate.py`).
+ */
+function onboardRefuses(enabled: boolean, pct: number | null, threshold: number): boolean {
+  if (!enabled || pct === null) return false;
+  return pct <= threshold;
+}
+
+describe('battery switch parity: preflightGate.ts, launchReadiness.cjs and the onboard gate', () => {
+  const cases: Array<{ enabled: boolean; pct: number | null }> = [];
+  for (const enabled of [true, false]) {
+    for (const pct of [null, 0, 19, 20, 21]) cases.push({ enabled, pct });
+  }
+
+  it.each(cases)('agrees on enabled=$enabled pct=$pct', ({ enabled, pct }) => {
+    const known = pct !== null;
+    const gate = preflightBlockedReason({
+      paramsStatus: 'ready',
+      driverRunning: true,
+      benchMode: false,
+      connected: true,
+      flightReady: true,
+      missingTopics: [],
+      stale: false,
+      flyingState: 0,
+      batteryKnown: known,
+      batteryPct: pct,
+      batteryFailsafeThreshold: 20,
+      batteryFailsafeEnabled: enabled,
+      bridgeReady: true,
+    });
+    const verdict = evaluateLaunchReadiness({
+      benchMode: false,
+      noFly: false,
+      configValid: true,
+      driverRunning: true,
+      orphanPids: [],
+      statesLink: true,
+      telemetryAgeMs: 0,
+      odomFresh: true,
+      videoFresh: true,
+      missingTopics: [],
+      flyingState: 0,
+      batteryKnown: known,
+      batteryPct: pct,
+      batteryFailsafeThreshold: 20,
+      batteryFailsafeEnabled: enabled,
+      commandBridgeReady: true,
+      ros2CliAvailable: true,
+      voiceReady: true,
+      standbyReady: true,
+    });
+    expect(verdict.blockedReason).toBe(gate);
+    if (known) expect(gate !== null).toBe(onboardRefuses(enabled, pct, 20));
+    if (!enabled) expect(gate).toBeNull();
+  });
+});

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { RETURNABLE_STAGES, batteryTriggerArmed, clampThreshold, failsafeAction, launchParamsJson } from './batteryFailsafe';
+import { LAUNCH_COUNTDOWN_SEC } from './launchDocument';
 
 describe('clampThreshold', () => {
   it('keeps every whole percentage from 0 to 100 exactly', () => {
@@ -53,7 +54,7 @@ describe('batteryTriggerArmed', () => {
 });
 
 describe('launchParamsJson', () => {
-  const sent = (doc: unknown) => JSON.parse(launchParamsJson(doc, 25));
+  const sent = (doc: unknown) => JSON.parse(launchParamsJson(doc, { enabled: true, thresholdPct: 25 }));
 
   it('always sends the fixed 10 s countdown, whatever the document holds', () => {
     for (const value of [3, 0, 30, undefined]) {
@@ -69,5 +70,21 @@ describe('launchParamsJson', () => {
     const doc = { kinematics: { countdown_sec: 3 }, battery: { land_pct: 10 } };
     expect(sent(doc).battery.land_pct).toBe(25);
     expect(doc).toEqual({ kinematics: { countdown_sec: 3 }, battery: { land_pct: 10 } });
+  });
+});
+
+describe('launchParamsJson battery switch', () => {
+  it('writes the switch and the threshold, off and on', () => {
+    const off = JSON.parse(launchParamsJson({}, { enabled: false, thresholdPct: 35 }));
+    expect(off.battery.enabled).toBe(false);
+    expect(off.battery.land_pct).toBe(35);
+    const on = JSON.parse(launchParamsJson({}, { enabled: true, thresholdPct: 20 }));
+    expect(on.battery).toEqual({ enabled: true, land_pct: 20 });
+  });
+
+  it('works without a document and keeps the fixed countdown', () => {
+    const sent = JSON.parse(launchParamsJson(null, { enabled: false, thresholdPct: 10 }));
+    expect(sent.battery).toEqual({ enabled: false, land_pct: 10 });
+    expect(sent.kinematics.countdown_sec).toBe(LAUNCH_COUNTDOWN_SEC);
   });
 });

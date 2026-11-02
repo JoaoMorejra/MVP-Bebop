@@ -10,6 +10,7 @@
  * there to bring it home.
  */
 
+import type { BatteryFailsafe } from '../types/bmg';
 import { LAUNCH_COUNTDOWN_SEC } from './launchDocument';
 import { setPath } from './paths';
 
@@ -92,16 +93,27 @@ export function failsafeAction(stage: number, missionRunning: boolean): Failsafe
 export const LAND_PCT_PATH = 'battery.land_pct';
 
 /**
+ * Where the mission reads whether its battery failsafe acts at all:
+ * `BatteryConfig.enabled`. Off, the mission neither returns on a low charge
+ * nor refuses the launch, and the launch gates stop gating on the charge.
+ */
+export const ENABLED_PATH = 'battery.enabled';
+
+/**
  * The `--params-json` payload for a launch or a bench routine.
  *
  * The parameter document goes out whole, with the battery-flyout threshold
  * written under {@link LAND_PCT_PATH}, the charge at which the mission itself
- * starts the return. The flyout keeps its own persistence, so the value is
+ * starts the return, and the operator's switch under {@link ENABLED_PATH}. The flyout keeps its own persistence, so the value is
  * injected into a clone and never becomes a second stored copy. The countdown
  * goes out as {@link LAUNCH_COUNTDOWN_SEC} whatever the document holds, so the
  * mission never counts a window the overlay does not show.
  */
-export function launchParamsJson(doc: unknown, thresholdPct: number): string {
-  const withThreshold = setPath(doc ?? {}, LAND_PCT_PATH, thresholdPct);
-  return JSON.stringify(setPath(withThreshold, 'kinematics.countdown_sec', LAUNCH_COUNTDOWN_SEC));
+export function launchParamsJson(
+  doc: unknown,
+  failsafe: Pick<BatteryFailsafe, 'enabled' | 'thresholdPct'>,
+): string {
+  const withThreshold = setPath(doc ?? {}, LAND_PCT_PATH, failsafe.thresholdPct);
+  const withSwitch = setPath(withThreshold, ENABLED_PATH, failsafe.enabled === true);
+  return JSON.stringify(setPath(withSwitch, 'kinematics.countdown_sec', LAUNCH_COUNTDOWN_SEC));
 }

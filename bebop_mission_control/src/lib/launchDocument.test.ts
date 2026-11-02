@@ -433,7 +433,7 @@ describe('launchBlockers by mission mode', () => {
 describe('fillMissing', () => {
   it('backfills the turn rate of a store written before it existed', () => {
     expect(BACKFILL_PATHS).toEqual(['yaw_pattern.scan_vyaw']);
-    expect(getPath(fillMissing({}, factoryDocument()), 'yaw_pattern.scan_vyaw')).toBe(0.15);
+    expect(getPath(fillMissing({}, factoryDocument()), 'yaw_pattern.scan_vyaw')).toBe(0.08);
   });
 
   it('returns a document that already holds the value unchanged', () => {
@@ -444,7 +444,7 @@ describe('fillMissing', () => {
   it('replaces a value that is not a finite number', () => {
     for (const value of [Number.NaN, null, '0.2', Number.POSITIVE_INFINITY]) {
       const doc = validDocument({ 'yaw_pattern.scan_vyaw': value });
-      expect(getPath(fillMissing(doc, factoryDocument()), 'yaw_pattern.scan_vyaw')).toBe(0.15);
+      expect(getPath(fillMissing(doc, factoryDocument()), 'yaw_pattern.scan_vyaw')).toBe(0.08);
     }
   });
 

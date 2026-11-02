@@ -17,6 +17,8 @@ import {
   OVERVIEW_EXTENT_M,
   fixedView,
   project,
+  SCALE_BAR_TARGET_PX,
+  scaleBar,
 } from './mapView';
 import { MAP_ANCHOR } from './siteAnchor';
 
@@ -167,5 +169,62 @@ describe.skipIf(!existsSync(MANIFEST))('display zoom range against public/tiles/
   it('starts at the manifest minZoom', () => {
     const manifest = JSON.parse(readFileSync(MANIFEST, 'utf-8')) as { minZoom: number };
     expect(MIN_DISPLAY_ZOOM).toBe(manifest.minZoom);
+  });
+});
+
+describe('scaleBar', () => {
+  const SITE = MAP_ANCHOR.latitude;
+  const labelsAt = (step: number) => {
+    const labels: string[] = [];
+    for (let z = MIN_DISPLAY_ZOOM; z <= MAX_DISPLAY_ZOOM + 1e-9; z += step) {
+      labels.push(scaleBar(pixelsPerMetre(z, SITE)).label);
+    }
+    return labels;
+  };
+
+  it('labels are unique for every 0.5 zoom step from MIN to MAX at the site latitude', () => {
+    const labels = labelsAt(0.5);
+    expect(labels).toHaveLength(13);
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
+  it('labels are unique across quarter-step zoom values too', () => {
+    const labels = labelsAt(0.25);
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
+  it('metres strictly decrease as the zoom increases', () => {
+    let previous = Number.POSITIVE_INFINITY;
+    for (let z = MIN_DISPLAY_ZOOM; z <= MAX_DISPLAY_ZOOM + 1e-9; z += 0.25) {
+      const { metres } = scaleBar(pixelsPerMetre(z, SITE));
+      expect(metres).toBeLessThan(previous);
+      previous = metres;
+    }
+  });
+
+  it('bar length stays within 90 to 110 percent of the target', () => {
+    for (let z = MIN_DISPLAY_ZOOM; z <= MAX_DISPLAY_ZOOM + 1e-9; z += 0.125) {
+      const { px } = scaleBar(pixelsPerMetre(z, SITE));
+      expect(px).toBeGreaterThanOrEqual(0.9 * SCALE_BAR_TARGET_PX);
+      expect(px).toBeLessThanOrEqual(1.1 * SCALE_BAR_TARGET_PX);
+    }
+  });
+
+  it('label uses cm below one metre, m up to 999 m and km from 1000 m', () => {
+    expect(scaleBar(200).label).toBe('48 cm');
+    expect(scaleBar(0.4).label).toBe('240 m');
+    expect(scaleBar(0.05).label).toBe('1,9 km');
+    expect(scaleBar(30).label).toBe('3,2 m');
+  });
+
+  it('returns finite values for a non positive or non finite scale', () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(scaleBar(bad)).toEqual({ metres: 0, px: 0, label: '—' });
+    }
+  });
+
+  it('matches the pinned values at the default framing', () => {
+    const zoom = displayZoom(OVERVIEW_EXTENT_M, { width: 880, height: 360 }, SITE);
+    expect(scaleBar(pixelsPerMetre(zoom, SITE)).label).toBe('110 m');
   });
 });

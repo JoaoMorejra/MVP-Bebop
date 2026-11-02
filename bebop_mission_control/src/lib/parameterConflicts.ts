@@ -170,35 +170,18 @@ function noiseBand(read: Read): number | null {
 
 const RULES: readonly Rule[] = [
   {
+    // Retired: the gimbal framing supports upward, downward, and equal tilts.
     id: 'E01',
     severity: 'error',
     title: 'Câmera de inspeção acima da varredura',
-    evaluate: (read) => {
-      const s = read(P.search);
-      const n = read(P.nadir);
-      if (s === null || n === null || n <= s - EPS) return null;
-      return {
-        paths: [P.nadir, P.search],
-        message: `A câmera precisa terminar mais baixa que o ângulo de varredura (nadir ${n.toFixed(0)}°, varredura ${s.toFixed(0)}°): a aproximação nunca alcança a atitude de inspeção.`,
-        fix: `Ajuste o nadir para menos de ${s.toFixed(0)}° ou suba a varredura acima de ${n.toFixed(0)}°.`,
-      };
-    },
+    evaluate: () => null,
   },
   {
+    // Retired: equal search and nadir tilts are supported as fixed-gimbal flights.
     id: 'E02',
     severity: 'error',
     title: 'Varredura e nadir quase iguais',
-    evaluate: (read) => {
-      const s = read(P.search);
-      const n = read(P.nadir);
-      const tol = read(P.nadirTolerance);
-      if (s === null || n === null || tol === null || n > s - EPS || s - n > tol + EPS) return null;
-      return {
-        paths: [P.search, P.nadir],
-        message: `Diferença entre varredura e nadir de ${(s - n).toFixed(1)}°, dentro da tolerância de chegada (${tol.toFixed(1)}°): a aproximação termina sem se mover.`,
-        fix: `Deixe o nadir abaixo de ${(s - tol).toFixed(1)}°.`,
-      };
-    },
+    evaluate: () => null,
   },
   {
     // Retired: the mission's ceiling ratchet covers the end of the native

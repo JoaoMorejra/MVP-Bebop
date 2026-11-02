@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { preflightBlockedReason, type PreflightGateInput } from './preflightGate';
+import { preflightBlockedCode, preflightBlockedReason, preflightBlockedShort, type PreflightGateInput } from './preflightGate';
 
 const ready: PreflightGateInput = {
   paramsStatus: 'ready',
@@ -62,8 +62,57 @@ describe('preflightBlockedReason', () => {
     expect(gate(21)).toBeNull();
   });
 
+  it('lets a disabled battery failsafe launch on any charge, known or not', () => {
+    expect(preflightBlockedReason({ ...ready, batteryFailsafeEnabled: false, batteryKnown: true, batteryPct: 5 })).toBeNull();
+    expect(preflightBlockedReason({ ...ready, batteryFailsafeEnabled: false, batteryKnown: false })).toBeNull();
+    const enabled = { ...ready, batteryFailsafeEnabled: true, batteryKnown: true, batteryFailsafeThreshold: 20 };
+    expect(preflightBlockedReason({ ...enabled, batteryPct: 20 })).toBe('Bateria insuficiente para voo real (20% <= limiar 20%)');
+    expect(preflightBlockedReason({ ...enabled, batteryPct: 21 })).toBeNull();
+  });
+
   it('blocks real flight when command bridge is not ready', () => {
     expect(preflightBlockedReason({ ...ready, bridgeReady: false })).toBe('Ponte de comando não está pronta');
     expect(preflightBlockedReason({ ...ready, bridgeReady: true })).toBeNull();
+  });
+});
+
+describe('preflightBlockedShort', () => {
+  const cases: Array<[string, Partial<PreflightGateInput>, string | null]> = [
+    ['clear', {}, null],
+    ['loading', { paramsStatus: 'loading' }, 'Parâmetros'],
+    ['saving', { paramsStatus: 'saving' }, 'Parâmetros'],
+    ['error', { paramsStatus: 'error' }, 'Parâmetros'],
+    ['driver', { driverRunning: false }, 'Sem driver'],
+    ['bench', { benchMode: true, connected: false, flightReady: false }, null],
+    ['link', { connected: false }, 'Sem enlace'],
+    ['topics', { flightReady: false, missingTopics: ['/bebop/odom'] }, 'Sem tópicos'],
+    ['validating', { flightReady: false }, 'Sem tópicos'],
+    ['stale', { stale: true }, 'Sem odometria'],
+    ['airborne', { flyingState: 2 }, 'Fora do solo'],
+    ['battery unknown', { batteryKnown: false }, 'Bateria?'],
+    ['battery low', { batteryPct: 15 }, 'Bateria baixa'],
+    ['battery at threshold', { batteryPct: 30, batteryFailsafeThreshold: 30 }, 'Bateria baixa'],
+    ['failsafe off', { batteryPct: 5, batteryFailsafeEnabled: false }, null],
+    ['bridge', { bridgeReady: false }, 'Sem ponte'],
+  ];
+
+  it.each(cases)('preflightBlockedShort is null exactly when preflightBlockedReason is null (%s)', (_name, overrides, short) => {
+    const input = { ...ready, ...overrides };
+    expect(preflightBlockedShort(input)).toBe(short);
+    expect(preflightBlockedShort(input) === null).toBe(preflightBlockedReason(input) === null);
+  });
+
+  it('every short label fits 18 characters', () => {
+    for (const [, overrides] of cases) {
+      const short = preflightBlockedShort({ ...ready, ...overrides });
+      if (short !== null) expect(short.length).toBeLessThanOrEqual(18);
+    }
+  });
+
+  it('exposes the blocking gate code for distinct dial animations', () => {
+    expect(preflightBlockedCode(ready)).toBeNull();
+    expect(preflightBlockedCode({ ...ready, driverRunning: false })).toBe('driver');
+    expect(preflightBlockedCode({ ...ready, paramsStatus: 'loading' })).toBe('params');
+    expect(preflightBlockedCode({ ...ready, flightReady: false, missingTopics: ['/bebop/odom'] })).toBe('topics');
   });
 });

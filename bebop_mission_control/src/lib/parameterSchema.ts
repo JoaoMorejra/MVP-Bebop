@@ -136,8 +136,8 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
       {
         kind: 'number',
         path: 'kinematics.forward_cruise_velocity',
-        label: 'Velocidade de Deslocamento',
-        hint: 'Velocidade de avanço na varredura e de retorno do RTL, sempre com a mesma magnitude.',
+        label: 'Velocidade de Deslocamento (Pitch/Avanço)',
+        hint: 'Velocidade de avanço (pitch) na varredura e de retorno do RTL no modo avançado, sempre com a mesma magnitude.',
         min: 0.01,
         max: 0.6,
         step: 0.01,
@@ -160,8 +160,8 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
       {
         kind: 'number',
         path: 'yaw_pattern.scan_vyaw',
-        label: 'Velocidade de Giro',
-        hint: 'Taxa de giro da varredura, normalizada (0,15 equivale a cerca de 15 graus por segundo). Uma volta completa leva 360 dividido pela taxa em graus por segundo.',
+        label: 'Velocidade de Giro (Yaw)',
+        hint: 'Taxa de giro da varredura (yaw) no modo simples, normalizada (0,15 equivale a cerca de 15 graus por segundo).',
         min: 0.05,
         max: 0.3,
         step: 0.01,
@@ -178,8 +178,8 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
       {
         kind: 'number',
         path: 'gimbal.search_tilt_deg',
-        label: 'Inclinação Inicial de Varredura',
-        hint: 'Ângulo inicial da câmera durante a varredura para busca de alvos.',
+        label: 'Inclinação Inicial de Varredura (Gimbal)',
+        hint: 'Ângulo inicial de inclinação (tilt) do gimbal durante a varredura para busca de alvos.',
         min: -45,
         max: 0,
         step: 1,
@@ -189,8 +189,8 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
       {
         kind: 'number',
         path: 'gimbal.nadir_tilt_deg',
-        label: 'Ângulo da Câmera Apontada para Baixo',
-        hint: 'Inclinação final da câmera sobre o alvo. Ao atingir este ângulo, o drone congela o movimento horizontal para captura.',
+        label: 'Ângulo da Câmera Apontada para Baixo (Nadir)',
+        hint: 'Inclinação final do gimbal sobre o alvo. Ao atingir este ângulo nadir, o drone estabiliza o movimento horizontal para captura.',
         min: -80,
         max: 0,
         step: 1,

@@ -454,6 +454,12 @@ export interface AnnounceDoneEvent {
   ok: boolean;
 }
 
+/** One line began to sound: `audioMs` is how long it lasts, null when the copilot does not know yet. */
+export interface AnnounceStartEvent {
+  id: number | null;
+  audioMs: number | null;
+}
+
 /** The copilot's output level, as the operator set it. */
 export interface VoiceLevel {
   /** 0–1. Applied to the PCM samples inside `announcer.py`, not to the host mixer. */
@@ -511,35 +517,16 @@ export interface DiagnosticsReport {
   errors: string[];
 }
 
-/** A finished command in the diagnostics terminal. */
-/** `bmg:terminal-spawn`: a PTY session, or why one could not be opened. */
-export type TerminalSpawnResult =
-  | ({ success: true; id: string; pid: number; cols: number; rows: number } & TerminalIdentity)
-  | { success: false; error: string };
-
-/** Where a session's shell started and who it runs as, for its title. */
-export interface TerminalIdentity {
-  cwd: string;
-  /** Basename of the shell binary, e.g. `bash`. */
-  shell: string;
-  user: string;
-  host: string;
-  home: string;
-}
-
-/** Raw PTY output, escape sequences included, for xterm.js to render. */
-export interface TerminalDataEvent {
-  id: string;
-  data: string;
-}
-
-export interface TerminalExitEvent {
-  id: string;
-  exitCode: number;
-  signal: number | null;
-}
-
 /** Battery failsafe: land on its own when the charge reaches this level in flight. */
+/** Operator keyboard nudge, one ternary intent per axis: forward (W/S), left (A/D), yaw left (Q/R). */
+export type NudgeIntent = { vx: -1 | 0 | 1; vy: -1 | 0 | 1; vyaw: -1 | 0 | 1 };
+
+/** A nudge key the main process took before the page (`electron/nudgeShortcut.cjs`). */
+export interface NudgeKeyEvent {
+  type: 'keydown' | 'keyup';
+  code: string;
+}
+
 export interface BatteryFailsafe {
   enabled: boolean;
   /** 10–40 %. */
@@ -552,10 +539,14 @@ export interface BmgAPI {
 
   scanWifi: (options?: { forceRescan?: boolean }) => Promise<WifiScanResult>;
   connectWifi: (
-    ssid: string
+    ssid: string | { ssid: string; password?: string },
+    password?: string
   ) => Promise<{ success: boolean; pingOk?: boolean; message?: string; error?: string }>;
+  disconnectWifi: () => Promise<{ success: boolean }>;
+  getWifiPower: () => Promise<{ success: boolean; enabled: boolean }>;
+  setWifiPower: (enabled: boolean) => Promise<{ success: boolean; enabled: boolean; error?: string }>;
 
-  startDriver: () => Promise<{ success: boolean; pid?: number; message?: string; error?: string }>;
+  startDriver: (options?: { forceRestart?: boolean }) => Promise<{ success: boolean; pid?: number; message?: string; error?: string }>;
   stopDriver: () => Promise<{ success: boolean }>;
   checkDriverStatus: () => Promise<{ running: boolean }>;
 
@@ -600,6 +591,10 @@ export interface BmgAPI {
   getCameraTilt: () => Promise<{ tilt: number | null }>;
   /** Ask the running mission to continue at `stage`. The mission may refuse. */
   gotoStage: (stage: number) => Promise<{ success: boolean; stage?: number; error?: string }>;
+  /** Forwards the battery failsafe switch to a running mission (`mission/battery_failsafe`). */
+  setBatteryFailsafe?: (enabled: boolean, thresholdPct: number) => Promise<{ success: boolean; error?: string }>;
+  /** Keyboard nudge intent; fire-and-forget, throttled by the main process. */
+  sendNudge?: (intent: NudgeIntent) => void;
   /** Coarse, city-level host position. The fallback when Chromium cannot produce a fix. */
   getHostLocation: () => Promise<{
     success: boolean;
@@ -630,13 +625,6 @@ export interface BmgAPI {
   getDiagnostics: () => Promise<DiagnosticsReport>;
   getLogHistory: () => Promise<{ mission: LogLine[]; driver: LogLine[] }>;
 
-  /** Open an interactive bash on a PTY, sized to the terminal on screen. */
-  terminalSpawn: (options?: { cols?: number; rows?: number }) => Promise<TerminalSpawnResult>;
-  /** Raw bytes to the PTY, Tab, arrows and control characters included. */
-  terminalWrite: (id: string, data: string) => Promise<{ success: boolean }>;
-  terminalResize: (id: string, cols: number, rows: number) => Promise<{ success: boolean }>;
-  terminalKill: (id: string) => Promise<{ success: boolean }>;
-
   onTelemetryUpdate: (cb: (data: BmgTelemetry) => void) => () => void;
   onStepChange: (cb: (step: MissionStepEvent) => void) => () => void;
   onMilestone: (cb: (event: MilestoneEvent) => void) => () => void;
@@ -650,13 +638,17 @@ export interface BmgAPI {
   setCockpitAbortArmed?: (armed: boolean) => void;
   /** D8: Ctrl/Cmd+C or Escape taken by the main process while armed. */
   onAbortShortcut?: (cb: () => void) => () => void;
+  /** Whether the main process may take the nudge keys before the page. */
+  setCockpitNudgeArmed?: (armed: boolean) => void;
+  /** A nudge key taken by the main process while armed. */
+  onNudgeKey?: (cb: (event: NudgeKeyEvent) => void) => () => void;
   onLinkProgress: (cb: (event: LinkProgressEvent) => void) => () => void;
   onLandProgress: (cb: (event: LandProgressEvent) => void) => () => void;
   onAnnounceDone: (cb: (event: AnnounceDoneEvent) => void) => () => void;
+  /** A line began to sound, with its length when known. Optional: an older host does not send it. */
+  onAnnounceStart?: (cb: (event: AnnounceStartEvent) => void) => () => void;
   onCameraTiltChanged: (cb: (event: CameraTiltEvent) => void) => () => void;
   onMissionReset: (cb: (event: MissionResetEvent) => void) => () => void;
-  onTerminalData: (cb: (event: TerminalDataEvent) => void) => () => void;
-  onTerminalExit: (cb: (event: TerminalExitEvent) => void) => () => void;
 }
 
 declare global {

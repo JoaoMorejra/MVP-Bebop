@@ -7,6 +7,7 @@ const SRC = resolve(__dirname, '..');
 /** The only modules that may read the mission mode of a document. */
 const ALLOWED = new Set([
   'lib/missionMode.ts',
+  'lib/flightMode.ts',
   'lib/parameterSchema.ts',
   'lib/launchDocument.ts',
   'lib/parameterConflicts.ts',

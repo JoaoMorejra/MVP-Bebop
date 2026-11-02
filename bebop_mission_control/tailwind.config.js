@@ -30,16 +30,17 @@ export default {
           DEFAULT: '#14455D',
           bright: '#1E5C75',
         },
-        // Live, and only live. Sampled from the crest of the brand wave.
+        // Live, and only live. Solid emerald-jade graduated from the video wave.
         mint: {
-          DEFAULT: '#01D5A3',
-          bright: '#5CF2CE',
-          deep: '#00A87F',
+          DEFAULT: '#12B382',
+          bright: '#34D9A2',
+          deep: '#0B7A62',
+          crest: '#64E6BA',
         },
-        // The brand's mid-teal. Structure and inactive brand states.
+        // The brand's mid-teal petrol from the video swell. Structure and gradient bases.
         kelp: {
-          DEFAULT: '#12695E',
-          deep: '#0B4A48',
+          DEFAULT: '#095E54',
+          deep: '#053B44',
         },
         // Cool white, matched to the wordmark.
         frost: {
@@ -68,9 +69,11 @@ export default {
         },
       },
       fontFamily: {
-        sans: ['Barlow', 'Helvetica Neue', 'Arial', 'system-ui', 'sans-serif'],
-        cond: ['Barlow Semi Condensed', 'Barlow', 'Helvetica Neue', 'Arial', 'sans-serif'],
-        mono: ['Azeret Mono', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
+        sans: ['Outfit', 'Urbanist', 'system-ui', 'sans-serif'],
+        cond: ['Urbanist', 'Outfit', 'sans-serif'],
+        mono: ['"DM Mono"', 'Outfit', 'monospace'],
+        pixel: ['Outfit', 'Urbanist', 'sans-serif'],
+        ui: ['Outfit', 'Urbanist', 'sans-serif'],
       },
       fontSize: {
         '3xs': ['0.625rem', { lineHeight: '0.875rem' }],
@@ -95,7 +98,7 @@ export default {
       },
       boxShadow: {
         // Depth comes from tone; this is a contact glow for live elements only.
-        live: '0 0 0 1px rgba(1, 213, 163, 0.35), 0 0 24px -6px rgba(1, 213, 163, 0.45)',
+        live: '0 0 0 1px rgba(18, 179, 130, 0.38), 0 0 22px -6px rgba(12, 128, 100, 0.5)',
         abort: '0 0 0 1px rgba(255, 106, 69, 0.4), 0 0 28px -6px rgba(255, 106, 69, 0.5)',
         bench: '0 0 0 1px rgba(0, 229, 255, 0.4), 0 0 24px -6px rgba(0, 229, 255, 0.5)',
       },
