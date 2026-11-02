@@ -16,9 +16,11 @@ import {
   addPreset,
   applyPresetValues,
   deletePreset,
+  latestPreset,
   migrateSinglePreset,
   readPresets,
   renamePreset,
+  singleFavorite,
   writePresets,
   type OperatorPreset,
 } from '../lib/operatorPresets';
@@ -342,6 +344,33 @@ export function useMissionParameters() {
     [presets, working, persistDocument, missionMode]
   );
 
+  /** The favourite of the current mode: the single one, or the latest of a legacy list (D8). */
+  const favorite = useMemo(() => latestPreset(presets), [presets]);
+
+  /**
+   * Save the working values as the single favourite of the current mode,
+   * replacing whatever list the mode held. Returns false when there is no
+   * document or the store refused.
+   */
+  const saveFavorite = useCallback((): boolean => {
+    if (!working) return false;
+    const list = singleFavorite(working, newPresetId());
+    if (!writePresets(storage, missionMode, list)) return false;
+    setPresets(list);
+    return true;
+  }, [working, storage, missionMode]);
+
+  /**
+   * Bring the favourite's values into the working document. Nothing is
+   * persisted: the change reads as pending and the operator saves it from the
+   * sheet, as with the factory restore. Returns false without a favourite.
+   */
+  const restoreFavorite = useCallback((): boolean => {
+    if (!favorite) return false;
+    setWorking((prev) => (prev ? applyPresetValues(prev, favorite) : prev));
+    return true;
+  }, [favorite]);
+
   const applyFactory = useCallback(() => {
     if (factory) setWorking((prev) => (prev ? reconcileCoupledPaths(normalizeForMode(applySchemaFields(prev, factory))) : prev));
   }, [factory]);
@@ -402,5 +431,8 @@ export function useMissionParameters() {
     deletePreset: deletePresetById,
     applyFactory,
     switchMode,
+    favorite,
+    saveFavorite,
+    restoreFavorite,
   };
 }

@@ -10,11 +10,8 @@ import {
   launchParamsJson,
 } from './lib/batteryFailsafe';
 import { PreflightScreen } from './components/preflight/PreflightScreen';
-import { CountdownOverlay } from './components/preflight/CountdownOverlay';
 import { CockpitScreen } from './components/cockpit/CockpitScreen';
-import { DiagnosticsScreen } from './components/diagnostics/DiagnosticsScreen';
-import { DiagnosticsOverlayHeader } from './components/diagnostics/DiagnosticsOverlayHeader';
-import { TabSwitch } from './components/shell/TabSwitch';
+import { TopBar } from './components/shell/TopBar';
 import { useBridge } from './hooks/useBridge';
 import { useTelemetry } from './hooks/useTelemetry';
 import { useLink } from './hooks/useLink';
@@ -27,6 +24,7 @@ import { useCameraTilt } from './hooks/useCameraTilt';
 import {
   useCopilot,
   useFlightNarration,
+  type LaunchSpeechEvent,
   useForensicNarration,
   useLinkLossNarration,
   useNarrationQueue,
@@ -37,20 +35,22 @@ import { useForensicReport } from './hooks/useForensicReport';
 import { LAUNCH_KEYS, planSentence, reserveLaunchPhrase } from './lib/copilotPhrases';
 import { deepEqual, getPath } from './lib/paths';
 import { readMissionMode, readRtlEnabled, type MissionMode } from './lib/missionMode';
-import { launchBlockers, launchCountdownSec, reconcileCoupledPaths } from './lib/launchDocument';
+import { NO_FLY_PATH, readFlightMode, type FlightMode } from './lib/flightMode';
+import { LAUNCH_COUNTDOWN_SEC, launchBlockers, launchCountdownSec, reconcileCoupledPaths } from './lib/launchDocument';
 import { blockingConflicts } from './lib/parameterConflicts';
 import { isMissionOver } from './lib/missionOutcome';
 import { useFinishLock } from './hooks/useFinishLock';
 import { reportMayStart } from './lib/finishLock';
 import { useGuardedAsync } from './hooks/useGuardedAsync';
 import { useMissionCountdown } from './hooks/useMissionCountdown';
+import { useStageProgress } from './hooks/useStageProgress';
 import { useModeEcho, type LaunchPlan } from './hooks/useModeEcho';
+import { useLaunchSequence } from './hooks/useLaunchSequence';
+import { useLaunchAbortShortcut } from './hooks/useLaunchAbortShortcut';
 import { launchesFromGround } from './lib/altitudeEnvelope';
 import { useLandProgress } from './hooks/useLandProgress';
+import { useTouchdown } from './hooks/useTouchdown';
 import { landOnCriticalBattery, runCriticalBatteryReturn, type BatteryReturnHooks } from './lib/batteryReturn';
-
-/** The station is two tabs; these open over whichever one is current. */
-type Overlay = 'none' | 'diagnostics';
 
 /** `?screen=cockpit` opens a tab directly, for screenshots and tests. */
 function initialScreen(): Screen {
@@ -96,20 +96,30 @@ function previewCountdown(): number {
  * and there is one to unmake. The launch sequence is the hinge — it holds the
  * screen for ten seconds and then hands over on its own.
  *
- * The dock that switches between them is mounted here, once, at the top centre
- * of the window, and does not move when the tab under it changes: an operator
- * going back and forth reaches for the same coordinate both times.
- *
- * The forensic library and the process logs open over either tab rather than
- * competing with them for a place in the architecture.
+ * The top bar is mounted here, once, above both tabs: the dock that switches
+ * between them sits at its centre and does not move when the tab under it
+ * changes, so an operator going back and forth reaches for the same
+ * coordinate both times. Radio, driver, voice and charge live in its tray.
  */
 export const App: React.FC = () => {
   const [screen, setScreen] = useState<Screen>(initialScreen);
-  const [overlay, setOverlay] = useState<Overlay>('none');
   const [counting, setCounting] = useState(() => previewCountdown() > 0);
   const [countdownSeconds, setCountdownSeconds] = useState(() => previewCountdown() || 0);
   /** Click instant of the launch being counted down, epoch ms. */
-  const [launchAt, setLaunchAt] = useState<number | null>(null);
+  const [launchAt, setLaunchAt] = useState<number | null>(() => (previewCountdown() > 0 ? Date.now() : null));
+  /** The document of the launch being prepared was committed (the `params` checkpoint). */
+  const [paramsCommitted, setParamsCommitted] = useState(false);
+  /**
+   * The mission process was asked for. Until then a runtime still reporting
+   * the end of the previous flight is not the end of this one.
+   */
+  const [spawnRequested, setSpawnRequested] = useState(false);
+  /** Set by a cancel; the launch in progress checks it after each wait. */
+  const launchCancelledRef = useRef(false);
+  /** The clearance line of the launch being prepared, as the copilot handled it (D3). */
+  const [speech, setSpeech] = useState<{ startedAt: number | null; endedAt: number | null; heard: boolean; text: string | null }>(
+    { startedAt: null, endedAt: null, heard: false, text: null }
+  );
   /**
    * A launch click is being handled. Covers the pending-edit save as well as
    * the spawn, so a double click on the dial starts one flight and leaves no
@@ -154,6 +164,14 @@ export const App: React.FC = () => {
   const narration = useNarrationQueue(copilot);
   const missionCountdown = useMissionCountdown();
   const { phase: landProgress } = useLandProgress();
+  // The strip's fill follows the flight from its first milestone, before the
+  // cockpit opens: mounted here rather than in the cockpit.
+  const stageFill = useStageProgress({
+    stage: mission.stage,
+    state: mission.state,
+    altitude:
+      Boolean(telemetry.nav_fresh ?? telemetry.data_fresh) && Number.isFinite(telemetry.altitude) ? telemetry.altitude : null,
+  });
   const voice = useVoiceLevel();
 
   const running = mission.state === 'running' || mission.state === 'arming';
@@ -162,6 +180,27 @@ export const App: React.FC = () => {
   /** The aircraft is committed: pre-flight is locked until it is back down. See `preflightLocked`. */
   const airborne = preflightLocked(mission.state, mission.ran);
   const modeLocked = launchPending || counting || running || params.status === 'saving';
+  const flightMode = readFlightMode(params.working ?? params.committed);
+
+  /**
+   * Pick a flight mode (D1). `test` only arms `no_fly`, leaving the profile
+   * underneath as it is. A profile switches first and clears `no_fly` after:
+   * `switchMode` persists the working document it closes over, so clearing
+   * first would be overwritten by the stale `no_fly` it still holds.
+   */
+  const selectFlightMode = useCallback(
+    async (next: FlightMode) => {
+      if (modeLocked) return;
+      const doc = params.working ?? params.committed;
+      if (next === 'test') {
+        params.edit(NO_FLY_PATH, true);
+        return;
+      }
+      if (readMissionMode(doc) !== next) await params.switchMode(next);
+      if (getPath(doc, NO_FLY_PATH) === true) params.edit(NO_FLY_PATH, false);
+    },
+    [modeLocked, params]
+  );
 
   const committed = params.committed;
   const storedRadius = getPath(committed, 'rtl.arrival_radius_m');
@@ -175,8 +214,18 @@ export const App: React.FC = () => {
    * what the audience will hear.
    */
   const landed = over && mission.exitCode === 0;
+  const touchdown = useTouchdown();
+  /** The aircraft is down: the mission declared touchdown, or its run is over. */
+  const touchedDown = touchdown || landed || over;
 
-  useFlightNarration(narration, true, mission.startedAt);
+  const observeLaunchSpeech = useCallback((event: LaunchSpeechEvent) => {
+    setSpeech((previous) =>
+      event.phase === 'start'
+        ? { startedAt: event.at, endedAt: null, heard: false, text: event.text }
+        : { ...previous, endedAt: event.at, heard: event.heard === true, text: event.text }
+    );
+  }, []);
+  useFlightNarration(narration, true, mission.startedAt, observeLaunchSpeech);
   useLinkLossNarration(narration, mission.state === 'running' && !benchMode && benchStage === null && stale);
 
   useEffect(() => {
@@ -263,24 +312,38 @@ export const App: React.FC = () => {
     // The dial keeps the keyboard focus under the countdown overlay. A second
     // activation during a launch reached the runtime's "already running"
     // refusal, which closed the overlay of the countdown still in progress.
-    if (launching.current || preflightLocked(mission.state, mission.ran)) return;
+    if (launching.current) return;
+    if (isMissionOver(mission.state)) {
+      mission.reset();
+    } else if (preflightLocked(mission.state, mission.ran)) {
+      return;
+    }
     launching.current = true;
+    launchCancelledRef.current = false;
     setLaunchPending(true);
+    // The click instant. The mission takes off at it plus the countdown
+    // (engine/launch.py) and the dial counts towards the same instant, so the
+    // sequence starts here and not when the process answers: measured, that
+    // was 40 s later.
+    const clickedAt = Date.now();
+    setCounting(true);
+    setLaunchAt(clickedAt);
+    setParamsCommitted(false);
+    setSpawnRequested(false);
+    setSpeech({ startedAt: null, endedAt: null, heard: false, text: null });
+    setLaunchError(null);
+    let spawned = false;
     try {
-      // The click instant. The mission takes off at it plus the countdown
-      // (engine/launch.py) and the overlay counts towards the same instant, so
-      // the countdown starts here and not when the process answers: measured,
-      // that was 40 s later.
-      const clickedAt = Date.now();
       primeLaunchPhrases();
       const doc = await commitLaunchDocument();
-      if (!doc) return;
+      if (launchCancelledRef.current || !doc) return;
+      setParamsCommitted(true);
       setLaunchedMode(readMissionMode(doc));
       setLaunchedRtl(readRtlEnabled(doc));
       setLaunchedSurface(launchesFromGround(doc) ? 'ground' : 'platform');
       // No longer an operator parameter: the window is fixed at
       // LAUNCH_COUNTDOWN_SEC and pinned in the document, which the mission
-      // reads as `kinematics.countdown_sec`, so the overlay and the aircraft
+      // reads as `kinematics.countdown_sec`, so the dial and the aircraft
       // count the same window.
       const seconds = launchCountdownSec(doc) ?? 0;
 
@@ -292,11 +355,6 @@ export const App: React.FC = () => {
       setFailsafeTriggered(false);
       setPendingStage(null);
       setCountdownSeconds(seconds);
-      setLaunchAt(clickedAt);
-      // The countdown is the window in which walking away costs nothing; the
-      // mission runs its flat trim and ground reference inside it. The bench
-      // runs the same one, checklist and abort included.
-      if (seconds >= 1) setCounting(true);
 
       // The plan is part of what the operator commits to at the click: said
       // with the countdown, from the document sent (section 5.7).
@@ -307,11 +365,14 @@ export const App: React.FC = () => {
       // The document is the only source of the flight parameters (5.1): no
       // per-field option, so no fallback can stand in for a value the
       // operator never set.
+      if (launchCancelledRef.current) return;
+      spawned = true;
+      setSpawnRequested(true);
       const result = await mission.launch({
         countdown: seconds,
         noFly: Boolean(getPath(doc, 'no_fly')),
         launchAtMs: clickedAt,
-        paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
+        paramsJson: launchParamsJson(doc, failsafe),
       });
 
       if (!result.success) {
@@ -322,8 +383,17 @@ export const App: React.FC = () => {
         return;
       }
 
-      if (seconds < 1) setScreen('cockpit');
+      if (seconds < 1) {
+        setCounting(false);
+        setScreen('cockpit');
+      }
     } finally {
+      // Nothing was spawned: a refused document, a cancel or a throw leaves
+      // the dial split and idle again.
+      if (!spawned) {
+        setCounting(false);
+        setParamsCommitted(false);
+      }
       launching.current = false;
       setLaunchPending(false);
     }
@@ -363,7 +433,7 @@ export const App: React.FC = () => {
 
         const result = await bridge.startBenchStage({
           stage,
-          paramsJson: launchParamsJson(doc, failsafe.thresholdPct),
+          paramsJson: launchParamsJson(doc, failsafe),
           countdown: seconds,
         });
 
@@ -376,6 +446,9 @@ export const App: React.FC = () => {
         if (seconds >= 1) {
           setCountdownSeconds(seconds);
           setLaunchAt(clickedAt);
+          setParamsCommitted(true);
+          setSpawnRequested(true);
+          setSpeech({ startedAt: null, endedAt: null, heard: false, text: null });
           setCounting(true);
         } else {
           // The rehearsal's own feed is the point of watching it.
@@ -426,6 +499,8 @@ export const App: React.FC = () => {
 
   const finishCountdown = useCallback(() => {
     setCounting(false);
+    setParamsCommitted(false);
+    setSpawnRequested(false);
     setScreen('cockpit');
   }, []);
 
@@ -433,8 +508,8 @@ export const App: React.FC = () => {
   // ground calibration — is shown at once rather than after the remaining
   // seconds of a countdown for a process that is no longer there.
   useEffect(() => {
-    if (counting && isMissionOver(mission.state)) finishCountdown();
-  }, [counting, mission.state, finishCountdown]);
+    if (counting && spawnRequested && isMissionOver(mission.state)) finishCountdown();
+  }, [counting, spawnRequested, mission.state, finishCountdown]);
 
   // A launch document the mission refused (exit 78): nothing was commanded, so
   // the countdown is cancelled without opening the cockpit, and the operator
@@ -446,9 +521,31 @@ export const App: React.FC = () => {
     setLaunchError(`Lançamento recusado: ${mission.refusal.reason}`);
   }, [mission.refusal]);
 
+  // Whenever the aircraft becomes airborne or reaches flight stages, ALWAYS transition
+  // immediately to the cockpit so the operator never stays stuck on the preflight screen.
+  useEffect(() => {
+    const isFlyingOrAirborne =
+      isAirborne(telemetry.flying_state) ||
+      (typeof telemetry.altitude === 'number' && telemetry.altitude > 0.35) ||
+      mission.stage >= 2;
+    if (
+      isFlyingOrAirborne &&
+      (counting || screen === 'preflight') &&
+      (mission.state === 'running' || mission.state === 'arming' || spawnRequested)
+    ) {
+      finishCountdown();
+    }
+  }, [telemetry.flying_state, telemetry.altitude, mission.stage, mission.state, counting, screen, spawnRequested, finishCountdown]);
+
   const cancelCountdown = useCallback(async () => {
+    launchCancelledRef.current = true;
+    launching.current = false;
+    setLaunchPending(false);
     setCounting(false);
+    setParamsCommitted(false);
+    setSpawnRequested(false);
     await mission.abort();
+    mission.reset();
   }, [mission]);
 
   const launchedPlan = useMemo<LaunchPlan | null>(
@@ -468,6 +565,25 @@ export const App: React.FC = () => {
       );
       void cancelCountdown();
     },
+  });
+
+  const sequence = useLaunchSequence({
+    active: counting,
+    clickedAt: launchAt,
+    seconds: countdownSeconds || LAUNCH_COUNTDOWN_SEC,
+    paramsCommitted,
+    linkReady: benchMode || benchStage !== null ? link.driverRunning : link.flightReady,
+    stageReached: mission.stage >= 1,
+    countdown: missionCountdown,
+    speech,
+    speechText: speech.text,
+    onDone: finishCountdown,
+  });
+
+  useLaunchAbortShortcut({
+    armed: counting && screen === 'preflight',
+    handoff: screen === 'cockpit',
+    onAbort: () => void cancelCountdown(),
   });
 
   const abort = useCallback(async () => {
@@ -491,14 +607,23 @@ export const App: React.FC = () => {
     }
   }, [bridge, mission]);
 
-  const changeFailsafe = useCallback((next: BatteryFailsafe) => {
-    setFailsafe(next);
-    try {
-      window.localStorage.setItem(FAILSAFE_KEY, JSON.stringify(next));
-    } catch {
-      /* private mode: the setting lives for the session only */
-    }
-  }, []);
+  const changeFailsafe = useCallback(
+    (next: BatteryFailsafe) => {
+      setFailsafe(next);
+      try {
+        window.localStorage.setItem(FAILSAFE_KEY, JSON.stringify(next));
+      } catch {
+        /* private mode: the setting lives for the session only */
+      }
+      // A running mission took the switch from the launch payload; a change
+      // in flight reaches it on mission/battery_failsafe. A return already
+      // started is not cancelled by switching off (the mission keeps it).
+      if (running && bridge?.setBatteryFailsafe) {
+        void bridge.setBatteryFailsafe(next.enabled, next.thresholdPct);
+      }
+    },
+    [bridge, running],
+  );
 
   /**
    * Battery failsafe: at the configured charge, bring the aircraft home.
@@ -651,11 +776,12 @@ export const App: React.FC = () => {
     setLaunchedRtl(null);
     setLaunchedSurface(null);
     setCounting(false);
+    setParamsCommitted(false);
+    setSpawnRequested(false);
     failsafeFiredRef.current = false;
     clearRtlWatchdog();
     batteryReturnAckRef.current = false;
     setFailsafeTriggered(false);
-    setOverlay('none');
     setScreen('preflight');
   }, [bridge, camera, clearRtlWatchdog, mission, narration, resetTrack]);
 
@@ -689,7 +815,12 @@ export const App: React.FC = () => {
   const report = forensic.script?.findings ?? null;
 
   // The report opens with "Aeronave em solo": it waits for confirmed ground.
-  const { revealed: reportRevealed, closing: reportClosing } = useForensicNarration(
+  const {
+    revealed: reportRevealed,
+    announced: reportAnnounced,
+    readings: reportReadings,
+    closing: reportClosing,
+  } = useForensicNarration(
     narration,
     grounded && !reportDismissed && Boolean(mission.latestCapture),
     forensic.script
@@ -716,7 +847,6 @@ export const App: React.FC = () => {
           stale={stale}
           missionState={mission.state}
           stage={mission.stage}
-          stageName={mission.stageName}
           missionMode={readMissionMode(params.working ?? params.committed)}
           rtlEnabled={launchedRtl ?? readRtlEnabled(params.working ?? params.committed)}
           streamFps={Math.round(stream.fps)}
@@ -724,34 +854,35 @@ export const App: React.FC = () => {
           streamLive={stream.live}
           streamWidth={stream.width}
           streamHeight={stream.height}
-          streamSource={stream.source}
           captureFlash={mission.captureFlash}
           captureCount={mission.captureCount}
           latestCapture={mission.latestCapture}
           arrivalRadius={arrivalRadius}
           // A flight that faulted produced no assessment. The capture still
           // rises and holds — it is evidence either way — but there is no
-          // report under it to reveal.
-          landed={landed || over}
+          // report under it to reveal. The mission's own touchdown milestone
+          // is the moment: it precedes the process exit by about a second.
+          landed={touchedDown}
           benchMode={benchMode}
           benchStage={benchStage}
+          benchCountdown={benchStage !== null && counting ? missionCountdown.remaining : null}
           onRunStage={(stage) => void runBenchStage(stage)}
           onGotoStage={(stage) => void gotoStage(stage)}
           pendingStage={pendingStage}
-          voice={voice.level}
-          onVolume={voice.setVolume}
-          onToggleMute={voice.toggleMute}
           cameraTilt={camera.tilt}
           cameraAvailable={camera.available}
           onCameraTilt={camera.set}
-          report={landed || over ? report : null}
-          reportAnalyzing={(landed || over) && forensic.analyzing}
+          report={touchedDown ? report : null}
+          reportAnalyzing={touchedDown && forensic.analyzing}
           reportRevealed={reportRevealed}
+          reportAnnounced={reportAnnounced}
+          reportReadings={reportReadings}
           reportClosing={reportClosing}
           onAbort={() => void land()}
           onFinish={() => void finishMission()}
           finishLock={finishLock}
           landProgress={landProgress}
+          stageFill={stageFill}
         />
       );
     }
@@ -760,47 +891,33 @@ export const App: React.FC = () => {
       <PreflightScreen
         telemetry={telemetry}
         stale={stale}
-        networks={link.networks}
-        currentSsid={link.currentSsid}
-        scanning={link.scanning}
-        linkPhase={link.phase}
-        linkMessage={link.message}
-        linkProgress={link.progress}
         readiness={link.readiness}
         flightReady={link.flightReady}
         driverRunning={link.driverRunning}
-        onScan={() => void link.scan(true)}
-        onConnect={(ssid) => void link.connect(ssid)}
-        onStartDriver={() => void link.startDriver()}
-        onStopDriver={() => void link.stopDriver()}
         params={params.working}
         paramDefaults={params.factory}
         paramsStatus={params.status}
         paramsError={params.error}
         changedPaths={params.changedPaths}
         dirty={params.dirty}
-        presets={params.presets}
-        activePresetId={params.activePresetId}
+        favoriteActive={Boolean(params.favorite) && params.activePresetId === params.favorite?.id}
+        hasFavorite={Boolean(params.favorite)}
         onEdit={params.edit}
-        onModeChange={(mode) => void params.switchMode(mode)}
+        flightMode={flightMode}
+        onFlightModeChange={(mode) => void selectFlightMode(mode)}
         onSave={() => void params.save()}
-        saveAttempted={params.saveAttempted}
         onDiscard={params.discard}
-        onSavePreset={params.savePreset}
-        onApplyPreset={(id) => void params.applyPreset(id)}
-        onRenamePreset={params.renamePreset}
-        onDeletePreset={params.deletePreset}
-        failsafe={failsafe}
-        onFailsafeChange={changeFailsafe}
-        failsafeTriggered={failsafeTriggered}
-        voice={voice.level}
-        onVolume={voice.setVolume}
-        onToggleMute={voice.toggleMute}
+        onSaveFavorite={() => void params.saveFavorite()}
+        onRestoreFavorite={() => void params.restoreFavorite()}
+        batteryThresholdPct={failsafe.thresholdPct}
+        batteryFailsafeEnabled={failsafe.enabled}
         launchError={launchError}
         refusedPath={mission.refusal?.field ?? null}
         altitudeNotice={params.altitudeNotice}
         onLaunch={() => void launch()}
-        onOpenDiagnostics={() => setOverlay('diagnostics')}
+        sequence={screen === 'preflight' ? sequence : null}
+        onAbortLaunch={() => void cancelCountdown()}
+        launchErrorShort="Falha ao iniciar"
         modeLocked={modeLocked}
       />
     );
@@ -821,7 +938,10 @@ export const App: React.FC = () => {
     report,
     forensic.analyzing,
     landed,
+    touchedDown,
     reportRevealed,
+    reportAnnounced,
+    reportReadings,
     reportClosing,
     reportDismissed,
     benchStage,
@@ -835,51 +955,52 @@ export const App: React.FC = () => {
     changeFailsafe,
     failsafeTriggered,
     modeLocked,
+    flightMode,
+    selectFlightMode,
     params.working,
     params.committed,
     launchedRtl,
+    sequence,
+    cancelCountdown,
+    counting,
+    missionCountdown.remaining,
+    stageFill,
   ]);
 
   return (
-    <div className="relative h-full w-full bg-abyss">
-      {body}
-
-      {/* The dock. One mount, one coordinate, both tabs. */}
-      <TabSwitch
+    <div className="flex h-full w-full flex-col bg-abyss">
+      <TopBar
         screen={screen}
         onNavigate={setScreen}
         live={running}
         locked={airborne}
-        className="fixed left-1/2 top-4 z-40 -translate-x-1/2"
+        frozen={counting}
+        telemetry={telemetry}
+        networks={link.networks}
+        currentSsid={link.currentSsid}
+        scanning={link.scanning}
+        linkPhase={link.phase}
+        readiness={link.readiness}
+        flightReady={link.flightReady}
+        driverRunning={link.driverRunning}
+        wifiPower={link.wifiPower}
+        onToggleWifiPower={(enabled) => void link.setWifiPower(enabled)}
+        onDisconnectWifi={() => void link.disconnectWifi()}
+        onScan={() => void link.scan(true)}
+        onConnect={(ssid, password) => void link.connect(ssid, password)}
+        onStartDriver={() => void link.startDriver()}
+        onStopDriver={() => void link.stopDriver()}
+        failsafe={failsafe}
+        onFailsafeChange={changeFailsafe}
+        failsafeTriggered={failsafeTriggered}
+        voice={voice.level}
+        onVolume={voice.setVolume}
+        onToggleMute={voice.toggleMute}
       />
 
+      <div className="relative min-h-0 flex-1">{body}</div>
 
-      {counting ? (
-        <CountdownOverlay
-          seconds={countdownSeconds}
-          remaining={missionCountdown.remaining}
-          clearance={missionCountdown.clearance}
-          trim={missionCountdown.trim}
-          launchAt={launchAt}
-          stageReached={mission.stage >= 1}
-          linkReady={benchMode || benchStage !== null ? link.driverRunning : link.flightReady}
-          onDone={finishCountdown}
-          onCancel={() => void cancelCountdown()}
-        />
-      ) : null}
 
-      {overlay !== 'none' ? (
-        <div className="fixed inset-0 z-[60] flex flex-col bg-abyss/92 backdrop-blur-sm">
-          <DiagnosticsOverlayHeader title="Diagnóstico · Terminal" onClose={() => setOverlay('none')} />
-          <div className="min-h-0 flex-1">
-            <DiagnosticsScreen
-              missionRunning={running}
-              onLand={land}
-              onClose={() => setOverlay('none')}
-            />
-          </div>
-        </div>
-      ) : null}
     </div>
   );
 };

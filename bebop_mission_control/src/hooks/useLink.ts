@@ -57,6 +57,7 @@ export function useLink(opts: { connected: boolean; driverRunning: boolean }) {
   const [progress, setProgress] = useState<LinkProgressEvent[]>([]);
   /** A forced rescan is in flight; routine polls do not count. */
   const [scanning, setScanning] = useState(false);
+  const [wifiPower, setWifiPowerState] = useState(true);
 
   // Serialises bring-up against the polling loops; the main process refuses a
   // concurrent `ensure-link` anyway, this keeps the UI honest about it.
@@ -80,6 +81,53 @@ export function useLink(opts: { connected: boolean; driverRunning: boolean }) {
     },
     [bridge]
   );
+
+  const refreshWifiPower = useCallback(async () => {
+    if (!bridge?.getWifiPower) return;
+    try {
+      const res = await bridge.getWifiPower();
+      if (res && typeof res.enabled === 'boolean') setWifiPowerState(res.enabled);
+    } catch {
+      // ignore
+    }
+  }, [bridge]);
+
+  useEffect(() => {
+    void refreshWifiPower();
+  }, [refreshWifiPower]);
+
+  const setWifiPower = useCallback(
+    async (enabled: boolean) => {
+      if (!bridge?.setWifiPower) return;
+      try {
+        const res = await bridge.setWifiPower(enabled);
+        if (res.success) {
+          setWifiPowerState(res.enabled);
+          if (!res.enabled) {
+            setCurrentSsid('');
+            setNetworks([]);
+          } else {
+            void scan(true);
+          }
+        }
+      } catch (err) {
+        setMessage(err instanceof Error ? err.message : 'Falha ao alterar rádio Wi-Fi');
+      }
+    },
+    [bridge, scan]
+  );
+
+  const disconnectWifi = useCallback(async () => {
+    if (!bridge?.disconnectWifi) return;
+    try {
+      await bridge.disconnectWifi();
+      setCurrentSsid('');
+      setMessage('Wi-Fi desconectado');
+      void scan(false);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Falha ao desconectar Wi-Fi');
+    }
+  }, [bridge, scan]);
 
   const runEnsureLink = useCallback(
     async (ssid?: string) => {
@@ -124,7 +172,7 @@ export function useLink(opts: { connected: boolean; driverRunning: boolean }) {
    * router would end in a timeout that reads like a fault.
    */
   const connect = useCallback(
-    async (ssid: string) => {
+    async (ssid: string, password?: string) => {
       const target = networks.find((n) => n.ssid === ssid);
       const isBebop = target ? target.isBebop : isBebopSsid(ssid);
       if (isBebop) {
@@ -137,7 +185,8 @@ export function useLink(opts: { connected: boolean; driverRunning: boolean }) {
       setPhase('connecting');
       setMessage(`Entrando em ${ssid}`);
       try {
-        const result = await bridge.connectWifi(ssid);
+        const payload = password ? { ssid, password } : ssid;
+        const result = await bridge.connectWifi(payload);
         if (result.success) {
           setCurrentSsid(ssid);
           setPhase('idle');
@@ -162,18 +211,29 @@ export function useLink(opts: { connected: boolean; driverRunning: boolean }) {
   );
 
   const startDriver = useCallback(async () => {
+    busyRef.current = false;
+    manualStopRef.current = false;
+    setPhase('starting-driver');
+    setMessage('Iniciando o driver ROS 2...');
+    try {
+      await bridge?.startDriver?.({ forceRestart: true });
+    } catch {
+      // ignore
+    }
     await runEnsureLink();
-  }, [runEnsureLink]);
+  }, [bridge, runEnsureLink]);
 
   const stopDriver = useCallback(async () => {
     if (!bridge) return;
+    busyRef.current = false;
     // An explicit stop must not be undone by the automatic bring-up on the
     // next tick.
     manualStopRef.current = true;
-    await bridge.stopDriver();
     setDriverProbe(false);
     setReadiness(null);
     setPhase('idle');
+    setMessage('Parando driver ROS 2...');
+    await bridge.stopDriver();
     setMessage('Driver encerrado');
   }, [bridge]);
 
@@ -232,22 +292,23 @@ export function useLink(opts: { connected: boolean; driverRunning: boolean }) {
   /**
    * Automatic bring-up.
    *
-   * Runs whenever the aircraft's network is reachable and the link is not
-   * ready, with a cooling period between attempts. Unlike the ref-guarded
+   * Runs whenever the aircraft answers, or the station is joined to its
+   * network before it does, and the link is not ready, with a cooling period
+   * between attempts. A manual stop holds it off until the next connect. Unlike the ref-guarded
    * effect it replaces, a failed attempt is retried — the common real failure
    * is the driver losing the ARSDK session, which no amount of "we already
    * tried once" will recover from.
    */
   useEffect(() => {
     if (!bridge || busyRef.current || manualStopRef.current) return;
-    if (!opts.connected) return;
+    if (!opts.connected && !isBebopSsid(currentSsid)) return;
     if (readiness?.ready) return;
 
     const now = Date.now();
     if (now - lastAutoAttemptRef.current < AUTO_RETRY_MS) return;
     lastAutoAttemptRef.current = now;
     void runEnsureLink();
-  }, [bridge, opts.connected, readiness?.ready, runEnsureLink]);
+  }, [bridge, opts.connected, currentSsid, readiness?.ready, runEnsureLink]);
 
   return {
     networks,
@@ -260,6 +321,9 @@ export function useLink(opts: { connected: boolean; driverRunning: boolean }) {
     driverRunning: opts.driverRunning || driverProbe,
     /** The only gate the launch control should consult. */
     flightReady: Boolean(readiness?.ready),
+    wifiPower,
+    setWifiPower,
+    disconnectWifi,
     scan,
     connect,
     startDriver,

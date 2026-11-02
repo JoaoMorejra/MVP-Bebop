@@ -2,15 +2,11 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { LaunchView } from '../../lib/launchSequence';
 import { LaunchDial } from './LaunchDial';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
-}
-
-if (typeof globalThis.PointerEvent === 'undefined') {
-  // @ts-expect-error test polyfill
-  globalThis.PointerEvent = class PointerEvent extends MouseEvent {};
 }
 
 let host: HTMLDivElement;
@@ -22,141 +18,228 @@ beforeEach(() => {
   document.body.appendChild(host);
   root = createRoot(host);
   vi.useFakeTimers();
-
-  vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
-    return setTimeout(() => cb(Date.now()), 16);
-  });
-  vi.stubGlobal('cancelAnimationFrame', (id: number) => {
-    clearTimeout(id);
-  });
 });
 
 afterEach(() => {
   act(() => root.unmount());
   host.remove();
-  vi.restoreAllMocks();
   vi.useRealTimers();
-  vi.unstubAllGlobals();
 });
 
-const getButton = (): HTMLButtonElement => host.querySelector('button')!;
+type Props = React.ComponentProps<typeof LaunchDial>;
 
-describe('LaunchDial (R4 / R8 Arming Hold & Preflight Gate)', () => {
-  describe('bench mode', () => {
-    it('displays motors offline text and launches on single click', () => {
-      const onLaunch = vi.fn();
-      act(() => {
-        root.render(
-          <LaunchDial ready={true} blockedReason={null} benchMode={true} onLaunch={onLaunch} />
-        );
-      });
+function render(overrides: Partial<Props> = {}) {
+  const props: Props = {
+    view: null,
+    ready: true,
+    blockedCode: null,
+    blockedShort: null,
+    blockedReason: null,
+    errorShort: null,
+    benchMode: false,
+    onLaunch: vi.fn(),
+    ...overrides,
+  };
+  act(() => root.render(<LaunchDial {...props} />));
+  return props;
+}
 
-      const btn = getButton();
-      expect(btn.disabled).toBe(false);
-      expect(host.textContent).toContain('INICIAR');
-      expect(host.textContent).toContain('Motores desligados');
-
-      act(() => {
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-      });
-      expect(onLaunch).toHaveBeenCalledTimes(1);
-    });
-
-    it('prevents double launch on repeated rapid clicks in bench mode', () => {
-      const onLaunch = vi.fn();
-      act(() => {
-        root.render(
-          <LaunchDial ready={true} blockedReason={null} benchMode={true} onLaunch={onLaunch} />
-        );
-      });
-
-      const btn = getButton();
-      act(() => {
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-      });
-      expect(onLaunch).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  describe('real flight mode', () => {
-    it('displays warning text and launches on single click', () => {
-      const onLaunch = vi.fn();
-      act(() => {
-        root.render(
-          <LaunchDial ready={true} blockedReason={null} benchMode={false} onLaunch={onLaunch} />
-        );
-      });
-
-      const btn = getButton();
-      expect(btn.disabled).toBe(false);
-      expect(host.textContent).toContain('INICIAR');
-      expect(host.textContent).toContain('VOO REAL: motores serão armados');
-
-      act(() => {
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-      });
-      expect(onLaunch).toHaveBeenCalledTimes(1);
-    });
-
-    it('prevents double launch on repeated rapid clicks in real flight mode', () => {
-      const onLaunch = vi.fn();
-      act(() => {
-        root.render(
-          <LaunchDial ready={true} blockedReason={null} benchMode={false} onLaunch={onLaunch} />
-        );
-      });
-
-      const btn = getButton();
-      act(() => {
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-      });
-      expect(onLaunch).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  describe('blocked state', () => {
-    it('disables button and displays blocked reason', () => {
-      const onLaunch = vi.fn();
-      act(() => {
-        root.render(
-          <LaunchDial
-            ready={false}
-            blockedReason="Driver ROS 2 fora do ar"
-            benchMode={false}
-            onLaunch={onLaunch}
-          />
-        );
-      });
-
-      const btn = getButton();
-      expect(btn.disabled).toBe(true);
-      expect(host.textContent).toContain('Driver ROS 2 fora do ar');
-
-      act(() => {
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-      });
-      expect(onLaunch).not.toHaveBeenCalled();
-    });
-  });
+const dial = () => host.querySelector<HTMLButtonElement>('button[data-launch-dial]')!;
+const ring = () => host.querySelector('[data-progress]')!;
+const view = (overrides: Partial<LaunchView>): LaunchView => ({
+  phase: 'loading',
+  percent: 0,
+  stepId: 'params',
+  label: 'Parâmetros',
+  message: null,
+  ...overrides,
 });
 
-describe('LaunchDial slot above the dial', () => {
-  it('renders the slot before the launch button in document order', () => {
+describe('LaunchDial', () => {
+  it('ready and idle shows only "Iniciar" in both flight and Teste modes', () => {
+    render();
+    expect(dial().textContent).toBe('Iniciar');
+    expect(dial().getAttribute('data-theme')).toBe('flight');
+    render({ benchMode: true });
+    expect(dial().textContent).toBe('Iniciar');
+    expect(dial().getAttribute('data-theme')).toBe('bench');
+    expect(host.textContent).not.toMatch(/VOO REAL|Motores desligados/);
+    expect(host.querySelector('svg.lucide-play')).toBeNull();
+  });
+
+  it('blocked shows the short reason in white inside the dial and the long reason in aria-label without a hover title', () => {
+    render({
+      ready: false,
+      blockedCode: 'link',
+      blockedShort: 'Sem enlace',
+      blockedReason: 'Conecte-se à rede da aeronave para liberar o comando',
+    });
+    expect(dial().textContent).toBe('Sem enlace');
+    expect(dial().title).toBe('');
+    expect(dial().getAttribute('aria-label')).toContain('Conecte-se à rede da aeronave');
+    expect(dial().disabled).toBe(true);
+    const label = host.querySelector('[data-dial-label]')!;
+    expect(label.className).toContain('text-frost');
+    expect(label.className).not.toContain('text-amber');
+  });
+
+  it('launchError shows "Falha ao iniciar" in white in the dial and the long text only in aria-label without a hover title', () => {
+    render({ errorShort: 'Falha ao iniciar', blockedReason: 'A missão não iniciou: o processo não subiu' });
+    expect(dial().textContent).toBe('Falha ao iniciar');
+    expect(dial().title).toBe('');
+    expect(dial().getAttribute('aria-label')).toContain('A missão não iniciou: o processo não subiu');
+    expect(host.textContent).not.toContain('o processo não subiu');
+    const label = host.querySelector('[data-dial-label]')!;
+    expect(label.className).toContain('text-frost');
+    expect(label.className).not.toContain('text-amber');
+  });
+
+  it('keeps one continuous orbital carrier without DOM cuts as 2 beams at 180deg converge and merge into 1 beam at ready', () => {
+    render({
+      ready: false,
+      blockedCode: 'driver',
+      blockedShort: 'Sem driver',
+      blockedReason: 'Driver ROS 2 fora do ar',
+    });
+    const carrierBefore = host.querySelector('[data-orbit-carrier]')!;
+    expect(dial().getAttribute('data-dial-state')).toBe('no-driver');
+    expect(host.querySelector('[data-perimeter-light="no-driver"]')!.getAttribute('data-beam-gap')).toBe('180');
+    expect(host.querySelector<HTMLElement>('[data-beam-gap-carrier]')!.style.transform).toBe('rotate(180deg)');
+
+    render({
+      ready: false,
+      blockedCode: 'link',
+      blockedShort: 'Sem enlace',
+      blockedReason: 'Conecte-se à rede da aeronave para liberar o comando',
+    });
+    expect(host.querySelector('[data-orbit-carrier]')).toBe(carrierBefore);
+    expect(dial().getAttribute('data-dial-state')).toBe('blocked');
+    expect(host.querySelector('[data-perimeter-light="blocked"]')!.getAttribute('data-beam-gap')).toBe('105');
+    expect(host.querySelector<HTMLElement>('[data-beam-gap-carrier]')!.style.transform).toBe('rotate(105deg)');
+
+    render({
+      ready: false,
+      blockedCode: 'topics',
+      blockedShort: 'Sem tópicos',
+      blockedReason: 'Tópicos sem tráfego: /bebop/odom',
+    });
+    expect(host.querySelector('[data-orbit-carrier]')).toBe(carrierBefore);
+    expect(host.querySelector('[data-perimeter-light="blocked"]')!.getAttribute('data-beam-gap')).toBe('70');
+    expect(host.querySelector<HTMLElement>('[data-beam-gap-carrier]')!.style.transform).toBe('rotate(70deg)');
+    expect(host.querySelector('[data-beam-secondary]')!.className).toContain('dial-beam-converging');
+
+    render({ ready: true });
+    expect(host.querySelector('[data-orbit-carrier]')).toBe(carrierBefore);
+    expect(dial().getAttribute('data-dial-state')).toBe('ready');
+    expect(host.querySelector('[data-perimeter-light="ready"]')!.getAttribute('data-beam-gap')).toBe('0');
+    expect(host.querySelector<HTMLElement>('[data-beam-gap-carrier]')!.style.transform).toBe('rotate(0deg)');
+    expect(host.querySelector('[data-ready-halo]')!.className).toContain('opacity-100');
+  });
+
+  it('with a view it shows a large percent, a larger legible step label, and no inner radar or scan overlays', () => {
+    render({ view: view({ percent: 37, stepId: 'imu', label: 'IMU' }) });
+    const pct = host.querySelector('[data-percent]')!;
+    expect(pct.textContent).toBe('37%');
+    expect(pct.className).toContain('text-5xl');
+    const stepLabel = host.querySelector('[data-step-label]:not([data-leaving])')!;
+    expect(stepLabel.textContent).toBe('IMU');
+    expect(stepLabel.className).toContain('text-xl');
+    expect(stepLabel.className).toContain('t-texts-reveal');
+    expect(stepLabel.querySelectorAll('.t-reveal-item').length).toBe(3);
+    expect(host.querySelector('[data-dial-circle-fill]')).toBeNull();
+    expect(host.querySelector('.dial-fill-sector')).toBeNull();
+    expect(host.querySelector('.dial-fill-horizon')).toBeNull();
+  });
+
+  it('at announcing it shows "Tudo Pronto!" and 90 or more', () => {
+    render({ view: view({ phase: 'announcing', percent: 92, stepId: null, label: null, message: 'Tudo Pronto!' }) });
+    expect(host.querySelector('[data-step-label]:not([data-leaving])')!.textContent).toBe('Tudo Pronto!');
+    expect(Number(ring().getAttribute('data-progress'))).toBeGreaterThanOrEqual(90);
+  });
+
+  it('smoothly transitions into a proportional perimeter light during launch progression', () => {
+    render({ view: view({ percent: 45, stepId: 'imu', label: 'IMU' }) });
+    expect(dial().getAttribute('data-dial-state')).toBe('running');
+    const fillLight = host.querySelector<HTMLElement>('[data-dial-fill-light]')!;
+    expect(fillLight.getAttribute('data-fill-progress')).toBe('45');
+    expect(fillLight.className).toContain('opacity-100');
+    expect(host.querySelector('[data-dial-perimeter-fill]')).not.toBeNull();
+  });
+
+  it('the ring offset follows the percent', () => {
+    render({ view: view({ percent: 25 }) });
+    expect(ring().getAttribute('data-progress')).toBe('25');
+    const circle = host.querySelector<SVGCircleElement>('circle[data-progress-arc]')!;
+    const length = Number(circle.getAttribute('stroke-dasharray'));
+    expect(Number(circle.getAttribute('stroke-dashoffset'))).toBeCloseTo(length * 0.75, 3);
+    render();
+    expect(ring().getAttribute('data-progress')).toBe('0');
+  });
+
+  it('step label changes with text-states-swap enter and leave animation', () => {
+    render({ view: view({ stepId: 'params', label: 'Parâmetros' }) });
+    render({ view: view({ stepId: 'link', label: 'Enlace', percent: 10 }) });
+    const leaving = host.querySelector('[data-step-label][data-leaving]');
+    expect(leaving?.textContent).toBe('Parâmetros');
+    expect(leaving?.className).toContain('anim-step-out');
+    expect(leaving?.className).toContain('t-text-swap-out');
+    const entering = host.querySelector('[data-step-label]:not([data-leaving])')!;
+    expect(entering.className).toContain('anim-step-in');
+    expect(entering.className).toContain('t-text-swap-in');
     act(() => {
+      vi.advanceTimersByTime(200);
+    });
+    expect(host.querySelector('[data-step-label][data-leaving]')).toBeNull();
+  });
+
+  it('announces the step, never the percent, to assistive technology', () => {
+    render({ view: view({ percent: 37, stepId: 'imu', label: 'IMU' }) });
+    const live = host.querySelector('[aria-live="polite"]')!;
+    expect(live.textContent).toBe('IMU');
+  });
+
+  it('is not clickable while a view is active', () => {
+    const props = render({ view: view({ percent: 10 }) });
+    act(() => dial().click());
+    expect(props.onLaunch).not.toHaveBeenCalled();
+  });
+
+  it('a double activation within 1 s launches once', () => {
+    const props = render();
+    act(() => {
+      dial().click();
+      dial().click();
+    });
+    expect(props.onLaunch).toHaveBeenCalledTimes(1);
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    act(() => dial().click());
+    expect(props.onLaunch).toHaveBeenCalledTimes(2);
+  });
+
+  it('bench theme keeps the cyan ring', () => {
+    render({ benchMode: true, view: view({ percent: 40 }) });
+    expect(host.querySelector('circle[data-progress-arc]')!.getAttribute('stroke')).toBe('#00E5FF');
+    render({ benchMode: false, view: view({ percent: 40 }) });
+    expect(host.querySelector('circle[data-progress-arc]')!.getAttribute('stroke')).toBe('#01D5A3');
+  });
+
+  it('renders the beneath slot after the dial', () => {
+    act(() =>
       root.render(
         <LaunchDial
-          ready={true}
+          view={null}
+          ready
+          blockedShort={null}
           blockedReason={null}
+          errorShort={null}
           benchMode={false}
           onLaunch={() => undefined}
-          above={<div data-testid="mode-slot">modo</div>}
+          beneath={<span data-slot>x</span>}
         />
-      );
-    });
-    const slot = host.querySelector('[data-testid="mode-slot"]')!;
-    const button = host.querySelector('button')!;
-    expect(slot.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      )
+    );
+    expect(dial().compareDocumentPosition(host.querySelector('[data-slot]')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

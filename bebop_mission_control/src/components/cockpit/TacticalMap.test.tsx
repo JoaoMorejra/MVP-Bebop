@@ -49,28 +49,23 @@ function render(track: TrackPoint[]) {
   );
 }
 
-const baseLabel = () =>
-  Array.from(container.querySelectorAll('text')).find((t) => t.textContent === 'BASE · DECOLAGEM (0, 0)')!;
+const baseMarker = () => container.querySelector('[data-base-marker]')!;
 const tilePositions = () =>
   Array.from(container.querySelectorAll('img')).map((img) => `${img.style.left}|${img.style.top}|${img.src}`);
-const scaleLabel = () =>
-  Array.from(container.querySelectorAll('svg text'))
-    .map((t) => t.textContent ?? '')
-    .find((text) => /^\d+ (m|cm)$/.test(text));
+const scaleLabel = () => container.querySelector('svg text[data-scale-label]')?.textContent ?? undefined;
 const zoomInDisabled = () => (container.querySelector('[aria-label="Aproximar o mapa"]') as HTMLButtonElement).disabled;
 
 describe('TacticalMap anchored at the site', () => {
-  it('keeps the basemap, the scale and the base label still while the aircraft flies away', () => {
+  it('keeps the basemap, the scale and the base still while the aircraft flies away', () => {
     render([point(0, 0)]);
-    const before = { tiles: tilePositions(), x: baseLabel().getAttribute('x'), y: baseLabel().getAttribute('y') };
+    const before = { tiles: tilePositions(), base: baseMarker().getAttribute('transform') };
     const scaleBefore = scaleLabel();
     expect(scaleBefore).toBeDefined();
     expect(before.tiles.length).toBeGreaterThan(0);
 
     render([point(0, 0), point(40, 25), point(180, -120)]);
     expect(tilePositions()).toEqual(before.tiles);
-    expect(baseLabel().getAttribute('x')).toBe(before.x);
-    expect(baseLabel().getAttribute('y')).toBe(before.y);
+    expect(baseMarker().getAttribute('transform')).toBe(before.base);
     expect(scaleLabel()).toBe(scaleBefore);
     expect(zoomInDisabled()).toBe(false);
   });
@@ -78,9 +73,8 @@ describe('TacticalMap anchored at the site', () => {
   it('draws the aircraft at the base at rest and away from it in flight', () => {
     render([point(0, 0)]);
     const marker = () => container.querySelector('[data-aircraft]')!.getAttribute('transform');
-    const label = baseLabel();
     const atRest = marker();
-    expect(atRest).toBe(`translate(${label.getAttribute('x')}, ${Number(label.getAttribute('y')) - 27})`);
+    expect(atRest).toBe(baseMarker().getAttribute('transform'));
     render([point(0, 0), point(30, 0)]);
     expect(marker()).not.toBe(atRest);
   });
@@ -259,6 +253,31 @@ describe('TacticalMap zoom', () => {
     expect(scaleLabel()).toBe(initial);
   });
 
+  it('scale legend updates when the zoom buttons are pressed', () => {
+    render([point(0, 0)]);
+    while (!button('Afastar o mapa').disabled) click('Afastar o mapa');
+    const labels = [scaleLabel()];
+    while (!button('Aproximar o mapa').disabled) {
+      click('Aproximar o mapa');
+      labels.push(scaleLabel());
+    }
+    expect(labels.length).toBe((MAX_DISPLAY_ZOOM - MIN_DISPLAY_ZOOM) / ZOOM_STEP + 1);
+    expect(labels.every((label) => typeof label === 'string' && !label.includes('NaN'))).toBe(true);
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
+  it('scale legend never repeats between two adjacent wheel steps', () => {
+    render([point(0, 0)]);
+    let previous = scaleLabel();
+    for (let i = 0; i < 12; i += 1) {
+      fire(host(), new WheelEvent('wheel', { deltaY: -50, bubbles: true, cancelable: true }));
+      const next = scaleLabel();
+      if (button('Aproximar o mapa').disabled && next === previous) break;
+      expect(next).not.toBe(previous);
+      previous = next;
+    }
+  });
+
   it('does not cap overzoomed tiles at the panel width', () => {
     render([point(0, 0)]);
     while (!button('Aproximar o mapa').disabled) click('Aproximar o mapa');
@@ -331,5 +350,70 @@ describe.skipIf(!HAS_MANIFEST)('TacticalMap against public/tiles/manifest.json (
 
   it('serves up to the manifest maxZoom', () => {
     expect(TILE_SOURCES[0].maxZoom).toBe(manifest().maxZoom);
+  });
+});
+
+describe('TacticalMap frame and aircraft', () => {
+  it('has no border and no title, and lays the legend over the map', () => {
+    render([point(0, 0)]);
+    const panel = container.firstElementChild as HTMLElement;
+    expect(panel.className).not.toMatch(/\bborder\b/);
+    expect(container.textContent).not.toContain('MAPA TÁTICO');
+    const legend = container.querySelector('[data-map-legend]')!;
+    expect(legend.className).toContain('absolute');
+    expect(legend.parentElement!.querySelector('svg')).not.toBeNull();
+  });
+
+  it('turns the aircraft to the compass heading', () => {
+    act(() => root.render(<TacticalMap track={[point(0, 0)]} heading={90} arrivalRadius={0.2} stale={false} flyingState={null} />));
+    expect(container.querySelector('[data-drone-marker]')!.getAttribute('transform')).toBe('rotate(90)');
+    act(() => root.render(<TacticalMap track={[point(0, 0)]} heading={-30} arrivalRadius={0.2} stale={false} flyingState={null} />));
+    expect(container.querySelector('[data-drone-marker]')!.getAttribute('transform')).toBe('rotate(330)');
+  });
+
+  it('spins the rotors only while the aircraft reports flying', () => {
+    act(() => root.render(<TacticalMap track={[point(0, 0)]} heading={0} arrivalRadius={0.2} stale={false} flyingState={0} />));
+    expect(container.querySelector('[data-drone-marker]')!.hasAttribute('data-spinning')).toBe(false);
+    act(() => root.render(<TacticalMap track={[point(0, 0)]} heading={0} arrivalRadius={0.2} stale={false} flyingState={2} />));
+    expect(container.querySelector('[data-drone-marker]')!.hasAttribute('data-spinning')).toBe(true);
+  });
+
+  it('traces a subtle minimalist line from the home marker along the flown path', () => {
+    render([point(0, 0)]);
+    expect(container.querySelector('[data-flight-trail]')).toBeNull();
+
+    render([point(0, 0), point(30, 0), point(30, 20)]);
+    const trails = container.querySelectorAll('[data-flight-trail]');
+    expect(trails).toHaveLength(1);
+    const trail = trails[0];
+    const d = trail.getAttribute('d') ?? '';
+    expect(d).toMatch(/^M 320\.0 160\.0 L \d+\.\d \d+\.\d L \d+\.\d \d+\.\d$/);
+    expect(Number(trail.getAttribute('stroke-width'))).toBeLessThanOrEqual(2);
+    expect(Number(trail.getAttribute('stroke-opacity'))).toBeLessThanOrEqual(0.5);
+
+    render([point(30, 0)]);
+    expect(container.querySelector('[data-flight-trail]')?.getAttribute('d')).toMatch(/^M 320\.0 160\.0 L \d+\.\d \d+\.\d$/);
+  });
+});
+
+describe('TacticalMap base and zoom', () => {
+  it('marks the base without a text label', () => {
+    render([point(0, 0)]);
+    expect(container.querySelector('[data-base-marker]')).not.toBeNull();
+    expect(container.textContent).not.toContain('BASE · DECOLAGEM');
+  });
+
+  it('draws no glow under the aircraft', () => {
+    render([point(0, 0)]);
+    expect(container.querySelector('[data-aircraft] circle')).toBeNull();
+    expect(container.querySelector('radialGradient')).toBeNull();
+  });
+
+  it('centres the zoom control on the map\'s height, at the right edge', () => {
+    render([point(0, 0)]);
+    const zoom = container.querySelector('[data-map-zoom]') as HTMLElement;
+    expect(zoom.className).toContain('top-1/2');
+    expect(zoom.className).toContain('-translate-y-1/2');
+    expect(zoom.className).toContain('right-2');
   });
 });

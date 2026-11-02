@@ -6,7 +6,6 @@ import { completeDocument } from '../../lib/__fixtures__/missionDocument';
 import { getPath, setPath } from '../../lib/paths';
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { ParameterSheet } from './ParameterSheet';
-import { FavoritesMenu, relativeDate } from './FavoritesMenu';
 import {
   LEGACY_PRESET_NAME,
   MAX_PRESETS,
@@ -23,7 +22,6 @@ import {
   type OperatorPreset,
 } from '../../lib/operatorPresets';
 import { MODE_OWNED_PATHS, presetKey } from '../../lib/parameterModes';
-import { DiscardChangesDialog } from './DiscardChangesDialog';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -150,182 +148,63 @@ describe('operator favourites (lib)', () => {
   });
 });
 
-describe('FavoritesMenu', () => {
-  const list = () => saved(saved([], 'Pista A', tuned()), 'Pista B', tuned());
-  const trigger = () => Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.startsWith('Favoritos'))!;
-  const byLabel = (label: string) => container.querySelector(`[aria-label="${label}"]`) as HTMLElement;
-  const press = (key: string) =>
-    act(() => {
-      container.querySelector('[role="dialog"]')!.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
-    });
-
-  const renderMenu = (presets: OperatorPreset[], active: string | null = null, handlers: Partial<Record<string, unknown>> = {}) => {
+describe('ParameterSheet favourite', () => {
+  const sheet = (overrides: Partial<React.ComponentProps<typeof ParameterSheet>> = {}) => {
     const props = {
-      presets,
-      activePresetId: active,
-      onSave: vi.fn(() => null),
-      onApply: vi.fn(),
-      onRename: vi.fn(() => null),
-      onDelete: vi.fn(),
-      now: () => NOW,
-      ...handlers,
+      working: tuned(),
+      defaults: tuned(),
+      changedPaths: new Set<string>(),
+      dirty: false,
+      saving: false,
+      favoriteActive: false,
+      hasFavorite: false,
+      onEdit: vi.fn(),
+      onSave: () => undefined,
+      onDiscard: () => undefined,
+      onSaveFavorite: vi.fn(),
+      onRestoreFavorite: vi.fn(),
+      ...overrides,
     };
-    act(() => root.render(<FavoritesMenu {...(props as React.ComponentProps<typeof FavoritesMenu>)} />));
+    act(() => root.render(<ParameterSheet {...props} />));
     return props;
   };
+  const star = () => container.querySelector<HTMLButtonElement>('button[aria-label="Salvar como favorito"]')!;
+  const restore = () =>
+    Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.includes('Restaurar Padrões'))!;
 
-  it('counts the favourites and opens a labelled panel, marking the active one', () => {
-    const presets = list();
-    renderMenu(presets, presets[1].id);
-    expect(trigger().textContent).toBe('Favoritos (2)');
-    expect(trigger().getAttribute('aria-expanded')).toBe('false');
-    act(() => trigger().click());
-    expect(trigger().getAttribute('aria-expanded')).toBe('true');
-    expect(container.querySelector('[role="dialog"]')!.getAttribute('aria-label')).toBe('Favoritos deste modo');
-    const items = Array.from(container.querySelectorAll('[data-favorite]'));
-    expect(items.map((item) => item.getAttribute('aria-current'))).toEqual([null, 'true']);
-    expect(container.textContent).toContain('agora');
-    expect(trigger().querySelector('[data-preset-star]')!.getAttribute('data-preset-star')).toBe('filled');
+  it('the star is outlined without a favorite and filled when the working values match it', () => {
+    sheet();
+    expect(star().getAttribute('aria-pressed')).toBe('false');
+    expect(star().getAttribute('data-filled')).toBe('false');
+    sheet({ hasFavorite: true, favoriteActive: false });
+    expect(star().getAttribute('aria-pressed')).toBe('false');
+    sheet({ hasFavorite: true, favoriteActive: true });
+    expect(star().getAttribute('aria-pressed')).toBe('true');
+    expect(star().getAttribute('data-filled')).toBe('true');
   });
 
-  it('applies a favourite and closes', () => {
-    const presets = list();
-    const props = renderMenu(presets);
-    act(() => trigger().click());
-    act(() => byLabel('Aplicar Pista B').click());
-    expect(props.onApply).toHaveBeenCalledWith(presets[1].id);
-    expect(container.querySelector('[role="dialog"]')).toBeNull();
+  it('clicking the star calls onSaveFavorite', () => {
+    const props = sheet();
+    act(() => star().click());
+    expect(props.onSaveFavorite).toHaveBeenCalledTimes(1);
   });
 
-  it('saves the current values under a typed name, showing a refusal', () => {
-    const onSave = vi.fn((name: string) => (name === 'Pista A' ? 'Já existe um favorito com esse nome neste modo.' : null));
-    renderMenu(list(), null, { onSave });
-    act(() => trigger().click());
-    const saveButton = Array.from(container.querySelectorAll('button')).find((b) => b.textContent === 'Salvar configuração atual')!;
-    act(() => saveButton.click());
-    const field = byLabel('Nome do favorito') as HTMLInputElement;
-    const type = (value: string) =>
-      act(() => {
-        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
-        setter.call(field, value);
-        field.dispatchEvent(new Event('input', { bubbles: true }));
-      });
-    type('Pista A');
-    act(() => field.form!.requestSubmit());
-    expect(container.querySelector('[role="alert"]')!.textContent).toMatch(/Já existe/);
-    type('Pista C');
-    act(() => field.form!.requestSubmit());
-    expect(onSave).toHaveBeenLastCalledWith('Pista C');
-    expect(container.querySelector('[role="alert"]')).toBeNull();
+  it('Restaurar Padrões calls onRestoreFavorite when a favorite exists, and falls back to factory defaults otherwise', () => {
+    const withFavorite = sheet({ hasFavorite: true });
+    act(() => restore().click());
+    expect(withFavorite.onRestoreFavorite).toHaveBeenCalledTimes(1);
+    expect(withFavorite.onEdit).not.toHaveBeenCalled();
+
+    const factory = sheet({ hasFavorite: false });
+    act(() => restore().click());
+    expect(factory.onRestoreFavorite).not.toHaveBeenCalled();
+    expect(factory.onEdit).toHaveBeenCalled();
   });
 
-  it('asks before deleting', () => {
-    const presets = list();
-    const props = renderMenu(presets);
-    act(() => trigger().click());
-    act(() => byLabel('Excluir Pista A').click());
-    expect(props.onDelete).not.toHaveBeenCalled();
-    expect(container.textContent).toContain('Excluir “Pista A”?');
-    const confirm = Array.from(container.querySelectorAll('button')).find((b) => b.textContent === 'Excluir')!;
-    act(() => confirm.click());
-    expect(props.onDelete).toHaveBeenCalledWith(presets[0].id);
-  });
-
-  it('renames in place', () => {
-    const presets = list();
-    const props = renderMenu(presets);
-    act(() => trigger().click());
-    act(() => byLabel('Renomear Pista A').click());
-    const field = byLabel('Novo nome de Pista A') as HTMLInputElement;
-    expect(field.value).toBe('Pista A');
-    act(() => field.form!.requestSubmit());
-    expect(props.onRename).toHaveBeenCalledWith(presets[0].id, 'Pista A');
-  });
-
-  it('moves between favourites with the arrow keys and closes on Escape, back on the trigger', () => {
-    renderMenu(list());
-    act(() => trigger().click());
-    expect(document.activeElement).toBe(byLabel('Aplicar Pista A'));
-    press('ArrowDown');
-    expect(document.activeElement).toBe(byLabel('Aplicar Pista B'));
-    press('ArrowDown');
-    expect(document.activeElement).toBe(byLabel('Aplicar Pista A'));
-    press('Escape');
-    expect(container.querySelector('[role="dialog"]')).toBeNull();
-    expect(document.activeElement).toBe(trigger());
-  });
-
-  it('disables saving at the limit of 12', () => {
-    let presets: OperatorPreset[] = [];
-    for (let i = 0; i < MAX_PRESETS; i += 1) presets = saved(presets, `F${i}`, tuned());
-    renderMenu(presets);
-    act(() => trigger().click());
-    const saveButton = Array.from(container.querySelectorAll('button')).find((b) => b.textContent === 'Salvar configuração atual')!;
-    expect((saveButton as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  it('dates a favourite relative to now', () => {
-    expect(relativeDate('2026-10-21T11:55:00Z', NOW)).toBe('há 5 min');
-    expect(relativeDate('2026-10-21T09:00:00Z', NOW)).toBe('há 3 h');
-    expect(relativeDate('2026-10-18T12:00:00Z', NOW)).toBe('há 3 dias');
-  });
-});
-
-describe('ParameterSheet', () => {
-  it('replaces the single preset with the favourites menu and no longer shows the config file name', () => {
-    act(() =>
-      root.render(
-        <ParameterSheet
-          working={tuned()}
-          defaults={tuned()}
-          changedPaths={new Set()}
-          dirty={false}
-          saving={false}
-          presets={[]}
-          activePresetId={null}
-          onEdit={() => undefined}
-          onSave={() => undefined}
-          onDiscard={() => undefined}
-          onSavePreset={() => null}
-          onRenamePreset={() => null}
-          onDeletePreset={() => undefined}
-          onApplyPreset={() => undefined}
-        />
-      )
-    );
-    expect(container.textContent).toContain('Favoritos (0)');
+  it('has no favourites menu and no config file name', () => {
+    sheet();
+    expect(container.textContent).not.toContain('Favoritos');
     expect(container.textContent).not.toContain('Meu ajuste');
     expect(container.textContent).not.toContain('mission_config.json');
-  });
-});
-
-describe('DiscardChangesDialog', () => {
-  it('asks the exact question and focuses the safe answer', () => {
-    act(() => root.render(<DiscardChangesDialog onConfirm={() => undefined} onCancel={() => undefined} />));
-    expect(container.textContent).toContain('As alterações não salvas serão descartadas. Deseja continuar?');
-    expect(document.activeElement?.textContent).toBe('Continuar editando');
-  });
-
-  it('discards only on the explicit confirm', () => {
-    const onConfirm = vi.fn();
-    const onCancel = vi.fn();
-    act(() => root.render(<DiscardChangesDialog onConfirm={onConfirm} onCancel={onCancel} />));
-    const [keep, discard] = Array.from(container.querySelectorAll('button'));
-
-    act(() => keep.click());
-    expect(onCancel).toHaveBeenCalledTimes(1);
-    expect(onConfirm).not.toHaveBeenCalled();
-
-    act(() => discard.click());
-    expect(onConfirm).toHaveBeenCalledTimes(1);
-  });
-
-  it('treats Escape as keep editing', () => {
-    const onCancel = vi.fn();
-    act(() => root.render(<DiscardChangesDialog onConfirm={() => undefined} onCancel={onCancel} />));
-    act(() => {
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
-    });
-    expect(onCancel).toHaveBeenCalledTimes(1);
   });
 });

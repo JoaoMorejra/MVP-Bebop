@@ -35,15 +35,12 @@ function render(working: Record<string, unknown>, defaults: Record<string, unkno
         changedPaths={new Set()}
         dirty={false}
         saving={false}
-        presets={[]}
-        activePresetId={null}
+        favoriteActive={false}
+        hasFavorite={false}
         onEdit={onEdit}
         onSave={() => undefined}
-        onDiscard={() => undefined}
-        onSavePreset={() => null}
-          onRenamePreset={() => null}
-          onDeletePreset={() => undefined}
-        onApplyPreset={() => undefined}
+        onSaveFavorite={() => undefined}
+        onRestoreFavorite={() => undefined}
       />
     )
   );
@@ -111,15 +108,12 @@ describe('ParameterSheet launch refusal', () => {
           changedPaths={new Set()}
           dirty={false}
           saving={false}
-          presets={[]}
-          activePresetId={null}
+          favoriteActive={false}
+          hasFavorite={false}
           onEdit={() => undefined}
           onSave={() => undefined}
-          onDiscard={() => undefined}
-          onSavePreset={() => null}
-          onRenamePreset={() => null}
-          onDeletePreset={() => undefined}
-          onApplyPreset={() => undefined}
+            onSaveFavorite={() => undefined}
+          onRestoreFavorite={() => undefined}
           refusedPath="kinematics.target_altitude_m"
         />
       )
@@ -130,7 +124,7 @@ describe('ParameterSheet launch refusal', () => {
   });
 });
 
-describe('ParameterSheet advanced settings', () => {
+describe('ParameterSheet Pouso ArUco', () => {
   const pad = (overrides: Record<string, unknown> = {}) =>
     completeDocument({
       'rtl.target_aruco_id': 8,
@@ -139,54 +133,69 @@ describe('ParameterSheet advanced settings', () => {
       'rtl.centering_timeout_sec': 25,
       ...overrides,
     });
-  const dialog = () => document.querySelector('[role="dialog"][aria-labelledby="advanced-settings-title"]');
-  const field = (label: string) => dialog()!.querySelector(`[aria-label="${label}"]`) as HTMLInputElement | HTMLSelectElement;
-  const dialogButton = (label: string) =>
-    Array.from(dialog()!.querySelectorAll('button')).find((b) => b.textContent?.includes(label))!;
-  const setValue = (input: HTMLInputElement | HTMLSelectElement, value: string) => {
-    const proto = input instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(input, value);
-    input.dispatchEvent(new Event(input instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }));
+  const section = () => container.querySelector('[data-section="aruco"]');
+  const range = (path: string) => container.querySelector(`[data-parameter="${path}"] input[type="range"]`) as HTMLInputElement;
+  const slide = (input: HTMLInputElement, value: string) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  const figure = (path: string) => container.querySelector(`[data-parameter="${path}"] .exact-field input`) as HTMLInputElement;
+  const type = (path: string, value: string) => {
+    const input = figure(path);
+    act(() => input.focus());
+    act(() => slide(input, value));
+    act(() => input.blur());
   };
 
-  it('opens from the footer next to the preset button', () => {
+  it('lays the pad marker fields on the sheet, with no separate Aruco button or dialog', () => {
     render(pad(), null);
-    expect(dialog()).toBeNull();
-    act(() => button('Configurações Avançadas').click());
-    expect(dialog()).not.toBeNull();
-    expect(dialog()!.textContent).toContain('IDs válidos: 0 a 586');
+    expect(section()).not.toBeNull();
+    expect(section()!.querySelector('h3')?.textContent).toBe('Pouso ArUco');
+    const paths = Array.from(section()!.querySelectorAll('[data-parameter]')).map((n) => n.getAttribute('data-parameter'));
+    expect(paths).toEqual(['rtl.target_aruco_id', 'rtl.tag_size', 'rtl.centering_timeout_sec']);
+    expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Aruco')).toBe(false);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it('does not offer the dictionary, and bounds the ID by the one the document holds', () => {
+    render(pad(), null);
+    expect(container.textContent).not.toContain('Dicionário');
+    expect(container.querySelector('[data-parameter="rtl.marker_dict"]')).toBeNull();
+    const onEdit = render(pad(), null);
+    type('rtl.target_aruco_id', '999');
+    expect(onEdit).toHaveBeenLastCalledWith('rtl.target_aruco_id', 586);
+    const small = render(pad({ 'rtl.marker_dict': 'DICT_4X4_50' }), null);
+    type('rtl.target_aruco_id', '999');
+    expect(small).toHaveBeenLastCalledWith('rtl.target_aruco_id', 49);
+  });
+
+  it('offers the ID and the tag size as typed or scrubbed figures, without a slider', () => {
+    render(pad(), null);
+    for (const path of ['rtl.target_aruco_id', 'rtl.tag_size']) {
+      expect(range(path)).toBeNull();
+      expect(container.querySelector(`[data-parameter="${path}"] .exact-field`)!.hasAttribute('data-scrub')).toBe(true);
+    }
+    expect(range('rtl.centering_timeout_sec')).not.toBeNull();
   });
 
   it('writes each field straight to the working document', () => {
     const onEdit = render(pad(), null);
-    act(() => button('Configurações Avançadas').click());
-    act(() => setValue(field('ID do marcador'), '12'));
+    type('rtl.target_aruco_id', '12');
     expect(onEdit).toHaveBeenLastCalledWith('rtl.target_aruco_id', 12);
-    act(() => setValue(field('Dicionário do marcador'), 'DICT_4X4_50'));
-    expect(onEdit).toHaveBeenLastCalledWith('rtl.marker_dict', 'DICT_4X4_50');
-    act(() => setValue(field('Tamanho da tag'), '0.175'));
+    type('rtl.tag_size', '0,175');
     expect(onEdit).toHaveBeenLastCalledWith('rtl.tag_size', 0.175);
-    act(() => dialogButton('0.16').click());
-    expect(onEdit).toHaveBeenLastCalledWith('rtl.tag_size', 0.16);
-    act(() => setValue(field('Janela de centragem'), '40'));
+    act(() => slide(range('rtl.centering_timeout_sec'), '40'));
     expect(onEdit).toHaveBeenLastCalledWith('rtl.centering_timeout_sec', 40);
   });
 
-  it('shows an ID outside the chosen dictionary as an error without correcting it', () => {
-    const onEdit = render(pad({ 'rtl.marker_dict': 'DICT_4X4_50', 'rtl.target_aruco_id': 50 }), null);
-    act(() => button('Configurações Avançadas').click());
-    expect(dialog()!.textContent).toContain('IDs válidos: 0 a 49');
-    expect(dialog()!.querySelector('[data-field-error="rtl.target_aruco_id"]')).not.toBeNull();
-    expect(onEdit).not.toHaveBeenCalled();
+  it('marks an ID outside the dictionary as an error and keeps Salvar shut', () => {
+    render(pad({ 'rtl.marker_dict': 'DICT_4X4_50', 'rtl.target_aruco_id': 50 }), null);
+    const id = container.querySelector('[data-parameter="rtl.target_aruco_id"]')!;
+    expect(id.getAttribute('data-conflict')).toBe('error');
+    expect(container.querySelector('[data-save-phase]')!.hasAttribute('data-blocked')).toBe(true);
   });
 
-  it('shows a dictionary the sheet does not list as not recognised', () => {
-    render(pad({ 'rtl.marker_dict': 5 }), null);
-    act(() => button('Configurações Avançadas').click());
-    expect(dialog()!.textContent).toContain('não reconhecido pela ficha');
-  });
-
-  it('restores the advanced fields from the mission defaults only from inside the dialog', () => {
+  it('restores the pad marker fields with every other field', () => {
     const defaults = pad({
       'rtl.target_aruco_id': 3,
       'rtl.marker_dict': 'DICT_5X5_100',
@@ -195,33 +204,14 @@ describe('ParameterSheet advanced settings', () => {
     });
     const onEdit = render(pad({ 'rtl.target_aruco_id': 30 }), defaults);
     act(() => button('Restaurar Padrões').click());
-    expect(onEdit.mock.calls.map((call) => call[0])).not.toContain('rtl.target_aruco_id');
-    onEdit.mockClear();
-    act(() => button('Configurações Avançadas').click());
-    act(() => dialogButton('Restaurar padrões avançados').click());
-    expect(onEdit.mock.calls).toEqual([
-      ['rtl.target_aruco_id', 3],
-      ['rtl.marker_dict', 'DICT_5X5_100'],
-      ['rtl.tag_size', 0.15],
-      ['rtl.centering_timeout_sec', 30],
-    ]);
-  });
-
-  it('closes on Fechar and on Escape', () => {
-    render(pad(), null);
-    act(() => button('Configurações Avançadas').click());
-    act(() => dialogButton('Fechar').click());
-    expect(dialog()).toBeNull();
-    act(() => button('Configurações Avançadas').click());
-    act(() => {
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
-    });
-    expect(dialog()).toBeNull();
+    expect(onEdit).toHaveBeenCalledWith('rtl.target_aruco_id', 3);
+    expect(onEdit).toHaveBeenCalledWith('rtl.tag_size', 0.15);
+    expect(onEdit).toHaveBeenCalledWith('rtl.centering_timeout_sec', 30);
   });
 });
 
-describe('ParameterSheet conflicts on save', () => {
-  const sheet = (working: Record<string, unknown>, onSave = vi.fn(), saveAttempted = false) => {
+describe('ParameterSheet conflicts', () => {
+  const sheet = (working: Record<string, unknown>, onSave = vi.fn()) => {
     act(() =>
       root.render(
         <ParameterSheet
@@ -230,81 +220,56 @@ describe('ParameterSheet conflicts on save', () => {
           changedPaths={new Set(['kinematics.target_altitude_m'])}
           dirty
           saving={false}
-          presets={[]}
-          activePresetId={null}
-          saveAttempted={saveAttempted}
+          favoriteActive={false}
+          hasFavorite={false}
           onEdit={() => undefined}
           onSave={onSave}
-          onDiscard={() => undefined}
-          onSavePreset={() => null}
-          onRenamePreset={() => null}
-          onDeletePreset={() => undefined}
-          onApplyPreset={() => undefined}
+          onSaveFavorite={() => undefined}
+          onRestoreFavorite={() => undefined}
         />
       )
     );
     return onSave;
   };
-  const conflictDialog = () => document.querySelector('[aria-labelledby="parameter-conflict-title"]');
-  const dialogButton = (label: string) =>
-    Array.from(conflictDialog()?.querySelectorAll('button') ?? []).find((b) => b.textContent?.includes(label));
-  const save = () =>
-    act(() => Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Salvar')!.click());
-  const altitudeCard = () =>
-    container.querySelector('[data-parameter="kinematics.target_altitude_m"]') as HTMLElement;
+  const saveButton = () => container.querySelector('[data-save-phase]') as HTMLButtonElement;
+  const altitudeCard = () => container.querySelector('[data-parameter="kinematics.target_altitude_m"]') as HTMLElement;
   const low = () => validDocument({ 'platform.height_m': 1, 'kinematics.target_altitude_m': 1.25 });
 
-  it('refuses an inexecutable combination: explains it and does not save', () => {
+  it('keeps Salvar shut on an inexecutable combination, with no dialog', () => {
     const onSave = sheet(low());
-    save();
+    expect(saveButton().disabled).toBe(true);
+    expect(saveButton().hasAttribute('data-blocked')).toBe(true);
+    act(() => saveButton().click());
     expect(onSave).not.toHaveBeenCalled();
-    expect(conflictDialog()).not.toBeNull();
-    expect(conflictDialog()!.getAttribute('data-mode')).toBe('blocked');
-    expect(conflictDialog()!.textContent).toContain('Cota fora do envelope da superfície de decolagem');
-    expect(conflictDialog()!.textContent).toContain('Altitude de Voo');
-    expect(conflictDialog()!.textContent).toContain('1.25m');
-    expect(dialogButton('Salvar mesmo assim')).toBeUndefined();
-    act(() => dialogButton('Voltar e ajustar')!.click());
-    expect(conflictDialog()).toBeNull();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
   });
 
-  it('asks before saving a combination that only warns', () => {
+  it('marks the fields of an error at once, with the reason in data-conflict-reason and no hover title', () => {
+    sheet(low());
+    expect(altitudeCard().getAttribute('data-conflict')).toBe('error');
+    expect(altitudeCard().title).toBe('');
+    expect(altitudeCard().getAttribute('data-conflict-reason')).toContain('Cota fora do envelope da superfície de decolagem');
+    const envelopePaths = new Set(PARAMETER_GROUPS[0].items.map((item) => item.path));
+    const expected = PARAMETER_GROUPS[0].items.filter((item) =>
+      activeConflicts(low()).some((c) => c.severity === 'error' && c.paths.includes(item.path) && envelopePaths.has(item.path))
+    ).length;
+    expect(expected).toBeGreaterThan(0);
+    expect(container.querySelector('[data-group-conflicts="envelope"]')?.textContent).toBe(String(expected));
+  });
+
+  it('saves a combination that only warns straight away, with no warning shown', () => {
     const onSave = sheet(validDocument({ 'kinematics.countdown_sec': 4 }));
-    save();
-    expect(conflictDialog()!.getAttribute('data-mode')).toBe('confirm');
-    expect(onSave).not.toHaveBeenCalled();
-    act(() => dialogButton('Salvar mesmo assim')!.click());
+    act(() => saveButton().click());
     expect(onSave).toHaveBeenCalledTimes(1);
-    expect(conflictDialog()).toBeNull();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    sheet(validDocument({ 'kinematics.target_altitude_m': 0.1, 'kinematics.altitude_ceiling_margin_m': 0.9 }));
+    expect(altitudeCard().getAttribute('data-conflict')).toBeNull();
   });
 
   it('saves straight away without conflicts', () => {
     const onSave = sheet(validDocument());
-    save();
+    act(() => Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Salvar')!.click());
     expect(onSave).toHaveBeenCalledTimes(1);
-    expect(conflictDialog()).toBeNull();
-  });
-
-  it('marks the fields involved only after an attempt, and clears them once corrected', () => {
-    sheet(low());
-    expect(altitudeCard().getAttribute('data-conflict')).toBeNull();
-    save();
-    act(() => dialogButton('Voltar e ajustar')!.click());
-    expect(altitudeCard().getAttribute('data-conflict')).toBe('error');
-    const envelopePaths = new Set(PARAMETER_GROUPS[0].items.map((item) => item.path));
-    const expected = activeConflicts(low()).filter((c) => c.paths.some((path) => envelopePaths.has(path))).length;
-    expect(expected).toBeGreaterThan(0);
-    expect(container.querySelector('[data-group-conflicts="envelope"]')?.textContent).toBe(String(expected));
-
-    sheet(validDocument({ 'kinematics.target_altitude_m': 0.1, 'kinematics.altitude_ceiling_margin_m': 0.9 }));
-    expect(altitudeCard().getAttribute('data-conflict')).toBe('warning');
-    sheet(validDocument());
-    expect(altitudeCard().getAttribute('data-conflict')).toBeNull();
-  });
-
-  it('marks the fields after a refused save elsewhere, such as the launch', () => {
-    sheet(low(), vi.fn(), true);
-    expect(altitudeCard().getAttribute('data-conflict')).toBe('error');
   });
 });
 
@@ -320,7 +285,7 @@ describe('ParameterSheet by mission mode', () => {
     expect(text()).toContain('Velocidade de Deslocamento');
     expect(text()).toContain('Timeout de Retorno e Pouso ArUco');
     expect(text()).not.toContain('Velocidade de Giro');
-    expect(text()).toContain('Modo: Avançado');
+    expect(container.querySelector('h2')?.textContent).toBe('Avançado');
   });
 
   it('hides the return timeout and the turn rate in the advanced mode without the return', () => {
@@ -331,7 +296,7 @@ describe('ParameterSheet by mission mode', () => {
     expect(text()).not.toContain('Contagem Regressiva');
     expect(text()).toContain('Velocidade de Deslocamento');
     expect(text()).toContain('Gimbal & Câmera');
-    expect(text()).toContain('Modo: Avançado');
+    expect(container.querySelector('h2')?.textContent).toBe('Avançado');
   });
 
   it('swaps the cruise velocity for the turn rate in the simple mode', () => {
@@ -343,7 +308,7 @@ describe('ParameterSheet by mission mode', () => {
     expect(text()).toContain('Ângulo da Câmera Apontada para Baixo');
     expect(text()).toContain('Timeout de Procura/Varredura');
     expect(text()).not.toContain('Contagem Regressiva');
-    expect(text()).toContain('Modo: Simples');
+    expect(container.querySelector('h2')?.textContent).toBe('Simples');
     expect(text()).toContain('Margem do Teto de Altitude');
   });
 
@@ -354,29 +319,16 @@ describe('ParameterSheet by mission mode', () => {
     expect(text()).toContain('Margem do Teto de Altitude');
   });
 
-  it('offers the advanced settings only with the return, in both modes', () => {
-    const hasButton = () =>
-      Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.includes('Configurações Avançadas'));
+  it('offers the pad marker section only with the return, in both modes', () => {
+    const hasSection = () => container.querySelector('[data-section="aruco"]') !== null;
     render(withMode('advanced'), completeDocument());
-    expect(hasButton()).toBe(true);
+    expect(hasSection()).toBe(true);
     render(withMode('simple'), completeDocument());
-    expect(hasButton()).toBe(true);
+    expect(hasSection()).toBe(true);
     render(setPath(withMode('advanced'), 'rtl.enabled', false), completeDocument());
-    expect(hasButton()).toBe(false);
+    expect(hasSection()).toBe(false);
     render(setPath(withMode('simple'), 'rtl.enabled', false), completeDocument());
-    expect(hasButton()).toBe(false);
-  });
-
-  it('closes an open advanced dialog when the return is turned off', () => {
-    render(withMode('advanced'), completeDocument());
-    act(() => button('Configurações Avançadas').click());
-    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(container.textContent).toContain('Janela de centragem');
-    render(setPath(withMode('advanced'), 'rtl.enabled', false), completeDocument());
-    expect(container.querySelector('[role="dialog"]')).toBeNull();
-    expect(container.textContent).not.toContain('Janela de centragem');
-    render(withMode('advanced'), completeDocument());
-    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(hasSection()).toBe(false);
   });
 
   it('still restores every field, hidden ones included', () => {
@@ -394,18 +346,20 @@ describe('ParameterSheet launch surface and return plan', () => {
   const pad = (overrides: Record<string, unknown> = {}) =>
     completeDocument({ 'platform.height_m': 1, 'kinematics.target_altitude_m': 1.8, 'platform.venue_ceiling_agl_m': 2.5, ...overrides });
 
-  it('offers both booleans as labelled checkboxes that report a JSON boolean', () => {
+  it('offers the takeoff point as Solo or Totem and the return as a labelled switch', () => {
     const onEdit = render(pad(), completeDocument());
-    for (const path of ['platform.takeoff_from_ground', 'rtl.enabled']) {
-      const box = checkbox(path)!;
-      expect(box).not.toBeNull();
-      expect(box.labels?.[0]?.textContent).toMatch(path === 'rtl.enabled' ? /Retorno a base \(RTL\)/ : /Decolagem do Solo/);
-      expect(box.getAttribute('aria-describedby')).toBeTruthy();
-    }
-    expect(checkbox('rtl.enabled')!.checked).toBe(true);
-    act(() => checkbox('platform.takeoff_from_ground')!.click());
+    const point = card('platform.takeoff_from_ground')!;
+    expect(point.textContent).toContain('Ponto de Decolagem');
+    expect(point.textContent).not.toContain('Decolagem do Solo');
+    const radios = Array.from(point.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+    expect(radios.map((r) => r.labels?.[0]?.textContent)).toEqual(['Solo', 'Totem']);
+    expect(radios[1].checked).toBe(true);
+    act(() => radios[0].click());
     expect(onEdit).toHaveBeenCalledWith('platform.takeoff_from_ground', true);
-    act(() => checkbox('rtl.enabled')!.click());
+    const rtl = checkbox('rtl.enabled')!;
+    expect(rtl.labels?.[0]?.textContent).toMatch(/Retorno a base \(RTL\)/);
+    expect(rtl.checked).toBe(true);
+    act(() => rtl.click());
     expect(onEdit).toHaveBeenCalledWith('rtl.enabled', false);
   });
 
@@ -443,15 +397,6 @@ describe('ParameterSheet launch surface and return plan', () => {
     expect((margin.querySelector('input[type="range"]') as HTMLInputElement).disabled).toBe(false);
   });
 
-  it('shows the plan chips of the document', () => {
-    render(pad(), completeDocument());
-    expect(container.querySelector('[data-plan-chip="end"]')?.textContent).toBe('Final: RTL + pouso de precisão');
-    expect(container.querySelector('[data-plan-chip="surface"]')?.textContent).toBe('Decolagem: totem 1,00 m');
-    render(pad({ 'rtl.enabled': false, 'platform.takeoff_from_ground': true }), completeDocument());
-    expect(container.querySelector('[data-plan-chip="end"]')?.textContent).toBe('Final: pouso no local');
-    expect(container.querySelector('[data-plan-chip="surface"]')?.textContent).toBe('Decolagem: solo');
-  });
-
   it('shows the notice of an altitude the envelope moved', () => {
     act(() =>
       root.render(
@@ -461,15 +406,12 @@ describe('ParameterSheet launch surface and return plan', () => {
           changedPaths={new Set()}
           dirty={false}
           saving={false}
-          presets={[]}
-          activePresetId={null}
+          favoriteActive={false}
+          hasFavorite={false}
           onEdit={() => undefined}
           onSave={() => undefined}
-          onDiscard={() => undefined}
-          onSavePreset={() => null}
-          onRenamePreset={() => null}
-          onDeletePreset={() => undefined}
-          onApplyPreset={() => undefined}
+            onSaveFavorite={() => undefined}
+          onRestoreFavorite={() => undefined}
           altitudeNotice="Cota ajustada para 1,30 m: mínimo sobre o totem."
         />
       )
@@ -482,5 +424,192 @@ describe('ParameterSheet launch surface and return plan', () => {
     act(() => button('Restaurar Padrões').click());
     expect(onEdit).toHaveBeenCalledWith('rtl.enabled', true);
     expect(onEdit).toHaveBeenCalledWith('platform.takeoff_from_ground', false);
+  });
+});
+
+describe('ParameterSheet minimal layout', () => {
+  it('header shows only the mode name', () => {
+    render({ ...completeDocument(), mission_mode: 'advanced' }, completeDocument());
+    expect(container.querySelector('h2')?.textContent).toBe('Avançado');
+    expect(container.textContent).not.toContain('Os ajustes que definem');
+    expect(container.textContent).not.toContain('Modo:');
+    expect(container.textContent).not.toContain('Parâmetros de voo');
+    expect(container.querySelector('[data-plan-chips]')).toBeNull();
+  });
+
+  it('shows no help text', () => {
+    render(completeDocument(), completeDocument());
+    for (const spec of ALL_PARAMETERS) {
+      if (spec.hint) expect(container.textContent).not.toContain(spec.hint);
+    }
+    for (const group of PARAMETER_GROUPS) {
+      if (group.summary) expect(container.textContent).not.toContain(group.summary);
+    }
+    expect(container.textContent).not.toContain('A câmera desce do ângulo de varredura');
+    expect(container.querySelector('[data-gimbal-arc]')).toBeNull();
+  });
+
+  it('each number parameter is label, slider and numeric input', () => {
+    render(completeDocument(), completeDocument());
+    const card = container.querySelector('[data-parameter="kinematics.target_altitude_m"]')!;
+    const spec = ALL_PARAMETERS.find((item) => item.path === 'kinematics.target_altitude_m')!;
+    expect(card.textContent).toContain(spec.label);
+    expect(card.querySelector('input[type="range"]')).not.toBeNull();
+    expect(card.querySelector('input:not([type="range"])')).not.toBeNull();
+  });
+
+  it('each boolean parameter is label and checkbox', () => {
+    render(completeDocument(), completeDocument());
+    const card = container.querySelector('[data-parameter="rtl.enabled"]')!;
+    expect(card.querySelector('input[type="checkbox"]')).not.toBeNull();
+    expect(card.querySelector('[id$="-hint"]')).toBeNull();
+    expect(card.querySelector('input[type="checkbox"]')!.getAttribute('aria-describedby')).toBeNull();
+  });
+
+  it('names a missing value in one short line', () => {
+    render(completeDocument({ 'kinematics.target_altitude_m': null }), completeDocument());
+    const missing = container.querySelector('[data-missing-value="kinematics.target_altitude_m"]')!;
+    expect(missing.textContent).toContain('Valor ausente');
+    expect(missing.textContent).not.toContain('Restaure os padrões');
+  });
+});
+
+describe('ParameterSheet one-screen layout', () => {
+  it('draws the return as a switch with its state in one word, and the takeoff point as a choice', () => {
+    render(completeDocument({ 'rtl.enabled': true, 'platform.takeoff_from_ground': false }), completeDocument());
+    const rtl = container.querySelector('[data-parameter="rtl.enabled"]')!;
+    const surface = container.querySelector('[data-parameter="platform.takeoff_from_ground"]')!;
+    expect(rtl.querySelector('input[type="checkbox"]')!.getAttribute('role')).toBe('switch');
+    expect(rtl.querySelector('.param-state')?.textContent).toBe('Ativo');
+    expect(surface.querySelector('[role="radiogroup"]')!.getAttribute('data-choice')).toBe('second');
+  });
+
+  it('lays the envelope and the camera on top, the time limits and the pad marker below, with no camera drawing', () => {
+    render(completeDocument({ 'rtl.enabled': true }), completeDocument());
+    const sections = Array.from(container.querySelectorAll('[data-section]')).map((s) => s.getAttribute('data-section'));
+    expect(sections).toEqual(['envelope', 'gimbal', 'timeouts', 'aruco']);
+    expect(container.querySelector('[data-gimbal-arc]')).toBeNull();
+  });
+
+  it('says Tudo salvo inside the button when nothing is pending, and Salvar once something is', () => {
+    render(completeDocument(), completeDocument());
+    expect(container.querySelector('[data-save-phase]')!.textContent?.trim()).toBe('Tudo salvo');
+    expect(container.textContent).not.toContain('Descartar');
+    expect(container.textContent).not.toContain('sem salvar');
+  });
+
+  it('shows the figure large and editable in place', () => {
+    render(completeDocument(), completeDocument());
+    const altitude = container.querySelector('[data-parameter="kinematics.target_altitude_m"]')!;
+    expect(altitude.querySelector('.exact-field-display input')).not.toBeNull();
+  });
+});
+
+describe('ParameterSheet save states', () => {
+  const renderSave = (dirty: boolean, saving: boolean) =>
+    act(() =>
+      root.render(
+        <ParameterSheet
+          working={completeDocument()}
+          defaults={completeDocument()}
+          changedPaths={new Set(dirty ? ['kinematics.target_altitude_m'] : [])}
+          dirty={dirty}
+          saving={saving}
+          favoriteActive={false}
+          hasFavorite={false}
+          onEdit={() => undefined}
+          onSave={() => undefined}
+            onSaveFavorite={() => undefined}
+          onRestoreFavorite={() => undefined}
+        />
+      )
+    );
+  const phase = () => container.querySelector('[data-save-phase]')?.getAttribute('data-save-phase');
+
+  it('goes from Salvar to the bouncing dots to Salvo, then settles back', () => {
+    vi.useFakeTimers();
+    renderSave(true, false);
+    expect(phase()).toBe('idle');
+    renderSave(true, true);
+    expect(phase()).toBe('loading');
+    expect(container.querySelector('.save-dots')).not.toBeNull();
+    renderSave(false, false);
+    act(() => {
+      vi.advanceTimersByTime(800);
+    });
+    expect(phase()).toBe('done');
+    expect(container.querySelector('[data-save-phase]')?.textContent).toContain('Salvo');
+    act(() => {
+      vi.advanceTimersByTime(1600);
+    });
+    expect(phase()).toBe('idle');
+    vi.useRealTimers();
+  });
+
+  it('shakes Salvar on each nudge from the screen', () => {
+    const at = (nudge: number) =>
+      act(() =>
+        root.render(
+          <ParameterSheet
+            working={completeDocument()}
+            defaults={completeDocument()}
+            changedPaths={new Set(['kinematics.target_altitude_m'])}
+            dirty
+            saving={false}
+            favoriteActive={false}
+            hasFavorite={false}
+            onEdit={() => undefined}
+            onSave={() => undefined}
+            onSaveFavorite={() => undefined}
+            onRestoreFavorite={() => undefined}
+            nudgeSave={nudge}
+          />
+        )
+      );
+    at(0);
+    expect(container.querySelector('[data-save-phase]')!.classList.contains('is-shaking')).toBe(false);
+    at(1);
+    expect(container.querySelector('[data-save-phase]')!.classList.contains('is-shaking')).toBe(true);
+  });
+
+  it('returns to Salvar without the tick when the save left edits pending', () => {
+    vi.useFakeTimers();
+    renderSave(true, true);
+    renderSave(true, false);
+    act(() => {
+      vi.advanceTimersByTime(800);
+    });
+    expect(phase()).toBe('idle');
+    vi.useRealTimers();
+  });
+});
+
+describe('ParameterSheet close button', () => {
+  it('sits in the header, on the right, and asks the screen to close', () => {
+    const onClose = vi.fn();
+    act(() =>
+      root.render(
+        <ParameterSheet
+          working={completeDocument()}
+          defaults={completeDocument()}
+          changedPaths={new Set()}
+          dirty={false}
+          saving={false}
+          favoriteActive={false}
+          hasFavorite={false}
+          onEdit={() => undefined}
+          onSave={() => undefined}
+          onSaveFavorite={() => undefined}
+          onRestoreFavorite={() => undefined}
+          onClose={onClose}
+        />
+      )
+    );
+    const header = container.querySelector('[data-sheet-header]')!;
+    const close = header.querySelector<HTMLButtonElement>('button[aria-label="Fechar"]')!;
+    expect(close).not.toBeNull();
+    expect(header.lastElementChild).toBe(close);
+    act(() => close.click());
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

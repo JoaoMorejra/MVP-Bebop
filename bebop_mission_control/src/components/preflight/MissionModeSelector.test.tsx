@@ -22,85 +22,135 @@ afterEach(() => {
   host.remove();
 });
 
-const radios = () => Array.from(host.querySelectorAll<HTMLElement>('[role="radio"]'));
+const trigger = () => host.querySelector<HTMLButtonElement>('[aria-haspopup="listbox"]')!;
+const listbox = () => host.querySelector<HTMLElement>('[role="listbox"]');
+const options = () => Array.from(host.querySelectorAll<HTMLElement>('[role="option"]'));
 
 const press = (target: HTMLElement, key: string) =>
   act(() => {
     target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
   });
 
+const open = () => act(() => trigger().click());
+
 describe('MissionModeSelector', () => {
-  it('offers the two modes in order inside a radiogroup', () => {
+  it('shows the selected mode label on the trigger', () => {
     act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
-    expect(host.querySelector('[role="radiogroup"]')).not.toBeNull();
-    expect(radios().map((r) => r.textContent)).toEqual(['Simples', 'Avançado']);
+    expect(trigger().textContent).toBe('Avançado');
+    expect(listbox()).toBeNull();
   });
 
-  it('marks exactly the active mode', () => {
+  it('lists Simples, Avançado and Teste when opened', () => {
     act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
-    expect(radios().map((r) => r.getAttribute('aria-checked'))).toEqual(['false', 'true']);
+    open();
+    expect(listbox()).not.toBeNull();
+    expect(options().map((o) => o.textContent)).toEqual(['Simples', 'Avançado', 'Teste']);
+    expect(trigger().getAttribute('aria-expanded')).toBe('true');
   });
 
-  it('reports the mode the operator picks', () => {
+  it('marks the selected option with aria-selected', () => {
+    act(() => root.render(<MissionModeSelector value="test" onChange={() => undefined} />));
+    open();
+    expect(options().map((o) => o.getAttribute('aria-selected'))).toEqual(['false', 'false', 'true']);
+  });
+
+  it('reports the picked mode and closes', () => {
     const onChange = vi.fn();
     act(() => root.render(<MissionModeSelector value="advanced" onChange={onChange} />));
-    act(() => radios()[0].click());
-    expect(onChange).toHaveBeenCalledWith('simple');
+    open();
+    act(() => options()[2].click());
+    expect(onChange).toHaveBeenCalledWith('test');
+    expect(listbox()).toBeNull();
   });
 
-  it('does not re-report the active mode', () => {
+  it('does not report the already selected mode', () => {
     const onChange = vi.fn();
     act(() => root.render(<MissionModeSelector value="advanced" onChange={onChange} />));
-    act(() => radios()[1].click());
+    open();
+    act(() => options()[1].click());
     expect(onChange).not.toHaveBeenCalled();
+    expect(listbox()).toBeNull();
+  });
+
+  it('closes on Escape and returns focus to the trigger', () => {
+    act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
+    open();
+    press(listbox()!, 'Escape');
+    expect(listbox()).toBeNull();
+    expect(document.activeElement).toBe(trigger());
+  });
+
+  it('closes on a click outside', () => {
+    act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
+    open();
+    act(() => {
+      document.body.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+    });
+    expect(listbox()).toBeNull();
   });
 
   it('is inert when disabled', () => {
     const onChange = vi.fn();
     act(() => root.render(<MissionModeSelector value="advanced" onChange={onChange} disabled />));
-    act(() => radios()[0].click());
+    open();
+    expect(listbox()).toBeNull();
+    expect(trigger().getAttribute('aria-disabled')).toBe('true');
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it('describes the active mode under the control', () => {
-    act(() => root.render(<MissionModeSelector value="simple" onChange={() => undefined} />));
-    expect(host.textContent).toContain('Giro no lugar, foto e retorno do rumo');
-  });
-});
-
-describe('MissionModeSelector keyboard', () => {
-  it('keeps only the active mode in the tab order', () => {
-    act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
-    expect(radios().map((r) => r.tabIndex)).toEqual([-1, 0]);
-  });
-
-  it('moves the selection with the arrow keys, wrapping at the ends', () => {
+  it('moves selection with ArrowDown/ArrowUp and wraps', () => {
     const onChange = vi.fn();
     act(() => root.render(<MissionModeSelector value="advanced" onChange={onChange} />));
-    press(radios()[1], 'ArrowRight');
-    expect(onChange).toHaveBeenLastCalledWith('simple');
-    press(radios()[1], 'ArrowLeft');
-    expect(onChange).toHaveBeenLastCalledWith('simple');
+    open();
+    expect(document.activeElement).toBe(options()[1]);
+    press(listbox()!, 'ArrowDown');
+    expect(document.activeElement).toBe(options()[2]);
+    press(listbox()!, 'ArrowDown');
+    expect(document.activeElement).toBe(options()[0]);
+    press(listbox()!, 'ArrowUp');
+    expect(document.activeElement).toBe(options()[2]);
+    press(listbox()!, 'Enter');
+    expect(onChange).toHaveBeenCalledWith('test');
+    expect(listbox()).toBeNull();
   });
 
-  it('moves the focus to the mode it selected', () => {
-    function Controlled() {
-      const [mode, setMode] = React.useState<'simple' | 'advanced'>('simple');
-      return <MissionModeSelector value={mode} onChange={setMode} />;
-    }
-    act(() => root.render(<Controlled />));
-    radios()[0].focus();
-    press(radios()[0], 'ArrowRight');
-    expect(document.activeElement).toBe(radios()[1]);
-    expect(radios()[1].getAttribute('aria-checked')).toBe('true');
+  it('runs the shimmer only on the modes on offer in the open list, never on the chosen one', () => {
+    act(() => root.render(<MissionModeSelector value="simple" onChange={() => undefined} />));
+    expect(trigger().querySelector('.mode-shimmer')).toBeNull();
+    open();
+    const shimmers = Array.from(host.querySelectorAll<HTMLElement>('.mode-shimmer')).map((s) => s.getAttribute('data-text'));
+    expect(shimmers).toEqual(['Avançado', 'Teste']);
+    expect(trigger().querySelector('.mode-shimmer')).toBeNull();
   });
 
-  it('ignores the arrow keys and announces the lock when disabled', () => {
-    const onChange = vi.fn();
-    act(() => root.render(<MissionModeSelector value="advanced" onChange={onChange} disabled />));
-    press(radios()[1], 'ArrowRight');
-    expect(onChange).not.toHaveBeenCalled();
-    expect(radios().every((r) => r.getAttribute('aria-disabled') === 'true')).toBe(true);
-    expect(host.querySelector('[role="radiogroup"]')!.getAttribute('aria-disabled')).toBe('true');
+  it('draws the track on the trigger only, never in the open list', () => {
+    act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
+    open();
+    expect(trigger().querySelector('.mode-track')).not.toBeNull();
+    expect(options().some((o) => o.querySelector('.mode-track') !== null)).toBe(false);
+  });
+
+  it('lights the stop of the current mode on the trigger track', () => {
+    act(() => root.render(<MissionModeSelector value="test" onChange={() => undefined} />));
+    const stops = Array.from(trigger().querySelectorAll('.mode-track-stop')).map((s) => s.hasAttribute('data-lit'));
+    expect(stops).toEqual([false, false, true]);
+  });
+
+  it('keeps the folded list inert and grows the capsule in place when opened', () => {
+    act(() => root.render(<MissionModeSelector value="advanced" onChange={() => undefined} />));
+    const root_ = host.querySelector<HTMLElement>('.mode-select')!;
+    const body = host.querySelector<HTMLElement>('.mode-select-body-inner')!;
+    expect(root_.hasAttribute('data-open')).toBe(false);
+    expect(body.hasAttribute('inert')).toBe(true);
+    open();
+    expect(root_.hasAttribute('data-open')).toBe(true);
+    expect(body.hasAttribute('inert')).toBe(false);
+  });
+
+  it('takes the cyan theme in Teste and the mint one in the flight modes', () => {
+    act(() => root.render(<MissionModeSelector value="test" onChange={() => undefined} />));
+    expect(host.querySelector('.mode-select')?.getAttribute('data-theme')).toBe('test');
+    act(() => root.render(<MissionModeSelector value="simple" onChange={() => undefined} />));
+    expect(host.querySelector('.mode-select')?.getAttribute('data-theme')).toBe('flight');
   });
 });

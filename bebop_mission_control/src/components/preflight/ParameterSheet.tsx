@@ -1,30 +1,25 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Camera, Plane, RotateCcw, Save, Settings2, Timer, Undo2 } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Camera, Check, Plane, QrCode, RotateCcw, Save, Star, Timer, X } from 'lucide-react';
 import {
+  ADVANCED_PATHS,
+  CENTERING_TIMEOUT_RANGE_SEC,
   PARAMETER_GROUPS,
   groupsForMode,
+  markerCount,
   type BooleanParameter,
   type NumberParameter,
   type ParameterGroup,
-  type ParameterGroupId,
   type ParameterSpec,
 } from '../../lib/parameterSchema';
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { getPath } from '../../lib/paths';
 import { MISSION_MODES, readMissionMode, readRtlEnabled } from '../../lib/missionMode';
-import { Button } from '../ui/Button';
-import { ExactValueField, HybridSlider } from '../ui/HybridSlider';
+import { TAKEOFF_FROM_GROUND_PATH } from '../../lib/altitudeEnvelope';
+import { MAX_TAG_SIZE_M, advancedFieldErrors } from '../../lib/launchDocument';
+import { DirectionalButton } from '../ui/DirectionalButton';
+import { ExactValueField, HybridSlider, REJECT_HOLD_MS } from '../ui/HybridSlider';
 import { cn } from '../../lib/format';
-import { launchesFromGround, padHeightM } from '../../lib/altitudeEnvelope';
-import { AdvancedSettingsDialog } from './AdvancedSettingsDialog';
-import { FavoritesMenu } from './FavoritesMenu';
-import type { OperatorPreset } from '../../lib/operatorPresets';
-import { ParameterConflictDialog } from './ParameterConflictDialog';
-import {
-  activeConflicts,
-  type ConflictSeverity,
-  type ParameterConflict,
-} from '../../lib/parameterConflicts';
+import { activeConflicts, type ConflictSeverity } from '../../lib/parameterConflicts';
 
 interface ParameterSheetProps {
   working: ParamsDoc;
@@ -33,47 +28,89 @@ interface ParameterSheetProps {
   changedPaths: Set<string>;
   dirty: boolean;
   saving: boolean;
-  /** The favourites of the mode on screen (`useMissionParameters.presets`). */
-  presets: readonly OperatorPreset[];
-  /** The favourite the working values hold; its star is filled. */
-  activePresetId: string | null;
-  /** The mission parameters refused a save for an error conflict (`useMissionParameters`). */
-  saveAttempted?: boolean;
+  /** The working values equal the favourite of the mode on screen; the star is filled. */
+  favoriteActive: boolean;
+  /** The mode on screen has a favourite; "Restaurar Padrões" reapplies it instead of the factory values. */
+  hasFavorite: boolean;
   onEdit: (path: string, value: unknown) => void;
   onSave: () => void;
-  onDiscard: () => void;
-  onSavePreset: (name: string) => string | null;
-  onApplyPreset: (id: string) => void;
-  onRenamePreset: (id: string, name: string) => string | null;
-  onDeletePreset: (id: string) => void;
+  onSaveFavorite: () => void;
+  onRestoreFavorite: () => void;
   /** Field of the last launch document the mission refused (`bmg:launch-refused`); marked as an error. */
   refusedPath?: string | null;
   /** An altitude the envelope of the launch surface moved, shown above the cards. */
   altitudeNotice?: string | null;
+  /**
+   * Bumped by the screen when the operator tries to leave with edits pending:
+   * Salvar shakes once for each bump, asking to be pressed before leaving.
+   */
+  nudgeSave?: number;
+  /** Leave the sheet: the screen decides whether pending edits shake Salvar first. */
+  onClose?: () => void;
 }
 
 /** The conflict a field is marked with: its most severe one, by title. */
 export type FieldConflict = { severity: ConflictSeverity; title: string };
 
-/** Each involved path's most severe conflict; an error outranks a warning. */
-function conflictsByPath(conflicts: ParameterConflict[]): Partial<Record<string, FieldConflict>> {
-  const byPath: Partial<Record<string, FieldConflict>> = {};
-  for (const conflict of conflicts) {
-    for (const path of conflict.paths) {
-      const current = byPath[path];
-      if (!current || (current.severity === 'warning' && conflict.severity === 'error')) {
-        byPath[path] = { severity: conflict.severity, title: conflict.title };
-      }
-    }
-  }
-  return byPath;
+/** A section of the sheet: a schema group, or the pad marker fields of the return. */
+interface SheetSection {
+  id: string;
+  title: string;
+  icon: React.ElementType;
+  items: ParameterSpec[];
 }
 
-const GROUP_ICON: Record<ParameterGroupId, React.ElementType> = {
+const GROUP_ICON: Record<string, React.ElementType> = {
   envelope: Plane,
   gimbal: Camera,
   timeouts: Timer,
 };
+
+/** Names the sheet gives a field instead of the schema's, where the control says it differently. */
+const LABEL_OVERRIDE: Readonly<Record<string, string>> = {
+  [TAKEOFF_FROM_GROUND_PATH]: 'Ponto de Decolagem',
+};
+
+/** What the RTL toggle says it is, on and off. */
+const RTL_STATES: readonly [on: string, off: string] = ['Ativo', 'Desligado'];
+
+const MARKER_ID_PATH = 'rtl.target_aruco_id';
+const MARKER_DICT_PATH = 'rtl.marker_dict';
+const TAG_SIZE_PATH = 'rtl.tag_size';
+const CENTERING_PATH = 'rtl.centering_timeout_sec';
+
+/**
+ * Figures typed or scrubbed, without a slider: a marker ID and a printed size
+ * are read off the pad, not swept across a range.
+ */
+const SCRUB_PATHS: ReadonlySet<string> = new Set([MARKER_ID_PATH, TAG_SIZE_PATH]);
+
+/** IDs a marker can have when the dictionary is one the sheet does not know. */
+const FALLBACK_MARKER_COUNT = 1000;
+
+/**
+ * The pad marker of the return, as tiles like every other number: its ID in
+ * the dictionary the document holds, its printed size and the centering
+ * window. The dictionary itself is not offered; the ID is bounded by it.
+ */
+function arucoSpecs(doc: unknown): NumberParameter[] {
+  const count = markerCount(getPath(doc, MARKER_DICT_PATH)) ?? FALLBACK_MARKER_COUNT;
+  return [
+    { kind: 'number', path: MARKER_ID_PATH, label: 'ID do Marcador', hint: '', min: 0, max: count - 1, step: 1, precision: 0 },
+    { kind: 'number', path: TAG_SIZE_PATH, label: 'Tamanho da Tag', hint: '', min: 0.05, max: MAX_TAG_SIZE_M, step: 0.005, precision: 3, unit: 'm' },
+    {
+      kind: 'number',
+      path: CENTERING_PATH,
+      label: 'Janela de Centragem',
+      hint: '',
+      min: CENTERING_TIMEOUT_RANGE_SEC.min,
+      max: CENTERING_TIMEOUT_RANGE_SEC.max,
+      step: 1,
+      precision: 0,
+      unit: 's',
+    },
+  ];
+}
 
 /**
  * The figure at `spec.path`, or `null`. Never a default: a missing value shown
@@ -90,39 +127,82 @@ const readBoolean = (doc: ParamsDoc | null, spec: ParameterSpec): boolean | null
   return typeof raw === 'boolean' ? raw : null;
 };
 
-/** Border and fill of a field card: a conflict outranks an unsaved change. */
-function fieldTone(conflict: FieldConflict | undefined, changed: boolean): string {
-  if (conflict?.severity === 'error') return 'border-ember/60 bg-ember/[0.06]';
-  if (conflict?.severity === 'warning') return 'border-amber/55 bg-amber/[0.06]';
-  return changed ? 'border-mint/45 bg-mint/[0.06]' : 'border-strut-soft bg-abyss/40';
+/** The tile's state for its edge and fill: an error outranks an unsaved change. */
+function tileState(conflict: FieldConflict | undefined, changed: boolean): string | undefined {
+  if (conflict) return conflict.severity;
+  return changed ? 'changed' : undefined;
 }
 
+const ChangedDot: React.FC<{ changed: boolean }> = ({ changed }) =>
+  changed ? <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-mint" aria-label="alterado" /> : null;
+
+const TileLabel: React.FC<{ spec: ParameterSpec; changed: boolean }> = ({ spec, changed }) => (
+  <span className="flex items-start gap-2">
+    <span className="param-label">{LABEL_OVERRIDE[spec.path] ?? spec.label}</span>
+    <ChangedDot changed={changed} />
+  </span>
+);
+
 const MissingValue: React.FC<{ spec: ParameterSpec }> = ({ spec }) => (
-  <div data-missing-value={spec.path} className="rounded-bezel border border-amber/45 bg-amber/[0.06] px-3.5 py-2.5">
-    <span className="font-sans text-sm font-medium text-frost">{spec.label}</span>
-    <p className="mt-0.5 font-sans text-2xs leading-relaxed text-amber">
-      Valor ausente no documento de parâmetros. Restaure os padrões ou ajuste antes de lançar.
-    </p>
+  <div data-missing-value={spec.path} className="param-tile" data-state="warning">
+    <span className="param-label">{LABEL_OVERRIDE[spec.path] ?? spec.label}</span>
+    <p className="mt-auto text-[13px] text-amber">Valor ausente</p>
   </div>
 );
 
-const ConflictNote: React.FC<{ conflict?: FieldConflict }> = ({ conflict }) =>
-  conflict ? (
-    <p
-      className={cn(
-        'mt-1.5 font-sans text-2xs leading-relaxed',
-        conflict.severity === 'error' ? 'text-ember' : 'text-amber'
-      )}
+/**
+ * Where the aircraft takes off from, as two options side by side with one
+ * thumb sliding to the chosen one. Radio inputs underneath, so the group is a
+ * real radiogroup to the keyboard and to a screen reader; the document still
+ * receives the boolean it always did (`platform.takeoff_from_ground`).
+ */
+const TakeoffPointTile: React.FC<{
+  spec: BooleanParameter;
+  value: boolean | null;
+  changed: boolean;
+  conflict?: FieldConflict;
+  onEdit: (path: string, value: unknown) => void;
+}> = ({ spec, value, changed, conflict, onEdit }) => {
+  const name = `parameter-${spec.path.replace(/\./g, '-')}`;
+  const options = [
+    { label: 'Solo', value: true },
+    { label: 'Totem', value: false },
+  ] as const;
+  return (
+    <div
+      data-parameter={spec.path}
+      data-conflict={conflict?.severity}
+      data-conflict-reason={conflict?.title}
+      data-state={tileState(conflict, changed)}
+      className="param-tile"
     >
-      {conflict.title}
-    </p>
-  ) : null;
+      <TileLabel spec={spec} changed={changed} />
+      <div role="radiogroup" aria-label={LABEL_OVERRIDE[spec.path]} className="param-options" data-choice={value ? 'first' : 'second'}>
+        <span className="param-options-thumb" aria-hidden />
+        {options.map((option) => (
+          <label key={option.label} className="param-option" data-checked={value === option.value || undefined}>
+            <input
+              type="radio"
+              name={name}
+              checked={value === option.value}
+              onChange={() => onEdit(spec.path, option.value)}
+              className="sr-only"
+            />
+            {option.label}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+};
 
 /**
- * A yes/no parameter: a native checkbox inside its label, so the whole card
- * row toggles it, the keyboard reaches it and a screen reader announces it.
+ * A yes/no parameter: its name, what it means right now in one word, and a
+ * toggle. The toggle is the native checkbox, drawn as the switch of the top
+ * bar menu, inside its label, so the whole tile toggles it, the keyboard
+ * reaches it and a screen reader announces it as a switch.
  */
-const BooleanControl: React.FC<{
+const BooleanTile: React.FC<{
   spec: BooleanParameter;
   value: boolean | null;
   changed: boolean;
@@ -130,54 +210,140 @@ const BooleanControl: React.FC<{
   onEdit: (path: string, value: unknown) => void;
 }> = ({ spec, value, changed, conflict, onEdit }) => {
   const id = `parameter-${spec.path.replace(/\./g, '-')}`;
+  const [on, off] = RTL_STATES;
   return (
     <div
       data-parameter={spec.path}
       data-conflict={conflict?.severity}
-      className={cn('rounded-bezel border px-3.5 py-2.5 transition-colors duration-200', fieldTone(conflict, changed))}
+      data-conflict-reason={conflict?.title}
+      data-state={tileState(conflict, changed)}
+      className="param-tile"
     >
-      <label htmlFor={id} className="flex cursor-pointer items-start gap-3">
-        <input
-          id={id}
-          type="checkbox"
-          checked={value === true}
-          aria-describedby={`${id}-hint`}
-          onChange={(event) => onEdit(spec.path, event.target.checked)}
-          className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer rounded-sm border border-strut-bright bg-abyss accent-mint focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-mint"
-        />
-        <span className="min-w-0">
-          <span className="flex items-center gap-2">
-            <span className="font-sans text-sm font-medium text-frost">{spec.label}</span>
-            {changed ? <span className="h-1.5 w-1.5 rounded-full bg-mint" aria-label="alterado" /> : null}
+      <label htmlFor={id} className="flex h-full cursor-pointer flex-col">
+        <TileLabel spec={spec} changed={changed} />
+        <span className="mt-auto flex items-center justify-between gap-3 pb-1">
+          <span key={String(value)} className="param-state anim-param-state">
+            {value ? on : off}
           </span>
-          <span id={`${id}-hint`} className="mt-0.5 block font-sans text-2xs leading-relaxed text-haze">
-            {spec.hint}
-          </span>
+          <input
+            id={id}
+            type="checkbox"
+            role="switch"
+            checked={value === true}
+            onChange={(event) => onEdit(spec.path, event.target.checked)}
+            className="param-switch"
+          />
         </span>
       </label>
-      <ConflictNote conflict={conflict} />
     </div>
   );
 };
 
-/** The two plan chips: how the flight ends and where it takes off from (section 5.2). */
-export const PlanChips: React.FC<{ doc: unknown; className?: string }> = ({ doc, className }) => {
-  const ground = launchesFromGround(doc);
-  const pad = padHeightM(doc);
+/**
+ * One number: its name, the figure in large type and editable in place, a
+ * slider across the whole range with the default as a tick, and the range
+ * printed under it with the default between the ends. A figure typed out of
+ * range is corrected and said, and an unreadable one refused; the field shakes
+ * and the reason takes the last line for a moment.
+ */
+const NumberTile: React.FC<{
+  spec: NumberParameter;
+  value: number | null;
+  defaultValue: number | null;
+  changed: boolean;
+  /** An error on the field: its edge turns red and its title carries the reason. */
+  conflict?: FieldConflict;
+  /** Why the field cannot be edited now (`ParameterSpec.disabledReason`); `null` when it can. */
+  locked: string | null;
+  onEdit: (path: string, value: unknown) => void;
+}> = ({ spec, value, defaultValue, changed, conflict, locked, onEdit }) => {
+  const [rejection, setRejection] = useState<string | null>(null);
+  useEffect(() => {
+    if (!rejection) return;
+    const id = window.setTimeout(() => setRejection(null), REJECT_HOLD_MS);
+    return () => window.clearTimeout(id);
+  }, [rejection]);
+
+  if (value === null) return <MissingValue spec={spec} />;
+
+  const atDefault = defaultValue !== null && Math.abs(value - defaultValue) < 10 ** -(spec.precision + 1);
+  const edit = (next: number) => onEdit(spec.path, next);
+  const scrub = SCRUB_PATHS.has(spec.path);
+  const bound = (n: number) => n.toFixed(spec.precision);
+
   return (
-    <div className={cn('flex flex-wrap items-center justify-end gap-1.5', className)} data-plan-chips>
-      <span data-plan-chip="end" className="rounded-full border border-strut-soft bg-abyss/50 px-2.5 py-0.5 font-sans text-3xs text-frost">
-        {readRtlEnabled(doc) ? 'Final: RTL + pouso de precisão' : 'Final: pouso no local'}
-      </span>
-      <span data-plan-chip="surface" className="rounded-full border border-strut-soft bg-abyss/50 px-2.5 py-0.5 font-sans text-3xs text-frost">
-        {ground ? 'Decolagem: solo' : `Decolagem: totem ${pad.toFixed(2).replace('.', ',')} m`}
-      </span>
+    <div
+      data-parameter={spec.path}
+      data-conflict={conflict?.severity}
+      data-conflict-reason={conflict?.title}
+      data-locked={locked !== null ? 'true' : undefined}
+      data-state={tileState(conflict, changed)}
+      aria-disabled={locked !== null ? true : undefined}
+      className={cn('param-tile', locked !== null && 'param-tile-locked')}
+    >
+      <TileLabel spec={spec} changed={changed} />
+
+      <div className="mt-1.5">
+        {locked !== null ? (
+          <span className="param-figure tnum">
+            {value.toFixed(spec.precision)}
+            <span className="param-unit">{spec.unit}</span>
+          </span>
+        ) : (
+          <ExactValueField
+            value={value}
+            min={spec.min}
+            max={spec.max}
+            precision={spec.precision}
+            unit={spec.unit}
+            label={LABEL_OVERRIDE[spec.path] ?? spec.label}
+            variant="display"
+            scrubStep={scrub ? spec.step : undefined}
+            onCommit={edit}
+            onReject={setRejection}
+          />
+        )}
+      </div>
+
+      {scrub ? null : (
+        <HybridSlider
+          value={value}
+          min={spec.min}
+          max={spec.max}
+          step={spec.step}
+          precision={spec.precision}
+          label={LABEL_OVERRIDE[spec.path] ?? spec.label}
+          marker={defaultValue ?? undefined}
+          onChange={edit}
+          disabled={locked !== null}
+          className="mt-2"
+        />
+      )}
+
+      {rejection ? (
+        <p role="alert" className="param-foot-note param-reject text-ember">
+          {rejection}
+        </p>
+      ) : locked !== null ? (
+        <p className="param-foot-note text-frost/55">{locked}</p>
+      ) : (
+        <div className="param-range tnum">
+          <span>{bound(spec.min)}</span>
+          {defaultValue !== null ? (
+            <span className={atDefault ? 'text-frost/40' : 'text-frost/75'}>
+              padrão {defaultValue.toFixed(spec.precision)}
+              {spec.unit ?? ''}
+            </span>
+          ) : null}
+          <span>{bound(spec.max)}</span>
+        </div>
+      )}
     </div>
   );
 };
 
-/** One field of a card, by kind; a value the document lacks is named as missing. */
-const ParameterControl: React.FC<{
+/** One field of a section, by kind; a value the document lacks is named as missing. */
+const ParameterTile: React.FC<{
   spec: ParameterSpec;
   working: ParamsDoc;
   defaults: ParamsDoc | null;
@@ -187,14 +353,15 @@ const ParameterControl: React.FC<{
 }> = ({ spec, working, defaults, changed, conflict, onEdit }) => {
   if (spec.kind === 'boolean') {
     const value = readBoolean(working, spec);
-    return value === null && getPath(working, spec.path) !== undefined ? (
-      <MissingValue spec={spec} />
+    if (value === null && getPath(working, spec.path) !== undefined) return <MissingValue spec={spec} />;
+    return spec.path === TAKEOFF_FROM_GROUND_PATH ? (
+      <TakeoffPointTile spec={spec} value={value} changed={changed} conflict={conflict} onEdit={onEdit} />
     ) : (
-      <BooleanControl spec={spec} value={value} changed={changed} conflict={conflict} onEdit={onEdit} />
+      <BooleanTile spec={spec} value={value} changed={changed} conflict={conflict} onEdit={onEdit} />
     );
   }
   return (
-    <NumberControl
+    <NumberTile
       spec={spec}
       value={readNumber(working, spec)}
       defaultValue={readNumber(defaults, spec)}
@@ -206,234 +373,46 @@ const ParameterControl: React.FC<{
   );
 };
 
-/**
- * One parameter: its name, the exact figure, a slider across the full range
- * and the range itself printed at both ends, so the operator sees where in the
- * envelope the value sits without having to know the bounds.
- */
-const NumberControl: React.FC<{
-  spec: NumberParameter;
-  value: number | null;
-  defaultValue: number | null;
-  changed: boolean;
-  /** Shown only once a save was attempted; follows the edits live. */
-  conflict?: FieldConflict;
-  /** Why the field cannot be edited now (`ParameterSpec.disabledReason`); `null` when it can. */
-  locked: string | null;
-  onEdit: (path: string, value: unknown) => void;
-}> = ({ spec, value, defaultValue, changed, conflict, locked, onEdit }) => {
-  const atDefault =
-    value !== null && defaultValue !== null && Math.abs(value - defaultValue) < 10 ** -(spec.precision + 1);
-  const edit = (next: number) => onEdit(spec.path, next);
-
-  if (value === null) return <MissingValue spec={spec} />;
-
-  return (
-    <div
-      data-parameter={spec.path}
-      data-conflict={conflict?.severity}
-      data-locked={locked !== null ? 'true' : undefined}
-      aria-disabled={locked !== null ? true : undefined}
-      className={cn(
-        'rounded-bezel border px-3.5 py-2.5 transition-colors duration-200',
-        fieldTone(conflict, changed),
-        locked !== null && 'opacity-70'
-      )}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="font-sans text-sm font-medium text-frost">{spec.label}</span>
-            {changed ? <span className="h-1.5 w-1.5 rounded-full bg-mint" aria-label="alterado" /> : null}
-          </div>
-          <p className="mt-0.5 font-sans text-2xs leading-relaxed text-haze">{locked ?? spec.hint}</p>
-        </div>
-
-        {locked !== null ? (
-          <span className="tnum w-[92px] shrink-0 text-right font-mono text-sm text-haze">
-            {value.toFixed(spec.precision)}
-            {spec.unit}
-          </span>
-        ) : (
-          <ExactValueField
-            value={value}
-            min={spec.min}
-            max={spec.max}
-            precision={spec.precision}
-            unit={spec.unit}
-            label={spec.label}
-            onCommit={edit}
-            className="w-[92px] shrink-0"
-          />
-        )}
-      </div>
-
-      {/* The default tick makes a return to it one drag and not a guess. */}
-      <HybridSlider
-        value={value}
-        min={spec.min}
-        max={spec.max}
-        step={spec.step}
-        precision={spec.precision}
-        label={spec.label}
-        marker={defaultValue ?? undefined}
-        onChange={edit}
-        disabled={locked !== null}
-        className="mt-3"
-      />
-
-      <div className="mt-1 flex items-center justify-between font-mono text-3xs text-haze-deep">
-        <span className="tnum">
-          {spec.min.toFixed(spec.precision)}
-          {spec.unit}
-        </span>
-        {defaultValue !== null ? (
-          <span className={cn('tnum', atDefault ? 'text-haze-deep' : 'text-haze')}>
-            padrão {defaultValue.toFixed(spec.precision)}
-            {spec.unit}
-          </span>
-        ) : null}
-        <span className="tnum">
-          {spec.max.toFixed(spec.precision)}
-          {spec.unit}
-        </span>
-      </div>
-      <ConflictNote conflict={conflict} />
-    </div>
-  );
-};
-
-/**
- * The camera's travel, drawn: the search angle it starts at and the nadir
- * angle where the approach freezes. Both come straight from the working
- * document, so the drawing moves with the sliders beneath it.
- */
-const GimbalArc: React.FC<{ searchDeg: number; nadirDeg: number }> = ({ searchDeg, nadirDeg }) => {
-  const cx = 16;
-  const cy = 12;
-  const r = 78;
-  const point = (deg: number) => {
-    const rad = (Math.abs(deg) * Math.PI) / 180;
-    return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
-  };
-  const s = point(searchDeg);
-  const n = point(nadirDeg);
-  const h = point(0);
-  const v = point(-90);
-
-  return (
-    <svg viewBox="0 0 110 100" className="h-[92px] w-[104px] shrink-0" aria-hidden>
-      <path
-        d={`M ${h.x} ${h.y} A ${r} ${r} 0 0 1 ${v.x} ${v.y}`}
-        fill="none"
-        stroke="rgba(232,242,240,0.12)"
-        strokeDasharray="2 3"
-      />
-      <path
-        d={`M ${s.x} ${s.y} A ${r} ${r} 0 0 1 ${n.x} ${n.y}`}
-        fill="none"
-        stroke="#01D5A3"
-        strokeWidth={2.5}
-        strokeLinecap="round"
-      />
-      <line x1={cx} y1={cy} x2={s.x} y2={s.y} stroke="rgba(124,153,164,0.8)" strokeWidth={1} />
-      <line x1={cx} y1={cy} x2={n.x} y2={n.y} stroke="#5CF2CE" strokeWidth={1.4} />
-      <circle cx={n.x} cy={n.y} r={3.2} fill="#5CF2CE" />
-      <circle cx={s.x} cy={s.y} r={2.6} fill="#7C99A4" />
-      <rect x={cx - 7} y={cy - 5} width={14} height={10} rx={2} fill="#0B3752" stroke="#01D5A3" strokeWidth={1} />
-    </svg>
-  );
-};
-
-const GroupCard: React.FC<{
-  group: ParameterGroup;
+const Section: React.FC<{
+  section: SheetSection;
   working: ParamsDoc;
   defaults: ParamsDoc | null;
   changedPaths: Set<string>;
-  /** Conflicts to mark, empty until a save was attempted. */
-  marked: ParameterConflict[];
+  errors: Partial<Record<string, FieldConflict>>;
   onEdit: (path: string, value: unknown) => void;
-  index: number;
-  refusedPath?: string | null;
-}> = ({ group, working, defaults, changedPaths, marked, onEdit, index, refusedPath }) => {
-  const Icon = GROUP_ICON[group.id];
-  const changed = group.items.filter((item) => changedPaths.has(item.path)).length;
-  const groupPaths = new Set(group.items.map((item) => item.path));
-  const conflictCount = marked.filter((conflict) => conflict.paths.some((path) => groupPaths.has(path))).length;
-  const groupErrors = marked.some(
-    (conflict) => conflict.severity === 'error' && conflict.paths.some((path) => groupPaths.has(path))
-  );
-  const byPath = conflictsByPath(marked);
-  if (refusedPath && groupPaths.has(refusedPath) && byPath[refusedPath]?.severity !== 'error') {
-    byPath[refusedPath] = { severity: 'error', title: 'Recusado pela missão no lançamento' };
-  }
+}> = ({ section, working, defaults, changedPaths, errors, onEdit }) => {
+  const Icon = section.icon;
+  const changed = section.items.filter((item) => changedPaths.has(item.path)).length;
+  const errorCount = section.items.filter((item) => errors[item.path]).length;
 
   return (
-    <section
-      className={cn(
-        // The sheet behind is already frosted glass over the film; a second
-        // blur here would sample a flat field and cost GPU for nothing.
-        'glass flex min-h-0 flex-col rounded-panel backdrop-filter-none transition-[border-color,box-shadow] duration-300 ease-instrument',
-        changed > 0 && 'glass-live'
-      )}
-    >
-      <header className="flex items-center gap-3 border-b border-strut-soft px-4 py-3">
-        <span
-          className={cn(
-            'grid h-8 w-8 shrink-0 place-items-center rounded-bezel border transition-colors duration-300',
-            changed > 0 ? 'border-mint/35 bg-mint/10 text-mint' : 'border-strut-soft bg-hull-raise/60 text-frost-dim'
-          )}
-        >
-          <Icon size={15} strokeWidth={1.8} />
+    <section className="param-section" data-section={section.id} data-live={changed > 0 || undefined}>
+      <header className="flex items-center gap-2.5 px-1 pb-3">
+        <span className="param-section-icon">
+          <Icon size={15} strokeWidth={1.9} />
         </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-baseline gap-2">
-            <span className="tnum font-mono text-3xs text-haze-deep">0{index + 1}</span>
-            <h3 className="font-cond text-base font-semibold tracking-wide text-frost">{group.title}</h3>
-          </div>
-          <p className="line-clamp-2 font-sans text-2xs text-haze">{group.summary}</p>
-        </div>
-        {conflictCount > 0 ? (
-          <span
-            data-group-conflicts={group.id}
-            title="Conflitos entre parâmetros"
-            className={cn(
-              'tnum rounded-full px-2 py-0.5 font-mono text-3xs',
-              groupErrors ? 'bg-ember/15 text-ember' : 'bg-amber/15 text-amber'
-            )}
-          >
-            {conflictCount}
-          </span>
-        ) : null}
-        {changed > 0 ? (
-          <span className="tnum rounded-full bg-mint/15 px-2 py-0.5 font-mono text-3xs text-mint">
-            {changed}
-          </span>
-        ) : null}
+        <h3 className="title-pixel font-pixel text-[14.5px] font-semibold tracking-[0.02em] text-frost">{section.title}</h3>
+        <span className="ml-auto flex items-center gap-1.5">
+          {errorCount > 0 ? (
+            <span data-group-conflicts={section.id} className="tnum rounded-full bg-ember/15 px-2 py-0.5 text-[11px] font-medium text-ember">
+              {errorCount}
+            </span>
+          ) : null}
+          {changed > 0 ? (
+            <span className="tnum rounded-full bg-mint/15 px-2 py-0.5 text-[11px] font-medium text-mint">{changed}</span>
+          ) : null}
+        </span>
       </header>
 
-      <div className="scroll-thin flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto p-3">
-        {group.id === 'gimbal' ? (
-          <div className="flex items-center gap-3 rounded-bezel border border-strut-soft bg-abyss/40 px-3 py-2">
-            <GimbalArc
-              searchDeg={readNumber(working, group.items[0]) ?? 0}
-              nadirDeg={readNumber(working, group.items[1]) ?? -90}
-            />
-            <p className="text-3xs leading-relaxed text-haze">
-              A câmera desce do ângulo de varredura até apontar totalmente para baixo durante o
-              rastreamento. Nessa posição, a velocidade horizontal é zerada e a inspeção começa.
-            </p>
-          </div>
-        ) : null}
-
-        {group.items.map((spec) => (
-          <ParameterControl
+      <div className="grid min-h-0 flex-1 gap-2.5" style={{ gridTemplateColumns: `repeat(${section.items.length}, minmax(0, 1fr))` }}>
+        {section.items.map((spec) => (
+          <ParameterTile
             key={spec.path}
             spec={spec}
             working={working}
             defaults={defaults}
             changed={changedPaths.has(spec.path)}
-            conflict={byPath[spec.path]}
+            conflict={errors[spec.path]}
             onEdit={onEdit}
           />
         ))}
@@ -442,13 +421,120 @@ const GroupCard: React.FC<{
   );
 };
 
+/** Least time the dots of a save stay up, so a fast write still reads as one, ms. */
+const SAVE_MIN_LOADING_MS = 700;
+/** How long "Salvo" holds before the button settles into "Tudo salvo", ms. */
+const SAVE_DONE_HOLD_MS = 1500;
+
+type SavePhase = 'idle' | 'loading' | 'done';
+
 /**
- * The parameters that define the mission, in three cards.
+ * Salvar, in its states (kinetics "submit states"): "Salvar" while edits are
+ * pending; three dots bouncing while the document is written; a tick drawing
+ * itself with "Salvo" once it is, which holds and settles into "Tudo salvo",
+ * the button's word for nothing left to save. A combination the mission
+ * cannot fly keeps it shut. Each `nudge` shakes it once.
+ */
+const SaveButton: React.FC<{ dirty: boolean; saving: boolean; blocked: boolean; nudge: number; onSave: () => void }> = ({
+  dirty,
+  saving,
+  blocked,
+  nudge,
+  onSave,
+}) => {
+  const [phase, setPhase] = useState<SavePhase>('idle');
+  const loadingSince = useRef(0);
+  const wasSaving = useRef(saving);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    const was = wasSaving.current;
+    wasSaving.current = saving;
+    if (saving && !was) {
+      loadingSince.current = Date.now();
+      setPhase('loading');
+      return;
+    }
+    if (!saving && was) {
+      const wait = Math.max(0, SAVE_MIN_LOADING_MS - (Date.now() - loadingSince.current));
+      const id = window.setTimeout(() => setPhase(dirty ? 'idle' : 'done'), wait);
+      return () => window.clearTimeout(id);
+    }
+  }, [saving, dirty]);
+
+  useEffect(() => {
+    if (phase !== 'done') return;
+    const id = window.setTimeout(() => setPhase('idle'), SAVE_DONE_HOLD_MS);
+    return () => window.clearTimeout(id);
+  }, [phase]);
+
+  useEffect(() => {
+    const button = buttonRef.current;
+    if (!nudge || !button) return;
+    button.classList.remove('is-shaking');
+    void button.offsetWidth;
+    button.classList.add('is-shaking');
+  }, [nudge]);
+
+  return (
+    <DirectionalButton
+      ref={buttonRef}
+      tone={dirty || phase !== 'idle' ? 'primary' : 'ghost'}
+      onClick={onSave}
+      onAnimationEnd={(event) => event.currentTarget.classList.remove('is-shaking')}
+      disabled={!dirty || saving || blocked || phase !== 'idle'}
+      data-save-phase={phase}
+      data-blocked={blocked || undefined}
+      className="save-btn min-w-[148px] justify-center"
+    >
+      {phase === 'loading' ? (
+        <span key="loading" className="save-face" aria-live="polite">
+          <span className="save-dots" aria-hidden>
+            <i />
+            <i />
+            <i />
+          </span>
+          <span className="sr-only">Salvando</span>
+        </span>
+      ) : phase === 'done' ? (
+        <span key="done" className="save-face" aria-live="polite">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden className="save-check">
+            <path d="M5 12.5l4.5 4.5L19 7.5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          Salvo
+        </span>
+      ) : dirty ? (
+        <span key="idle" className="save-face">
+          <Save size={15} strokeWidth={1.9} aria-hidden />
+          Salvar
+        </span>
+      ) : (
+        <span key="clean" className="save-face">
+          <Check size={15} strokeWidth={2.2} aria-hidden />
+          Tudo salvo
+        </span>
+      )}
+    </DirectionalButton>
+  );
+};
+
+/**
+ * The parameters that define the mission, on one screen.
+ *
+ * The flight envelope and the camera share the top row; the time limits and,
+ * when the flight returns, the pad marker share the row below. Every number is
+ * the same tile and every yes/no the same control, so one is read like all the
+ * others.
+ *
+ * There are no warnings to read and no dialog to answer. A combination the
+ * mission cannot fly turns the fields involved red, with the reason in their
+ * title, and keeps Salvar shut; anything it can fly saves as it is.
  *
  * Saving writes the whole document, so the fields not shown here — PID gains,
- * jerk ceilings, calibration statistics — keep the values the mission last
- * wrote. "Restaurar padrões" resets only the sheet fields, for the same
- * reason, to the mission's own defaults.
+ * jerk ceilings, calibration statistics, the marker dictionary — keep the
+ * values the mission last wrote. "Restaurar Padrões" reapplies the favourite
+ * of the mode when there is one, and otherwise resets the sheet fields to the
+ * mission's own defaults. Neither persists: the change reads as pending.
  */
 export const ParameterSheet: React.FC<ParameterSheetProps> = ({
   working,
@@ -456,49 +542,61 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
   changedPaths,
   dirty,
   saving,
-  presets,
-  activePresetId,
-  saveAttempted = false,
+  favoriteActive,
+  hasFavorite,
   onEdit,
   onSave,
-  onDiscard,
-  onSavePreset,
-  onApplyPreset,
-  onRenamePreset,
-  onDeletePreset,
+  onSaveFavorite,
+  onRestoreFavorite,
   refusedPath = null,
   altitudeNotice = null,
+  nudgeSave = 0,
+  onClose,
 }) => {
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [conflictMode, setConflictMode] = useState<'blocked' | 'confirm' | null>(null);
-  const [attempted, setAttempted] = useState(false);
-  const conflicts = useMemo(() => activeConflicts(working), [working]);
   const missionMode = readMissionMode(working);
   const groups = useMemo(() => groupsForMode(missionMode, working), [missionMode, working]);
-  // The advanced settings are the pad marker of the return: a flight that
-  // lands in place reads none of them.
+  // The pad marker fields belong to the return: a flight that lands in place
+  // reads none of them.
   const returns = readRtlEnabled(working);
-  useEffect(() => {
-    if (!returns) setAdvancedOpen(false);
-  }, [returns]);
   const modeLabel = MISSION_MODES.find((mode) => mode.id === missionMode)?.label ?? missionMode;
-  // Marks appear after the first attempt to save and follow the edits live;
-  // a save that went through, or a discard, leaves nothing pending to mark.
-  useEffect(() => {
-    if (!dirty) setAttempted(false);
-  }, [dirty]);
-  const marked = attempted || saveAttempted ? conflicts : [];
 
-  const requestSave = () => {
-    if (conflicts.length === 0) {
-      onSave();
-      return;
+  const errors = useMemo(() => {
+    const byPath: Partial<Record<string, FieldConflict>> = {};
+    for (const conflict of activeConflicts(working)) {
+      if (conflict.severity !== 'error') continue;
+      for (const path of conflict.paths) byPath[path] ??= { severity: 'error', title: conflict.title };
     }
-    setAttempted(true);
-    setConflictMode(conflicts.some((conflict) => conflict.severity === 'error') ? 'blocked' : 'confirm');
-  };
+    if (returns) {
+      const fieldErrors = advancedFieldErrors(working);
+      for (const path of [MARKER_ID_PATH, TAG_SIZE_PATH, CENTERING_PATH]) {
+        const message = fieldErrors[path];
+        if (message) byPath[path] ??= { severity: 'error', title: message };
+      }
+    }
+    if (refusedPath && !byPath[refusedPath]) byPath[refusedPath] = { severity: 'error', title: 'Recusado pela missão no lançamento' };
+    return byPath;
+  }, [working, returns, refusedPath]);
+  const blocked = Object.keys(errors).length > 0;
+
+  const sections = useMemo(() => {
+    const asSection = (group: ParameterGroup): SheetSection => ({
+      id: group.id,
+      title: group.title,
+      icon: GROUP_ICON[group.id],
+      items: group.items,
+    });
+    const byId = (id: string) => groups.find((group) => group.id === id);
+    const top = ['envelope', 'gimbal'].map(byId).filter((group): group is ParameterGroup => Boolean(group)).map(asSection);
+    const bottom = ['timeouts'].map(byId).filter((group): group is ParameterGroup => Boolean(group)).map(asSection);
+    if (returns) bottom.push({ id: 'aruco', title: 'Pouso ArUco', icon: QrCode, items: arucoSpecs(working) });
+    return [top, bottom].filter((row) => row.length > 0);
+  }, [groups, returns, working]);
 
   const restoreDefaults = () => {
+    if (hasFavorite) {
+      onRestoreFavorite();
+      return;
+    }
     if (!defaults) return;
     for (const group of PARAMETER_GROUPS) {
       for (const spec of group.items) {
@@ -506,111 +604,76 @@ export const ParameterSheet: React.FC<ParameterSheetProps> = ({
         if (value !== null) onEdit(spec.path, value);
       }
     }
+    for (const path of ADVANCED_PATHS) {
+      const value = getPath(defaults, path);
+      if (value !== undefined) onEdit(path, value);
+    }
   };
 
   return (
-    <div className="glass flex h-full min-h-0 flex-col overflow-hidden rounded-panel bg-abyss/75">
-      <div className="flex shrink-0 items-center justify-between border-b border-strut-soft px-5 py-3.5">
-        <div>
-          <h2 className="font-cond text-lg font-semibold tracking-wide text-frost">Parâmetros de voo</h2>
-          <p className="text-2xs text-haze">Os ajustes que definem o comportamento da missão.</p>
-          <p className="text-2xs text-haze">Modo: {modeLabel}</p>
+    <div className="param-sheet">
+      <div data-sheet-header className="flex shrink-0 items-center justify-between gap-4 px-7 pb-4 pt-6">
+        <div className="flex items-center gap-2">
+          <h2 className="title-pixel font-pixel text-[23px] font-semibold leading-none tracking-[0.01em] text-white">{modeLabel}</h2>
+          <DirectionalButton
+            tone="icon"
+            onClick={onSaveFavorite}
+            aria-label="Salvar como favorito"
+            aria-pressed={favoriteActive}
+            data-filled={favoriteActive}
+            className="param-star"
+          >
+            <Star size={17} strokeWidth={1.9} aria-hidden className={favoriteActive ? 'fill-mint text-mint' : 'text-frost/70'} />
+          </DirectionalButton>
         </div>
-        <PlanChips doc={working} />
+        {onClose ? (
+          <DirectionalButton tone="icon" onClick={onClose} aria-label="Fechar" className="param-close">
+            <X size={18} strokeWidth={2} aria-hidden />
+          </DirectionalButton>
+        ) : null}
       </div>
       {altitudeNotice ? (
-        <p role="status" data-altitude-notice className="shrink-0 border-b border-amber/40 bg-amber/[0.08] px-5 py-2 font-sans text-2xs text-amber">
+        <p role="status" data-altitude-notice className="mx-7 mb-3 shrink-0 rounded-full border border-amber/30 bg-amber/[0.08] px-4 py-1.5 text-[12.5px] text-amber">
           {altitudeNotice}
         </p>
       ) : null}
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto p-4 lg:grid-cols-3">
-        {groups.map((group, index) => (
-          <GroupCard
-            key={group.id}
-            group={group}
-            index={index}
-            working={working}
-            defaults={defaults}
-            changedPaths={changedPaths}
-            marked={marked}
-            onEdit={onEdit}
-            refusedPath={refusedPath}
-          />
+      <div className="flex min-h-0 flex-1 flex-col gap-3 px-5">
+        {sections.map((row, index) => (
+          <div
+            key={index}
+            className="grid min-h-0 gap-3"
+            style={{ gridTemplateColumns: row.map((section) => `${section.items.length}fr`).join(' ') }}
+          >
+            {row.map((section) => (
+              <Section
+                key={section.id}
+                section={section}
+                working={working}
+                defaults={defaults}
+                changedPaths={changedPaths}
+                errors={errors}
+                onEdit={onEdit}
+              />
+            ))}
+          </div>
         ))}
       </div>
 
-      <div className="flex shrink-0 items-center gap-2 border-t border-strut-soft px-4 py-3">
-        <Button
-          variant="quiet"
+      <div className="flex shrink-0 items-center gap-2 px-7 pb-6 pt-4">
+        <DirectionalButton
+          tone="ghost"
           onClick={restoreDefaults}
-          disabled={!defaults}
-          title={defaults ? undefined : 'Padrões da missão indisponíveis'}
-          icon={<RotateCcw size={13} />}
+          disabled={!hasFavorite && !defaults}
         >
+          <RotateCcw size={15} strokeWidth={1.9} aria-hidden />
           Restaurar Padrões
-        </Button>
-        <FavoritesMenu
-          presets={presets}
-          activePresetId={activePresetId}
-          onSave={onSavePreset}
-          onApply={onApplyPreset}
-          onRename={onRenamePreset}
-          onDelete={onDeletePreset}
-        />
-        {returns ? (
-          <Button variant="ghost" onClick={() => setAdvancedOpen(true)} icon={<Settings2 size={13} />}>
-            Configurações Avançadas
-          </Button>
-        ) : null}
+        </DirectionalButton>
 
-        <div className="ml-auto flex items-center gap-2">
-          {dirty ? (
-            <>
-              <span className="text-2xs text-mint">
-                {changedPaths.size} {changedPaths.size === 1 ? 'alteração' : 'alterações'} sem salvar
-              </span>
-              <Button variant="quiet" onClick={onDiscard} icon={<Undo2 size={13} />}>
-                Descartar
-              </Button>
-            </>
-          ) : (
-            <span className="text-2xs text-haze-deep">Tudo salvo</span>
-          )}
-          <Button
-            variant={dirty ? 'primary' : 'quiet'}
-            onClick={requestSave}
-            disabled={!dirty || saving}
-            icon={<Save size={13} />}
-          >
-            {saving ? 'Salvando' : 'Salvar'}
-          </Button>
+        <div className="ml-auto">
+          <SaveButton dirty={dirty} saving={saving} blocked={blocked} nudge={nudgeSave} onSave={onSave} />
         </div>
       </div>
-
-      {advancedOpen && returns ? (
-        <AdvancedSettingsDialog
-          working={working}
-          defaults={defaults}
-          changedPaths={changedPaths}
-          conflicts={conflictsByPath(marked)}
-          onEdit={onEdit}
-          onClose={() => setAdvancedOpen(false)}
-        />
-      ) : null}
-
-      {conflictMode !== null ? (
-        <ParameterConflictDialog
-          mode={conflictMode}
-          conflicts={conflicts}
-          working={working}
-          onBack={() => setConflictMode(null)}
-          onConfirm={() => {
-            setConflictMode(null);
-            onSave();
-          }}
-        />
-      ) : null}
     </div>
   );
 };

@@ -9,6 +9,8 @@ export interface AbortControlProps {
   disabled?: boolean;
   busy?: boolean;
   landProgress?: LandProgressPhase | null;
+  /** Fill the parent, label centred: the pre-flight dock, where it is the two pills fused. */
+  fill?: boolean;
 }
 
 /**
@@ -22,6 +24,7 @@ export const AbortControl: React.FC<AbortControlProps> = ({
   disabled,
   busy,
   landProgress,
+  fill = false,
 }) => {
   const [flash, setFlash] = useState(false);
   const firedRef = useRef(false);
@@ -60,16 +63,10 @@ export const AbortControl: React.FC<AbortControlProps> = ({
     label = 'POUSO COMANDADO';
   }
 
-  const title = isUnconfirmed
-    ? 'Pouso não confirmado: reenviar'
-    : effectiveDisabled
-    ? 'Disponível durante a missão'
-    : 'Pousa a aeronave imediatamente';
-
   const progressText = landProgressLabel(landProgress);
 
   return (
-    <div className="flex flex-col items-center gap-1">
+    <div className={cn('flex flex-col items-center gap-1', fill && 'h-full w-full')}>
       <button
         type="button"
         disabled={effectiveDisabled}
@@ -81,9 +78,9 @@ export const AbortControl: React.FC<AbortControlProps> = ({
           }
         }}
         aria-label={isUnconfirmed ? 'Reenviar pouso imediatamente' : 'Abortar missão e pousar imediatamente'}
-        title={title}
         className={cn(
           'group relative flex items-center gap-2.5 overflow-hidden rounded-full border-2 px-6 py-2.5',
+          fill && 'h-full w-full justify-center',
           'transition-all duration-150 active:scale-[0.98]',
           isUnconfirmed
             ? 'border-amber-500 bg-amber-500/25 text-amber-200 shadow-abort backdrop-blur-sm hover:bg-amber-500/40 animate-pulse'
@@ -109,7 +106,7 @@ export const AbortControl: React.FC<AbortControlProps> = ({
             )}
           />
         )}
-        <span className="relative font-cond text-sm font-semibold tracking-[0.12em]">
+        <span className="title-pixel relative font-pixel text-[13px] font-semibold tracking-[0.08em]">
           {label}
         </span>
       </button>

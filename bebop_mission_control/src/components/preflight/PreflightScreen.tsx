@@ -1,39 +1,30 @@
-import React, { useMemo, useState } from 'react';
-import { SlidersHorizontal, TerminalSquare, Wrench, X } from 'lucide-react';
-import type { BatteryFailsafe, VoiceLevel } from '../../types/bmg';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { SlidersHorizontal } from 'lucide-react';
 import type { TelemetryView } from '../../types/mission';
-import type { LinkProgressEvent, LinkReadiness, WifiNetwork } from '../../types/bmg';
-import type { LinkPhase } from '../../hooks/useLink';
+import type { LinkReadiness } from '../../types/bmg';
 import type { ParamsDoc } from '../../hooks/useMissionParameters';
 import { getPath } from '../../lib/paths';
-import type { OperatorPreset } from '../../lib/operatorPresets';
-import { readMissionMode, type MissionMode } from '../../lib/missionMode';
-import { preflightBlockedReason } from '../../lib/preflightGate';
+import { parametersEnabled, type FlightMode } from '../../lib/flightMode';
+import {
+  preflightBlockedCode,
+  preflightBlockedReason,
+  preflightBlockedShort,
+  type PreflightGateInput,
+} from '../../lib/preflightGate';
+import type { LaunchView } from '../../lib/launchSequence';
 import { VideoBackdrop } from '../brand/VideoBackdrop';
-import { StatusBar } from '../shell/StatusBar';
 import { LaunchDial } from './LaunchDial';
+import { ControlDock } from './ControlDock';
 import { MissionModeSelector } from './MissionModeSelector';
-import { ConnectionSheet } from './ConnectionSheet';
 import { ParameterSheet } from './ParameterSheet';
-import { DiscardChangesDialog } from './DiscardChangesDialog';
 import { cn } from '../../lib/format';
 
 interface PreflightScreenProps {
   telemetry: TelemetryView;
   stale: boolean;
-  networks: WifiNetwork[];
-  currentSsid: string;
-  scanning: boolean;
-  linkPhase: LinkPhase;
-  linkMessage: string | null;
-  linkProgress: LinkProgressEvent[];
   readiness: LinkReadiness | null;
   flightReady: boolean;
   driverRunning: boolean;
-  onScan: () => void;
-  onConnect: (ssid: string) => void;
-  onStartDriver: () => void;
-  onStopDriver: () => void;
 
   params: ParamsDoc | null;
   /** `MissionParameters.factory()`, for "Restaurar Padrões"; `null` until served. */
@@ -42,28 +33,21 @@ interface PreflightScreenProps {
   paramsError: string | null;
   changedPaths: Set<string>;
   dirty: boolean;
-  presets: readonly OperatorPreset[];
-  activePresetId: string | null;
+  /** The working values equal the favourite of the mode (`activePresetId === favorite.id`). */
+  favoriteActive: boolean;
+  hasFavorite: boolean;
   onEdit: (path: string, value: unknown) => void;
-  onModeChange: (mode: MissionMode) => void;
+  /** The flight mode of the working document (`readFlightMode`). */
+  flightMode: FlightMode;
+  onFlightModeChange: (mode: FlightMode) => void;
   onSave: () => void;
-  /** A save was refused for a conflict between parameters; the sheet marks the fields. */
-  saveAttempted?: boolean;
   onDiscard: () => void;
-  onSavePreset: (name: string) => string | null;
-  onApplyPreset: (id: string) => void;
-  onRenamePreset: (id: string, name: string) => string | null;
-  onDeletePreset: (id: string) => void;
+  onSaveFavorite: () => void;
+  onRestoreFavorite: () => void;
 
-  /** Battery failsafe, configured from the battery flyout. */
-  failsafe: BatteryFailsafe;
-  onFailsafeChange: (next: BatteryFailsafe) => void;
-  failsafeTriggered: boolean;
-
-  /** The copilot's output level, controlled from the status bar. */
-  voice: VoiceLevel;
-  onVolume: (volume: number) => void;
-  onToggleMute: () => void;
+  /** Battery failsafe threshold and switch, set from the top bar; they feed the launch gate. */
+  batteryThresholdPct: number;
+  batteryFailsafeEnabled: boolean;
 
   launchError: string | null;
   /** Field of the launch document the mission refused; the sheet marks it. */
@@ -71,7 +55,12 @@ interface PreflightScreenProps {
   /** An altitude the envelope of the launch surface moved (`useMissionParameters.altitudeNotice`). */
   altitudeNotice?: string | null;
   onLaunch: () => void;
-  onOpenDiagnostics: () => void;
+  /** The launch sequence on the dial, or null when none is being prepared. */
+  sequence?: LaunchView | null;
+  /** Cancel the launch being prepared ("Abortar Missão"). */
+  onAbortLaunch?: () => void;
+  /** Short form of `launchError` for the centre of the dial. */
+  launchErrorShort?: string | null;
   /**
    * True from the click on the launch dial until the mission ends; the
    * profile is part of the document already sent.
@@ -84,14 +73,8 @@ interface PreflightScreenProps {
  *
  * The brand field is the screen rather than a backdrop to it, and the command
  * sits alone at its centre with the two things an operator reaches for next —
- * the flight parameters and the bench — directly beneath it.
- *
- * Everything else reports rather than asks. Charge and radio sit in the top
- * right the way a menu bar states them; the machinery behind those two figures
- * opens from them on demand. What used to occupy this screen — a ground
- * telemetry card on the left, a parameters card on the right, a build chip and
- * an environment chip in the corner — said the same few things four times and
- * left the command competing with them for the centre.
+ * the flight parameters and the flight mode — directly beneath it. Charge,
+ * radio, driver and voice live in the global top bar.
  */
 export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
   const {
@@ -106,44 +89,74 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
     dirty,
   } = props;
 
-  const [sheet, setSheet] = useState<'none' | 'link' | 'params'>('none');
-  const [confirmingDiscard, setConfirmingDiscard] = useState(false);
+  const [sheet, setSheet] = useState<'none' | 'params'>('none');
+  /** The operator tried to leave with edits pending once; the next attempt discards them. */
+  const [exitArmed, setExitArmed] = useState(false);
+  const [saveNudge, setSaveNudge] = useState(0);
 
-  // Closing the parameter sheet with edits pending asks first; confirming
-  // restores the last saved document. Launching still commits a pending draft
-  // silently (App.launch), which this deliberately leaves alone.
-  const closeParams = () => {
-    if (dirty) setConfirmingDiscard(true);
-    else setSheet('none');
-  };
-  const discardAndClose = () => {
-    props.onDiscard();
-    setConfirmingDiscard(false);
+  // Leaving the parameter sheet with edits pending shakes Salvar instead of
+  // asking in a dialog; a second attempt leaves and restores the last saved
+  // document. Launching still commits a pending draft silently (App.launch),
+  // which this deliberately leaves alone.
+  const closeSheet = () => {
+    setExitArmed(false);
     setSheet('none');
   };
+  const closeParams = () => {
+    if (dirty && !exitArmed) {
+      setExitArmed(true);
+      setSaveNudge((count) => count + 1);
+      return;
+    }
+    if (dirty) props.onDiscard();
+    closeSheet();
+  };
+  useEffect(() => {
+    if (!dirty) setExitArmed(false);
+  }, [dirty]);
+
+  // Escape leaves the sheet the way its close button does.
+  const closeRef = useRef(closeParams);
+  closeRef.current = closeParams;
+  useEffect(() => {
+    if (sheet !== 'params') return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeRef.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [sheet]);
 
   const benchMode = Boolean(getPath(params, 'no_fly'));
-  const missionMode = readMissionMode(params);
+  const flightMode = props.flightMode;
+  const paramsAvailable = parametersEnabled(flightMode);
+
+  // The bench runs the stored document as it is: the sheet has nothing to
+  // edit in Teste, and a switch to it closes an open sheet.
+  useEffect(() => {
+    if (!paramsAvailable && sheet === 'params') {
+      closeSheet();
+    }
+  }, [paramsAvailable, sheet]);
   const missingTopics = readiness?.missing ?? [];
 
-
   /** What stops the mission from being commanded; see `lib/preflightGate.ts`. */
-  const blockedReason = useMemo(
-    () =>
-      preflightBlockedReason({
-        paramsStatus,
-        driverRunning,
-        benchMode,
-        connected: telemetry.connected,
-        flightReady,
-        missingTopics,
-        stale,
-        flyingState: telemetry.flying_state,
-        batteryPct: telemetry.battery_pct,
-        batteryKnown: telemetry.battery_known,
-        batteryFailsafeThreshold: props.failsafe?.thresholdPct,
-        bridgeReady: readiness?.ready,
-      }),
+  const gate = useMemo<PreflightGateInput>(
+    () => ({
+      paramsStatus,
+      driverRunning,
+      benchMode,
+      connected: telemetry.connected,
+      flightReady,
+      missingTopics,
+      stale,
+      flyingState: telemetry.flying_state,
+      batteryPct: telemetry.battery_pct,
+      batteryKnown: telemetry.battery_known,
+      batteryFailsafeThreshold: props.batteryThresholdPct,
+      batteryFailsafeEnabled: props.batteryFailsafeEnabled,
+      bridgeReady: readiness?.ready,
+    }),
     [
       paramsStatus,
       driverRunning,
@@ -155,152 +168,79 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
       flightReady,
       missingTopics,
       stale,
-      props.failsafe?.thresholdPct,
+      props.batteryThresholdPct,
+      props.batteryFailsafeEnabled,
       readiness?.ready,
     ]
   );
+  const blockedCode = useMemo(() => preflightBlockedCode(gate), [gate]);
+  const blockedReason = useMemo(() => preflightBlockedReason(gate), [gate]);
+  const blockedShort = useMemo(() => preflightBlockedShort(gate), [gate]);
+  const sequence = props.sequence ?? null;
+
+  // The sheet does not open over a launch being prepared.
+  useEffect(() => {
+    if (sequence !== null && sheet === 'params') {
+      closeSheet();
+    }
+  }, [sequence, sheet]);
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-abyss">
       <VideoBackdrop subdued={sheet !== 'none'} />
 
       <div className="relative flex h-full flex-col">
-        {/* The dock floats over the centre of this row; both clusters stay clear of it. */}
-        <header className="flex shrink-0 items-start justify-between p-7">
-          {/* The video background (/assets/Tech4aiMVPvideo.mp4) renders the
-              Tech4ai brand mark in this corner. An empty placeholder preserves
-              header geometry without obscuring or duplicating the video's mark. */}
-          <span aria-hidden className="w-10" />
-
-          <div className="flex items-center gap-2.5">
-            <StatusBar
-              telemetry={telemetry}
-              onOpenLink={() => setSheet('link')}
-              networks={props.networks}
-              currentSsid={props.currentSsid}
-              scanning={props.scanning}
-              linkPhase={props.linkPhase}
-              linkMessage={props.linkMessage}
-              readiness={readiness}
-              flightReady={flightReady}
-              driverRunning={driverRunning}
-              onScan={props.onScan}
-              onConnect={props.onConnect}
-              onStartDriver={props.onStartDriver}
-              onStopDriver={props.onStopDriver}
-              failsafe={props.failsafe}
-              onFailsafeChange={props.onFailsafeChange}
-              failsafeTriggered={props.failsafeTriggered}
-              voice={props.voice}
-              onVolume={props.onVolume}
-              onToggleMute={props.onToggleMute}
-            />
-
-            <button
-              type="button"
-              onClick={props.onOpenDiagnostics}
-              aria-label="Abrir diagnóstico"
-              title="Diagnóstico"
-              className="rounded-full border border-frost/12 bg-abyss/45 p-2 text-haze backdrop-blur-md transition-colors hover:border-frost/30 hover:text-frost"
-            >
-              <TerminalSquare size={14} strokeWidth={1.8} />
-            </button>
-          </div>
-        </header>
-
         <main className="flex min-h-0 flex-1 flex-col items-center justify-center px-10 pb-16">
           <LaunchDial
+            view={sequence}
             ready={blockedReason === null}
+            blockedCode={blockedCode}
+            blockedShort={blockedShort}
             blockedReason={
               props.launchError ? `A missão não iniciou: ${props.launchError}` : blockedReason
             }
+            errorShort={props.launchError ? props.launchErrorShort ?? 'Falha ao iniciar' : null}
             benchMode={benchMode}
             onLaunch={props.onLaunch}
-            above={
-              <MissionModeSelector
-                value={missionMode}
-                onChange={props.onModeChange}
-                disabled={props.modeLocked}
-              />
-            }
             beneath={
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setSheet('params')}
-                  className={cn(
-                    'flex items-center gap-2 rounded-full border px-5 py-2 backdrop-blur-md transition-colors',
-                    dirty
-                      ? 'border-mint/45 bg-mint/[0.08] text-frost hover:border-mint/70'
-                      : 'border-frost/15 bg-abyss/45 text-frost/85 hover:border-frost/35 hover:text-frost'
-                  )}
-                >
-                  <SlidersHorizontal size={13} strokeWidth={1.8} className="text-haze" />
-                  <span className="font-cond text-sm tracking-wide">Parâmetros de voo</span>
-                  {dirty ? <span className="h-1.5 w-1.5 rounded-full bg-mint" /> : null}
-                </button>
-
-                {/* One switch, not a panel. What bench mode does — keep the
-                    motors inert — is a property of the next launch, and the
-                    routines it used to list are now the stage pills in the
-                    cockpit. Its colour is the brand's electric cyan, and the
-                    dial above takes the same colour while it is on, so a
-                    rehearsal never reads as the mint of a real flight. */}
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={benchMode}
-                  onClick={() => props.onEdit('no_fly', !benchMode)}
-                  title={
-                    benchMode
-                      ? 'Modo bancada ativo: os motores não giram. As etapas são disparadas na Cabine.'
-                      : 'Ativar o modo bancada: motores inertes, visão e gimbal reais.'
-                  }
-                  className={cn(
-                    'flex items-center gap-2 rounded-full border px-5 py-2 backdrop-blur-md transition-all',
-                    benchMode
-                      ? 'border-cyan/60 bg-cyan/10 text-cyan shadow-bench hover:border-cyan'
-                      : 'border-frost/15 bg-abyss/45 text-frost/85 hover:border-frost/35 hover:text-frost'
-                  )}
-                >
-                  <Wrench
-                    size={13}
-                    strokeWidth={1.8}
-                    className={benchMode ? 'text-cyan' : 'text-haze'}
+              <ControlDock
+                fused={sequence !== null}
+                onAbort={() => props.onAbortLaunch?.()}
+                parameters={
+                  <button
+                    type="button"
+                    onClick={() => setSheet('params')}
+                    disabled={!paramsAvailable || sequence !== null}
+                    className={cn(
+                      'dock-pill',
+                      !paramsAvailable && 'cursor-not-allowed opacity-45',
+                      dirty && paramsAvailable && 'border-mint/45'
+                    )}
+                  >
+                    <SlidersHorizontal size={15} strokeWidth={1.8} className="text-frost/75" />
+                    <span>Parâmetros</span>
+                    {dirty && paramsAvailable ? <span className="h-1.5 w-1.5 rounded-full bg-mint" /> : null}
+                  </button>
+                }
+                mode={
+                  <MissionModeSelector
+                    value={flightMode}
+                    onChange={props.onFlightModeChange}
+                    disabled={props.modeLocked}
                   />
-                  <span className="font-cond text-sm tracking-wide">Bancada</span>
-                  {benchMode ? <span className="h-1.5 w-1.5 rounded-full bg-cyan anim-breathe" /> : null}
-                </button>
-              </div>
+                }
+              />
             }
           />
         </main>
       </div>
 
-      <ConnectionSheet
-        open={sheet === 'link'}
-        onClose={() => setSheet('none')}
-        telemetry={telemetry}
-        networks={props.networks}
-        currentSsid={props.currentSsid}
-        phase={props.linkPhase}
-        message={props.linkMessage}
-        progress={props.linkProgress}
-        readiness={readiness}
-        flightReady={flightReady}
-        driverRunning={driverRunning}
-        onScan={props.onScan}
-        onConnect={props.onConnect}
-        onStartDriver={props.onStartDriver}
-        onStopDriver={props.onStopDriver}
-      />
-
       {sheet === 'params' ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-8"
+          className="fixed inset-x-0 bottom-0 top-12 z-50 flex items-center justify-center px-8 pb-6 pt-12"
           role="dialog"
           aria-modal="true"
-          aria-label="Parâmetros de voo"
+          aria-label="Parâmetros"
         >
           <button
             type="button"
@@ -308,16 +248,7 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
             onClick={closeParams}
             className="absolute inset-0 cursor-default bg-abyss/70 backdrop-blur-[3px]"
           />
-          <div className="anim-rise relative flex h-full max-h-[780px] w-full max-w-[1120px] flex-col">
-            <button
-              type="button"
-              onClick={closeParams}
-              aria-label="Fechar"
-              className="absolute -top-10 right-0 rounded-bezel p-1.5 text-haze transition-colors hover:bg-hull-raise hover:text-frost"
-            >
-              <X size={16} />
-            </button>
-
+          <div className="anim-rise relative flex max-h-full w-full max-w-[1320px] flex-col">
             {params ? (
               <ParameterSheet
                 working={params}
@@ -325,16 +256,14 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
                 changedPaths={props.changedPaths}
                 dirty={dirty}
                 saving={paramsStatus === 'saving'}
-                presets={props.presets}
-                activePresetId={props.activePresetId}
+                favoriteActive={props.favoriteActive}
+                hasFavorite={props.hasFavorite}
                 onEdit={props.onEdit}
                 onSave={props.onSave}
-                saveAttempted={props.saveAttempted}
-                onDiscard={props.onDiscard}
-                onSavePreset={props.onSavePreset}
-                onApplyPreset={props.onApplyPreset}
-                onRenamePreset={props.onRenamePreset}
-                onDeletePreset={props.onDeletePreset}
+                nudgeSave={saveNudge}
+                onClose={closeParams}
+                onSaveFavorite={props.onSaveFavorite}
+                onRestoreFavorite={props.onRestoreFavorite}
                 refusedPath={props.refusedPath ?? null}
                 altitudeNotice={props.altitudeNotice ?? null}
               />
@@ -348,9 +277,6 @@ export const PreflightScreen: React.FC<PreflightScreenProps> = (props) => {
               </div>
             )}
           </div>
-          {confirmingDiscard ? (
-            <DiscardChangesDialog onConfirm={discardAndClose} onCancel={() => setConfirmingDiscard(false)} />
-          ) : null}
         </div>
       ) : null}
     </div>

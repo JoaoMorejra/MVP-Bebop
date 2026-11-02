@@ -7,7 +7,8 @@ import type { Finding, ForensicScript } from '../lib/forensics';
 import { VICTIM_WORDINGS, scriptLines } from '../lib/forensics';
 import { NarrationQueue } from '../lib/narrationQueue';
 import type { InspectionAssessment, RawEvidence, VictimStatus } from '../types/bmg';
-import { useForensicNarration } from './useCopilot';
+import { TYPE_FINISH_MS, useForensicNarration, type FindingReading } from './useCopilot';
+import { SPEECH_MS_KEY, estimateSpeechMs } from '../lib/speechTiming';
 import { ASSESSMENT_GROUND_WAIT_MS, useForensicReport, type ForensicReportState } from './useForensicReport';
 
 declare global {
@@ -56,11 +57,18 @@ function voice() {
 
 let container: HTMLDivElement;
 let root: Root;
-const seen = { revealed: 0, closing: null as string | null };
+const seen = {
+  revealed: 0,
+  announced: 0,
+  readings: [] as ReadonlyArray<FindingReading | undefined>,
+  closing: null as string | null,
+};
 
 function Report({ queue, active, report }: { queue: NarrationQueue; active: boolean; report: ForensicScript | null }) {
-  const { revealed, closing } = useForensicNarration(queue, active, report);
+  const { revealed, announced, readings, closing } = useForensicNarration(queue, active, report);
   seen.revealed = revealed;
+  seen.announced = announced;
+  seen.readings = readings;
   seen.closing = closing;
   return null;
 }
@@ -109,6 +117,73 @@ describe('useForensicNarration', () => {
     const outro = v.spoken[v.spoken.length - 1];
     expect(PHRASE_POOLS['inspection.outro']).toContain(outro);
     expect(seen.closing).toBe(outro);
+  });
+
+  it('shows each card as its sentence starts and ends its text when the voice stops', async () => {
+    const pending: Array<{ resolve: (ok: boolean) => void; onAudio?: (ms: number | null) => void }> = [];
+    const spoken: string[] = [];
+    const queue = new NarrationQueue(
+      (text, _priority, onAudio) =>
+        new Promise<boolean>((resolve) => {
+          spoken.push(text);
+          pending.push({ resolve, onAudio });
+        })
+    );
+    await act(async () => root.render(<Report queue={queue} active report={SCRIPT} />));
+    await act(async () => pending.shift()?.resolve(true));
+    await tick(0);
+
+    // Handed to the voice: the card is up, its text paces on the expected speech length.
+    expect(spoken[spoken.length - 1]).toBe(REPORT[0].speech);
+    expect(seen.announced).toBe(1);
+    expect(seen.revealed).toBe(0);
+    expect(seen.readings[0]?.endsAt).toBe(Date.now() + estimateSpeechMs(REPORT[0].speech));
+
+    // The voice starts and says how long: the text is due when it stops.
+    await tick(200);
+    const startedAt = Date.now();
+    await act(async () => pending[0].onAudio?.(2600));
+    expect(seen.readings[0]?.endsAt).toBe(startedAt + 2600);
+
+    await tick(2600);
+    await act(async () => pending.shift()?.resolve(true));
+    await tick(0);
+    expect(seen.revealed).toBe(1);
+    expect(seen.readings[0]?.endsAt, 'a voice on time leaves the pace alone').toBe(startedAt + 2600);
+    expect(seen.announced).toBe(2);
+
+    // A voice that stops early: what is left eases in over TYPE_FINISH_MS.
+    await act(async () => pending[0].onAudio?.(5000));
+    await tick(1000);
+    await act(async () => pending.shift()?.resolve(true));
+    await tick(0);
+    expect(seen.readings[1]?.endsAt).toBe(Date.now() + TYPE_FINISH_MS);
+
+    // Heard sentences are measured from the moment they began to sound.
+    const store = JSON.parse(window.localStorage.getItem(SPEECH_MS_KEY) ?? '{}') as Record<string, number>;
+    expect(store[REPORT[0].speech]).toBe(2600);
+    expect(store[REPORT[1].speech]).toBe(1000);
+  });
+
+  it('paces an unknown length on the last measurement of that sentence', async () => {
+    const pending: Array<{ resolve: (ok: boolean) => void; onAudio?: (ms: number | null) => void }> = [];
+    window.localStorage.setItem(SPEECH_MS_KEY, JSON.stringify({ [REPORT[0].speech]: 3100 }));
+    const queue = new NarrationQueue(
+      (_text, _priority, onAudio) => new Promise<boolean>((resolve) => pending.push({ resolve, onAudio }))
+    );
+    await act(async () => root.render(<Report queue={queue} active report={SCRIPT} />));
+    await act(async () => pending.shift()?.resolve(true));
+    await tick(0);
+    await act(async () => pending[0].onAudio?.(null));
+    expect(seen.readings[0]?.endsAt).toBe(Date.now() + 3100);
+  });
+
+  it('types a silent report over its fallback beat', async () => {
+    const queue = new NarrationQueue(async () => false, () => undefined);
+    await act(async () => root.render(<Report queue={queue} active report={SCRIPT} />));
+    await tick(1800);
+    expect(seen.announced).toBe(1);
+    expect(seen.readings[0]?.endsAt).toBe(Date.now() + 1800);
   });
 
   it('keeps the two-second floor when the copilot cannot speak', async () => {

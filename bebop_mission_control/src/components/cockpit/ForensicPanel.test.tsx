@@ -3,6 +3,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ForensicPanel } from './ForensicPanel';
+import { GRID_TEMPO, PHOTO_IN_MS } from './EvidenceGrid';
 import { isAirborne } from '../../lib/flightState';
 import { FINISH_HOLD_MS, FINISH_REASONS, type FinishLockResult } from '../../lib/finishLock';
 import { TOPIC_LABEL, buildForensicReport, type Finding, type FindingTopic } from '../../lib/forensics';
@@ -41,6 +42,12 @@ const LINK_LOST: FinishLockResult = {
   requiresConfirm: true,
 };
 
+/** Let the photograph come over the grid and the panel settle (real timers). */
+const settle = () =>
+  act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, PHOTO_IN_MS + 40));
+  });
+
 function render(lock: FinishLockResult, onFinish = vi.fn()) {
   act(() =>
     root.render(
@@ -62,29 +69,26 @@ function render(lock: FinishLockResult, onFinish = vi.fn()) {
 }
 
 describe('Finalizar missão', () => {
-  it('is disabled, and says why, with nothing to finish', () => {
-    const { button, onFinish } = render(LOCKED);
-    expect(button.disabled).toBe(true);
-    expect(button.getAttribute('aria-disabled')).toBe('true');
-    expect(button.title).toBe('Disponível após iniciar uma missão');
-    act(() => button.click());
-    expect(onFinish).not.toHaveBeenCalled();
+  it.each([
+    ['no_mission', LOCKED],
+    ['in_flight', { state: 'in_flight', enabled: false, reason: FINISH_REASONS.inFlight, requiresConfirm: false }],
+    ['await_ground', { state: 'await_ground', enabled: false, reason: FINISH_REASONS.awaitGround, requiresConfirm: false }],
+    ['aborting', { state: 'aborting', enabled: false, reason: FINISH_REASONS.landing, requiresConfirm: false }],
+  ] as const)('is not shown while it cannot finish (%s)', (_state, lock) => {
+    const { button } = render(lock as FinishLockResult);
+    expect(button).toBeNull();
+    expect(container.textContent).not.toContain('Finalizar missão');
   });
 
-  it.each([
-    ['in_flight', FINISH_REASONS.inFlight],
-    ['await_ground', FINISH_REASONS.awaitGround],
-    ['aborting', FINISH_REASONS.landing],
-  ] as const)('locked in %s shows "%s" as its tooltip', (state, reason) => {
-    const { button } = render({ state, enabled: false, reason, requiresConfirm: false });
-    expect(button.disabled).toBe(true);
-    expect(button.title).toBe(reason);
+  it('appears in the bottom-right corner once it can', () => {
+    const { button } = render(GROUNDED);
+    expect(button.className).toContain('bottom-3');
+    expect(button.className).toContain('right-3');
   });
 
   it('ends the cycle once the aircraft is confirmed on the ground', () => {
     const { button, onFinish } = render(GROUNDED);
     expect(button.disabled).toBe(false);
-    expect(button.getAttribute('aria-disabled')).toBe('false');
     act(() => button.click());
     expect(onFinish).toHaveBeenCalledTimes(1);
   });
@@ -104,7 +108,8 @@ describe('Finalizar missão', () => {
 
     it('a click does nothing; only a press held for the full duration finishes', () => {
       const { button, onFinish } = render(LINK_LOST);
-      expect(button.title).toBe(FINISH_REASONS.linkLost);
+      expect(button.title).toBe('');
+      expect(button.getAttribute('data-finish-reason')).toBe(FINISH_REASONS.linkLost);
       expect(button.textContent?.trim()).toBe('Segure para finalizar');
       act(() => button.click());
       expect(onFinish).not.toHaveBeenCalled();
@@ -177,20 +182,21 @@ describe('the report waiting for the victim assessment', () => {
     );
   }
 
-  it('holds a placeholder victim card with no finding text while analyzing', () => {
+  it('holds a placeholder victim card with no finding text while analyzing', async () => {
     renderReport({ report: null, analyzing: true });
+    await settle();
     const card = container.querySelector('[data-finding-state="analyzing"]');
     expect(card?.textContent).toContain('Analisando imagem');
-    expect(card?.textContent).toContain('Estado do acidentado');
+    expect(card?.textContent).toContain('Avaliação da vítima');
     expect(container.querySelector('ul')?.getAttribute('aria-busy')).toBe('true');
-    expect(container.textContent).toContain('analisando imagem');
   });
 
-  it('replaces the placeholder with the drawn findings', () => {
+  it('replaces the placeholder with the drawn findings', async () => {
     renderReport({
       report: [{ topic: 'victim', card: 'Cena sem vítimas aparentes', speech: 'Por fim, cena sem vítimas aparentes.' }],
       analyzing: false,
     });
+    await settle();
     expect(container.querySelector('[data-finding-state="analyzing"]')).toBeNull();
     expect(container.textContent).toContain('Cena sem vítimas aparentes');
   });
@@ -259,6 +265,7 @@ describe('the report inside the cockpit', () => {
         />
       )
     );
+    await settle();
   }
 
   const cardTopics = (): FindingTopic[] =>
@@ -299,5 +306,151 @@ describe('the report inside the cockpit', () => {
     expect(topics).toEqual(report.map((finding) => finding.topic));
     expect(topics.slice(0, 2)).toEqual(lead);
     expect(new Set(topics.slice(2))).toEqual(new Set(['samu', 'police']));
+  });
+});
+
+describe('the evidence from the flight to touchdown', () => {
+  const CAPTURE: RawEvidence = {
+    filename: 'accident_raw_20261029_111530.png',
+    url: '/evidence/accident_raw_20261029_111530.png',
+    timestamp: 0,
+  };
+  const FINDINGS: Finding[] = [
+    { topic: 'vehicle', card: 'Veículo sem danos estruturais aparentes', speech: 'Para começar, veículo sem danos.' },
+    { topic: 'victim', card: 'Vítima consciente', speech: 'Além disso, vítima consciente.' },
+  ];
+
+  function renderPanel(props: {
+    latest?: RawEvidence | null;
+    landed?: boolean;
+    stage?: number;
+    report?: Finding[] | null;
+    revealed?: number;
+    announced?: number;
+    readings?: Array<{ endsAt: number | null } | undefined>;
+    lock?: FinishLockResult;
+  }) {
+    act(() =>
+      root.render(
+        <ForensicPanel
+          latest={props.latest ?? null}
+          count={props.latest ? 1 : 0}
+          stage={props.stage ?? 2}
+          missionOver={false}
+          landed={props.landed ?? false}
+          report={props.report ?? null}
+          reportRevealed={props.revealed ?? 0}
+          reportAnnounced={props.announced}
+          reportReadings={props.readings}
+          flightProgress={0.5}
+          waitProgress={0.4}
+          onFinish={vi.fn()}
+          lock={props.lock ?? LOCKED}
+        />
+      )
+    );
+  }
+
+  const grid = () => container.querySelector('[data-evidence-grid]');
+
+  it('waits as a grid under the reticle, with only its caption and no header', () => {
+    renderPanel({});
+    expect(grid()?.getAttribute('data-evidence-grid')).toBe('waiting');
+    expect(container.querySelector('.evgrid-reticle')).not.toBeNull();
+    expect(container.textContent?.trim()).toBe('Aguardando evidência');
+    expect(container.querySelector('header')).toBeNull();
+    expect(container.querySelector('button[data-finish-state]')).toBeNull();
+  });
+
+  it('says the aircraft is over the target', () => {
+    renderPanel({ stage: 4 });
+    expect(grid()?.hasAttribute('data-inspecting')).toBe(true);
+  });
+
+  it('forms the photograph out of the grid, with no time of capture before touchdown', () => {
+    renderPanel({});
+    renderPanel({ latest: CAPTURE });
+    expect(grid()?.getAttribute('data-evidence-grid')).toBe('revealing');
+    expect(grid()?.hasAttribute('data-shooting')).toBe(true);
+    const photo = container.querySelector('.evgrid-photo');
+    expect(photo?.getAttribute('src')).toBe(CAPTURE.url);
+    expect(photo?.className).not.toContain('evgrid-photo-in');
+    expect(container.querySelector('[data-capture-stamp]')).toBeNull();
+    expect(container.querySelector('[data-scan-sweep]')).toBeNull();
+  });
+
+  it('runs the grid tempo 4x faster from the start of the flight', () => {
+    expect(GRID_TEMPO).toBe(12);
+  });
+
+  it('reveals the photograph immediately in flight after capture and runs a minimalist scan until touchdown', async () => {
+    renderPanel({});
+    renderPanel({ latest: CAPTURE, landed: false });
+    await settle();
+    expect(grid()?.getAttribute('data-evidence-grid')).toBe('revealed');
+    expect(container.querySelector('.evgrid-photo')?.className).toContain('evgrid-photo-in');
+    const scan = container.querySelector('[data-scan-sweep]');
+    expect(scan).not.toBeNull();
+    expect(scan?.textContent).toBe('');
+    expect(container.querySelector('[data-capture-stamp]')).toBeNull();
+    expect(container.querySelector('[data-evidence-frame]')?.className).toContain('h-full');
+
+    renderPanel({ latest: CAPTURE, landed: true, report: FINDINGS, revealed: 1, announced: 1, lock: GROUNDED });
+    expect(container.querySelector('[data-scan-sweep]')).toBeNull();
+    expect(container.querySelector('[data-capture-stamp]')?.textContent).toMatch(/capturada em/);
+    expect(container.querySelector('[data-evidence-frame]')?.className).toContain('h-[38%]');
+  });
+
+  it('is whole on touchdown, then tells the time of capture', async () => {
+    renderPanel({ latest: CAPTURE });
+    renderPanel({ latest: CAPTURE, landed: true, lock: GROUNDED });
+    expect(container.querySelector('.evgrid-photo')?.className).toContain('evgrid-photo-in');
+    expect(container.querySelector('[data-capture-stamp]')).toBeNull();
+    await settle();
+    expect(grid()?.getAttribute('data-evidence-grid')).toBe('revealed');
+    expect(container.querySelector('[data-capture-stamp]')?.textContent).toMatch(/capturada em/);
+  });
+
+  it('shows the cards in their boxes, typing the white sentence to end with the voice', async () => {
+    renderPanel({ latest: CAPTURE, landed: true, report: FINDINGS, revealed: 0, announced: 1, readings: [{ endsAt: null }], lock: GROUNDED });
+    await settle();
+    vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      const cards = () => Array.from(container.querySelectorAll('ul > li'));
+      expect(cards()[0].className).toContain('opacity-100');
+      expect(cards()[0].className).toContain('rounded-bezel');
+      expect(cards()[1].className).toContain('opacity-0');
+      expect(cards()[0].querySelector('[data-finding-badge="vehicle"] .finding-badge-diamond')).not.toBeNull();
+      expect(cards()[0].textContent).toContain('Análise do veículo');
+      expect(cards()[0].textContent).not.toMatch(/\b0\d\b/);
+      const typed = () => cards()[0].querySelector('[data-typing] > span:nth-child(2)')?.textContent ?? FINDINGS[0].card;
+      expect(typed(), 'waits for the voice').toBe('');
+      expect(cards()[0].querySelector('.sr-only')?.textContent).toBe(FINDINGS[0].card);
+
+      const text = FINDINGS[0].card;
+      renderPanel({
+        latest: CAPTURE,
+        landed: true,
+        report: FINDINGS,
+        revealed: 0,
+        announced: 1,
+        readings: [{ endsAt: Date.now() + 2000 }],
+        lock: GROUNDED,
+      });
+      const lengths: number[] = [];
+      for (let i = 0; i < 125; i += 1) {
+        act(() => vi.advanceTimersByTime(16));
+        lengths.push(typed().length);
+      }
+      expect(lengths.every((value, index) => index === 0 || value >= lengths[index - 1])).toBe(true);
+      expect(Math.max(...lengths.slice(1).map((value, index) => value - lengths[index]))).toBeLessThanOrEqual(2);
+      expect(lengths[60]).toBeGreaterThan(text.length * 0.4);
+      expect(lengths[60]).toBeLessThan(text.length * 0.6);
+      act(() => vi.advanceTimersByTime(32));
+      expect(cards()[0].querySelector('[data-typing]')).toBeNull();
+      expect(cards()[0].textContent).toContain(text);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

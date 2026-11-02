@@ -1,14 +1,12 @@
 import React from 'react';
-import { Camera, Check, Plane, RotateCcw, ScanLine, Siren, Wrench } from 'lucide-react';
+import { Camera, Check, Plane, RotateCcw, ScanLine, Siren } from 'lucide-react';
 import type { MissionState } from '../../types/mission';
-import type { VoiceLevel } from '../../types/bmg';
-import { VoiceControl } from '../shell/StatusBar';
+import type { FillState } from '../../lib/stageProgress';
 import { cn } from '../../lib/format';
 import { stageLabel, type MissionMode } from '../../lib/missionMode';
 
 interface StageBarProps {
   stage: number;
-  stageName: string;
   state: MissionState;
   /**
    * Bench mode. The stage pills launch a single routine rather than commanding
@@ -23,26 +21,27 @@ interface StageBarProps {
   /** A jump has been asked for and the current step has not unwound yet. */
   pendingStage: number | null;
   /**
-   * The copilot's level, controlled from here as well as from pre-flight.
-   *
-   * A flight is exactly when an operator wants the voice down — it is talking,
-   * and there is someone in the room — and pre-flight is not on screen then.
+   * Seconds left before the bench routine of `benchStage` spawns, shown inside
+   * its pill (D7); `null` or zero shows nothing.
    */
-  voice: VoiceLevel;
-  onVolume: (volume: number) => void;
-  onToggleMute: () => void;
+  benchCountdown?: number | null;
   /** Relabels the last stage; the sheet is locked during flight, so it matches the launched mode. */
   missionMode?: MissionMode;
-  /** Return plan of the flight (`rtl.enabled`): relabels the last stage and sets the plan chip. */
+  /** Return plan of the flight (`rtl.enabled`): relabels the last stage. */
   rtlEnabled?: boolean;
+  /**
+   * How far each stage has filled (`useStageProgress`). Without it each pill
+   * is empty or full by the stage the mission reports.
+   */
+  fill?: FillState;
 }
 
 /**
  * The five deterministic stages, named as the demonstration names them.
  *
  * The same five names are in `STEP_NAMES` (`electron/main.cjs`) and in
- * `MISSION_STAGES` (`types/mission.ts`), so the strip, the header and the log
- * all say the same word for the same stage.
+ * `MISSION_STAGES` (`types/mission.ts`), so the strip and the log say the
+ * same word for the same stage.
  */
 const STAGES = [
   { step: 1, label: 'Decolagem', icon: Plane },
@@ -52,58 +51,87 @@ const STAGES = [
   { step: 5, label: 'Retornando base', icon: RotateCcw },
 ] as const;
 
-/**
- * States worth naming. Idle is absent on purpose: a bar announcing "aguardando
- * comando" told the operator what the unlit stage chips beneath it already say.
- */
-const STATE_LABEL: Partial<Record<MissionState, string>> = {
-  arming: 'Armando',
-  running: 'Missão autônoma Bebop 2',
-  aborting: 'Abortando',
-  finished: 'Missão concluída',
-  finished_unconfirmed: 'Pouso sem confirmação',
-  aborted: 'Missão abortada',
-  faulted: 'Missão interrompida',
+type Tone = 'flight' | 'bench' | 'halted';
+
+const FILL_TONE: Record<Tone, string> = {
+  flight: 'bg-mint',
+  bench: 'bg-cyan',
+  halted: 'bg-ember',
 };
+
+/**
+ * One pill's content. Drawn twice, on top of each other: once light for the
+ * part not yet filled, once dark and clipped to the fill, so the label reads
+ * on either side of the edge as it moves across it.
+ */
+const PillContent: React.FC<{
+  step: number;
+  label: string;
+  Icon: React.ElementType;
+  done: boolean;
+  onFill: boolean;
+  dim: boolean;
+  /** Colour of the fill the dark copy sits on, so its icon ring covers the light one beneath. */
+  tone: Tone;
+  trailing?: React.ReactNode;
+}> = ({ step, label, Icon, done, onFill, dim, tone, trailing }) => (
+  <>
+    <span
+      className={cn(
+        'grid h-7 w-7 shrink-0 place-items-center rounded-full border',
+        onFill ? cn('border-abyss/35 text-abyss', FILL_TONE[tone]) : 'border-strut bg-abyss/60 text-haze'
+      )}
+    >
+      {done ? <Check size={14} strokeWidth={3} /> : <Icon size={14} strokeWidth={onFill ? 2.4 : 2} />}
+    </span>
+    <span className="flex min-w-0 items-baseline gap-1.5">
+      <span className={cn('tnum font-mono text-sm font-bold', onFill ? 'text-abyss' : dim ? 'text-haze' : 'text-frost/85')}>
+        {step}
+      </span>
+      <span className={cn('text-sm', onFill ? 'text-abyss/60' : 'text-haze-deep')}>·</span>
+      <span
+        className={cn(
+          'truncate font-pixel text-[13.5px] font-semibold tracking-[0.02em]',
+          onFill ? 'text-abyss' : dim ? 'text-haze' : 'text-frost/85'
+        )}
+      >
+        {label}
+      </span>
+    </span>
+    {trailing}
+  </>
+);
 
 /**
  * Where the aircraft is in its own sequence.
  *
- * A stage only lights when `mission.py` has logged its `[STEP N:` marker, so
- * the strip reports the pipeline rather than predicting it. Stages behind the
- * current one are marked done; stages ahead are drawn but unlit, which is what
- * makes the remaining flight legible at a glance.
+ * Each pill fills from the left, in the colour of the flight, as the stage
+ * runs (`lib/stageProgress.ts`): from what the mission reports for it, never
+ * on a timer, and only to the end once the mission has moved on. A stage the
+ * mission skips is still filled in full, in its turn, before the next one
+ * starts. The stage being filled breathes; the pills behind it hold their full
+ * fill with a tick. An abort stops the fill where it is and turns it ember; on
+ * the bench it runs in the bench's cyan.
  *
- * The strip is the centrepiece of a demonstration, so it has a row of its own
- * across the full width of the cockpit: five large numbered pills, the active
- * one lit solid mint with a breathing glow, and a progress rule under them that
- * moves with the pipeline. An evaluator across the room reads the stage from
- * here before they read anything else on the screen.
- *
- * On the bench the same pills become buttons. Running one routine is the point
- * of bench mode, and the strip is already the map of which routines exist.
- *
- * The header's middle column is empty by construction: the station's dock
- * floats at the top centre of the window in both tabs, directly over it.
+ * The strip opens the cockpit on its own, with no header above it and no rule
+ * under it: the fills are the progress. On the bench the pills become
+ * buttons, and in flight they ask the mission to continue at that stage.
  */
 export const StageBar: React.FC<StageBarProps> = ({
   stage,
-  stageName,
   state,
   benchMode,
   benchStage,
   onRunStage,
   onGotoStage,
   pendingStage,
-  voice,
-  onVolume,
-  onToggleMute,
+  benchCountdown = null,
   missionMode = 'advanced',
   rtlEnabled = true,
+  fill,
 }) => {
   const aborted = state === 'aborting' || state === 'aborted' || state === 'faulted';
   const running = state === 'running' || state === 'arming';
-  const label = STATE_LABEL[state];
   /**
    * On the bench every stage is always a button — the point of a bench is that
    * the operator tries one routine, sees what it does, and tries another.
@@ -117,196 +145,108 @@ export const StageBar: React.FC<StageBarProps> = ({
    */
   const redirectable = running;
   const interactive = launchable || redirectable;
-  const progress = Math.max(0, Math.min(5, stage)) / 5;
+  const cursor = fill ? fill.cursor : stage;
 
   return (
-    <div className="flex shrink-0 flex-col gap-2">
-      <header className="grid h-12 shrink-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center rounded-panel border border-strut-soft bg-hull-deep/80 px-4">
-        <div className="flex min-w-0 items-center gap-2.5">
-          {label ? (
+    <nav aria-label="Modos de voo" className="shrink-0">
+      <ol className="grid grid-cols-5 gap-1.5">
+        {STAGES.map(({ step, label: stepLabel, icon: Icon }) => {
+          const amount = fill ? fill.fills[step - 1] : stage > step ? 1 : 0;
+          const done = amount >= 1;
+          const current = cursor === step && !done;
+          const active = current && !aborted;
+          const halted = current && aborted;
+          const rehearsing = benchStage === step;
+          const pending = pendingStage === step && !current;
+          const tone: Tone = halted ? 'halted' : benchMode ? 'bench' : 'flight';
+          const percent = Math.round(Math.max(0, Math.min(1, amount)) * 1000) / 10;
+          const label = stageLabel(missionMode, step, stepLabel, rtlEnabled);
+
+          const trailing = (onFill: boolean) => (
             <>
-              <span
-                className={cn(
-                  'h-2 w-2 shrink-0 rounded-full',
-                  aborted ? 'bg-ember' : running ? 'bg-mint anim-breathe' : 'bg-haze-deep'
-                )}
-              />
-              <span className="shrink-0 font-cond text-sm tracking-wide text-frost">{label}</span>
-              {running && stageName ? (
-                <>
-                  <span aria-hidden className="text-haze-deep">
-                    /
+              {rehearsing && benchCountdown !== null && benchCountdown > 0 && !onFill ? (
+                <span className="ml-auto shrink-0">
+                  <span data-bench-countdown aria-hidden="true" className="tnum font-mono text-3xs text-cyan">
+                    {benchCountdown}
                   </span>
-                  <span className="truncate font-cond text-sm font-semibold tracking-wide text-mint">
-                    {stage > 0 ? `${stage} · ` : ''}
-                    {stageLabel(missionMode, stage, stageName, rtlEnabled)}
-                  </span>
-                </>
+                  <span className="sr-only">{`${benchCountdown} segundos para iniciar`}</span>
+                </span>
+              ) : null}
+              {active ? (
+                <span
+                  aria-hidden
+                  className={cn('ml-auto h-2 w-2 shrink-0 rounded-full anim-breathe', onFill ? 'bg-abyss' : 'bg-mint')}
+                />
               ) : null}
             </>
-          ) : launchable ? (
-            <span className="flex items-center gap-2 font-cond text-sm tracking-wide text-cyan">
-              <Wrench size={13} strokeWidth={2} />
-              Bancada · escolha uma etapa
-            </span>
-          ) : (
-            <span className="font-cond text-sm tracking-wide text-haze">Aguardando missão</span>
-          )}
-          {launchable && label ? (
-            <span className="shrink-0 font-cond text-2xs tracking-wide text-cyan">· bancada</span>
-          ) : null}
-          {pendingStage !== null ? (
-            <span className="shrink-0 font-cond text-2xs tracking-wide text-amber anim-breathe">
-              · salto para {pendingStage} pedido
-            </span>
-          ) : null}
-          <span
-            data-plan-chip="end"
-            className="shrink-0 rounded-full border border-strut-soft px-2 py-0.5 font-sans text-3xs text-haze"
-          >
-            {rtlEnabled ? 'Final: RTL + pouso de precisão' : 'Final: pouso no local'}
-          </span>
-        </div>
+          );
 
-        {/* Reserved for the dock. */}
-        <span aria-hidden className="w-[230px]" />
+          const body = (
+            <>
+              <span
+                aria-hidden
+                data-stage-fill
+                data-stage={step}
+                className={cn('stage-fill', FILL_TONE[tone], tone === 'flight' && 'stage-fill-flight')}
+                style={{ width: `${percent}%` }}
+              />
+              <span className="stage-face">
+                <PillContent
+                  step={step}
+                  label={label}
+                  Icon={Icon}
+                  done={done}
+                  onFill={false}
+                  dim={!interactive && amount === 0}
+                  tone={tone}
+                  trailing={trailing(false)}
+                />
+              </span>
+              <span aria-hidden className="stage-face stage-face-on" style={{ clipPath: `inset(0 ${100 - percent}% 0 0)` }}>
+                <PillContent step={step} label={label} Icon={Icon} done={done} onFill dim={false} tone={tone} trailing={trailing(true)} />
+              </span>
+            </>
+          );
 
-        <div className="flex items-center justify-end">
-          <VoiceControl voice={voice} onVolume={onVolume} onToggleMute={onToggleMute} align="right" />
-        </div>
-      </header>
+          const shell = cn(
+            'stage-pill',
+            active && 'stage-pill-active',
+            halted && 'border-ember shadow-abort',
+            rehearsing && !current && 'border-cyan shadow-bench',
+            pending && 'border-amber anim-breathe',
+            done && !halted && !pending && 'border-mint/45',
+            !done && !current && !rehearsing && !pending && 'border-transparent'
+          );
+          const dataProps = {
+            'data-stage': step,
+            'data-fill': percent,
+            'data-state': done ? 'done' : active ? 'active' : halted ? 'halted' : 'idle',
+            'aria-current': active ? ('step' as const) : undefined,
+          };
 
-      <nav
-        aria-label="Modos de voo"
-        className="relative rounded-panel border border-strut-soft bg-hull-deep/80 px-2.5 pb-3 pt-2.5"
-      >
-        <ol className="grid grid-cols-5 gap-2">
-          {STAGES.map(({ step, label: stepLabel, icon: Icon }) => {
-            const done = stage > step;
-            const active = stage === step && !aborted;
-            const halted = stage === step && aborted;
-            const rehearsing = benchStage === step;
-            const pending = pendingStage === step && !active;
-
-            const body = (
-              <>
-                <span
+          return (
+            <li key={step} className="min-w-0">
+              {interactive ? (
+                <button
+                  type="button"
+                  {...dataProps}
+                  onClick={() => (launchable ? onRunStage(step) : onGotoStage(step))}
                   className={cn(
-                    'grid h-7 w-7 shrink-0 place-items-center rounded-full border transition-all duration-500',
-                    active
-                      ? 'border-abyss/30 bg-abyss text-mint'
-                      : halted
-                      ? 'border-ember/60 bg-ember/15 text-ember'
-                      : done
-                      ? 'border-mint/50 bg-mint/15 text-mint'
-                      : rehearsing
-                      ? 'border-cyan/60 bg-cyan/15 text-cyan'
-                      : pending
-                      ? 'border-amber/60 bg-amber/15 text-amber'
-                      : 'border-strut bg-abyss/60 text-haze'
+                    shell,
+                    !active && (launchable ? 'hover:border-cyan hover:bg-cyan/10' : 'hover:border-frost/40 hover:bg-frost/[0.04]')
                   )}
                 >
-                  {done && !active && !halted ? (
-                    <Check size={14} strokeWidth={3} />
-                  ) : (
-                    <Icon size={14} strokeWidth={active ? 2.6 : 2} />
-                  )}
+                  {body}
+                </button>
+              ) : (
+                <span {...dataProps} className={shell}>
+                  {body}
                 </span>
-                <span className="flex min-w-0 items-baseline gap-1.5">
-                  <span
-                    className={cn(
-                      'tnum font-mono text-sm font-bold',
-                      active ? 'text-abyss' : halted ? 'text-ember' : done ? 'text-mint' : 'text-haze'
-                    )}
-                  >
-                    {step}
-                  </span>
-                  <span className={cn('text-sm', active ? 'text-abyss/60' : 'text-haze-deep')}>·</span>
-                  <span
-                    className={cn(
-                      'truncate font-cond text-base font-semibold tracking-wide',
-                      halted
-                        ? 'text-ember'
-                        : active
-                        ? 'text-abyss'
-                        : done
-                        ? 'text-frost'
-                        : rehearsing
-                        ? 'text-cyan'
-                        : pending
-                        ? 'text-amber'
-                        : interactive
-                        ? 'text-frost/85'
-                        : 'text-haze'
-                    )}
-                  >
-                    {stageLabel(missionMode, step, stepLabel, rtlEnabled)}
-                  </span>
-                </span>
-                {active ? (
-                  <span aria-hidden className="ml-auto h-2 w-2 shrink-0 rounded-full bg-abyss anim-breathe" />
-                ) : null}
-              </>
-            );
-
-            const shell = cn(
-              'flex h-12 w-full min-w-0 items-center gap-2.5 rounded-panel border px-3 text-left',
-              'transition-all duration-500 ease-settle',
-              active && 'scale-[1.02] border-mint-bright bg-mint anim-stage-glow',
-              halted && 'border-ember bg-ember/15 shadow-abort',
-              rehearsing && !active && 'border-cyan bg-cyan/10 shadow-bench',
-              pending && !active && 'border-amber bg-amber/15 anim-breathe',
-              done && !active && !halted && !pending && 'border-mint/35 bg-mint/[0.07]',
-              !done && !active && !halted && !rehearsing && !pending && 'border-strut bg-abyss/40'
-            );
-
-            return (
-              <li key={step} className="min-w-0">
-                {interactive ? (
-                  <button
-                    type="button"
-                    aria-current={active ? 'step' : undefined}
-                    onClick={() => (launchable ? onRunStage(step) : onGotoStage(step))}
-                    title={
-                      launchable
-                        ? rehearsing
-                          ? `A etapa ${step} está em execução na bancada`
-                          : `Executar a etapa ${step} na bancada, com os motores inertes${
-                              running ? ' (interrompe a rotina atual)' : ''
-                            }`
-                        : `Comandar a missão a seguir na etapa ${step}`
-                    }
-                    className={cn(
-                      shell,
-                      !active &&
-                        (launchable
-                          ? 'hover:border-cyan hover:bg-cyan/15'
-                          : 'hover:border-frost/40 hover:bg-frost/[0.06]')
-                    )}
-                  >
-                    {body}
-                  </button>
-                ) : (
-                  <span aria-current={active ? 'step' : undefined} className={shell}>
-                    {body}
-                  </span>
-                )}
-              </li>
-            );
-          })}
-        </ol>
-
-        {/* The pipeline's progress, under the pills. */}
-        <div aria-hidden className="absolute inset-x-2.5 bottom-1 h-[3px] overflow-hidden rounded-full bg-strut/60">
-          <div
-            className={cn(
-              'h-full rounded-full transition-[width] duration-700 ease-settle',
-              aborted ? 'bg-ember' : 'bg-gradient-to-r from-kelp via-mint to-mint-bright'
-            )}
-            style={{ width: `${progress * 100}%` }}
-          />
-        </div>
-      </nav>
-    </div>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+    </nav>
   );
 };

@@ -58,7 +58,7 @@ export const PlateHead: React.FC<PlateHeadProps> = ({ title, aside, className })
       className
     )}
   >
-    <h2 className="font-cond text-xs font-medium tracking-wide text-haze">{title}</h2>
+    <h2 className="title-pixel font-pixel text-xs font-medium tracking-[0.06em] text-haze">{title}</h2>
     {aside ? <div className="flex items-center gap-2">{aside}</div> : null}
   </div>
 );

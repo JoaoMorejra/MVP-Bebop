@@ -28,6 +28,7 @@ const MILESTONE_STAGE: Record<string, number> = {
   'mission.touchdown': 5,
 };
 import { NarrationQueue } from '../lib/narrationQueue';
+import { estimateSpeechMs, readSpeechMs, recordSpeechMs } from '../lib/speechTiming';
 import { useBridge } from './useBridge';
 
 /**
@@ -39,8 +40,12 @@ import { useBridge } from './useBridge';
 export const SPEECH_CEILING_MS = 14000;
 
 export interface Copilot {
-  /** Speak one line. Resolves when the operator has heard it, or when it is clear they will not. */
-  say: (text: string, priority?: AnnouncePriority) => Promise<boolean>;
+  /**
+   * Speak one line. Resolves when the operator has heard it, or when it is
+   * clear they will not. `onAudio` is called once when it begins to sound,
+   * with its length in ms when the copilot knows it.
+   */
+  say: (text: string, priority?: AnnouncePriority, onAudio?: (durationMs: number | null) => void) => Promise<boolean>;
   /** Synthesize the line that will be said next, so it starts without delay. */
   prepare: (text: string) => void;
   /** Drop whatever is queued and silence the current line. */
@@ -71,6 +76,24 @@ export function useCopilot(): Copilot {
    * out the full ceiling for an answer that had already come and gone.
    */
   const settled = useRef(new Map<number, boolean>());
+  /** Who waits for a line to begin sounding, and starts that came before anyone waited (same race). */
+  const starting = useRef(new Map<number, (durationMs: number | null) => void>());
+  const started = useRef(new Map<number, number | null>());
+
+  useEffect(() => {
+    if (!bridge?.onAnnounceStart) return;
+    return bridge.onAnnounceStart((event) => {
+      if (event.id === null) return;
+      const listener = starting.current.get(event.id);
+      if (listener) {
+        starting.current.delete(event.id);
+        listener(event.audioMs);
+        return;
+      }
+      started.current.set(event.id, event.audioMs);
+      if (started.current.size > 32) started.current.delete(Math.min(...started.current.keys()));
+    });
+  }, [bridge]);
 
   useEffect(() => {
     if (!bridge) return;
@@ -108,18 +131,28 @@ export function useCopilot(): Copilot {
   );
 
   const say = useCallback(
-    async (text: string, priority: AnnouncePriority = 'NORMAL') => {
+    async (text: string, priority: AnnouncePriority = 'NORMAL', onAudio?: (durationMs: number | null) => void) => {
       if (!bridge || !text.trim()) return false;
 
       const result = await bridge.announce({ text, priority }).catch(() => null);
       if (!result?.success || result.id === undefined) return false;
 
       const id = result.id;
+      if (onAudio) {
+        if (started.current.has(id)) {
+          const durationMs = started.current.get(id) ?? null;
+          started.current.delete(id);
+          onAudio(durationMs);
+        } else {
+          starting.current.set(id, onAudio);
+        }
+      }
 
       // The verdict may already be in hand.
       const early = settled.current.get(id);
       if (early !== undefined) {
         settled.current.delete(id);
+        starting.current.delete(id);
         return early;
       }
 
@@ -127,6 +160,7 @@ export function useCopilot(): Copilot {
         const settle = (ok: boolean) => {
           window.clearTimeout(timer);
           pending.current.delete(id);
+          starting.current.delete(id);
           resolve(ok);
         };
         // Past the ceiling the line is written off here, so it is cancelled in
@@ -178,7 +212,7 @@ export function useNarrationQueue(copilot: Copilot): NarrationQueue {
   const queue = useRef<NarrationQueue | null>(null);
   if (queue.current === null) {
     queue.current = new NarrationQueue(
-      (text, priority) => sayRef.current(text, priority),
+      (text, priority, onAudio) => sayRef.current(text, priority, onAudio),
       () => cancelRef.current(),
       (text) => prepareRef.current(text)
     );
@@ -218,12 +252,62 @@ export function useNarrationQueue(copilot: Copilot): NarrationQueue {
  * (`announcer.station_narrates`), so a failure, abort or failsafe it reports is
  * heard only if this says it: every alert preempts the narration, bench or not.
  */
+/** The clearance line (`mission.countdown_3`) handed to the voice, then ended (D3). */
+export interface LaunchSpeechEvent {
+  phase: 'start' | 'end';
+  text: string;
+  /** Epoch ms. */
+  at: number;
+  /** On `end`: whether the voice actually played it. */
+  heard?: boolean;
+}
+
+/** The milestone whose line paces the last tenth of the launch ring. */
+const LAUNCH_SPEECH_KEY = 'mission.countdown_3';
+
+/**
+ * When a card's sentence is heard: `endsAt` (epoch ms) is when its voice stops,
+ * or null while the copilot has the sentence but it has not begun to sound.
+ * The typed text under the card finishes at `endsAt`.
+ */
+export interface FindingReading {
+  endsAt: number | null;
+}
+
+/** How long a sentence the voice has finished still takes to finish typing, ms: an ease, not a jump. */
+export const TYPE_FINISH_MS = 320;
+
+/** How long `text` takes to say: the last measurement of it, else the estimate from its length. */
+function expectedSpeechMs(text: string): number {
+  let measured: number | null = null;
+  try {
+    measured = readSpeechMs(window.localStorage, text);
+  } catch {
+    /* the estimate stands in */
+  }
+  return measured ?? estimateSpeechMs(text);
+}
+
+/** Keep a measured duration; a store that refuses only loses the measurement. */
+function rememberSpeechMs(text: string, ms: number): void {
+  try {
+    recordSpeechMs(window.localStorage, text, ms);
+  } catch {
+    /* the estimate stands in */
+  }
+}
+
 export function useFlightNarration(
   queue: NarrationQueue,
   enabled: boolean,
-  flightKey: number | null
+  flightKey: number | null,
+  observe?: (event: LaunchSpeechEvent) => void
 ): void {
   const bridge = useBridge();
+  const observeRef = useRef(observe);
+  observeRef.current = observe;
+  /** Bumped by every `mission.start`: a line of an earlier flight reports nothing. */
+  const flightRef = useRef(0);
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
   const parameters = useRef<MissionParametersPayload>({});
@@ -265,6 +349,7 @@ export function useFlightNarration(
       if (!enabledRef.current || !isMilestoneKey(event.key)) return;
       const key = event.key;
       if (key === 'mission.start') {
+        flightRef.current += 1;
         queue.reset();
         spoken.current.clear();
         parameters.current = {};
@@ -290,8 +375,32 @@ export function useFlightNarration(
       // A launch line drawn ahead (`reserveLaunchPhrase`) is spoken as drawn,
       // so the audio synthesized for it at the click is the audio played.
       const launchLine = takeLaunchPhrase(key);
-      queue.enqueue(key, () => launchLine ?? phraseForMilestone(key, payload, parameters.current, {}, plan), {
+      let line = '';
+      const compose = () => {
+        line = launchLine ?? phraseForMilestone(key, payload, parameters.current, {}, plan);
+        return line;
+      };
+      if (key !== LAUNCH_SPEECH_KEY) {
+        queue.enqueue(key, compose, { stage: MILESTONE_STAGE[key] });
+        return;
+      }
+      // Only observed: the line, its order, its stage and its pacing are the
+      // same as any other milestone's.
+      const flight = flightRef.current;
+      let startedAt: number | null = null;
+      queue.enqueue(key, compose, {
         stage: MILESTONE_STAGE[key],
+        onStart: () => {
+          if (flight !== flightRef.current) return;
+          startedAt = Date.now();
+          observeRef.current?.({ phase: 'start', text: line, at: startedAt });
+        },
+        onDone: (heard) => {
+          if (flight !== flightRef.current) return;
+          const at = Date.now();
+          if (heard && startedAt !== null) rememberSpeechMs(line, at - startedAt);
+          observeRef.current?.({ phase: 'end', text: line, at, heard });
+        },
       });
     });
 
@@ -386,21 +495,32 @@ export function useLinkLossNarration(
  * victim assessment arrived, so all six lines were synthesized ahead and the
  * victim line is never read before there is a result or the wait has run out.
  *
- * Returns how many cards have been revealed, which is what the panel renders,
- * and the closing line as spoken, so the screen shows the same sentence.
+ * Returns how many cards have been read (`revealed`), how many the copilot has
+ * begun to read (`announced`: a card's box appears as its sentence is handed to
+ * the voice), when each card's sentence stops sounding (`readings`, which the
+ * typed text under it follows), and the closing line as spoken, so the screen
+ * shows the same sentence. The copilot reports when a sentence begins to sound
+ * and how long it lasts; when it cannot say how long, the last measurement of
+ * that sentence stands in, else the estimate from its length
+ * (`lib/speechTiming.ts`). A sentence that ends before its text is typed
+ * finishes typing over {@link TYPE_FINISH_MS}.
  */
 export function useForensicNarration(
   queue: NarrationQueue,
   active: boolean,
   script: ForensicScript | null
-): { revealed: number; closing: string | null } {
+): { revealed: number; announced: number; readings: ReadonlyArray<FindingReading | undefined>; closing: string | null } {
   const [revealed, setRevealed] = useState(0);
+  const [announced, setAnnounced] = useState(0);
+  const [readings, setReadings] = useState<ReadonlyArray<FindingReading | undefined>>([]);
   const [closing, setClosing] = useState<string | null>(null);
   const runRef = useRef(0);
 
   useEffect(() => {
     if (!active || !script || script.findings.length === 0) {
       setRevealed(0);
+      setAnnounced(0);
+      setReadings([]);
       setClosing(null);
       return;
     }
@@ -410,8 +530,16 @@ export function useForensicNarration(
     const token = runRef.current + 1;
     runRef.current = token;
     const live = () => runRef.current === token;
+    const setReading = (index: number, reading: FindingReading) =>
+      setReadings((previous) => {
+        const next = previous.slice();
+        next[index] = reading;
+        return next;
+      });
 
     setRevealed(0);
+    setAnnounced(0);
+    setReadings([]);
     const { intro, findings, outro } = script;
     setClosing(outro);
 
@@ -420,11 +548,31 @@ export function useForensicNarration(
       fallbackMs: findingGapMs(),
     });
     findings.forEach((finding, index) => {
+      let soundedAt: number | null = null;
+      let endsAt: number | null = null;
       queue.enqueue(`inspection.point_${index + 1}`, () => finding.speech, {
         group: REPORT_GROUP,
         fallbackMs: findingGapMs(),
-        onDone: () => {
-          if (live()) setRevealed(index + 1);
+        onStart: () => {
+          if (!live()) return;
+          soundedAt = Date.now();
+          endsAt = soundedAt + expectedSpeechMs(finding.speech);
+          setAnnounced(index + 1);
+          setReading(index, { endsAt });
+        },
+        onAudio: (durationMs) => {
+          if (!live()) return;
+          soundedAt = Date.now();
+          endsAt = soundedAt + (durationMs ?? expectedSpeechMs(finding.speech));
+          setReading(index, { endsAt });
+        },
+        onDone: (heard) => {
+          if (!live()) return;
+          const now = Date.now();
+          if (heard && soundedAt !== null) rememberSpeechMs(finding.speech, now - soundedAt);
+          setAnnounced((previous) => Math.max(previous, index + 1));
+          setRevealed(index + 1);
+          if (endsAt === null || endsAt > now + TYPE_FINISH_MS) setReading(index, { endsAt: now + TYPE_FINISH_MS });
         },
       });
     });
@@ -436,5 +584,5 @@ export function useForensicNarration(
     };
   }, [active, script, queue]);
 
-  return { revealed, closing };
+  return { revealed, announced, readings, closing };
 }

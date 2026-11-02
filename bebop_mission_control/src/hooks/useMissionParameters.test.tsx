@@ -210,8 +210,8 @@ describe('useMissionParameters', () => {
   it('backfills the turn rate of an older store without reading it as a change', async () => {
     const stored = setPath(validDocument(), 'yaw_pattern', undefined);
     await mount({ success: true, params: stored }, { success: true, params: validDocument() });
-    expect(getPath(latest.committed, 'yaw_pattern.scan_vyaw')).toBe(0.15);
-    expect(getPath(latest.working, 'yaw_pattern.scan_vyaw')).toBe(0.15);
+    expect(getPath(latest.committed, 'yaw_pattern.scan_vyaw')).toBe(0.08);
+    expect(getPath(latest.working, 'yaw_pattern.scan_vyaw')).toBe(0.08);
     expect(latest.dirty).toBe(false);
   });
 
@@ -219,7 +219,7 @@ describe('useMissionParameters', () => {
     const preset = setPath(validDocument(), 'yaw_pattern', undefined);
     window.localStorage.setItem('bmg.operator-preset.advanced', JSON.stringify(preset));
     await mount({ success: true, params: validDocument() }, { success: true, params: validDocument() });
-    expect(getPath(latest.working, 'yaw_pattern.scan_vyaw')).toBe(0.15);
+    expect(getPath(latest.working, 'yaw_pattern.scan_vyaw')).toBe(0.08);
     expect(latest.activePresetId).toBe(latest.presets[0].id);
   });
 
@@ -234,8 +234,8 @@ describe('useMissionParameters', () => {
     await act(async () => {
       serve({ success: true, params: setPath(validDocument(), 'yaw_pattern', undefined) });
     });
-    expect(getPath(latest.committed, 'yaw_pattern.scan_vyaw')).toBe(0.15);
-    expect(getPath(latest.working, 'yaw_pattern.scan_vyaw')).toBe(0.15);
+    expect(getPath(latest.committed, 'yaw_pattern.scan_vyaw')).toBe(0.08);
+    expect(getPath(latest.working, 'yaw_pattern.scan_vyaw')).toBe(0.08);
     expect(latest.dirty).toBe(false);
   });
 });
@@ -424,5 +424,94 @@ describe('per-mode parameters', () => {
     expect(hook.current.status).toBe('ready');
     await act(() => hook.current.switchMode('simple'));
     expect(hook.current.missionMode).toBe('simple');
+  });
+});
+
+describe('the single favourite of a mode', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+  });
+
+  const legacy = (id: string, savedAt: string, altitude: number) => ({
+    id,
+    name: id,
+    savedAt,
+    values: { 'kinematics.target_altitude_m': altitude },
+  });
+
+  it('favorite is null until saved', async () => {
+    const hook = await mountReady({ mission_mode: 'advanced' });
+    expect(hook.current.favorite).toBeNull();
+  });
+
+  it('saveFavorite replaces a legacy list with a single item', async () => {
+    window.localStorage.setItem(
+      'bmg.operator-presets.v2.advanced',
+      JSON.stringify([legacy('a', '2026-01-01T00:00:00.000Z', 1.2), legacy('b', '2026-02-01T00:00:00.000Z', 1.4)])
+    );
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
+    let saved = false;
+    act(() => {
+      saved = hook.current.saveFavorite();
+    });
+    expect(saved).toBe(true);
+    const stored = JSON.parse(window.localStorage.getItem('bmg.operator-presets.v2.advanced') ?? '[]');
+    expect(stored).toHaveLength(1);
+    expect(stored[0].name).toBe('Favorito');
+    expect(hook.current.presets).toHaveLength(1);
+    expect(hook.current.favorite?.values['kinematics.target_altitude_m']).toBe(1.6);
+    expect(hook.current.activePresetId).toBe(hook.current.favorite?.id);
+  });
+
+  it('favorite is the most recent legacy item before any save and nothing is deleted', async () => {
+    const list = [legacy('a', '2026-03-01T00:00:00.000Z', 1.2), legacy('b', '2026-02-01T00:00:00.000Z', 1.4)];
+    window.localStorage.setItem('bmg.operator-presets.v2.advanced', JSON.stringify(list));
+    const hook = await mountReady({ mission_mode: 'advanced' });
+    expect(hook.current.favorite?.id).toBe('a');
+    expect(JSON.parse(window.localStorage.getItem('bmg.operator-presets.v2.advanced') ?? '[]')).toHaveLength(2);
+  });
+
+  it('restoreFavorite edits working values without persisting', async () => {
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
+    act(() => {
+      hook.current.saveFavorite();
+    });
+    act(() => hook.current.edit('kinematics.target_altitude_m', 1.1));
+    saveParameters.mockClear();
+    let restored = false;
+    act(() => {
+      restored = hook.current.restoreFavorite();
+    });
+    expect(restored).toBe(true);
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1.6);
+    expect(saveParameters).not.toHaveBeenCalled();
+  });
+
+  it('restoreFavorite returns false without a favorite', async () => {
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
+    let restored = true;
+    act(() => {
+      restored = hook.current.restoreFavorite();
+    });
+    expect(restored).toBe(false);
+    expect(getPath(hook.current.working, 'kinematics.target_altitude_m')).toBe(1.6);
+  });
+
+  it('favorite is per mode', async () => {
+    const hook = await mountReady({ mission_mode: 'advanced', 'kinematics.target_altitude_m': 1.6 });
+    act(() => {
+      hook.current.saveFavorite();
+    });
+    const advancedId = hook.current.favorite?.id;
+    await act(() => hook.current.switchMode('simple'));
+    expect(hook.current.favorite).toBeNull();
+    act(() => hook.current.edit('kinematics.target_altitude_m', 1.9));
+    act(() => {
+      hook.current.saveFavorite();
+    });
+    expect(hook.current.favorite?.values['kinematics.target_altitude_m']).toBe(1.9);
+    await act(() => hook.current.switchMode('advanced'));
+    expect(hook.current.favorite?.id).toBe(advancedId);
   });
 });

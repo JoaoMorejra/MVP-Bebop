@@ -178,7 +178,6 @@ export const ClassPicker: React.FC<ClassPickerProps> = ({ selected, options, onC
           type="button"
           aria-pressed={on}
           disabled={isLast}
-          title={isLast ? 'Ao menos uma classe precisa ficar ativa' : undefined}
           onClick={() =>
             onChange(on ? selected.filter((c) => c !== option.id) : [...selected, option.id])
           }

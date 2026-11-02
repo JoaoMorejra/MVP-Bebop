@@ -3,7 +3,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AbortControl } from './AbortControl';
-import { isTextInputOrTerminal } from './CockpitScreen';
+import { isTextInput } from './CockpitScreen';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -100,53 +100,39 @@ describe('AbortControl (R6 / L2)', () => {
   });
 });
 
-describe('isTextInputOrTerminal (R11)', () => {
+describe('isTextInput (R11)', () => {
   it('identifies input elements', () => {
     const input = document.createElement('input');
-    expect(isTextInputOrTerminal(input)).toBe(true);
+    expect(isTextInput(input)).toBe(true);
   });
 
   it('identifies textarea elements', () => {
     const textarea = document.createElement('textarea');
-    expect(isTextInputOrTerminal(textarea)).toBe(true);
+    expect(isTextInput(textarea)).toBe(true);
   });
 
   it('does not take a select, a range, a checkbox or a button for a text field (D8)', () => {
-    expect(isTextInputOrTerminal(document.createElement('select'))).toBe(false);
+    expect(isTextInput(document.createElement('select'))).toBe(false);
     for (const type of ['range', 'checkbox', 'radio', 'button']) {
       const input = document.createElement('input');
       input.type = type;
-      expect(isTextInputOrTerminal(input)).toBe(false);
+      expect(isTextInput(input)).toBe(false);
     }
   });
 
   it('identifies contenteditable elements', () => {
     const div = document.createElement('div');
     div.setAttribute('contenteditable', 'true');
-    expect(isTextInputOrTerminal(div)).toBe(true);
-  });
-
-  it('identifies elements inside embedded terminal', () => {
-    const terminalContainer = document.createElement('div');
-    terminalContainer.className = 'xterm';
-    const innerSpan = document.createElement('span');
-    terminalContainer.appendChild(innerSpan);
-    expect(isTextInputOrTerminal(innerSpan)).toBe(true);
-
-    const termWithAttr = document.createElement('div');
-    termWithAttr.setAttribute('data-terminal', 'true');
-    const child = document.createElement('div');
-    termWithAttr.appendChild(child);
-    expect(isTextInputOrTerminal(child)).toBe(true);
+    expect(isTextInput(div)).toBe(true);
   });
 
   it('returns false for regular elements', () => {
     const button = document.createElement('button');
-    expect(isTextInputOrTerminal(button)).toBe(false);
+    expect(isTextInput(button)).toBe(false);
 
     const div = document.createElement('div');
-    expect(isTextInputOrTerminal(div)).toBe(false);
+    expect(isTextInput(div)).toBe(false);
 
-    expect(isTextInputOrTerminal(null)).toBe(false);
+    expect(isTextInput(null)).toBe(false);
   });
 });

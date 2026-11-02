@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
-import { Building2, Crosshair, LocateFixed, MapPin, Minus, Plus } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Building2, LocateFixed, MapPin, Minus, Plus } from 'lucide-react';
 import type { TrackPoint } from '../../types/mission';
 import { fromEnu, niceGridStep } from '../../lib/geo';
 import {
@@ -10,11 +10,13 @@ import {
   fixedView,
   type FixedView,
   pinchZoom,
+  scaleBar,
   wheelZoom,
 } from '../../lib/mapView';
 import { MAP_ANCHOR } from '../../lib/siteAnchor';
 import { cn } from '../../lib/format';
 import { rotorsTurning } from '../../lib/flightState';
+import { DroneMarker } from './DroneMarker';
 
 interface TacticalMapProps {
   track: TrackPoint[];
@@ -75,11 +77,11 @@ export const TILE_SOURCES: readonly TileSource[] = [
   },
 ];
 
-/**
- * Drawn size of the aircraft marker relative to its geometry. The marker is
- * what the operator's eye goes to first, across the room from the station.
- */
-const MARKER_SCALE = 1.45;
+/** Height of the legend strip over the map's foot, px: the scale bar sits above it. */
+const LEGEND_STRIP_PX = 30;
+
+/** The compass: centre this far in from the top right corner, px. */
+const COMPASS_INSET_PX = 46;
 
 /**
  * Without a single tile loaded in this long, the basemap is given up for the
@@ -126,7 +128,6 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   stale,
   flyingState = null,
 }) => {
-  const uid = useId().replace(/:/g, '');
   const [size, setSize] = useState({ width: 640, height: 320 });
   const [tilesOk, setTilesOk] = useState<boolean | null>(null);
   /** Keys of the tiles that failed; only those of the grid on screen count. */
@@ -253,16 +254,21 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   const tiles = useMemo(() => (basemapUsable ? tileGrid(view, size, source) : []), [view, size, basemapUsable, source]);
   gridKeys.current = useMemo(() => new Set(tiles.map((tile) => tile.key)), [tiles]);
 
-  const toPath = (points: TrackPoint[]) =>
-    points
-      .map((p, i) => `${i === 0 ? 'M' : 'L'} ${view.sx(p.x).toFixed(1)} ${view.sy(p.y).toFixed(1)}`)
-      .join(' ');
-
-  const fullPath = track.length > 1 ? toPath(track) : '';
-  const recentPath = track.length > 1 ? toPath(track.slice(Math.max(0, track.length - 30))) : '';
-
   const homeX = view.sx(0);
   const homeY = view.sy(0);
+
+  const trailCoords = [`${homeX.toFixed(1)} ${homeY.toFixed(1)}`];
+  for (const p of track) {
+    const coord = `${view.sx(p.x).toFixed(1)} ${view.sy(p.y).toFixed(1)}`;
+    if (coord !== trailCoords[trailCoords.length - 1]) {
+      trailCoords.push(coord);
+    }
+  }
+  const trailPath =
+    trailCoords.length > 1
+      ? trailCoords.map((coord, i) => `${i === 0 ? 'M' : 'L'} ${coord}`).join(' ')
+      : '';
+
   const distance = Math.hypot(droneEast, droneNorth);
   const basemapState = tilesOk === true ? 'mapa local' : tilesOk === null ? 'carregando mapa' : 'grade offline';
   const mapStatus = [`${GEO_LABEL[geo.source]} (${MAP_ANCHOR.name})`, basemapState, `${distance.toFixed(1)} m da base`].join(
@@ -270,26 +276,17 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   );
 
   // A round number of metres near a fifth of the panel.
-  const scaleMetres = niceGridStep((size.width / Math.max(view.pxPerMetre, 0.0001)) * 0.9);
-  const scaleBarPx = scaleMetres * view.pxPerMetre;
-  const scaleLabel = scaleMetres >= 1 ? `${scaleMetres} m` : `${Math.round(scaleMetres * 100)} cm`;
+  const scale = scaleBar(view.pxPerMetre);
+  const scaleBarPx = scale.px;
   const compass = ((heading % 360) + 360) % 360;
   const showGrid = tilesOk !== true;
 
   return (
-    <div className="flex min-h-0 flex-col overflow-hidden rounded-panel border border-strut-soft bg-hull-deep">
-      {/* The panel's name only. How the position was obtained, whether the
-          basemap is live and the range to the base stay available on hover:
-          they are diagnostics, not something the operator reads in flight. */}
-      <div
-        className="flex h-9 shrink-0 items-center gap-2 border-b border-strut-soft px-3"
-        title={mapStatus}
-      >
-        <Crosshair size={12} strokeWidth={2} aria-hidden className="text-frost" />
-        <span className="font-cond text-2xs font-semibold tracking-wide text-frost">MAPA TÁTICO</span>
-        <span className="sr-only">{mapStatus}</span>
-      </div>
-
+    <div className="flex min-h-0 flex-col overflow-hidden rounded-panel bg-hull-deep">
+      {/* No frame and no title: the map is the panel. How the position was
+          obtained, whether the basemap is live and the range to the base stay
+          available on hover; they are diagnostics, not something the operator
+          reads in flight. */}
       <div
         ref={hostRef}
         className="relative min-h-0 flex-1 touch-none overflow-clip bg-hull-deep"
@@ -298,6 +295,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         onPointerUp={onPointerEnd}
         onPointerCancel={onPointerEnd}
       >
+        <span className="sr-only">{mapStatus}</span>
         {/* Basemap. */}
         {basemapUsable ? (
           <div aria-hidden className="absolute inset-0">
@@ -341,13 +339,6 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           role="img"
           aria-label="Trajetória da aeronave sobre o terreno"
         >
-          <defs>
-            <radialGradient id={`${uid}-halo`}>
-              <stop offset="0%" stopColor="#01D5A3" stopOpacity="0.3" />
-              <stop offset="100%" stopColor="#01D5A3" stopOpacity="0" />
-            </radialGradient>
-          </defs>
-
           {/* The local tactical grid: ruled in real metres, registered to the
               launch point, drawn whenever there is no loaded basemap to read
               distances against — which on the aircraft's own Wi-Fi is always. */}
@@ -359,65 +350,34 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               cx={homeX}
               cy={homeY}
               r={Math.max(arrivalRadius * view.pxPerMetre, 7)}
-              fill="#01D5A3"
-              fillOpacity="0.08"
-              stroke="#5CF2CE"
-              strokeOpacity="0.7"
+              fill="#12B382"
+              fillOpacity="0.1"
+              stroke="#34D9A2"
+              strokeOpacity="0.75"
               strokeWidth="1.5"
               strokeDasharray="4 3"
             />
           ) : null}
 
-          {/* A dark casing under the trail keeps it legible over bright tiles. */}
-          {fullPath ? (
+          {/* Minimalist flight trail from the launch marker along the flown path. */}
+          {trailPath ? (
             <path
-              d={fullPath}
+              data-flight-trail
+              d={trailPath}
               fill="none"
-              stroke="#001A2F"
-              strokeOpacity="0.6"
-              strokeWidth="7.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          ) : null}
-          {fullPath ? (
-            <path
-              d={fullPath}
-              fill="none"
-              stroke="#01D5A3"
-              strokeOpacity="0.5"
-              strokeWidth="4"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          ) : null}
-          {recentPath ? (
-            <path
-              d={recentPath}
-              fill="none"
-              stroke="#5CF2CE"
-              strokeOpacity="0.95"
-              strokeWidth="4.5"
+              stroke="#E8F2F0"
+              strokeOpacity="0.45"
+              strokeWidth="1.5"
               strokeLinecap="round"
               strokeLinejoin="round"
             />
           ) : null}
 
           {/* Launch point. */}
-          <g transform={`translate(${homeX}, ${homeY})`}>
+          <g data-base-marker transform={`translate(${homeX}, ${homeY})`}>
             <circle r="9" fill="#001A2F" stroke="#E8F2F0" strokeWidth="2.5" />
             <circle r="3" fill="#E8F2F0" />
           </g>
-          <text
-            x={homeX}
-            y={homeY + 27}
-            textAnchor="middle"
-            className="fill-frost/85 font-cond"
-            fontSize="12.5"
-            style={{ paintOrder: 'stroke', stroke: '#001A2F', strokeWidth: 3.5 }}
-          >
-            BASE · DECOLAGEM (0, 0)
-          </text>
 
           {/* The aircraft, at its odometry offset from the fixed base. */}
           <g
@@ -425,38 +385,37 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             transform={`translate(${view.sx(droneEast)}, ${view.sy(droneNorth)})`}
             opacity={stale ? 0.45 : 1}
           >
-            <circle r="44" fill={`url(#${uid}-halo)`} />
-            <g transform={`scale(${MARKER_SCALE})`}>
-              <Quadcopter heading={compass} spinning={rotorsTurning(flyingState)} />
-            </g>
+            <DroneMarker heading={compass} spinning={rotorsTurning(flyingState)} />
           </g>
 
           {/* Tactical compass: north fixed, heading needle live. */}
-          <g transform={`translate(${size.width - 46}, 46) scale(1.35)`}>
+          <g transform={`translate(${size.width - COMPASS_INSET_PX}, ${COMPASS_INSET_PX}) scale(1.35)`}>
             <TacticalCompass x={0} y={0} heading={compass} stale={stale} />
           </g>
 
           {/* Scale. */}
-          <g transform={`translate(20, ${size.height - 18})`}>
+          <g transform={`translate(20, ${size.height - LEGEND_STRIP_PX - 14})`}>
             <rect x={-8} y={-25} width={scaleBarPx + 16} height={33} rx={4} fill="#001A2F" fillOpacity="0.62" />
             <line x1="0" y1="0" x2={scaleBarPx} y2="0" stroke="#E8F2F0" strokeOpacity="0.8" strokeWidth="2" />
             <line x1={scaleBarPx / 2} y1="-3" x2={scaleBarPx / 2} y2="3" stroke="#E8F2F0" strokeOpacity="0.6" strokeWidth="1.2" />
             <line x1="0" y1="-5" x2="0" y2="5" stroke="#E8F2F0" strokeOpacity="0.8" strokeWidth="2" />
             <line x1={scaleBarPx} y1="-5" x2={scaleBarPx} y2="5" stroke="#E8F2F0" strokeOpacity="0.8" strokeWidth="2" />
-            <text x={scaleBarPx / 2} y="-9" textAnchor="middle" className="fill-frost/90 font-mono" fontSize="11.5">
-              {scaleLabel}
+            <text data-scale-label x={scaleBarPx / 2} y="-9" textAnchor="middle" className="fill-frost/90 font-mono" fontSize="11.5">
+              {scale.label}
             </text>
           </g>
         </svg>
 
-        {/* Manual zoom, under the compass. */}
-        <div className="absolute right-2 top-[92px] z-10 flex flex-col overflow-hidden rounded-bezel border border-strut-soft bg-abyss/75 backdrop-blur-sm">
+        {/* Manual zoom, on the right edge, centred on the map's height. */}
+        <div
+          data-map-zoom
+          className="absolute right-2 top-1/2 z-10 flex -translate-y-1/2 flex-col overflow-hidden rounded-bezel border border-strut-soft bg-abyss/75 backdrop-blur-sm"
+        >
           <button
             type="button"
             onClick={() => zoomBy(ZOOM_STEP)}
             disabled={view.zoom >= MAX_DISPLAY_ZOOM}
             aria-label="Aproximar o mapa"
-            title="Aproximar"
             className="grid h-7 w-7 place-items-center text-frost transition-colors hover:bg-hull-raise disabled:cursor-not-allowed disabled:text-haze-deep"
           >
             <Plus size={14} strokeWidth={2} />
@@ -466,7 +425,6 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             onClick={() => zoomBy(-ZOOM_STEP)}
             disabled={view.zoom <= MIN_DISPLAY_ZOOM}
             aria-label="Afastar o mapa"
-            title="Afastar"
             className="grid h-7 w-7 place-items-center border-t border-strut-soft text-frost transition-colors hover:bg-hull-raise disabled:cursor-not-allowed disabled:text-haze-deep"
           >
             <Minus size={14} strokeWidth={2} />
@@ -477,7 +435,6 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             disabled={manualZoom === null}
             aria-label="Voltar ao enquadramento padrão"
             aria-pressed={manualZoom === null}
-            title={manualZoom === null ? 'Enquadramento padrão ativo' : 'Voltar ao enquadramento padrão'}
             className={cn(
               'grid h-7 w-7 place-items-center border-t border-strut-soft transition-colors hover:bg-hull-raise disabled:cursor-default',
               manualZoom === null ? 'text-mint' : 'text-amber'
@@ -487,25 +444,33 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           </button>
         </div>
 
-        {/* Attribution is a condition of using the tileset. */}
+        {/* The coordinates, and where that is on the ground, over the map's
+            foot on a dark fade so they read on any tile. Attribution is a
+            condition of using the tileset. */}
+        <div
+          data-map-legend
+          className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex items-end gap-3 bg-gradient-to-t from-abyss/90 via-abyss/55 to-transparent px-3 pb-1.5 pt-6"
+        >
+          <div className="flex min-w-0 flex-nowrap items-center gap-x-4 overflow-hidden">
+            <span className="flex shrink-0 items-center gap-1.5">
+              <MapPin size={11} strokeWidth={2} className="shrink-0 text-frost" />
+              <span className="hud-legible shrink-0 font-cond text-3xs tracking-wide text-frost/70">BASE FIXA:</span>{' '}
+              <span className="hud-legible tnum truncate font-mono text-2xs text-frost">
+                {`${MAP_ANCHOR.latitude.toFixed(6)}, ${MAP_ANCHOR.longitude.toFixed(6)}`}
+              </span>
+            </span>
+            <GeoField icon={<Building2 size={11} strokeWidth={2} />} label="Cidade" value={MAP_ANCHOR.city} />
+            <GeoField icon={<MapPin size={11} strokeWidth={2} />} label="Localização" value={MAP_ANCHOR.name} />
+          </div>
+        </div>
         {tilesOk ? (
-          <span className="pointer-events-none absolute bottom-1 right-2 font-mono text-[9px] text-frost/35">
+          <span
+            className="hud-legible pointer-events-none absolute right-3 z-10 font-mono text-[9px] text-frost/50"
+            style={{ bottom: LEGEND_STRIP_PX - 4 }}
+          >
             {source.attribution}
           </span>
         ) : null}
-      </div>
-
-      {/* The coordinates, and where that is on the ground. */}
-      <div className="flex min-h-9 shrink-0 flex-wrap items-center gap-x-4 gap-y-0.5 border-t border-strut-soft px-3 py-1">
-        <span className="flex min-w-0 max-w-full items-center gap-1.5" title={GEO_LABEL[geo.source]}>
-          <MapPin size={11} strokeWidth={2} className="shrink-0 text-frost" />
-          <span className="shrink-0 font-cond text-3xs tracking-wide text-haze-deep">BASE FIXA:</span>{' '}
-          <span className="tnum truncate font-mono text-2xs text-frost">
-            {`${MAP_ANCHOR.latitude.toFixed(6)}, ${MAP_ANCHOR.longitude.toFixed(6)}`}
-          </span>
-        </span>
-        <GeoField icon={<Building2 size={11} strokeWidth={2} />} label="Cidade" value={MAP_ANCHOR.city} />
-        <GeoField icon={<MapPin size={11} strokeWidth={2} />} label="Localização" value={MAP_ANCHOR.name} />
       </div>
     </div>
   );
@@ -609,7 +574,7 @@ const TacticalCompass: React.FC<{ x: number; y: number; heading: number; stale: 
         O
       </text>
       <g transform={`rotate(${heading})`} opacity={stale ? 0.35 : 1}>
-        <path d="M 0 -21 L 3 -4 L 0 -6 L -3 -4 Z" fill="#5CF2CE" />
+        <path d="M 0 -21 L 3 -4 L 0 -6 L -3 -4 Z" fill="#34D9A2" />
       </g>
       <circle r="1.6" fill="#E8F2F0" />
     </g>
@@ -678,116 +643,12 @@ const LocalGrid: React.FC<{
       <text
         x={12}
         y={18}
-        className="fill-frost/55 font-cond"
-        fontSize="12"
+        className="fill-frost/55 font-pixel"
+        fontSize="12.5"
         style={{ letterSpacing: '0.08em' }}
       >
         GRADE TÁTICA LOCAL · {step >= 1 ? `${step} m` : `${(step * 100).toFixed(0)} cm`}
       </text>
-    </g>
-  );
-};
-
-/**
- * The airframe, drawn as what it is.
- *
- * A Bebop 2 seen from above: four arms off a central body, a guarded rotor at
- * each tip, and a nose the operator can read at a glance. The generic dot and cone
- * this replaces told you where the aircraft was but not which way it was
- * pointing — on a map where the whole point is the heading relative to the
- * street under it, the marker has to carry its own orientation.
- *
- * The whole drawing rotates with the compass, so the nose is the heading. The
- * rotors turn only while the aircraft reports them turning (its ARSDK flying
- * state), not merely while telemetry is live: on the ground, armed or
- * landed, they stand still. A stale link reads through the marker's fade.
- */
-const Quadcopter: React.FC<{ heading: number; spinning: boolean }> = ({ heading, spinning }) => {
-  // Arm tips, clockwise from front-right, in the airframe's own frame.
-  const arms: [number, number][] = [
-    [11, -11],
-    [11, 11],
-    [-11, 11],
-    [-11, -11],
-  ];
-
-  return (
-    <g transform={`rotate(${heading})`}>
-      {/* Heading wedge: where the camera is looking. */}
-      <path d="M 0 -6 L -9 -27 A 26 26 0 0 1 9 -27 Z" fill="#5CF2CE" fillOpacity="0.28" />
-
-      {/* Arms. */}
-      {arms.map(([x, y]) => (
-        <line
-          key={`arm-${x}-${y}`}
-          x1="0"
-          y1="0"
-          x2={x}
-          y2={y}
-          stroke="#001A2F"
-          strokeWidth="5.5"
-          strokeLinecap="round"
-        />
-      ))}
-      {arms.map(([x, y]) => (
-        <line
-          key={`arm-fill-${x}-${y}`}
-          x1="0"
-          y1="0"
-          x2={x}
-          y2={y}
-          stroke="#01D5A3"
-          strokeWidth="3"
-          strokeLinecap="round"
-        />
-      ))}
-
-      {/* Rotors inside their guards: the guard ring is the Bebop 2's
-          silhouette from above, the inner disc the rotor that spins. */}
-      {arms.map(([x, y], index) => (
-        <g key={`rotor-${x}-${y}`} transform={`translate(${x}, ${y})`}>
-          <circle r="7.5" fill="none" stroke="#001A2F" strokeWidth="3.6" />
-          <circle r="7.5" fill="none" stroke="#01D5A3" strokeWidth="1.6" />
-          <circle r="5.6" fill="#001A2F" fillOpacity="0.85" stroke="#01D5A3" strokeOpacity="0.55" strokeWidth="0.8" />
-          <g>
-            <line
-              x1="-4.5"
-              y1="0"
-              x2="4.5"
-              y2="0"
-              stroke="#5CF2CE"
-              strokeWidth="1.4"
-              strokeLinecap="round"
-              opacity="0.9"
-            />
-            <line
-              x1="0"
-              y1="-4.5"
-              x2="0"
-              y2="4.5"
-              stroke="#5CF2CE"
-              strokeWidth="1.4"
-              strokeLinecap="round"
-              opacity="0.55"
-            />
-            {spinning ? (
-              <animateTransform
-                attributeName="transform"
-                type="rotate"
-                from="0"
-                to={index % 2 === 0 ? 360 : -360}
-                dur="0.42s"
-                repeatCount="indefinite"
-              />
-            ) : null}
-          </g>
-        </g>
-      ))}
-
-      {/* Fuselage, with the nose marked. */}
-      <rect x="-6" y="-8.5" width="12" height="17" rx="4.5" fill="#001A2F" stroke="#01D5A3" strokeWidth="2" />
-      <path d="M 0 -11.5 L 3.2 -7 L -3.2 -7 Z" fill="#5CF2CE" />
-      <circle cy="1.5" r="2.2" fill="#5CF2CE" fillOpacity="0.85" />
     </g>
   );
 };
@@ -797,10 +658,10 @@ const GeoField: React.FC<{ icon?: React.ReactNode; label: string; value: string 
   label,
   value,
 }) => (
-  <span className="flex min-w-0 max-w-full items-center gap-1.5" title={value ?? 'não resolvido'}>
-    {icon ? <span className="shrink-0 text-haze">{icon}</span> : null}
-    <span className="shrink-0 font-cond text-3xs tracking-wide text-haze-deep">{`${label}:`}</span>{' '}
-    <span className={cn('min-w-0 truncate text-2xs', value ? 'text-frost' : 'text-haze-deep')}>
+  <span className="flex min-w-0 max-w-full items-center gap-1.5">
+    {icon ? <span className="shrink-0 text-frost">{icon}</span> : null}
+    <span className="hud-legible shrink-0 font-cond text-3xs tracking-wide text-frost/70">{`${label}:`}</span>{' '}
+    <span className={cn('hud-legible min-w-0 truncate text-2xs', value ? 'text-frost' : 'text-frost/50')}>
       {value ?? '—'}
     </span>
   </span>

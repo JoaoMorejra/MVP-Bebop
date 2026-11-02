@@ -74,6 +74,7 @@ function renderCockpit(props: {
   flyingState?: number | null;
   landProgress?: any;
   missionMode?: MissionMode;
+  stage?: number;
 }) {
   const onAbort = props.onAbort ?? vi.fn();
   const telemetry = {
@@ -88,15 +89,13 @@ function renderCockpit(props: {
         track={[]}
         stale={false}
         missionState={props.missionState ?? 'running'}
-        stage={1}
-        stageName="Decolagem"
+        stage={props.stage ?? 1}
         missionMode={props.missionMode}
         streamFps={30}
         streamBridgeUp={true}
         streamLive={true}
         streamWidth={856}
         streamHeight={480}
-        streamSource="test"
         captureFlash={false}
         captureCount={0}
         latestCapture={null}
@@ -107,9 +106,6 @@ function renderCockpit(props: {
         onRunStage={vi.fn()}
         onGotoStage={vi.fn()}
         pendingStage={null}
-        voice={{ volume: 1, muted: false }}
-        onVolume={vi.fn()}
-        onToggleMute={vi.fn()}
         cameraTilt={0}
         cameraAvailable={true}
         onCameraTilt={vi.fn()}
@@ -159,16 +155,26 @@ describe('CockpitScreen Global Escape Shortcut (R11)', () => {
     expect(onAbort).not.toHaveBeenCalled();
   });
 
-  it('does NOT trigger onAbort when focus is inside a terminal element', () => {
+  it('isTextInput ignores text fields', () => {
     const { onAbort } = renderCockpit({ missionState: 'running' });
-    const term = document.createElement('div');
-    term.className = 'xterm';
-    const inner = document.createElement('span');
-    term.appendChild(inner);
-    host.appendChild(term);
+    const input = document.createElement('input');
+    input.type = 'text';
+    host.appendChild(input);
+    input.focus();
 
-    inner.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', ctrlKey: true, bubbles: true }));
     expect(onAbort).not.toHaveBeenCalled();
+  });
+
+  it('isTextInput lets range sliders abort', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running' });
+    const range = document.createElement('input');
+    range.type = 'range';
+    host.appendChild(range);
+    range.focus();
+
+    range.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', ctrlKey: true, bubbles: true }));
+    expect(onAbort).toHaveBeenCalledTimes(1);
   });
 
   it('does NOT trigger onAbort when on the ground and mission is idle', () => {
@@ -330,5 +336,75 @@ describe('abort shortcut through the main process (D8)', () => {
     const { onAbort } = renderCockpit({ missionState: 'idle', flyingState: 0 });
     act(() => deliver!());
     expect(onAbort).not.toHaveBeenCalled();
+  });
+});
+
+describe('keyboard nudge (W A S D Q R)', () => {
+  const sendNudge = vi.fn();
+
+  beforeEach(() => {
+    sendNudge.mockClear();
+    (window as unknown as { bmgAPI?: unknown }).bmgAPI = { sendNudge };
+  });
+
+  afterEach(() => {
+    delete (window as unknown as { bmgAPI?: unknown }).bmgAPI;
+  });
+
+  const keydown = (code: string, init: KeyboardEventInit = {}) =>
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { code, key: code.slice(3).toLowerCase(), bubbles: true, cancelable: true, ...init }));
+    });
+
+  it('sends the intent while hovering in stage 2 of a running mission', () => {
+    renderCockpit({ missionState: 'running', flyingState: 3, stage: 2 });
+    keydown('KeyW');
+    expect(sendNudge).toHaveBeenCalledWith({ vx: 1, vy: 0, vyaw: 0 });
+    expect(host.querySelector('[data-testid="nudge-chip"]')).toBeNull();
+    expect(host.textContent).not.toContain('NUDGE');
+    unmountCockpit();
+    root = createRoot(host);
+  });
+
+  it('sends nothing on the ground or in stage 1', () => {
+    renderCockpit({ missionState: 'running', flyingState: 0, stage: 2 });
+    keydown('KeyW');
+    expect(sendNudge.mock.calls.filter(([intent]) => intent.vx !== 0 || intent.vy !== 0 || intent.vyaw !== 0)).toEqual([]);
+    renderCockpit({ missionState: 'running', flyingState: 3, stage: 1 });
+    keydown('KeyW');
+    expect(sendNudge.mock.calls.filter(([intent]) => intent.vx !== 0 || intent.vy !== 0 || intent.vyaw !== 0)).toEqual([]);
+  });
+
+  it('keeps Escape and Ctrl+C aborting', () => {
+    const { onAbort } = renderCockpit({ missionState: 'running', flyingState: 3, stage: 2 });
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    });
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+    expect(onAbort).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('CockpitScreen standby vs mission layout', () => {
+  it('shows only the video and the map filling the screen when the mission has not started', () => {
+    renderCockpit({ missionState: 'idle', flyingState: 0 });
+    expect(host.querySelector('[data-cockpit-layout="standby"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="optical-feed"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="tactical-map"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="stage-bar"]')).toBeNull();
+    expect(host.querySelector('[data-testid="forensic-panel"]')).toBeNull();
+    expect(host.textContent).not.toContain('ABORTAR MISSÃO');
+  });
+
+  it('shows the full mission layout (StageBar, OpticalFeed, AbortControl, TacticalMap, ForensicPanel) once the mission starts', () => {
+    renderCockpit({ missionState: 'running', flyingState: 2 });
+    expect(host.querySelector('[data-cockpit-layout="mission"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="optical-feed"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="tactical-map"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="stage-bar"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="forensic-panel"]')).not.toBeNull();
+    expect(host.textContent).toContain('ABORTAR MISSÃO');
   });
 });

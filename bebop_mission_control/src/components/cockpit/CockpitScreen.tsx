@@ -1,8 +1,9 @@
 import React, { useEffect, useRef } from 'react';
 import { useBridge } from '../../hooks/useBridge';
 import type { MissionState, TelemetryView, TrackPoint } from '../../types/mission';
-import type { LandProgressPhase, RawEvidence, VoiceLevel } from '../../types/bmg';
+import type { LandProgressPhase, RawEvidence } from '../../types/bmg';
 import type { Finding } from '../../lib/forensics';
+import type { FindingReading } from '../../hooks/useCopilot';
 import { StageBar } from './StageBar';
 import type { MissionMode } from '../../lib/missionMode';
 import { OpticalFeed } from './OpticalFeed';
@@ -11,39 +12,23 @@ import { ForensicPanel } from './ForensicPanel';
 import { abortEnabled } from '../../lib/flightState';
 import { isAbortShortcut } from '../../lib/abortShortcut';
 import { AbortControl } from './AbortControl';
-import { cn } from '../../lib/format';
+import type { FillState } from '../../lib/stageProgress';
+import { isTextInput } from '../../lib/textInput';
+import { nudgeEnabled } from '../../lib/nudge';
+import { useNudge } from '../../hooks/useNudge';
 import { isMissionOver } from '../../lib/missionOutcome';
 import type { FinishLockResult } from '../../lib/finishLock';
 
-/** Input types that take typed text; the others (range, checkbox, radio, button) never do. */
-const TEXT_INPUT_TYPES: ReadonlySet<string> = new Set(['text', 'search', 'email', 'password', 'url', 'tel', 'number']);
-
-/**
- * Checks whether the key event target takes typed text: a text-like `INPUT`, a
- * `TEXTAREA`, an editable element or the diagnostics terminal, where Ctrl+C is
- * copy or interrupt. Used by R11 to leave those keys alone.
- *
- * A range slider, a checkbox, a radio, a button and a `SELECT` do not: after a
- * drag of the camera tilt or of the volume the focus stays on the slider, and
- * treating it as a text field ignored the abort without a word.
- */
-export function isTextInputOrTerminal(target: EventTarget | null): boolean {
-  if (!target || !(target instanceof HTMLElement)) return false;
-  const tag = target.tagName;
-  if (tag === 'INPUT') return TEXT_INPUT_TYPES.has(((target as HTMLInputElement).type || 'text').toLowerCase());
-  if (tag === 'TEXTAREA') return true;
-  if (target.isContentEditable || target.getAttribute('contenteditable') === 'true') return true;
-  if (target.closest('.xterm, [data-terminal], [data-terminal-title], textarea')) return true;
-  return false;
-}
+export { isTextInput } from '../../lib/textInput';
 
 interface CockpitScreenProps {
+  /** The stage strip's fill, driven by the flight (`useStageProgress`). */
+  stageFill?: FillState;
   telemetry: TelemetryView;
   track: TrackPoint[];
   stale: boolean;
   missionState: MissionState;
   stage: number;
-  stageName: string;
   missionMode?: MissionMode;
   /** Return plan of the flight on screen (`rtl.enabled`). */
   rtlEnabled?: boolean;
@@ -52,7 +37,6 @@ interface CockpitScreenProps {
   streamLive: boolean;
   streamWidth: number;
   streamHeight: number;
-  streamSource: string;
   captureFlash: boolean;
   captureCount: number;
   latestCapture: RawEvidence | null;
@@ -67,14 +51,12 @@ interface CockpitScreenProps {
   /** Bench mode: the stage pills become the trigger for a single routine. */
   benchMode: boolean;
   benchStage: number | null;
+  /** Seconds before the bench routine spawns, for its stage pill; `null` outside that wait. */
+  benchCountdown?: number | null;
   onRunStage: (stage: number) => void;
   onGotoStage: (stage: number) => void;
   /** A jump asked for whose stage the mission has not reported reaching yet. */
   pendingStage: number | null;
-  /** The copilot's level, reachable without leaving the cockpit. */
-  voice: VoiceLevel;
-  onVolume: (volume: number) => void;
-  onToggleMute: () => void;
   /** The camera gimbal, commanded from the feed itself. */
   cameraTilt: number | null;
   cameraAvailable: boolean;
@@ -83,6 +65,10 @@ interface CockpitScreenProps {
   report: Finding[] | null;
   /** How many of them the copilot has read out so far. */
   reportRevealed: number;
+  /** How many findings the copilot has begun to read; defaults to `reportRevealed`. */
+  reportAnnounced?: number;
+  /** When each finding's sentence stops sounding, which paces its typed text. */
+  reportReadings?: ReadonlyArray<FindingReading | undefined>;
   /** The aircraft is down and the report waits for the victim assessment. */
   reportAnalyzing: boolean;
   /** The report's closing line as the copilot said it. */
@@ -110,7 +96,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   stale,
   missionState,
   stage,
-  stageName,
   missionMode,
   rtlEnabled,
   streamFps,
@@ -118,7 +103,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   streamLive,
   streamWidth,
   streamHeight,
-  streamSource,
   captureFlash,
   captureCount,
   latestCapture,
@@ -126,23 +110,24 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   landed,
   benchMode,
   benchStage,
+  benchCountdown = null,
   onRunStage,
   onGotoStage,
   pendingStage,
-  voice,
-  onVolume,
-  onToggleMute,
   cameraTilt,
   cameraAvailable,
   onCameraTilt,
   report,
   reportRevealed,
+  reportAnnounced,
+  reportReadings,
   reportAnalyzing,
   reportClosing,
   onAbort,
   onFinish,
   finishLock,
   landProgress,
+  stageFill,
 }) => {
   const bridge = useBridge();
   const running = missionState === 'running' || missionState === 'arming';
@@ -174,15 +159,15 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
 
   // R11 without the bridge (a browser session, an older preload): Escape and
   // Ctrl/Cmd+C fire onAbort exactly as the button does, while the abort is
-  // available. Ignored inside text fields and the diagnostics terminal, where
-  // Ctrl+C is copy / interrupt. When the abort is not available the event is
-  // left alone, so copy still works on the ground. With the bridge the main
-  // process consumes the key first, so the two never both fire.
+  // available. Ignored inside text fields, where Ctrl+C is copy. When the
+  // abort is not available the event is left alone, so copy still works on the
+  // ground. With the bridge the main process consumes the key first, so the
+  // two never both fire.
   useEffect(() => {
     if (viaMain) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isAbortShortcut(event) === null) return;
-      if (isTextInputOrTerminal(event.target)) return;
+      if (isTextInput(event.target)) return;
       if (abortEnabled(missionState, telemetry.flying_state, landProgress)) {
         event.preventDefault();
         onAbort();
@@ -191,6 +176,17 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [viaMain, missionState, telemetry.flying_state, landProgress, onAbort]);
+
+  // Keyboard nudge (W A S D Q R): an additive trim of the autonomous command,
+  // never a takeover. The mission applies its own, finer permit on top.
+  const nudgeArmed = nudgeEnabled({
+    missionState,
+    flyingState: telemetry.flying_state,
+    stage,
+    landProgress,
+  });
+  // The keys stay live without a badge over the feed (operator's choice).
+  useNudge(bridge, nudgeArmed);
 
   // The last gimbal command on /bebop/move_camera, from the mission's ramp or
   // the station's slider, as the telemetry bridge echoes it. A command, not a
@@ -201,27 +197,12 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
       ? telemetry.camera_tilt_deg
       : null;
 
-  return (
-    <div className="flex h-full min-h-0 flex-col gap-2.5 p-2.5">
-      <StageBar
-        stage={stage}
-        stageName={stageName}
-        missionMode={missionMode}
-        rtlEnabled={rtlEnabled}
-        state={missionState}
-        benchMode={benchMode}
-        benchStage={benchStage}
-        onRunStage={onRunStage}
-        onGotoStage={onGotoStage}
-        pendingStage={pendingStage}
-        voice={voice}
-        onVolume={onVolume}
-        onToggleMute={onToggleMute}
-      />
+  const missionStarted = missionState !== 'idle' || benchStage !== null;
 
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.32fr)_minmax(0,1fr)] gap-2.5">
-        {/* What the aircraft is doing. */}
-        <div className="grid min-h-0 min-w-0 grid-rows-[minmax(0,1.05fr)_minmax(0,1fr)] gap-2.5">
+  if (!missionStarted) {
+    return (
+      <div data-cockpit-layout="standby" className="flex h-full min-h-0 flex-col p-1.5">
+        <div className="grid min-h-0 min-w-0 flex-1 grid-rows-[minmax(0,1.5fr)_minmax(0,1fr)] gap-1.5">
           <div className="relative min-h-0">
             <OpticalFeed
               fps={streamFps}
@@ -229,7 +210,59 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
               live={streamLive}
               width={streamWidth}
               height={streamHeight}
-              source={streamSource}
+              telemetry={telemetry}
+              running={running}
+              flash={captureFlash}
+              gimbalTilt={gimbalTilt}
+              cameraTilt={cameraTilt}
+              cameraAvailable={cameraAvailable}
+              onCameraTilt={onCameraTilt}
+            />
+          </div>
+
+          <TacticalMap
+            track={track}
+            heading={telemetry.heading}
+            arrivalRadius={arrivalRadius}
+            stale={stale}
+            flyingState={telemetry.flying_state ?? null}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // One 6 px gutter between every tile, the window edge included: the stages,
+  // the feed, the map and the forensic panel read as a single grid.
+  return (
+    <div data-cockpit-layout="mission" className="flex h-full min-h-0 flex-col gap-1.5 p-1.5">
+      <StageBar
+        stage={stage}
+        missionMode={missionMode}
+        rtlEnabled={rtlEnabled}
+        state={missionState}
+        benchMode={benchMode}
+        benchStage={benchStage}
+        benchCountdown={benchCountdown}
+        onRunStage={onRunStage}
+        onGotoStage={onGotoStage}
+        pendingStage={pendingStage}
+        fill={stageFill}
+      />
+
+      {/* The feed is drawn object-cover from a 16:9 stream: the columns and rows
+          keep its box near 16:9 at the station's 1600x900, so the picture is
+          not cropped to a letterbox. */}
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)] gap-1.5">
+        {/* What the aircraft is doing. */}
+        <div className="grid min-h-0 min-w-0 grid-rows-[minmax(0,1.5fr)_minmax(0,1fr)] gap-1.5">
+          <div className="relative min-h-0">
+            <OpticalFeed
+              fps={streamFps}
+              bridgeUp={streamBridgeUp}
+              live={streamLive}
+              width={streamWidth}
+              height={streamHeight}
               telemetry={telemetry}
               running={running}
               flash={captureFlash}
@@ -268,6 +301,10 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
           landed={landed}
           report={report}
           reportRevealed={reportRevealed}
+          reportAnnounced={reportAnnounced}
+          reportReadings={reportReadings}
+          flightProgress={stageFill ? (stageFill.fills[3] + stageFill.fills[4]) / 2 : undefined}
+          waitProgress={stageFill ? (stageFill.fills[0] + stageFill.fills[1] + stageFill.fills[2] + stageFill.fills[3]) / 4 : 0}
           reportAnalyzing={reportAnalyzing}
           reportClosing={reportClosing}
           onFinish={onFinish}

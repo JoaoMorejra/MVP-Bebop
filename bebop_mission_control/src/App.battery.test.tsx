@@ -66,6 +66,7 @@ const hoisted = vi.hoisted(() => {
   const abortMission = vi.fn(async () => {
     order.push('land');
   });
+  const setBatteryFailsafe = vi.fn(async (_enabled: boolean, _thresholdPct: number) => ({ success: true }));
   const missionAbort = vi.fn(async () => {
     order.push('land');
   });
@@ -80,6 +81,7 @@ const hoisted = vi.hoisted(() => {
       endMission: async () => undefined,
       gotoStage,
       abortMission,
+      setBatteryFailsafe,
       onMissionReset: () => () => undefined,
       onMilestone: (cb: (event: MilestoneEvent) => void) => {
         milestoneListeners.add(cb);
@@ -125,12 +127,7 @@ const hoisted = vi.hoisted(() => {
 
 vi.mock('./components/preflight/PreflightScreen', () => ({ PreflightScreen: hoisted.capture('preflight') }));
 vi.mock('./components/cockpit/CockpitScreen', () => ({ CockpitScreen: hoisted.capture('cockpit') }));
-vi.mock('./components/preflight/CountdownOverlay', () => ({ CountdownOverlay: hoisted.capture('countdown') }));
-vi.mock('./components/diagnostics/DiagnosticsScreen', () => ({ DiagnosticsScreen: () => null }));
-vi.mock('./components/diagnostics/DiagnosticsOverlayHeader', () => ({
-  DiagnosticsOverlayHeader: () => null,
-}));
-vi.mock('./components/shell/TabSwitch', () => ({ TabSwitch: hoisted.capture('tabs') }));
+vi.mock('./components/shell/TopBar', () => ({ TopBar: hoisted.capture('topbar') }));
 
 vi.mock('./hooks/useBridge', () => ({ useBridge: () => hoisted.stable.bridge }));
 vi.mock('./hooks/useTelemetry', () => ({ useTelemetry: () => hoisted.stable.telemetry }));
@@ -237,6 +234,7 @@ beforeEach(() => {
   hoisted.milestoneListeners.clear();
   hoisted.stable.bridge.gotoStage.mockClear();
   hoisted.stable.bridge.abortMission.mockClear();
+  hoisted.stable.bridge.setBatteryFailsafe.mockClear();
   hoisted.stable.mission.abort.mockClear();
   hoisted.stable.mission.launch.mockClear();
   hoisted.stable.narration.preempt.mockClear();
@@ -518,5 +516,48 @@ describe('the station trigger flying states', () => {
 
     expect(stageRequests()).toEqual([RTL_STAGE]);
     expect(landings()).toBe(0);
+  });
+});
+
+describe('the battery failsafe switch', () => {
+  const FAILSAFE_KEY = 'bmg.battery-failsafe.v1';
+
+  it('switched off before the launch, the payload carries battery.enabled false', async () => {
+    window.localStorage.setItem(FAILSAFE_KEY, JSON.stringify({ enabled: false, thresholdPct: 20 }));
+    await render();
+    await act(async () => {
+      await call('preflight', 'onLaunch');
+    });
+    const sent = JSON.parse(String(hoisted.stable.mission.launch.mock.calls[0][0].paramsJson));
+    expect(getPath(sent, 'battery.enabled')).toBe(false);
+    expect(getPath(sent, 'battery.land_pct')).toBe(20);
+  });
+
+  it('switched off, a charge under the threshold in flight asks nothing', async () => {
+    window.localStorage.setItem(FAILSAFE_KEY, JSON.stringify({ enabled: false, thresholdPct: 20 }));
+    await launchAndFly(3);
+    await crossThreshold();
+    await elapse(2 * RTL_ACK_TIMEOUT_MS);
+    expect(stageRequests()).toEqual([]);
+    expect(landings()).toBe(0);
+  });
+
+  it('switched on, asks for the return exactly once', async () => {
+    await launchAndFly(3);
+    await crossThreshold();
+    await crossThreshold();
+    expect(stageRequests()).toEqual([RTL_STAGE]);
+  });
+
+  it('switching it off in flight is forwarded to the mission and cancels no return', async () => {
+    await launchAndFly(3);
+    await crossThreshold();
+    expect(stageRequests()).toEqual([RTL_STAGE]);
+    await act(async () => {
+      await call('topbar', 'onFailsafeChange', { enabled: false, thresholdPct: 20 });
+    });
+    expect(hoisted.stable.bridge.setBatteryFailsafe).toHaveBeenCalledWith(false, 20);
+    expect(landings()).toBe(0);
+    expect(stageRequests()).toEqual([RTL_STAGE]);
   });
 });
