@@ -306,22 +306,85 @@ _PALETTE = (
 _BANNER_BOTTOM = 48
 
 
-def _display_class_name(name: str) -> str:
-    """Map raw detector class names to operator-facing mission terms.
+#: Labels the operator and the audience read on the boxes, by detector class.
+#: Mirrors ``mvp_mission_bebop/perception/classes.py`` (``display_class_name``):
+#: the bridge runs outside the mission package and cannot import it. ASCII,
+#: because OpenCV's Hershey fonts carry no accented glyphs.
+_ACCIDENT_CLASSES = ("acidente", "accident", "motorcycle", "bicycle", "bycicle")
+_VICTIM_CLASSES = ("person", "pessoa", "vitima")
+ACCIDENT_LABEL = "Acidente"
+VICTIM_LABEL = "Vitima"
+BASE_LABEL = "Base"
 
-    In this mission, YOLO detects a bicycle or motorcycle representing
-    the traffic accident scene. On the cockpit stream, the operator needs
-    to see 'acidente' instead of the raw COCO class labels.
+#: BGR of the labels that matter on stage: the accident in the station's
+#: ember, the victim in its amber, the landing base in its mint.
+_LABEL_COLOUR = {
+    ACCIDENT_LABEL: (69, 106, 255),
+    VICTIM_LABEL: (75, 194, 255),
+    BASE_LABEL: (163, 213, 1),
+}
+
+
+def _display_class_name(name: str) -> str:
+    """Map a raw detector class name to the word shown on its box.
+
+    In this mission YOLO's ``motorcycle`` or ``bicycle`` stands for the traffic
+    accident and a ``person`` for its victim, so the cockpit reads
+    ``Acidente`` and ``Vitima`` instead of the COCO labels. Any other class is
+    shown as the detector named it.
     """
     if not name:
         return ""
-    if name.lower() in ("motorcycle", "bicycle", "bycicle"):
-        return "acidente"
+    folded = name.strip().lower()
+    if folded in _ACCIDENT_CLASSES:
+        return ACCIDENT_LABEL
+    if folded in _VICTIM_CLASSES:
+        return VICTIM_LABEL
     return name
 
 
 def _class_colour(name: str) -> Tuple[int, int, int]:
+    if name in _LABEL_COLOUR:
+        return _LABEL_COLOUR[name]
     return _PALETTE[zlib.crc32(name.encode("utf-8")) % len(_PALETTE)]
+
+
+def _draw_labelled_box(
+    canvas: np.ndarray,
+    top_left: Tuple[int, int],
+    bottom_right: Tuple[int, int],
+    label: str,
+    colour: Tuple[int, int, int],
+    label_floor: int,
+) -> None:
+    """Draw a box with its label on a filled tab above it.
+
+    The tab drops inside the box when there is no room above it, so a box
+    touching the top edge does not lose its label behind the caption banner.
+    """
+    cv2.rectangle(canvas, top_left, bottom_right, colour, 2)
+    (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+    label_height = text_h + baseline + 4
+    label_top = top_left[1] - label_height
+    if label_top < label_floor:
+        label_top = max(label_floor, top_left[1])
+    cv2.rectangle(
+        canvas,
+        (top_left[0], label_top),
+        (top_left[0] + text_w + 6, label_top + label_height),
+        colour,
+        -1,
+    )
+    cv2.putText(
+        canvas,
+        label,
+        (top_left[0] + 3, label_top + text_h + 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def draw_detection_summary(frame: np.ndarray, summary: DetectionSummary) -> np.ndarray:
@@ -338,73 +401,36 @@ def draw_detection_summary(frame: np.ndarray, summary: DetectionSummary) -> np.n
     height, width = canvas.shape[:2]
     scale_x = width / float(summary.width)
     scale_y = height / float(summary.height)
-    # Lowest row a label may start on: below the caption banner when there is
-    # one, so a box touching the top edge does not lose its label behind it.
-    label_floor = _BANNER_BOTTOM + 2 if summary.status else 0
+    label_floor = 0
 
     for detection in summary.detections:
         x1, y1, x2, y2 = detection.bbox
         top_left = (int(round(x1 * scale_x)), int(round(y1 * scale_y)))
         bottom_right = (int(round(x2 * scale_x)), int(round(y2 * scale_y)))
         display_name = _display_class_name(detection.class_name)
-        colour = _class_colour(display_name)
-        cv2.rectangle(canvas, top_left, bottom_right, colour, 2)
-
-        label = f"{display_name} {detection.confidence:.2f}"
-        (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        label_height = text_h + baseline + 4
-        label_top = top_left[1] - label_height
-        if label_top < label_floor:
-            label_top = max(label_floor, top_left[1])
-        cv2.rectangle(
+        _draw_labelled_box(
             canvas,
-            (top_left[0], label_top),
-            (top_left[0] + text_w + 6, label_top + label_height),
-            colour,
-            -1,
-        )
-        cv2.putText(
-            canvas,
-            label,
-            (top_left[0] + 3, label_top + text_h + 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 0),
-            1,
-            cv2.LINE_AA,
+            top_left,
+            bottom_right,
+            f"{display_name} {detection.confidence:.2f}",
+            _class_colour(display_name),
+            label_floor,
         )
 
-    for marker_id, corners, axes in summary.markers:
-        points = np.array(
-            [[int(round(x * scale_x)), int(round(y * scale_y))] for x, y in corners], dtype=np.int32
-        )
-        cv2.polylines(canvas, [points], True, (0, 200, 255), 2)
-        cv2.putText(
-            canvas, f"ID {marker_id}", (int(points[0][0]), max(label_floor + 14, int(points[0][1]) - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA,
-        )
-        if axes:
-            origin = (int(round(axes["origin"][0] * scale_x)), int(round(axes["origin"][1] * scale_y)))
-            # OpenCV's drawFrameAxes palette: x red, y green, z blue.
-            for key, colour in (("x", (0, 0, 255)), ("y", (0, 255, 0)), ("z", (255, 0, 0))):
-                tip = (int(round(axes[key][0] * scale_x)), int(round(axes[key][1] * scale_y)))
-                cv2.line(canvas, origin, tip, colour, 2)
-
-    cv2.drawMarker(
-        canvas, (width // 2, height // 2), (0, 255, 255), cv2.MARKER_CROSS, 20, 1
-    )
-    if summary.status:
-        cv2.rectangle(canvas, (10, 10), (width - 10, _BANNER_BOTTOM), (20, 20, 20), -1)
-        cv2.putText(
+    for _marker_id, corners, _axes in summary.markers:
+        xs = [x * scale_x for x, _ in corners]
+        ys = [y * scale_y for _, y in corners]
+        top_left = (int(round(min(xs))), int(round(min(ys))))
+        bottom_right = (int(round(max(xs))), int(round(max(ys))))
+        _draw_labelled_box(
             canvas,
-            summary.status,
-            (20, 36),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
+            top_left,
+            bottom_right,
+            BASE_LABEL,
+            _class_colour(BASE_LABEL),
+            label_floor,
         )
+
     return canvas
 
 

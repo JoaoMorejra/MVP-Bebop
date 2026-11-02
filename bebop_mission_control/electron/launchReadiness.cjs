@@ -40,6 +40,7 @@
  * @property {boolean} [batteryKnown]
  * @property {number | null} [batteryPct]
  * @property {number} [batteryFailsafeThreshold]
+ * @property {boolean} [batteryFailsafeEnabled]  The operator's battery failsafe switch; off, the charge gates nothing. Default on.
  * @property {boolean} [commandBridgeReady]
  * @property {boolean} [ros2CliAvailable]
  * @property {boolean} [voiceReady]
@@ -155,16 +156,18 @@ function evaluateLaunchReadiness(input) {
     };
   }
 
-  // 11. Battery known and above the operator threshold
-  if (input.batteryKnown === false) {
-    return { ready: false, blockedReason: 'Bateria da aeronave desconhecida', warning: null };
-  }
-  const batteryReason = batteryBlockedReason(
-    input.batteryPct,
-    input.batteryFailsafeThreshold ?? DEFAULT_BATTERY_THRESHOLD_PCT
-  );
-  if (batteryReason) {
-    return { ready: false, blockedReason: batteryReason, warning: null };
+  // 11. Battery known and above the operator threshold, while the failsafe is on
+  if (input.batteryFailsafeEnabled !== false) {
+    if (input.batteryKnown === false) {
+      return { ready: false, blockedReason: 'Bateria da aeronave desconhecida', warning: null };
+    }
+    const batteryReason = batteryBlockedReason(
+      input.batteryPct,
+      input.batteryFailsafeThreshold ?? DEFAULT_BATTERY_THRESHOLD_PCT
+    );
+    if (batteryReason) {
+      return { ready: false, blockedReason: batteryReason, warning: null };
+    }
   }
 
   // 12. Resident command bridge ready

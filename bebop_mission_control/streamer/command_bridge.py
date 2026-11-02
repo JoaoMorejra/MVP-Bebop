@@ -21,6 +21,10 @@ Protocol, one JSON object per line on stdin::
     {"op": "land"}               # emergency landing, published immediately
     {"op": "stop"}               # zero the velocity setpoint
     {"op": "stage", "stage": 4}  # ask the running mission to continue at stage 4
+    {"op": "battery", "enabled": false, "land_pct": 20}
+                                 # the battery failsafe switch, to the running mission
+    {"op": "nudge", "vx": 1, "vy": 0, "vyaw": -1}
+                                 # keyboard nudge intent, each axis in [-1, 1]
     {"op": "quit"}
 
 Replies, one per line on stdout, prefixed so they survive anything rclpy
@@ -29,25 +33,34 @@ decides to print::
     BMG_CMD:{"event": "ready"}
     BMG_CMD:{"event": "tilt", "tilt": -40.0, "pan": 0.0}
     BMG_CMD:{"event": "land", "repeats": 5, "matched": 1}
+    BMG_CMD:{"event": "battery", "enabled": false, "land_pct": 20.0}
+
+The nudge is not acknowledged: it streams at up to 20 Hz while a key is held,
+and one reply per message would only load the pipe.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
+import signal
 import sys
 import time
+from typing import Optional, Tuple
 
 import rclpy
 from geometry_msgs.msg import Twist, Vector3
 from rclpy.node import Node
-from std_msgs.msg import Empty, Int32
+from std_msgs.msg import Empty, Int32, String
 
 NAMESPACE = os.environ.get("BMG_BEBOP_NS", "/bebop")
 TOPIC_MOVE_CAMERA = f"{NAMESPACE}/move_camera"
 TOPIC_LAND = f"{NAMESPACE}/land"
 TOPIC_CMD_VEL = f"{NAMESPACE}/cmd_vel"
 TOPIC_GOTO_STAGE = f"{NAMESPACE}/mission/goto_stage"
+TOPIC_BATTERY_FAILSAFE = f"{NAMESPACE}/mission/battery_failsafe"
+TOPIC_NUDGE = f"{NAMESPACE}/mission/nudge"
 
 EVENT_PREFIX = "BMG_CMD:"
 
@@ -84,7 +97,55 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def battery_payload(request: dict) -> Optional[str]:
+    """JSON for ``mission/battery_failsafe``, or ``None`` when the request is invalid.
+
+    ``enabled`` must be a JSON boolean; ``land_pct`` a finite number in
+    ``[0, 100]``. Anything else is dropped, never coerced: the mission keeps
+    the switch it has rather than flipping on a malformed line.
+    """
+    enabled = request.get("enabled")
+    if not isinstance(enabled, bool):
+        return None
+    land_pct = request.get("land_pct")
+    if isinstance(land_pct, bool) or not isinstance(land_pct, (int, float)):
+        return None
+    if not math.isfinite(land_pct) or not 0.0 <= land_pct <= 100.0:
+        return None
+    return json.dumps({"enabled": enabled, "land_pct": float(land_pct)})
+
+
+def nudge_intent(request: dict) -> Tuple[float, float, float]:
+    """``(vx, vy, vyaw)`` of a nudge request, each saturated to ``[-1, 1]``.
+
+    A missing, non-numeric or non-finite component reads as ``0.0``: a bad
+    line releases that axis rather than holding a stale intent.
+    """
+    values = []
+    for key in ("vx", "vy", "vyaw"):
+        value = request.get(key, 0.0)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            value = 0.0
+        values.append(clamp(float(value), -1.0, 1.0))
+    return values[0], values[1], values[2]
+
+
+def nudge_message(request: dict) -> Twist:
+    """The ``geometry_msgs/Twist`` the mission reads on ``mission/nudge``."""
+    vx, vy, vyaw = nudge_intent(request)
+    message = Twist()
+    message.linear.x = vx
+    message.linear.y = vy
+    message.angular.z = vyaw
+    return message
+
+
 def main() -> int:
+    def _terminate(_signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _terminate)
+
     rclpy.init(args=None)
     node = Node("bmg_command_bridge", start_parameter_services=False)
 
@@ -95,6 +156,9 @@ def main() -> int:
     land = node.create_publisher(Empty, TOPIC_LAND, 10)
     cmd_vel = node.create_publisher(Twist, TOPIC_CMD_VEL, 10)
     goto_stage = node.create_publisher(Int32, TOPIC_GOTO_STAGE, 10)
+    battery_cfg = node.create_publisher(String, TOPIC_BATTERY_FAILSAFE, 10)
+    # Depth 1, as the gimbal: only the newest intent matters.
+    nudge = node.create_publisher(Twist, TOPIC_NUDGE, 1)
 
     emit(
         {
@@ -104,6 +168,8 @@ def main() -> int:
                 "land": TOPIC_LAND,
                 "cmd_vel": TOPIC_CMD_VEL,
                 "stage": TOPIC_GOTO_STAGE,
+                "battery": TOPIC_BATTERY_FAILSAFE,
+                "nudge": TOPIC_NUDGE,
             },
         }
     )
@@ -167,6 +233,20 @@ def main() -> int:
                 emit({"event": "stage", "stage": stage})
                 continue
 
+            if op == "battery":
+                payload = battery_payload(request)
+                if payload is None:
+                    continue
+                battery_cfg.publish(String(data=payload))
+                spin()
+                emit({"event": "battery", **json.loads(payload)})
+                continue
+
+            if op == "nudge":
+                nudge.publish(nudge_message(request))
+                spin()
+                continue
+
             if "tilt" not in request:
                 continue
 
@@ -180,8 +260,20 @@ def main() -> int:
             message.x = tilt
             message.y = pan
             message.z = 0.0
-            gimbal.publish(message)
-            spin()
+
+            # Wait briefly for subscribers if none matched yet
+            wait_limit = 0.1
+            wait_start = time.monotonic()
+            while gimbal.get_subscription_count() == 0 and (time.monotonic() - wait_start) < wait_limit:
+                spin()
+                time.sleep(0.02)
+
+            # Burst publish 3 times to guarantee delivery over Wi-Fi
+            for _ in range(3):
+                gimbal.publish(message)
+                spin()
+                time.sleep(0.02)
+
             emit({"event": "tilt", "tilt": tilt, "pan": pan})
     except KeyboardInterrupt:
         pass

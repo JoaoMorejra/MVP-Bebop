@@ -57,6 +57,7 @@ TOPIC_CMD_VEL = f"{NAMESPACE}/cmd_vel"
 TOPIC_TAKEOFF = f"{NAMESPACE}/takeoff"
 TOPIC_LAND = f"{NAMESPACE}/land"
 TOPIC_MOVE_CAMERA = f"{NAMESPACE}/move_camera"
+TOPIC_CAMERA_ORIENTATION = f"{NAMESPACE}/states/ardrone3/CameraState/OrientationV2"
 TOPIC_BATTERY = f"{NAMESPACE}/states/battery"
 TOPIC_WIFI_RSSI = f"{NAMESPACE}/states/wifi_rssi"
 TOPIC_FLYING_STATE = f"{NAMESPACE}/states/flying_state"
@@ -785,6 +786,9 @@ class TelemetryNode(Node):
         self.create_subscription(
             Vector3, TOPIC_MOVE_CAMERA, self._on_move_camera, MOVE_CAMERA_QOS
         )
+        self.create_subscription(
+            Vector3, TOPIC_CAMERA_ORIENTATION, self._on_camera_orientation, state_qos
+        )
 
         self.base = BaseResolver()
 
@@ -851,9 +855,17 @@ class TelemetryNode(Node):
             longitude=longitude,
         )
 
+    def _on_camera_orientation(self, msg: Vector3) -> None:
+        if not math.isnan(msg.x):
+            STATE.note_sample(TOPIC_CAMERA_ORIENTATION)
+            STATE.set_camera_tilt(float(msg.x))
+
     def _on_move_camera(self, msg: Vector3) -> None:
         STATE.note_sample(TOPIC_MOVE_CAMERA)
-        STATE.set_camera_tilt(float(msg.x))
+        with STATE._lock:
+            has_real_orientation = TOPIC_CAMERA_ORIENTATION in STATE.topic_samples
+        if not has_real_orientation and not math.isnan(msg.x):
+            STATE.set_camera_tilt(float(msg.x))
 
     # -- graph validation ----------------------------------------------------
 

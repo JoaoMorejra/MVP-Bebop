@@ -18,12 +18,19 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   isElectron: true,
   missionDir: path.resolve(__dirname, '..', '..', 'mvp_mission_bebop'),
 
-  // Wi-Fi link to the aircraft
+  // Wi-Fi link to the aircraft and notebook network management
   scanWifi: (options) => ipcRenderer.invoke('bmg:scan-wifi', options),
-  connectWifi: (ssid) => ipcRenderer.invoke('bmg:connect-wifi', ssid),
+  connectWifi: (ssid, password) =>
+    ipcRenderer.invoke(
+      'bmg:connect-wifi',
+      typeof ssid === 'object' && ssid !== null ? ssid : { ssid, password }
+    ),
+  disconnectWifi: () => ipcRenderer.invoke('bmg:disconnect-wifi'),
+  getWifiPower: () => ipcRenderer.invoke('bmg:get-wifi-power'),
+  setWifiPower: (enabled) => ipcRenderer.invoke('bmg:set-wifi-power', { enabled }),
 
   // ROS 2 driver lifecycle
-  startDriver: () => ipcRenderer.invoke('bmg:start-driver'),
+  startDriver: (options = {}) => ipcRenderer.invoke('bmg:start-driver', options),
   stopDriver: () => ipcRenderer.invoke('bmg:stop-driver'),
   checkDriverStatus: () => ipcRenderer.invoke('bmg:check-driver-status'),
 
@@ -64,6 +71,11 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   getHostLocation: () => ipcRenderer.invoke('bmg:get-host-location'),
   saveOperatorLocation: (location) => ipcRenderer.invoke('bmg:save-operator-location', location),
   gotoStage: (stage) => ipcRenderer.invoke('bmg:goto-stage', { stage }),
+  // The battery failsafe switch, forwarded to a running mission.
+  setBatteryFailsafe: (enabled, thresholdPct) =>
+    ipcRenderer.invoke('bmg:set-battery-failsafe', { enabled, thresholdPct }),
+  // Keyboard nudge intent, fire-and-forget (main.cjs throttles it).
+  sendNudge: (intent) => ipcRenderer.send('bmg:nudge', intent),
 
   // Parameters
   getParameters: () => ipcRenderer.invoke('bmg:get-parameters'),
@@ -76,14 +88,6 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   getStreamStatus: () => ipcRenderer.invoke('bmg:get-stream-status'),
   getDiagnostics: () => ipcRenderer.invoke('bmg:get-diagnostics'),
   getLogHistory: () => ipcRenderer.invoke('bmg:get-log-history'),
-
-  // Diagnostics terminal: an interactive bash on a PTY, in the mission's own
-  // environment. Output streams on `bmg:terminal-data`; `bmg:terminal-exit`
-  // says the shell ended.
-  terminalSpawn: (options = {}) => ipcRenderer.invoke('bmg:terminal-spawn', options),
-  terminalWrite: (id, data) => ipcRenderer.invoke('bmg:terminal-write', { id, data }),
-  terminalResize: (id, cols, rows) => ipcRenderer.invoke('bmg:terminal-resize', { id, cols, rows }),
-  terminalKill: (id) => ipcRenderer.invoke('bmg:terminal-kill', id),
 
   // Events
   onTelemetryUpdate: subscribe('bmg:telemetry-update'),
@@ -99,11 +103,15 @@ contextBridge.exposeInMainWorld('bmgAPI', {
   // process then delivers Ctrl/Cmd+C and Escape as `bmg:abort-shortcut`.
   setCockpitAbortArmed: (armed) => ipcRenderer.send('bmg:cockpit-abort-armed', { armed: armed === true }),
   onAbortShortcut: subscribe('bmg:abort-shortcut'),
+  // The cockpit publishes whether the nudge may act; the main process then
+  // takes W A S D Q R before the page (the video iframe swallows them) and
+  // delivers them as `bmg:nudge-key` ({type, code}).
+  setCockpitNudgeArmed: (armed) => ipcRenderer.send('bmg:cockpit-nudge-armed', { armed: armed === true }),
+  onNudgeKey: subscribe('bmg:nudge-key'),
   onLinkProgress: subscribe('bmg:link-progress'),
   onLandProgress: subscribe('bmg:land-progress'),
   onAnnounceDone: subscribe('bmg:announce-done'),
+  onAnnounceStart: subscribe('bmg:announce-start'),
   onCameraTiltChanged: subscribe('bmg:camera-tilt-changed'),
   onMissionReset: subscribe('bmg:mission-reset'),
-  onTerminalData: subscribe('bmg:terminal-data'),
-  onTerminalExit: subscribe('bmg:terminal-exit'),
 });

@@ -9,7 +9,6 @@ const {
   createStepMarkerParser,
   emitLaunchMilestone,
 } = require('./milestones.cjs');
-const { createTerminalHost } = require('./terminal.cjs');
 const { deferBenchSpawn } = require('./benchCountdown.cjs');
 const { readSiteAnchorFile } = require('./siteAnchor.cjs');
 const { serveTile } = require('./tileRoute.cjs');
@@ -26,6 +25,7 @@ const { cleanOrphanShm, createSsidChangeDetector, restartRos2Daemon } = require(
 const { createStandbyManager } = require('./missionStandby.cjs');
 const { createLaunchRefusalTracker } = require('./launchRefusal.cjs');
 const { createAbortShortcutGuard } = require('./abortShortcut.cjs');
+const { createNudgeShortcutGuard } = require('./nudgeShortcut.cjs');
 const { createMissionLogFile } = require('./missionLogFile.cjs');
 const { createOrphanReaper, parseOrphanCandidates } = require('./orphanMissions.cjs');
 const { createLandSupervisor } = require('./landSupervisor.cjs');
@@ -56,8 +56,6 @@ const MEDIA_FETCH_SCRIPT = path.join(STREAMER_DIR, 'media_fetch.py');
 const MJPEG_PORT = 9090;
 const DRONE_IP = '192.168.42.1';
 const BEBOP_SSID_RE = /^Bebop2?[-_]/i;
-/** Where the diagnostics terminal's shell starts. */
-const TERMINAL_HOME = WORKSPACE_DIR;
 
 // Bring-up budget: how long the aircraft gets to answer each stage of
 // `bmg:ensure-link` before the GCS calls it a failure and says which stage.
@@ -197,8 +195,7 @@ function recordLog(channel, entry) {
   send(LOG_EVENTS[channel], line);
 
   // Also mirror to the terminal that launched the app. `bin/bmg` runs in a
-  // shell, and a driver that refuses to start is otherwise only visible by
-  // opening Diagnostics and picking the right tab -- no use at all when the
+  // shell, and a driver that refuses to start is otherwise invisible when the
   // window has not come up yet, or when the operator is reading a crash after
   // the fact.
   const stream = entry.type === 'stderr' ? process.stderr : process.stdout;
@@ -398,7 +395,7 @@ function superviseService(name, scriptArgs, onStdoutLine) {
     recordLog('driver', { type: 'stdout', text: `[${name}] iniciado (pid ${child.pid})\n` });
 
     if (onStdoutLine) {
-      const read = createLineReader(onStdoutLine);
+      const read = createLineReader((line) => onStdoutLine(line, child));
       child.stdout.setEncoding('utf-8');
       child.stdout.on('data', read);
     } else {
@@ -415,10 +412,10 @@ function superviseService(name, scriptArgs, onStdoutLine) {
         type: 'exit',
         text: `[${name}] encerrado (código ${code}${signal ? `, sinal ${signal}` : ''})\n`,
       });
-      if (name === 'mjpeg') mjpegProcess = null;
-      if (name === 'telemetry') telemetryProcess = null;
-      if (name === 'comando') commandProcess = null;
-      if (servicesStopping) return;
+      if (name === 'mjpeg' && mjpegProcess === child) mjpegProcess = null;
+      if (name === 'telemetry' && telemetryProcess === child) telemetryProcess = null;
+      if (name === 'comando' && commandProcess === child) commandProcess = null;
+      if (child._retired || servicesStopping) return;
 
       attempts += 1;
       const delay = Math.min(30000, 1000 * 2 ** Math.min(attempts, 4));
@@ -705,6 +702,8 @@ function stopBackgroundServices() {
   serviceRestartTimers.clear();
   for (const proc of [mjpegProcess, telemetryProcess, commandProcess]) {
     if (!proc) continue;
+    proc._retired = true;
+    try { proc.stdin?.end(); } catch (e) { /* already closed */ }
     try { proc.kill('SIGTERM'); } catch (e) { /* already exited */ }
     // A bridge wedged inside rclpy may not act on SIGTERM, and one that
     // outlives the shutdown holds port 9090 against the next launch.
@@ -716,7 +715,7 @@ function stopBackgroundServices() {
     // `proc.kill` on an already-exited child is a no-op.
     const escalate = setTimeout(() => {
       try { proc.kill('SIGKILL'); } catch (e) { /* already gone */ }
-    }, 3000);
+    }, 1500);
     escalate.unref?.();
     proc.once('close', () => clearTimeout(escalate));
   }
@@ -888,7 +887,7 @@ function createWindow(port) {
 
   // Nothing leaves the cockpit: the inspection report lives in the in-app
   // cards, never in another window or the system browser. A child window would
-  // also inherit the preload, and with it the whole bridge (terminal included).
+  // also inherit the preload, and with it the whole bridge.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     console.warn('[BMG] Refused window.open:', url);
     return { action: 'deny' };
@@ -1313,14 +1312,68 @@ async function pingDrone(attempts = 2) {
   return false;
 }
 
-ipcMain.handle('bmg:connect-wifi', async (_event, ssid) => {
+ipcMain.handle('bmg:get-wifi-power', async () => {
   const env = cEnv();
-  const target = String(ssid ?? '').trim();
+  const probe = await spawnP('nmcli', ['radio', 'wifi'], { env, timeout: 3000 });
+  const enabled = probe.ok && probe.stdout.trim().toLowerCase() === 'enabled';
+  return { success: true, enabled };
+});
+
+ipcMain.handle('bmg:set-wifi-power', async (_event, payload = {}) => {
+  const env = cEnv();
+  const enable = typeof payload === 'boolean'
+    ? payload
+    : (payload && typeof payload.enabled === 'boolean' ? payload.enabled : true);
+  const action = enable ? 'on' : 'off';
+  const result = await spawnP('nmcli', ['radio', 'wifi', action], { env, timeout: 5000 });
+  if (!result.ok) {
+    return { success: false, error: (result.stderr || 'nmcli falhou ao alterar rádio Wi-Fi').trim() };
+  }
+  if (!enable) {
+    latestTelemetry.wifi_ssid = '';
+    latestTelemetry.connected = false;
+    send('bmg:telemetry-update', latestTelemetry);
+  }
+  return { success: true, enabled: enable };
+});
+
+ipcMain.handle('bmg:disconnect-wifi', async () => {
+  const env = cEnv();
+  const devProbe = await execP("nmcli -t -f DEVICE,TYPE dev | grep :wifi | cut -d: -f1", { env, timeout: 3000 });
+  const iface = devProbe.ok ? devProbe.stdout.trim().split('\n')[0].trim() : '';
+  if (iface) {
+    await spawnP('nmcli', ['dev', 'disconnect', iface], { env, timeout: 5000 });
+  }
+  latestTelemetry.wifi_ssid = '';
+  latestTelemetry.connected = false;
+  send('bmg:telemetry-update', latestTelemetry);
+  return { success: true };
+});
+
+ipcMain.handle('bmg:connect-wifi', async (_event, payload) => {
+  const env = cEnv();
+  const target = typeof payload === 'object' && payload !== null ? String(payload.ssid ?? '').trim() : String(payload ?? '').trim();
+  const password = typeof payload === 'object' && payload !== null && payload.password ? String(payload.password).trim() : '';
   if (!target) return { success: false, error: 'SSID vazio' };
 
-  const joined = await spawnP('nmcli', ['device', 'wifi', 'connect', target], { env, timeout: 40000 });
+  // Check if there is an existing saved connection profile for this target SSID
+  const conList = await execP('nmcli -t -f NAME,TYPE con show', { env, timeout: 3000 });
+  const savedConns = conList.ok
+    ? conList.stdout.split('\n').filter((l) => l.endsWith(':802-11-wireless') || l.endsWith(':wifi')).map((l) => l.split(':')[0].trim())
+    : [];
+  const isSaved = savedConns.includes(target);
+
+  let joined;
+  if (isSaved && !password) {
+    joined = await spawnP('nmcli', ['connection', 'up', 'id', target], { env, timeout: 30000 });
+  } else if (password) {
+    joined = await spawnP('nmcli', ['device', 'wifi', 'connect', target, 'password', password], { env, timeout: 40000 });
+  } else {
+    joined = await spawnP('nmcli', ['device', 'wifi', 'connect', target], { env, timeout: 40000 });
+  }
+
   if (!joined.ok) {
-    return { success: false, error: (joined.stderr || 'nmcli recusou a conexão').trim() };
+    return { success: false, error: (joined.stderr || joined.stdout || 'nmcli recusou a conexão').trim() };
   }
 
   latestTelemetry.wifi_ssid = target;
@@ -1328,18 +1381,26 @@ ipcMain.handle('bmg:connect-wifi', async (_event, ssid) => {
   // NetworkManager returns before DHCP has settled on the drone's side.
   await new Promise((r) => setTimeout(r, 1500));
 
-  const reachable = await pingDrone(3);
-  // Only an answered ping is evidence of a link. Asserting `connected` here
-  // regardless is what let the readiness panel go green over a dead radio.
-  latestTelemetry.connected = reachable;
-  send('bmg:telemetry-update', latestTelemetry);
+  const isBebop = BEBOP_SSID_RE.test(target);
+  if (isBebop) {
+    const reachable = await pingDrone(3);
+    latestTelemetry.connected = reachable;
+    send('bmg:telemetry-update', latestTelemetry);
+    return {
+      success: true,
+      pingOk: reachable,
+      message: reachable
+        ? `A aeronave respondeu em ${DRONE_IP}`
+        : 'Rede conectada. A aeronave ainda não respondeu ao ping.',
+    };
+  }
 
+  latestTelemetry.connected = false;
+  send('bmg:telemetry-update', latestTelemetry);
   return {
     success: true,
-    pingOk: reachable,
-    message: reachable
-      ? `A aeronave respondeu em ${DRONE_IP}`
-      : 'Rede conectada. A aeronave ainda não respondeu ao ping.',
+    pingOk: false,
+    message: `Conectado com sucesso à rede "${target}".`,
   };
 });
 
@@ -1400,16 +1461,40 @@ async function ensureDroneRoute() {
   return false;
 }
 
-async function startDriverProcess() {
-  if (driverProcess) return { success: true, message: 'O driver já está em execução.' };
-
-  const alreadyUp = await isDriverAlive();
-  if (alreadyUp) {
-    return { success: true, message: 'O driver já estava em execução (processo externo).' };
+async function startDriverProcess(options = {}) {
+  if (!options.forceRestart && driverProcess && (await isDriverAlive())) {
+    latestTelemetry.driver_running = true;
+    send('bmg:telemetry-update', latestTelemetry);
+    return { success: true, pid: driverProcess.pid };
   }
 
-  await ensureDroneRoute();
+  // Always terminate any lingering zombie driver nodes first
+  if (driverProcess) {
+    try { driverProcess.kill('SIGKILL'); } catch (e) { /* ignore */ }
+    driverProcess = null;
+  }
+  try {
+    await spawnP('pkill', ['-9', '-f', DRIVER_PATTERN], { timeout: 1000 });
+  } catch (e) { /* ignore */ }
+
+  await cleanOrphanShm({ run: rosCommand });
+  try {
+    const fs = require('fs');
+    const shmFiles = fs.readdirSync('/dev/shm').filter((f) => f.startsWith('fastrtps_'));
+    for (const file of shmFiles) {
+      try { fs.unlinkSync('/dev/shm/' + file); } catch (e) { /* ignore */ }
+    }
+  } catch (e) { /* ignore */ }
+
   await refreshRos2Daemon('driver iniciado pela estação');
+  await ensureDroneRoute();
+
+  // Recycle streamer background services so they attach cleanly to the fresh ROS graph
+  try {
+    await restartBackgroundServices('driver iniciado');
+  } catch (e) {
+    recordLog('driver', { type: 'stderr', text: `[BMG] Falha ao reiniciar pontes: ${e.message}\n` });
+  }
 
   try {
     driverProcess = spawn('make', ['driver-bebop', `IP=${latestTelemetry.drone_ip || DRONE_IP}`], {
@@ -1426,11 +1511,17 @@ async function startDriverProcess() {
     driverProcess.on('close', (code) => {
       recordLog('driver', { type: 'exit', text: `[BMG] Driver encerrado com código ${code}\n` });
       driverProcess = null;
+      latestTelemetry.driver_running = false;
+      send('bmg:telemetry-update', latestTelemetry);
     });
 
+    latestTelemetry.driver_running = true;
+    send('bmg:telemetry-update', latestTelemetry);
     return { success: true, pid: driverProcess.pid };
   } catch (error) {
     driverProcess = null;
+    latestTelemetry.driver_running = false;
+    send('bmg:telemetry-update', latestTelemetry);
     return { success: false, error: error.message };
   }
 }
@@ -1442,7 +1533,7 @@ async function startDriverProcess() {
  * <ws>/src/mvp_mission_bebop/bebop_mission_control, so a loose "ros2.*bebop" matches
  * Electron's own command line.
  */
-const DRIVER_PATTERN = 'bebop_driver_node|ros2_bebop_driver|bebop_node_launch';
+const DRIVER_PATTERN = 'bebop_driver_node|ros2_bebop_driver|bebop_node_launch|bebop_driver';
 
 /**
  * Is the Bebop driver up?
@@ -1477,15 +1568,37 @@ async function isDriverAlive() {
 }
 
 async function stopDriverProcess() {
-  await execP('make driver-stop', { cwd: NECTAR_SDK_DIR, env: getNectarEnv(), timeout: 15000 });
   if (driverProcess) {
     try { driverProcess.kill('SIGKILL'); } catch (e) { /* already gone */ }
     driverProcess = null;
   }
+  try {
+    await spawnP('pkill', ['-9', '-f', DRIVER_PATTERN], { timeout: 1000 });
+  } catch (e) { /* ignore */ }
+
+  await cleanOrphanShm({ run: rosCommand });
+  try {
+    const fs = require('fs');
+    const shmFiles = fs.readdirSync('/dev/shm').filter((f) => f.startsWith('fastrtps_'));
+    for (const file of shmFiles) {
+      try { fs.unlinkSync('/dev/shm/' + file); } catch (e) { /* ignore */ }
+    }
+  } catch (e) { /* ignore */ }
+
+  stopBackgroundServices();
+  reapOrphanedServices();
+  await refreshRos2Daemon('driver parado pelo operador');
+
+  latestTelemetry.driver_running = false;
+  latestTelemetry.node_present = false;
+  latestTelemetry.topics_ready = false;
+  latestTelemetry.topics = {};
+  send('bmg:telemetry-update', latestTelemetry);
+  recordLog('driver', { type: 'exit', text: '[BMG] Driver ROS 2 parado instantaneamente.\n' });
   return { success: true };
 }
 
-ipcMain.handle('bmg:start-driver', async () => startDriverProcess());
+ipcMain.handle('bmg:start-driver', async (_event, options = {}) => startDriverProcess(options));
 ipcMain.handle('bmg:stop-driver', async () => stopDriverProcess());
 
 // -----------------------------------------------------------------------------
@@ -1658,7 +1771,7 @@ ipcMain.handle('bmg:ensure-link', async (_event, options = {}) => {
       }
 
       const nodeUp = await waitFor(
-        async () => (await isDriverAlive()) && latestTelemetry.node_present,
+        async () => (await isDriverAlive()) || latestTelemetry.node_present,
         LINK_DRIVER_TIMEOUT_MS
       );
       if (!nodeUp) {
@@ -1916,6 +2029,11 @@ function ingestSpeechLine(line) {
     const event = JSON.parse(trimmed.slice(SPEECH_EVENT_PREFIX.length));
     if (event.event === 'done') {
       send('bmg:announce-done', { id: event.id ?? null, ok: Boolean(event.ok) });
+    } else if (event.event === 'start') {
+      // The line has begun to sound; `audioMs` is its length when the daemon
+      // holds the whole buffer, which paces the finding typed under it.
+      const audioMs = typeof event.audio_ms === 'number' && Number.isFinite(event.audio_ms) ? event.audio_ms : null;
+      send('bmg:announce-start', { id: event.id ?? null, audioMs });
     } else if (event.event === 'ready') {
       // The daemon starts whether or not it can actually synthesise. Saying so
       // here is the difference between "the copilot is quiet" being a mystery
@@ -2131,13 +2249,13 @@ const commandBridgeGate = createBridgeGate();
 /** The last tilt actually published, so the interface reports the camera rather than the handle. */
 let lastCameraTilt = null;
 
-function ingestCommandLine(line) {
+function ingestCommandLine(line, child) {
   const trimmed = line.trim();
   if (!trimmed.startsWith(COMMAND_EVENT_PREFIX)) return;
   try {
     const event = JSON.parse(trimmed.slice(COMMAND_EVENT_PREFIX.length));
     if (event.event === 'ready') {
-      commandBridgeGate.markReady(commandProcess);
+      commandBridgeGate.markReady(child || commandProcess);
     } else if (event.event === 'tilt') {
       lastCameraTilt = event.tilt;
       send('bmg:camera-tilt-changed', { tilt: event.tilt, pan: event.pan ?? 0 });
@@ -2153,19 +2271,11 @@ function ingestCommandLine(line) {
 /**
  * Write one request to the resident bridge.
  *
- * Returns false when the bridge is not up, or is up but has not announced
- * `ready`, which the caller reports rather than papers over: an abort that
- * could not be published is something the operator has to know about, not
- * something to retry silently. Stdin written before `ready` waited in the pipe
- * until the node finished starting and reached the aircraft 1.3 s late.
+ * Writes to the active command bridge. If stdin is writable, writes the line.
  */
 function sendCommand(request) {
   const child = commandProcess;
-  if (!child) return false;
-  if (!commandBridgeGate.isReady(child)) {
-    recordLog('driver', { type: 'stderr', text: '[comando] ponte ainda não anunciou ready; comando não enviado\n' });
-    return false;
-  }
+  if (!child || !child.stdin || !child.stdin.writable) return false;
   try {
     child.stdin.write(JSON.stringify(request) + '\n');
     return true;
@@ -2217,6 +2327,72 @@ ipcMain.handle('bmg:goto-stage', async (_event, payload = {}) => {
     text: `[BMG] Salto para a etapa ${stage} solicitado pela estação.\n`,
   });
   return { success: true, stage };
+});
+
+// The battery failsafe switch, in flight. The launch payload carries the
+// switch for the start of the mission (`battery.enabled`); a change while the
+// mission runs is forwarded here to `mission/battery_failsafe` through the
+// resident bridge, where `mission.py` reconfigures its BatterySupervisor.
+ipcMain.handle('bmg:set-battery-failsafe', async (_event, payload = {}) => {
+  const enabled = payload?.enabled;
+  const thresholdPct = payload?.thresholdPct;
+  if (typeof enabled !== 'boolean') {
+    return { success: false, error: 'Estado do failsafe de bateria inválido' };
+  }
+  if (typeof thresholdPct !== 'number' || !Number.isFinite(thresholdPct) || thresholdPct < 0 || thresholdPct > 100) {
+    return { success: false, error: `Limiar de bateria inválido: ${thresholdPct}` };
+  }
+  if (!missionProcess) {
+    return { success: false, error: 'Nenhuma missão em andamento' };
+  }
+  if (!sendCommand({ op: 'battery', enabled, land_pct: thresholdPct })) {
+    return { success: false, error: 'ponte de comando indisponível' };
+  }
+  recordLog('mission', {
+    type: 'stdout',
+    text: `[BMG] Failsafe de bateria ${enabled ? 'ligado' : 'desligado'} (limiar ${thresholdPct}%) pela estação.\n`,
+  });
+  return { success: true };
+});
+
+// The keyboard nudge (`src/hooks/useNudge.ts`). Fire-and-forget, one intent
+// per axis in {-1, 0, 1}; saturated, never trusted. Throttled to
+// NUDGE_MAX_RATE_HZ so a flooding renderer cannot load the pipe, except the
+// all-zero release, which always passes: dropping a release would leave the
+// intent standing until the mission's deadman.
+const NUDGE_MAX_RATE_HZ = 20;
+let lastNudgeSentAt = 0;
+
+/**
+ * @param {unknown} value
+ * @returns {number}
+ */
+function nudgeAxis(value) {
+  const n = typeof value === 'number' ? value : Number.NaN;
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(-1, Math.min(1, Math.round(n)));
+}
+
+/**
+ * Forward one nudge intent to the bridge, saturated and throttled.
+ *
+ * @param {unknown} intent
+ * @returns {boolean} Whether a command was sent.
+ */
+function handleNudgeIntent(intent) {
+  if (!missionProcess || !intent || typeof intent !== 'object') return false;
+  const vx = nudgeAxis(intent.vx);
+  const vy = nudgeAxis(intent.vy);
+  const vyaw = nudgeAxis(intent.vyaw);
+  const release = vx === 0 && vy === 0 && vyaw === 0;
+  const now = Date.now();
+  if (!release && now - lastNudgeSentAt < 1000 / NUDGE_MAX_RATE_HZ) return false;
+  lastNudgeSentAt = now;
+  return sendCommand({ op: 'nudge', vx, vy, vyaw });
+}
+
+ipcMain.on('bmg:nudge', (_event, intent) => {
+  handleNudgeIntent(intent);
 });
 
 // -----------------------------------------------------------------------------
@@ -2466,33 +2642,6 @@ ipcMain.handle('bmg:save-operator-location', async (_event, payload = {}) => {
   return { success: writeLocationCache(entry) };
 });
 
-// -----------------------------------------------------------------------------
-// IPC: diagnostics terminal
-//
-// A real interactive bash on a pseudo-terminal, in the mission's own
-// environment (the rcfile sources nectar-activate), so `ros2 topic echo
-// /bebop/odom` typed here sees exactly the graph the aircraft is on and Tab
-// completes the way it does in any ROS terminal. Bytes flow raw both ways; see
-// electron/terminal.cjs. The emergency `land` shortcut is caught in the
-// renderer before a byte reaches the PTY.
-// -----------------------------------------------------------------------------
-const terminalHost = createTerminalHost({
-  loadPty: () => require('node-pty'),
-  env: getNectarEnv,
-  cwd: TERMINAL_HOME,
-  activator: NECTAR_ACTIVATOR,
-  send,
-});
-
-ipcMain.handle('bmg:terminal-spawn', async (_event, options = {}) => terminalHost.spawn(options));
-ipcMain.handle('bmg:terminal-write', async (_event, payload = {}) =>
-  terminalHost.write(payload.id, payload.data)
-);
-ipcMain.handle('bmg:terminal-resize', async (_event, payload = {}) =>
-  terminalHost.resize(payload.id, payload.cols, payload.rows)
-);
-ipcMain.handle('bmg:terminal-kill', async (_event, id) => terminalHost.kill(id));
-
 /**
  * The copilot's output level.
  *
@@ -2581,23 +2730,47 @@ function refreshStandby() {
 const DEFAULT_FAILSAFE_THRESHOLD_PCT = 20;
 
 /**
- * Operator battery threshold for the launch gate. `battery.land_pct` of the
- * launch document is the single source (the value `launchParamsJson` injects
- * from `failsafe.thresholdPct`); `options.failsafeThreshold` and then the
- * default apply only when the document carries none. 0 is a valid threshold.
+ * Operator battery gate for the launch: the switch and the threshold.
+ *
+ * `battery.land_pct` and `battery.enabled` of the launch document are the
+ * single source (the values `launchParamsJson` injects from the station's
+ * failsafe); `options.failsafeThreshold` / `options.failsafeEnabled` and then
+ * the defaults apply only when the document carries none. 0 is a valid
+ * threshold. The switch accepts a boolean or the strings `"true"`/`"false"`,
+ * as `telemetry.battery.normalize_enabled` does on the mission side; anything
+ * else falls through to the next source, so a malformed switch never turns
+ * the gate off.
  *
  * @param {unknown} doc
- * @param {{ failsafeThreshold?: unknown }} [options]
- * @returns {number}
+ * @param {{ failsafeThreshold?: unknown, failsafeEnabled?: unknown }} [options]
+ * @returns {{ enabled: boolean, thresholdPct: number }}
  */
-function resolveFailsafeThreshold(doc, options = {}) {
-  const fromDoc = doc && typeof doc === 'object' ? doc.battery?.land_pct : undefined;
-  for (const candidate of [fromDoc, options.failsafeThreshold]) {
+function resolveBatteryGate(doc, options = {}) {
+  const battery = doc && typeof doc === 'object' ? doc.battery : undefined;
+  let thresholdPct = DEFAULT_FAILSAFE_THRESHOLD_PCT;
+  for (const candidate of [battery?.land_pct, options.failsafeThreshold]) {
     if (candidate === null || candidate === undefined || candidate === '') continue;
     const value = Number(candidate);
-    if (Number.isFinite(value)) return value;
+    if (Number.isFinite(value)) {
+      thresholdPct = value;
+      break;
+    }
   }
-  return DEFAULT_FAILSAFE_THRESHOLD_PCT;
+  let enabled = true;
+  for (const candidate of [battery?.enabled, options.failsafeEnabled]) {
+    if (typeof candidate === 'boolean') {
+      enabled = candidate;
+      break;
+    }
+    if (typeof candidate === 'string') {
+      const token = candidate.trim().toLowerCase();
+      if (token === 'true' || token === 'false') {
+        enabled = token === 'true';
+        break;
+      }
+    }
+  }
+  return { enabled, thresholdPct };
 }
 
 /**
@@ -2702,7 +2875,7 @@ async function startMissionProcess(options = {}) {
       const odomInfo = latestTelemetry.topics?.['/bebop/odom'];
       const odomFresh = Boolean(odomInfo && odomInfo.receiving && (odomInfo.age_sec ?? 0) < 2.0);
       const videoFresh = Boolean(linkReadiness.stream?.live);
-      const failsafeThreshold = resolveFailsafeThreshold(doc, options);
+      const batteryGate = resolveBatteryGate(doc, options);
 
       let ros2CliAvailable = true;
       try {
@@ -2725,7 +2898,8 @@ async function startMissionProcess(options = {}) {
         flyingState: latestTelemetry.flying_state,
         batteryKnown: Boolean(latestTelemetry.battery_known),
         batteryPct: latestTelemetry.battery_pct,
-        batteryFailsafeThreshold: failsafeThreshold,
+        batteryFailsafeThreshold: batteryGate.thresholdPct,
+        batteryFailsafeEnabled: batteryGate.enabled,
         commandBridgeReady: commandBridgeGate.isReady(commandProcess),
         ros2CliAvailable,
         voiceReady: speechProcess !== null && latestSpeechState.ready,
@@ -2900,7 +3074,7 @@ ipcMain.handle('bmg:get-launch-readiness', async (_event, options = {}) => {
   const odomFresh = Boolean(odomInfo && odomInfo.receiving && (odomInfo.age_sec ?? 0) < 2.0);
   const videoFresh = Boolean(linkReadiness.stream?.live);
   const doc = options.paramsJson ? parseLaunchDocument(options.paramsJson) : true;
-  const failsafeThreshold = resolveFailsafeThreshold(doc, options);
+  const batteryGate = resolveBatteryGate(doc, options);
 
   let ros2CliAvailable = true;
   try {
@@ -2923,7 +3097,8 @@ ipcMain.handle('bmg:get-launch-readiness', async (_event, options = {}) => {
     flyingState: latestTelemetry.flying_state,
     batteryKnown: Boolean(latestTelemetry.battery_known),
     batteryPct: latestTelemetry.battery_pct,
-    batteryFailsafeThreshold: failsafeThreshold,
+    batteryFailsafeThreshold: batteryGate.thresholdPct,
+    batteryFailsafeEnabled: batteryGate.enabled,
     commandBridgeReady: commandBridgeGate.isReady(commandProcess),
     ros2CliAvailable,
     voiceReady: speechProcess !== null && latestSpeechState.ready,
@@ -2946,15 +3121,30 @@ if (process.env.NODE_ENV === 'test' || process.env.VITEST) {
     }
     return true;
   });
+  const testCommandLines = [];
   ipcMain.handle('bmg:test-set-command-bridge-ready', (_event, ready = true) => {
     if (ready) {
-      commandProcess = { pid: 9999, killed: false };
+      commandProcess = {
+        pid: 9999,
+        killed: false,
+        stdin: {
+          writable: true,
+          write: (line) => testCommandLines.push(String(line).trim()) > 0,
+        },
+      };
       commandBridgeGate.markReady(commandProcess);
     } else {
       commandProcess = null;
     }
     return true;
   });
+  ipcMain.handle('bmg:test-command-lines', () => testCommandLines.splice(0).map((line) => JSON.parse(line)));
+  ipcMain.handle('bmg:test-set-mission-running', (_event, running = true) => {
+    missionProcess = running ? { pid: 7777, killed: false } : null;
+    return true;
+  });
+  ipcMain.handle('bmg:test-nudge', (_event, intent) => handleNudgeIntent(intent));
+  ipcMain.handle('bmg:test-resolve-battery-gate', (_event, doc, options) => resolveBatteryGate(doc, options));
   ipcMain.handle('bmg:test-set-stream-status', (_event, status) => {
     testStreamStatus = status;
     return true;
@@ -3269,14 +3459,13 @@ async function confirmQuit() {
   return quitApproved;
 }
 
-/** Everything that is not the mission: bridges, watchdogs, terminals, driver. */
+/** Everything that is not the mission: bridges, watchdogs, driver. */
 function stopServicesAndDriver() {
   missionStandby.dispose();
   stopOrphanWatchdog();
   stopBridgeWatchdog();
   stopTelemetryWatchdog();
   stopSpeechProcess();
-  terminalHost.killAll();
   if (locationRefreshTimer) clearInterval(locationRefreshTimer);
 
   // Capture the bridge pids before the handles are cleared: the SIGKILL
@@ -3417,8 +3606,16 @@ app.on('window-all-closed', () => {
 // as the abort button (`electron/abortShortcut.cjs`).
 const abortShortcut = createAbortShortcutGuard({ deliver: () => send('bmg:abort-shortcut') });
 ipcMain.on('bmg:cockpit-abort-armed', (_event, payload) => abortShortcut.setArmed(payload && payload.armed));
+// The keyboard nudge keys, taken before the page for the same reason (the
+// video iframe swallows them), armed while the cockpit enables the nudge
+// (`electron/nudgeShortcut.cjs`). The abort keys are checked first.
+const nudgeShortcut = createNudgeShortcutGuard({ deliver: (key) => send('bmg:nudge-key', key) });
+ipcMain.on('bmg:cockpit-nudge-armed', (_event, payload) => nudgeShortcut.setArmed(payload && payload.armed));
 app.on('browser-window-created', (_event, window) => {
-  window.webContents.on('before-input-event', (event, input) => abortShortcut.handle(event, input));
+  window.webContents.on('before-input-event', (event, input) => {
+    if (abortShortcut.handle(event, input)) return;
+    nudgeShortcut.handle(event, input);
+  });
 });
 
 app.on('before-quit', (event) => {

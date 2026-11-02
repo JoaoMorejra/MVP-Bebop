@@ -67,11 +67,23 @@ function stationRosProcesses() {
  * @param {() => number} [deps.countSegments]
  * @param {(cmd: string, args: string[], opts?: object) => Promise<{ok: boolean}>} deps.run
  */
-async function cleanOrphanShm({ rosProcesses = stationRosProcesses, countSegments = countFastddsSegments, run }) {
+async function cleanOrphanShm(deps = {}) {
+  const rosProcesses = deps.rosProcesses || stationRosProcesses;
+  const countSegments = deps.countSegments || countFastddsSegments;
+  const run = deps.run;
   const alive = rosProcesses();
   if (alive.length) return { skipped: true, alive };
   const before = countSegments();
-  await run('fastdds', ['shm', 'clean'], { timeout: 15000 });
+  if (typeof run === 'function') {
+    try {
+      await run('fastdds', ['shm', 'clean'], { timeout: 15000 });
+    } catch (_e) { /* ignore */ }
+  } else {
+    try {
+      const { spawnSync } = require('node:child_process');
+      spawnSync('fastdds', ['shm', 'clean'], { timeout: 15000 });
+    } catch (_e) { /* ignore */ }
+  }
   const after = countSegments();
   return { skipped: false, before, after, removed: Math.max(0, before - after) };
 }
