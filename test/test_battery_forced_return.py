@@ -411,6 +411,7 @@ def forced_return(monkeypatch, mode: MissionMode, *, forced: bool, rtl_enabled: 
     ctx = ReturnCtx(altitude=0.30)
     ctx.params.rtl.enabled = rtl_enabled
     ctx.params.rtl.timeout_sec = 4.0
+    ctx.params.rtl.centering_timeout_sec = 12.0
     if forced:
         ctx.blackboard.battery_return = True
     sensor = ScriptedSensor(ctx.drone, acquire_after=3, ex=0.35, ey=-0.25)

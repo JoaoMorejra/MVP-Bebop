@@ -68,13 +68,16 @@ from __future__ import annotations
 
 import logging
 import math
+import time
+from collections import deque
 from enum import Enum
-from typing import Any, Dict, Final, FrozenSet, List, Optional
+from typing import Any, Deque, Dict, Final, FrozenSet, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from mvp_mission_bebop.context import MissionContext
+from mvp_mission_bebop.controllers.precision_descent import DescentCommand, PrecisionDescentController
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
 from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
 from mvp_mission_bebop.controllers.rtl_guidance import (
@@ -95,7 +98,7 @@ from mvp_mission_bebop.perception.intrinsics import (
     CalibrationMismatch,
     apply_driver_calibration,
 )
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
+from mvp_mission_bebop.steps.base import BaseStep, StepStatus, cross_axis_correction, governed_vz
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot, TelemetryHealth
 
@@ -189,6 +192,12 @@ _GIMBAL_TOLERANCE_DEG: Final[float] = 3.0
 #: low altitude. Better to treat the frame as missing and hold station.
 _CENTERING_FRAME_TIMEOUT_SEC: Final[float] = 0.4
 
+#: Detector calls kept for the timing percentiles: about 17 s at 15 Hz.
+_DETECT_TIMING_WINDOW: Final[int] = 256
+
+#: Floor of a frame wait bounded by the rest of the period, s.
+_MIN_FRAME_WAIT_SEC: Final[float] = 0.02
+
 #: Validity of an along-track position reported by the pad marker to the
 #: platform monitor, seconds. Covers the gap to the next centering frame.
 _MARKER_POSITION_TTL_SEC: Final[float] = 0.5
@@ -281,6 +290,9 @@ class ArucoMarkerSensor:
         "_degenerate",
         "_accepted",
         "_last_error",
+        "_detect_ms",
+        "_last_overlay_frame",
+        "_last_overlay",
     )
 
     #: Pose paths this class knows how to drive. See the class docstring.
@@ -309,6 +321,11 @@ class ArucoMarkerSensor:
         self._degenerate = 0
         self._accepted = 0
         self._last_error: Optional[str] = None
+        #: Wall time of each detector call, ms, newest last. The detection runs
+        #: inline in the Stage 5 loop, so its cost is part of the command period.
+        self._detect_ms: Deque[float] = deque(maxlen=_DETECT_TIMING_WINDOW)
+        self._last_overlay_frame: Optional[np.ndarray] = None
+        self._last_overlay: List[Dict[str, Any]] = []
 
         # ``None`` -- the flight default -- selects from what the runtime
         # actually provides. An explicit value is for diagnostics and for tests
@@ -365,10 +382,13 @@ class ArucoMarkerSensor:
             code path for "no image" and "no marker".
         """
         self._frames += 1
+        self._last_overlay_frame = frame
+        self._last_overlay = []
         if frame is None:
             self._no_frame += 1
             return None
 
+        started = time.perf_counter()
         try:
             if self._backend == "sdk":
                 marker_id, translation, yaw = self._detector.pose_estimate(
@@ -377,24 +397,29 @@ class ArucoMarkerSensor:
             else:
                 marker_id, translation, yaw = self._pose_via_solvepnp(frame)
         except Exception as exc:  # noqa: BLE001 - perception never ends a flight
+            self._detect_ms.append((time.perf_counter() - started) * 1000.0)
             self._failures += 1
             self._last_error = type(exc).__name__
+            self._last_overlay = []
             logger.debug("ArUco detection failed on this frame: %s", exc)
             return None
 
+        self._detect_ms.append((time.perf_counter() - started) * 1000.0)
         observation = MarkerObservation.from_pose_estimate(
             marker_id, translation, yaw, expected_id=self._target_id
         )
         if observation is not None:
             self._accepted += 1
-        elif marker_id is None or translation is None:
-            self._no_detection += 1
         else:
-            seen = self._identity_of(marker_id)
-            if seen is not None and seen != self._target_id:
-                self._wrong_ids[seen] = self._wrong_ids.get(seen, 0) + 1
+            self._last_overlay = []
+            if marker_id is None or translation is None:
+                self._no_detection += 1
             else:
-                self._degenerate += 1
+                seen = self._identity_of(marker_id)
+                if seen is not None and seen != self._target_id:
+                    self._wrong_ids[seen] = self._wrong_ids.get(seen, 0) + 1
+                else:
+                    self._degenerate += 1
         return observation
 
     @staticmethod
@@ -415,9 +440,18 @@ class ArucoMarkerSensor:
             ``no_detection`` (a frame with no marker in it); ``wrong_ids``
             (marker id -> frames, a marker of the dictionary that is not the
             pad); ``degenerate`` (the right id with an unusable pose);
-            ``accepted``; ``errors`` (detector exceptions) and ``last_error``
-            (the exception type, or ``None``).
+            ``accepted``; ``errors`` (detector exceptions); ``last_error``
+            (the exception type, or ``None``); ``detect_ms_p50`` and
+            ``detect_ms_p95`` (detector call time over the last
+            ``_DETECT_TIMING_WINDOW`` calls, ``0.0`` before any).
         """
+        timings = sorted(self._detect_ms)
+
+        def percentile(fraction: float) -> float:
+            if not timings:
+                return 0.0
+            return timings[min(len(timings) - 1, max(0, int(math.ceil(fraction * len(timings))) - 1))]
+
         return {
             "frames": self._frames,
             "no_frame": self._no_frame,
@@ -427,6 +461,8 @@ class ArucoMarkerSensor:
             "accepted": self._accepted,
             "errors": self._failures,
             "last_error": self._last_error,
+            "detect_ms_p50": percentile(0.50),
+            "detect_ms_p95": percentile(0.95),
         }
 
     def diagnostics_line(self) -> str:
@@ -436,18 +472,22 @@ class ArucoMarkerSensor:
             f"frames {d['frames']}, no frame {d['no_frame']}, nothing detected {d['no_detection']}, "
             f"wrong ids {d['wrong_ids']}, degenerate pose {d['degenerate']}, accepted {d['accepted']}, "
             f"errors {d['errors']}" + (f" ({d['last_error']})" if d["last_error"] else "")
+            + f", detect_ms p50 {d['detect_ms_p50']:.1f} p95 {d['detect_ms_p95']:.1f}"
         )
 
     def overlay_geometry(self, frame: Optional[np.ndarray]) -> List[Dict[str, Any]]:
         """Marker corners and projected pose axes, in pixels, for the GCS overlay.
 
-        One extra ``detect`` without drawing, a ``solvePnP`` and a projection of
-        the marker axes: the few milliseconds the station needs to draw the
-        HUD over the raw stream instead of receiving an annotated 1.2 MB frame.
+        Reuses the geometry already extracted by :meth:`observe` when called on
+        the same frame, avoiding a redundant detection pass and avoiding any
+        in-place annotations drawn on the frame. Falls back to a fresh
+        ``detect`` + ``solvePnP`` when called directly on an unobserved frame.
         Any failure reads as no marker; the overlay never ends a flight.
         """
         if frame is None:
             return []
+        if frame is self._last_overlay_frame:
+            return list(self._last_overlay)
         try:
             bbox, marker_id = self._detector.detect(frame, False)
             if marker_id is None or bbox is None or len(bbox) == 0:
@@ -497,6 +537,10 @@ class ArucoMarkerSensor:
         )
         if not solved:
             return None, None, None
+
+        identifier = self._identity_of(marker_id)
+        if identifier is not None:
+            self._last_overlay = [{"id": identifier, "corners_px": image_points.tolist()}]
 
         if self._annotate:
             cv2.drawFrameAxes(
@@ -605,6 +649,7 @@ class ClosedLoopRTLStep(BaseStep):
         if forced:
             self.name = f"STEP 5: {stage_five_name(self._mode, True)}"
         logger.info("--- [%s] ---", self.name)
+        ctx.blackboard.precision_landing_active = False
 
         rtl_cfg = ctx.params.rtl
         guidance = self._guidance or RTLGuidanceController(
@@ -728,20 +773,38 @@ class ClosedLoopRTLStep(BaseStep):
             return StepStatus.ABORTED
         if outcome is _PhaseOutcome.FAILED:
             return StepStatus.FAILURE
+
+        marker_sighted = (
+            (centering is not None and centering.last_radial_m is not None)
+            or (sensor is not None and getattr(sensor, "_accepted", 0) > 0)
+        )
+
         if outcome is _PhaseOutcome.EXHAUSTED:
-            # Land anyway, and say so. The aircraft is over or near the pad with
-            # a known residual error; holding it up waiting for a convergence
-            # that has already had its window spends battery to buy nothing.
-            logger.warning(
-                "Centering window of %.1f s expired with a residual radial error. "
-                "Landing from the position reached.",
-                rtl_cfg.centering_timeout_sec,
-            )
+            if marker_sighted:
+                logger.warning(
+                    "Centering window of %.1f s expired with residual error; "
+                    "proceeding to tracked precision descent to continue centering while descending.",
+                    rtl_cfg.centering_timeout_sec,
+                )
+            else:
+                logger.warning(
+                    "Centering window of %.1f s expired without marker sighting. "
+                    "Landing from the position reached.",
+                    rtl_cfg.centering_timeout_sec,
+                )
+                return self._touchdown(ctx, guidance, at_base=True)
         else:
             self._announce(
                 "Centralizado sobre a base",
                 "aeronave centralizada sobre o marcador, iniciando pouso de precisão",
             )
+
+        # ---- phase 3.5: precision tracked descent -----------------------
+        outcome = self._descend_over_marker(ctx, centering, sensor)
+        if outcome is _PhaseOutcome.ABORTED:
+            return StepStatus.ABORTED
+        if outcome is _PhaseOutcome.FAILED:
+            return StepStatus.FAILURE
 
         # ---- phase 4: precision touchdown -------------------------------
         return self._touchdown(ctx, guidance, at_base=True)
@@ -893,16 +956,39 @@ class ClosedLoopRTLStep(BaseStep):
             return StepStatus.ABORTED
         if outcome is _PhaseOutcome.FAILED:
             return StepStatus.FAILURE
+
+        marker_sighted = (
+            (centering is not None and centering.last_radial_m is not None)
+            or (sensor is not None and getattr(sensor, "_accepted", 0) > 0)
+        )
+
         if outcome is _PhaseOutcome.EXHAUSTED:
-            logger.warning(
-                "Centering window of %.1f s expired; landing from the position held.",
-                rtl_cfg.centering_timeout_sec,
-            )
+            if marker_sighted:
+                logger.warning(
+                    "Centering window of %.1f s expired with residual error; "
+                    "proceeding to tracked precision descent to continue centering while descending.",
+                    rtl_cfg.centering_timeout_sec,
+                )
+            else:
+                logger.warning(
+                    "Centering window of %.1f s expired without marker sighting; "
+                    "landing from the position held.",
+                    rtl_cfg.centering_timeout_sec,
+                )
+                return self._touchdown(ctx, guidance, at_base=True)
         else:
             self._announce(
                 "Centralizado sobre a base",
                 "aeronave centralizada sobre o marcador, iniciando pouso de precisão",
             )
+
+        # ---- phase 3.5: precision tracked descent -----------------------
+        outcome = self._descend_over_marker(ctx, centering, sensor)
+        if outcome is _PhaseOutcome.ABORTED:
+            return StepStatus.ABORTED
+        if outcome is _PhaseOutcome.FAILED:
+            return StepStatus.FAILURE
+
         return self._touchdown(ctx, guidance, at_base=True)
 
     @staticmethod
@@ -1056,7 +1142,7 @@ class ClosedLoopRTLStep(BaseStep):
             int(rtl_cfg.target_aruco_id),
         )
         self._check_intrinsics(ctx, detector)
-        return ArucoMarkerSensor(detector, int(rtl_cfg.target_aruco_id))
+        return ArucoMarkerSensor(detector, int(rtl_cfg.target_aruco_id), annotate=False)
 
     @staticmethod
     def _check_intrinsics(ctx: MissionContext, detector: Any) -> None:
@@ -1129,21 +1215,25 @@ class ClosedLoopRTLStep(BaseStep):
         """Cruise to the right along the outbound track until the marker confirms.
 
         The outbound search flew to the left, so the return is flown on body Y
-        at ``abs(reverse_cruise_velocity)`` converted on the lateral gain. The
-        kinematic invariants of this phase are the mirror of Stage 2's and are
-        enforced structurally rather than asserted:
+        at ``abs(reverse_cruise_velocity)`` converted on the lateral gain. In
+        Advanced mode, the initial 5.0 seconds also cruise backward on body X
+        (``vx < 0``) to retrace the outbound track and widen the camera's
+        view of the launch pad before transitioning to pure rightward flight.
+
+        The kinematic invariants of this phase are:
 
         * ``vy <= 0`` -- the shaped command is passed through ``min(0.0, vy)``
           before it reaches the envelope clamp, so neither a sign error in
           ``reverse_cruise_velocity`` nor a sigma-delta pulse of the wrong
           polarity can turn the return into an outbound cruise.
-        * ``vx == 0`` -- the literal zero. The search leg does not correct off
-          the track: it has nothing to correct *towards* until the marker is in
-          frame, and an off-track command with no reference is just a curved
-          search track.
+        * ``vx <= 0`` -- in Advanced mode, backward motion (``vx < 0``) for the
+          first 5.0 seconds, ramping smoothly to rest (``vx == 0.0``) under a
+          jerk-limited profile for the remainder of the search. In Simple mode,
+          ``vx == 0.0`` identically throughout. Forward flight is structurally
+          forbidden.
         * ``vyaw == 0`` -- as everywhere in this mission.
         * ``vz`` belongs to the altitude governor, inside the hold window the
-          caller opened.
+          caller opened, with 2D horizontal speed magnitude fed to feedforward.
 
         Confirmation is hysteretic over ``rtl.confirmation_frames``, released
         after ``rtl.lost_frames_tolerance`` consecutive misses. One frame
@@ -1238,6 +1328,13 @@ class ClosedLoopRTLStep(BaseStep):
                     ),
                 )
                 self._brake(ctx, profile, shaper, rate)
+                self._halt_translation(ctx)
+                settle_ticks = max(1, int(0.3 * ctx.params.kinematics.control_loop_hz))
+                for _ in range(settle_ticks):
+                    if ctx.interrupted():
+                        break
+                    self._halt_translation(ctx)
+                    rate.tick()
                 return _PhaseOutcome.ACHIEVED
 
             # No confirmation yet: keep flying the reverse line. The airframe
@@ -1312,7 +1409,7 @@ class ClosedLoopRTLStep(BaseStep):
         profile : JerkLimitedProfile
             Return-channel profile, in m/s.
         shaper : QuantizedCommandShaper
-            Sigma-delta shaper of the ``vy`` channel.
+            Sigma-delta shaper of the vy channel.
         dt : float
             Interval since the previous cycle, seconds.
         cruise_mps : float
@@ -1321,8 +1418,8 @@ class ClosedLoopRTLStep(BaseStep):
         Returns
         -------
         float
-            The ``vy`` transmitted, normalized; never positive. ``vx`` is sent as
-            the literal ``0.0``.
+            The vy transmitted, normalized; never positive. vx is sent as
+            the literal 0.0.
         """
         scale = getattr(ctx.governor, "horizontal_scale", None)
         permitted = abs(cruise_mps) * (float(scale()) if callable(scale) else 1.0)
@@ -1366,6 +1463,7 @@ class ClosedLoopRTLStep(BaseStep):
             if abs(profile.velocity) <= 1e-6:
                 break
             rate.tick()
+        self._halt_translation(ctx)
 
     # ---------------------------------------------------- phase 3: centering
 
@@ -1396,6 +1494,7 @@ class ClosedLoopRTLStep(BaseStep):
         rtl_cfg = ctx.params.rtl
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
         deadline = Deadline(rtl_cfg.centering_timeout_sec)
+        ctx.blackboard.precision_landing_active = True
 
         logger.info(
             "Centering on marker %d: tolerance %.3f m radial, %d settle cycles at <= %.3f m/s, "
@@ -1426,7 +1525,7 @@ class ClosedLoopRTLStep(BaseStep):
                 ctx.failsafe.trigger_emergency_land(health)
                 return _PhaseOutcome.FAILED
 
-            frame = self._acquire_frame(ctx, _CENTERING_FRAME_TIMEOUT_SEC)
+            frame = self._acquire_frame(ctx, self._bounded_frame_wait(rate))
             dt = rate.tick()
             if frame is not None:
                 ctx.failsafe.notify_frame_received()
@@ -1437,7 +1536,7 @@ class ClosedLoopRTLStep(BaseStep):
                 self._assert_tilt(ctx)
 
             observation = sensor.observe(frame)
-            command = centering.update(observation, dt)
+            command = centering.update(observation, dt, tilt_deg=self._projection_tilt(ctx))
             if observation is not None:
                 self._report_pad_position(ctx, command.ey_body_m)
             self._transmit_centering(ctx, command, dt)
@@ -1467,11 +1566,14 @@ class ClosedLoopRTLStep(BaseStep):
                     command.commanded_speed_mps,
                 )
                 self._halt_translation(ctx)
+                logger.info("Centering loop cadence: %s.", rate.cadence_report())
+                self._log_detector_summary(sensor, "centering", level=logging.INFO)
                 return _PhaseOutcome.ACHIEVED
 
             cycle += 1
 
         self._halt_translation(ctx)
+        logger.info("Centering loop cadence: %s.", rate.cadence_report())
         logger.warning(
             "Centering did not settle within %.1f s. Last radial error %s m, marker %s.",
             rtl_cfg.centering_timeout_sec,
@@ -1482,7 +1584,152 @@ class ClosedLoopRTLStep(BaseStep):
         return _PhaseOutcome.EXHAUSTED
 
     @staticmethod
-    def _log_detector_summary(sensor: Any, phase: str) -> None:
+    def _bounded_frame_wait(rate: LoopRate) -> float:
+        """Frame wait for a Stage 5 closed loop: the rest of the period, capped.
+
+        The wait precedes the tick, so a full ``_CENTERING_FRAME_TIMEOUT_SEC``
+        on a slow camera stretched the command period to the timeout plus the
+        detection. Bounded by :meth:`LoopRate.remaining_sec` the command still
+        leaves every period, with or without a new frame, as Stages 2 and 3 do.
+        """
+        return min(_CENTERING_FRAME_TIMEOUT_SEC, max(_MIN_FRAME_WAIT_SEC, rate.remaining_sec()))
+
+    def _descend_over_marker(
+        self,
+        ctx: MissionContext,
+        centering: ArucoCenteringController,
+        sensor: ArucoMarkerSensor,
+    ) -> _PhaseOutcome:
+        """Track the marker down from the centring height to the commit height.
+
+        The law is :class:`~mvp_mission_bebop.controllers.precision_descent.PrecisionDescentController`;
+        this is sequencing and transmission. The vertical command is the
+        controller's, not the governor's: the governor holds a setpoint and
+        this phase leaves it on purpose. It passes the same safety boundary as
+        every command (``clamp_kinematics`` keeps it descent-only,
+        ``clamp_translation`` bounds the horizontal pair). A deadline that runs
+        out, or a disabled or misconfigured descent, hands the touchdown over
+        from wherever the aircraft is, as before this phase existed.
+
+        Returns
+        -------
+        _PhaseOutcome
+            ``ACHIEVED`` when the touchdown may follow (committed, timed out or
+            skipped); ``ABORTED`` / ``FAILED`` on an interrupt or a health fault.
+        """
+        rtl_cfg = ctx.params.rtl
+        if not rtl_cfg.visual_descent_enabled:
+            return _PhaseOutcome.ACHIEVED
+        try:
+            descent = PrecisionDescentController(rtl_cfg, centering)
+        except (TypeError, ValueError) as exc:
+            logger.error("Tracked descent unavailable (%s); landing from the centring height.", exc)
+            return _PhaseOutcome.ACHIEVED
+
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        deadline = Deadline(rtl_cfg.descent_timeout_sec)
+        logger.info(
+            "Tracked descent over marker %d: gate %.3f m, %.2f m/s down to %.2f m, window %.1f s.",
+            sensor.target_id,
+            rtl_cfg.descent_gate_radius_m,
+            rtl_cfg.descent_speed_mps,
+            rtl_cfg.commit_height_m,
+            rtl_cfg.descent_timeout_sec,
+        )
+        cycle = 0
+        since_tilt = 0.0
+        command: Optional[DescentCommand] = None
+        while deadline.active:
+            if ctx.interrupted():
+                self._halt_translation(ctx)
+                return _PhaseOutcome.ABORTED
+
+            health = self._check_health(ctx)
+            if health is not None:
+                ctx.failsafe.trigger_emergency_land(health)
+                return _PhaseOutcome.FAILED
+
+            frame = self._acquire_frame(ctx, self._bounded_frame_wait(rate))
+            dt = rate.tick()
+            if frame is not None:
+                ctx.failsafe.notify_frame_received()
+            since_tilt += dt
+            if since_tilt >= _TILT_REASSERT_SEC:
+                since_tilt = 0.0
+                self._assert_tilt(ctx)
+
+            observation = sensor.observe(frame)
+            snapshot = ctx.odom_supervisor.snapshot()
+            command = descent.update(
+                observation, snapshot.relative_altitude, dt, tilt_deg=self._projection_tilt(ctx)
+            )
+            vz = ctx.speed_calibration.to_normalized(command.vz_mps, axis="vertical")
+            safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
+            safe_vx, safe_vy = ctx.failsafe.clamp_translation(command.vx, command.vy)
+            ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
+
+            if cycle % _STREAM_DECIMATION == 0 or command.commit:
+                self._publish_marker_stream(
+                    ctx,
+                    frame,
+                    self._hud(
+                        ctx,
+                        marker_id=observation.marker_id if observation is not None else None,
+                        distance_m=observation.slant_range_m if observation is not None else None,
+                        vx=command.vx,
+                        vy=command.vy,
+                        suffix=f" | {command.phase.value}",
+                    ),
+                )
+                logger.info(
+                    "[DESCENT t=%.2f phase=%s h=%s err=(%.3f,%.3f) vz=%.3f commit=%d]",
+                    deadline.elapsed_sec,
+                    command.phase.value,
+                    f"{command.height_m:.3f}" if command.height_m is not None else "nan",
+                    command.ex_body_m,
+                    command.ey_body_m,
+                    command.vz_mps,
+                    1 if command.commit else 0,
+                )
+            if command.commit:
+                logger.info("Tracked descent committed: %s.", command.note)
+                self._halt_translation(ctx)
+                logger.info("Descent loop cadence: %s.", rate.cadence_report())
+                return _PhaseOutcome.ACHIEVED
+            cycle += 1
+
+        self._halt_translation(ctx)
+        logger.warning(
+            "Tracked descent did not commit within %.1f s (%s); handing the touchdown over from here.",
+            rtl_cfg.descent_timeout_sec,
+            command.note if command is not None else "no cycle ran",
+        )
+        logger.info("Descent loop cadence: %s.", rate.cadence_report())
+        return _PhaseOutcome.ACHIEVED
+
+    @staticmethod
+    def _projection_tilt(ctx: MissionContext) -> Optional[float]:
+        """Tilt the marker projection is built against this cycle.
+
+        The aircraft's reported tilt when the gimbal monitor has a fresh one:
+        the mount settles short of the command (-79.2 for -80.0 in flight), and
+        at a metre over the pad each degree is 1.7 cm of along-track error.
+        Otherwise the commanded tilt recorded by :meth:`_assert_tilt`.
+        """
+        monitor = getattr(ctx, "gimbal_monitor", None)
+        if monitor is not None:
+            try:
+                reported = monitor.current_tilt()
+            except Exception as exc:  # noqa: BLE001 - the commanded tilt is the fallback
+                logger.debug("Gimbal readback unavailable: %s", exc)
+                reported = None
+            if reported is not None and math.isfinite(reported):
+                return float(reported)
+        current = getattr(ctx, "current_tilt_deg", None)
+        return float(current) if isinstance(current, (int, float)) else None
+
+    @staticmethod
+    def _log_detector_summary(sensor: Any, phase: str, level: int = logging.WARNING) -> None:
         """State why the marker was never sighted, when the sensor can say.
 
         ``marker absent`` in the control log covers a missing frame, an empty
@@ -1492,7 +1739,7 @@ class ClosedLoopRTLStep(BaseStep):
         """
         describe = getattr(sensor, "diagnostics_line", None)
         if callable(describe):
-            logger.warning("Marker detector during %s: %s.", phase, describe())
+            logger.log(level, "Marker detector during %s: %s.", phase, describe())
 
     def _transmit_centering(
         self, ctx: MissionContext, command: CenteringCommand, dt: float
@@ -1957,7 +2204,14 @@ class ClosedLoopRTLStep(BaseStep):
             # firmware is not acting on it, and re-sending the same request more
             # times will not change that. Command the descent explicitly, then
             # re-assert the landing.
-            if not assisted and stall_elapsed >= rtl_cfg.descent_stall_sec and descended <= 0.0:
+            # Escalation to assisted descent is only valid if the firmware never started landing
+            # (e.g. driver lost the command or simulated bench test). On a real aircraft whose
+            # landing state is active, sending velocity Twists breaks the autonomous landing.
+            landing_active = (
+                getattr(ctx.blackboard, "landing_started", False)
+                or getattr(ctx, "flying_state", None) in (4, 8)
+            )
+            if not landing_active and not assisted and stall_elapsed >= rtl_cfg.descent_stall_sec and descended <= 0.0:
                 assisted = True
                 logger.warning(
                     "No descent %.1f s after the landing request (altitude %.2f m). "
@@ -1973,7 +2227,7 @@ class ClosedLoopRTLStep(BaseStep):
                 stall_elapsed = 0.0
                 lowest_altitude = altitude
 
-            if assisted and not grounded:
+            if assisted and not grounded and not landing_active:
                 # Routed through the failsafe like every other command, so the
                 # descent-only invariant and the horizontal envelope still hold.
                 safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(
@@ -1997,6 +2251,7 @@ class ClosedLoopRTLStep(BaseStep):
         # Only a confirmed touchdown completes the RTL. This flag used to be set
         # unconditionally, so a drone still airborne at the timeout reported a
         # completed flight to everything downstream that reads the blackboard.
+        logger.info("Touchdown loop cadence: %s.", rate.cadence_report())
         ctx.blackboard.rtl_completed = confirmed
         ctx.blackboard.touchdown_confirmed = confirmed
         final = ctx.odom_supervisor.snapshot()

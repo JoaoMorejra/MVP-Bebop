@@ -9,10 +9,9 @@ import time
 from typing import Any, ContextManager, Dict, Final, FrozenSet, Optional
 
 from mvp_mission_bebop.context import MissionContext
-from mvp_mission_bebop.controllers.profiling import (
-    JerkLimitedProfile,
-    ProfileLimits,
-    braking_velocity,
+from mvp_mission_bebop.controllers.altitude_acquisition import (
+    AcquisitionLimits,
+    AltitudeAcquisitionController,
 )
 from mvp_mission_bebop.engine.launch import CountdownTicker
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
@@ -60,6 +59,15 @@ _CLIMB_DEADLINE_FACTOR: Final[float] = 1.5
 #: Fixed allowance added to the ascent deadline, seconds: the vertical
 #: settlement window and the odometry lag at the driver's 5 Hz.
 _CLIMB_DEADLINE_SLACK_SEC: Final[float] = 4.0
+
+#: Ceiling of the frame wait inside the ascent loop, s. The wait is otherwise
+#: the rest of the control period (``LoopRate.remaining_sec``), so it never
+#: stretches the period the climb command is sent at.
+_ASCENT_FRAME_TIMEOUT_SEC: Final[float] = 0.2
+
+#: Floor of a frame wait bounded by the rest of the period, s: a zero timeout
+#: would turn the grab into a poll that never sees a frame in flight.
+_MIN_FRAME_WAIT_SEC: Final[float] = 0.02
 
 
 class _NoPerception:
@@ -226,13 +234,70 @@ class TakeoffStep(BaseStep):
             return contextlib.nullcontext(_NoPerception())
         return perception.session(imgsz=ctx.params.vision.inference_imgsz)
 
+    def _verify_gimbal(self, ctx: MissionContext) -> bool:
+        """Verify gimbal actuation on ground before takeoff.
+
+        Commands the gimbal to search_tilt_deg and verifies feedback.
+        If the gimbal does not respond or cannot be moved, the flight MUST
+        be cancelled/aborted immediately on the ground before takeoff.
+        """
+        target = float(ctx.params.gimbal.search_tilt_deg)
+        ctx.current_tilt_deg = target
+        ctx.drone.camera_control(tilt=target, pan=0.0)
+
+        if getattr(ctx.params, "no_fly", False):
+            return True
+
+        monitor = getattr(ctx, "gimbal_monitor", None)
+        if monitor is None:
+            return True
+
+        outcome = monitor.wait_for_tilt(
+            target,
+            tolerance=float(getattr(ctx.params.gimbal, "nadir_tilt_tolerance_deg", 5.0)),
+            timeout=3.0,
+            assert_command=lambda: ctx.drone.camera_control(tilt=target, pan=0.0),
+            interrupted=ctx.interrupted,
+            period=0.2,
+        )
+
+        if outcome.interrupted:
+            return False
+
+        if not outcome.telemetry or not outcome.reached:
+            actual = outcome.actual if outcome.actual is not None else monitor.current_tilt()
+            ground_ok = (
+                actual is not None
+                and (
+                    abs(actual - target) <= 15.0
+                    or (target <= -15.0 and actual <= -10.0)
+                )
+            )
+            if ground_ok:
+                logger.info("Gimbal confirmado em solo: %.1f deg (alvo %.1f deg).", actual, target)
+                return True
+
+            logger.error(
+                "Falha no controle do gimbal: câmera não respondeu aos comandos em solo (%s).",
+                outcome.describe(target),
+            )
+            if hasattr(ctx, "emit_milestone"):
+                ctx.emit_milestone(
+                    "mission.abort",
+                    f"Falha no controle do gimbal: câmera não respondeu aos comandos ({outcome.describe(target)}). Voo cancelado em solo.",
+                )
+            return False
+
+        logger.info("Gimbal confirmado em solo: %s.", outcome.describe(target))
+        return True
+
     def _ground_sequence(self, ctx: MissionContext) -> StepStatus:
         """Pre-arm checks, gimbal, flat trim, ground reference and the countdown."""
         if not self._check_prearm_battery(ctx):
             return StepStatus.FAILURE
 
-        ctx.current_tilt_deg = ctx.params.gimbal.search_tilt_deg
-        ctx.drone.camera_control(tilt=ctx.current_tilt_deg, pan=0.0)
+        if not self._verify_gimbal(ctx):
+            return StepStatus.FAILURE
 
         started = time.monotonic()
         if not self._flat_trim(ctx):
@@ -321,6 +386,8 @@ class TakeoffStep(BaseStep):
         """
         battery = getattr(ctx.failsafe, "battery_supervisor", None)
         if battery is None:
+            return True
+        if not getattr(battery, "enabled", True):
             return True
         percentage = battery.current_percentage()
         if percentage is None or percentage > battery.land_pct:
@@ -787,12 +854,15 @@ class TakeoffStep(BaseStep):
         have, since the vertical invariant makes a positive ``vz``
         unrepresentable everywhere else.
 
-        This is the one authorized exception, and it is narrow: a jerk- and
-        acceleration-limited profile, bounded by a braking envelope that keeps
-        the drone able to stop inside the arrival window, wrapped in a supervisor
-        climb window that closes itself on the way out. The ceiling is checked
-        every cycle rather than once at the end, so an overshoot is caught while
-        there is still altitude left to give back.
+        This is the one authorized exception, and it is narrow: a closed-loop,
+        two-sided acquisition (:class:`AltitudeAcquisitionController`) whose
+        reference follows a jerk-limited braking envelope and whose position
+        error leads the airframe's vertical lag, wrapped in a supervisor climb
+        window that closes itself on the way out. Overshoot is corrected by
+        descending, which needs no window. The ceiling is checked every cycle
+        rather than once at the end, so an overshoot is caught while there is
+        still altitude left to give back. The outcome is logged as
+        ``[ASCENT_REPORT ...]`` for ``scripts/analyze_flight_logs.py``.
 
         A mission whose target is at or below the achieved hover height skips
         the manoeuvre entirely, which is the default configuration.
@@ -826,36 +896,31 @@ class TakeoffStep(BaseStep):
         )
         self._announce("Subindo", "ajustando altitude de operação")
 
-        profile = JerkLimitedProfile(
-            ProfileLimits(
-                max_velocity=kinematics.max_climb_speed_mps,
-                max_accel=kinematics.max_accel_mps2,
-                max_jerk=kinematics.max_jerk_mps3,
+        controller = AltitudeAcquisitionController(
+            AcquisitionLimits(
+                max_velocity_mps=kinematics.max_climb_speed_mps,
+                max_accel_mps2=kinematics.max_accel_mps2,
+                max_jerk_mps3=kinematics.max_jerk_mps3,
+                decel_mps2=kinematics.climb_decel_mps2,
+                lag_sec=kinematics.climb_lag_sec,
+                position_kp=kinematics.climb_position_kp,
+                deadband_m=deadband,
             )
         )
+        controller.start(altitude, target, ctx.odom_supervisor.snapshot().vz)
         # Vertical settlement. The detector is planar, so the altitude goes in
         # the x slot and y is held at zero: its isotropic sigma,
         # ``sqrt(var(x) + var(y))``, then reduces exactly to the standard
         # deviation of the altitude, which is the quantity of interest.
+        # The acquisition aims at the target itself (its reference ends on it,
+        # not on the edge of the band), so one deadband is the acceptance band.
         settlement = SettlementDetector(
             SettlementCriteria(
                 window_sec=kinematics.climb_settle_window_sec,
                 min_samples=kinematics.climb_settle_min_samples,
                 max_speed=kinematics.climb_settle_max_speed_mps,
                 max_position_sigma=kinematics.climb_settle_max_position_sigma_m,
-                # Twice the deadband, because the deadband is also where the
-                # feedforward *aims*. ``braking_velocity`` is given
-                # ``arrival_tolerance=deadband``, so the profile plans to stop at
-                # ``target - deadband`` -- exactly the lower edge of the
-                # acceptance band. Requiring every sample inside one deadband
-                # then made convergence turn on exact equality, and a centimetre
-                # of downward sonar noise was enough to fail the whole window.
-                # The climb would fly the profile correctly, never declare
-                # convergence, and exit on the 15 s timeout every single flight,
-                # logging a "did not converge" warning that meant nothing --
-                # which is worse than no warning, because it trains the operator
-                # to ignore the one place a real convergence failure would show.
-                max_distance=2.0 * deadband,
+                max_distance=deadband,
             )
         )
 
@@ -867,6 +932,8 @@ class TakeoffStep(BaseStep):
         )
         deadline = Deadline(climb_timeout)
         converged = False
+        peak = altitude
+        t_converge: Optional[float] = None
 
         # Progress telemetry so the operator can see the climb is alive.
         _LOG_INTERVAL_SEC: float = 2.0
@@ -907,39 +974,17 @@ class TakeoffStep(BaseStep):
                         ctx.failsafe.trigger_emergency_land(reason)
                         return StepStatus.FAILURE
 
-                if ctx.grab_frame(timeout_sec=0.2) is not None:
+                frame_wait = min(_ASCENT_FRAME_TIMEOUT_SEC, max(_MIN_FRAME_WAIT_SEC, rate.remaining_sec()))
+                if ctx.grab_frame(timeout_sec=frame_wait) is not None:
                     ctx.failsafe.notify_frame_received()
 
                 dt = rate.tick()
                 remaining = target - altitude
+                peak = max(peak, altitude)
 
-                # Feedforward: the fastest ascent that can still be arrested
-                # within the remaining distance, saturated at the authorized
-                # climb rate. For the operational climb (<= 0.30 m/s), size the
-                # deceleration at 0.12 m/s^2 so easing begins ~0.25 m out and
-                # stops inside the 0.25 m ceiling margin rather than overshooting.
-                climb_decel = (
-                    min(kinematics.max_accel_mps2, 0.12)
-                    if kinematics.max_climb_speed_mps <= 0.30
-                    else kinematics.max_accel_mps2
-                )
-                if remaining > 0.0:
-                    desired = braking_velocity(
-                        remaining,
-                        climb_decel,
-                        cruise_velocity=kinematics.max_climb_speed_mps,
-                        arrival_tolerance=deadband,
-                    )
-                    profiled = max(0.0, profile.step(desired, dt))
-                else:
-                    desired = 0.0
-                    profiled = max(0.0, profile.step(0.0, dt))
-                    if profiled < 0.01:
-                        profile.reset(0.0, 0.0)
-                        profiled = 0.0
-
+                command = controller.update(altitude, snapshot.vz, dt)
                 safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(
-                    profiled, 0.0, allow_climb=True
+                    command.vz_mps, 0.0, allow_climb=True
                 )
                 ctx.drone.move_velocity(
                     vx=0.0,
@@ -953,6 +998,7 @@ class TakeoffStep(BaseStep):
                 )
                 if report.settled:
                     converged = True
+                    t_converge = deadline.elapsed_sec
                     break
 
                 # -- periodic progress telemetry ----------------------------
@@ -972,16 +1018,18 @@ class TakeoffStep(BaseStep):
                     )
 
                 # -- altitude stall detection --------------------------------
-                # If the drone has not closed at least one deadband of altitude
-                # over a rolling window, the firmware is likely rejecting the
-                # commanded vz and waiting the full timeout is pointless.
+                # If the error has not shrunk by at least one deadband over a
+                # rolling window while still outside the band, the firmware is
+                # likely rejecting the commanded vz and waiting the full timeout
+                # is pointless. Measured on the error magnitude, so a slow but
+                # legitimate approach from either side is not read as a stall.
                 if elapsed - _stall_ref_time >= _STALL_WINDOW_SEC:
-                    gained = altitude - _stall_ref_alt
-                    if gained < deadband and remaining > deadband:
+                    closed = abs(target - _stall_ref_alt) - abs(remaining)
+                    if closed < deadband and abs(remaining) > deadband:
                         logger.warning(
-                            "Altitude stall detected: gained only %.3f m in %.1f s "
-                            "(need %.2f m more). Breaking out early.",
-                            gained,
+                            "Altitude stall detected: closed only %.3f m in %.1f s "
+                            "(%.2f m still to go). Breaking out early.",
+                            closed,
                             _STALL_WINDOW_SEC,
                             remaining,
                         )
@@ -990,6 +1038,19 @@ class TakeoffStep(BaseStep):
                     _stall_ref_alt = altitude
 
             self._halt(ctx)
+
+        logger.info("Ascent loop cadence: %s.", rate.cadence_report())
+        final_altitude = ctx.odom_supervisor.snapshot().relative_altitude
+        peak = max(peak, final_altitude)
+        logger.info(
+            "[ASCENT_REPORT target=%.3f peak=%.3f overshoot=%.3f t_converge=%.2f err_final=%.3f converged=%d]",
+            target,
+            peak,
+            max(0.0, peak - target),
+            t_converge if t_converge is not None else deadline.elapsed_sec,
+            final_altitude - target,
+            1 if converged else 0,
+        )
 
         altitude = ctx.odom_supervisor.snapshot().relative_altitude
         if converged:
@@ -1165,7 +1226,22 @@ class TakeoffStep(BaseStep):
             snapshot.relative_altitude,
             snapshot.horizontal_speed,
         )
+        # Dedicated hover stabilization: isolate takeoff and ascent completely
+        # from the subsequent search stage. Zero all velocities and hold hover
+        # so the airframe is motionless and optical flow is locked.
+        self._halt(ctx)
+        settle_sec = 1.5
+        logger.info("Stabilizing in motionless hover for %.1f s before commencing search...", settle_sec)
+        settle_deadline = Deadline(settle_sec)
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        while settle_deadline.active and not ctx.interrupted():
+            ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
+            rate.tick()
+
         self._announce("Decolagem concluída", "decolagem concluída, iniciando varredura")
+        nudge = getattr(ctx, "nudge", None)
+        if nudge is not None and hasattr(nudge, "arm"):
+            nudge.arm()
         return StepStatus.SUCCESS
 
     @staticmethod

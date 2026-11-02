@@ -220,3 +220,67 @@ def test_slew_toward_respects_the_rate_and_the_band():
         controller.slew_toward(float("nan"), -40.0, DT)
     with pytest.raises(ValueError):
         controller.slew_toward(-30.0, float("inf"), DT)
+
+
+def test_fixed_tilt_remains_stationary():
+    gimbal = GimbalConstraintsConfig()
+    gimbal.search_tilt_deg = -30.0
+    gimbal.nadir_tilt_deg = -30.0
+    controller = build_controller(gimbal)
+    assert controller.is_fixed_tilt
+
+    command = controller.compute((WIDTH / 2.0, HEIGHT / 2.0), FRAME, -30.0, DT)
+    assert command.framed
+    assert command.at_floor
+    assert command.tilt_deg == -30.0
+
+    command_no_target = controller.compute(None, FRAME, -30.0, DT)
+    assert command_no_target.framed
+    assert command_no_target.at_floor
+    assert command_no_target.tilt_deg == -30.0
+
+    assert controller.slew_toward(-30.0, -50.0, DT) == -30.0
+
+
+def test_upward_inclination_freedom():
+    """Gimbal can incline upward from search to nadir setpoint."""
+    gimbal = GimbalConstraintsConfig()
+    gimbal.search_tilt_deg = -60.0
+    gimbal.nadir_tilt_deg = -20.0
+    controller = build_controller(gimbal)
+    assert controller.min_tilt_deg == -60.0
+    assert controller.max_tilt_deg == -20.0
+
+    # Slews upward toward nadir setpoint (-20.0)
+    slewed = controller.slew_toward(-60.0, -20.0, DT)
+    assert slewed > -60.0
+    assert slewed <= -20.0
+
+    # Arriving at -20.0 triggers at_floor / framed
+    cmd = controller.compute(None, FRAME, -20.0, DT)
+    assert cmd.at_floor
+    assert cmd.framed
+
+
+def test_minimal_difference_inclination():
+    """Gimbal performs inclination even if difference is 1.0 deg or smaller."""
+    gimbal = GimbalConstraintsConfig()
+    gimbal.search_tilt_deg = -20.0
+    gimbal.nadir_tilt_deg = -21.0
+    gimbal.nadir_tilt_tolerance_deg = 1.0
+    controller = build_controller(gimbal)
+
+    # At start tilt (-20.0), at_floor must be False even though diff == tolerance
+    cmd_start = controller.compute(None, FRAME, -20.0, DT)
+    assert not cmd_start.at_floor
+    assert not cmd_start.framed
+
+    # Slewing toward -21.0 advances tilt
+    next_tilt = controller.slew_toward(-20.0, -21.0, DT)
+    assert next_tilt < -20.0
+
+    # Once at -21.0, it is framed
+    cmd_end = controller.compute(None, FRAME, -21.0, DT)
+    assert cmd_end.at_floor
+    assert cmd_end.framed
+

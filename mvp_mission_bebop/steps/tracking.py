@@ -50,11 +50,14 @@ from mvp_mission_bebop.controllers.visual_servoing import ServoCommand
 from mvp_mission_bebop.engine.rate import MAX_INTERVAL_SEC, Deadline, LoopRate
 from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker, TrackerGains
 from mvp_mission_bebop.mission_mode import MissionMode
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
+from mvp_mission_bebop.perception.classes import is_accident_class, is_victim_class
+from mvp_mission_bebop.steps.base import BaseStep, StepStatus, cross_axis_correction, governed_vz
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the runtime import out
     from nectar.ai.detection.core.types import Detection
+
+    from mvp_mission_bebop.estimation.target_selector import TargetSelector
 
 logger = logging.getLogger("Step3Tracking")
 
@@ -116,6 +119,7 @@ class VisualServoingStep(BaseStep):
             TrackerGains(), max_coast_sec=timeouts.target_recovery_timeout_sec
         )
 
+        tracking_timeout = min(15.0, float(timeouts.tracking_timeout_sec))
         logger.info(
             "Lateral servo engaged: tilt held at %.1f deg, gate %.0f px, dwell %d frames, "
             "stillness %.2f m/s, window %.1f s.",
@@ -126,14 +130,14 @@ class VisualServoingStep(BaseStep):
             ),
             max(1, int(vision_cfg.alignment_dwell_cycles)),
             ctx.params.inspection.settle_max_speed_mps,
-            timeouts.tracking_timeout_sec,
+            tracking_timeout,
         )
 
         emit_milestone(
             "mission.approaching",
-            {"window_sec": timeouts.tracking_timeout_sec, "ibvs": bool(vision_cfg.ibvs_enabled)},
+            {"window_sec": tracking_timeout, "ibvs": bool(vision_cfg.ibvs_enabled)},
         )
-        deadline = Deadline(timeouts.tracking_timeout_sec)
+        deadline = Deadline(tracking_timeout)
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
         approach_finished = False
 
@@ -166,7 +170,7 @@ class VisualServoingStep(BaseStep):
 
         if not approach_finished:
             logger.warning(
-                "Stage 3 ended without a lateral lock after %.1f s.",
+                "Stage 3 ended without a lateral lock after %.1f s. Proceeding to degraded capture.",
                 deadline.elapsed_sec,
             )
 
@@ -246,8 +250,9 @@ class VisualServoingStep(BaseStep):
             ctx.failsafe.notify_frame_received()
             targets = sample.result.filter_by_class(vision_cfg.target_classes)
 
+            selector = getattr(ctx, "target_selector", None)
             center, measured = self._resolve_target(
-                targets, tracker, frame_dt, (ctx.frame_width, ctx.frame_height)
+                targets, tracker, frame_dt, (ctx.frame_width, ctx.frame_height), selector=selector
             )
             if center is None:
                 lost_cycles += 1
@@ -265,12 +270,23 @@ class VisualServoingStep(BaseStep):
                 self._apply(ctx, command, frame_dt)
                 self._publish(ctx, command, deadline.elapsed_sec, False, float("nan"))
                 if command.recovery_exhausted:
+                    if selector is not None:
+                        selector.reset()
                     break
                 continue
 
             if measured:
                 lost_cycles = 0
-                last_measured_px = self._best_detection(targets).center
+                if selector is not None:
+                    last_measured_px = center
+                else:
+                    best = self._best_detection(targets)
+                    last_measured_px = best.center if best is not None else center
+                ctx.blackboard.confirmed_target_px = (
+                    float(last_measured_px[0]),
+                    float(last_measured_px[1]),
+                )
+                ctx.blackboard.confirmed_tilt_deg = ctx.current_tilt_deg
 
             snapshot = ctx.odom_supervisor.snapshot()
             command = controller.compute(
@@ -312,6 +328,12 @@ class VisualServoingStep(BaseStep):
                 # unconfirmed observation; the window is the same either way.
                 break
 
+        if last_measured_px is not None:
+            ctx.blackboard.confirmed_target_px = (
+                float(last_measured_px[0]),
+                float(last_measured_px[1]),
+            )
+            ctx.blackboard.confirmed_tilt_deg = ctx.current_tilt_deg
         return False
 
     # ---------------------------------------------------------------- helpers
@@ -356,9 +378,27 @@ class VisualServoingStep(BaseStep):
         return float(height) if height is not None else float(snapshot.relative_altitude)
 
     @staticmethod
-    def _best_detection(targets: Sequence["Detection"]) -> "Detection":
-        """The detection the servo follows: the most confident one in the frame."""
-        return max(targets, key=lambda detection: detection.confidence)
+    def _filter_centering_targets(targets: Sequence["Detection"]) -> Sequence["Detection"]:
+        """Filter out victims and prioritize accidents for centering.
+
+        Victims ('person', 'pessoa', 'vitima') are never centered.
+        Only accident classes ('motorcycle', 'bicycle', 'acidente') are followed.
+        """
+        if not targets:
+            return ()
+        non_victims = [t for t in targets if not is_victim_class(getattr(t, "class_name", ""))]
+        if not non_victims:
+            return ()
+        accidents = [t for t in non_victims if is_accident_class(getattr(t, "class_name", ""))]
+        return accidents if accidents else non_victims
+
+    @staticmethod
+    def _best_detection(targets: Sequence["Detection"]) -> Optional["Detection"]:
+        """The detection the servo follows: strictly prioritizing accidents over victims."""
+        candidates = VisualServoingStep._filter_centering_targets(targets)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda detection: detection.confidence)
 
     @staticmethod
     def _resolve_target(
@@ -366,6 +406,7 @@ class VisualServoingStep(BaseStep):
         tracker: ConstantVelocityTracker,
         dt: float,
         frame_dimensions: Tuple[int, int],
+        selector: Optional["TargetSelector"] = None,
     ) -> Tuple[Optional[Tuple[float, float]], bool]:
         """Return the target centre and whether it came from a real detection.
 
@@ -376,10 +417,19 @@ class VisualServoingStep(BaseStep):
         law would then dutifully chase a position no camera can see. Time alone
         is the wrong horizon; leaving the sensor's field of view is what actually
         ends the track's validity.
+
+        With a ``selector`` the measured target is the persistent track
+        (:class:`~mvp_mission_bebop.estimation.target_selector.TargetSelector`)
+        rather than the most confident box of the frame, and a frame where the
+        track is momentarily missing coasts like a frame with no target.
         """
-        if targets:
-            best = VisualServoingStep._best_detection(targets)
-            estimate = tracker.update(best.center, dt)
+        candidates = VisualServoingStep._filter_centering_targets(targets)
+        if selector is not None:
+            chosen = selector.select(candidates)
+        else:
+            chosen = VisualServoingStep._best_detection(candidates)
+        if chosen is not None:
+            estimate = tracker.update(chosen.center, dt)
             return estimate.center, True
 
         estimate = tracker.coast(dt)
@@ -425,11 +475,16 @@ class VisualServoingStep(BaseStep):
         simple = self._mode is MissionMode.SIMPLE
         lateral = 0.0 if simple else command.vy
         yaw = command.vyaw if simple else 0.0
-        vz = governed_vz(ctx, 
-            ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=abs(lateral)
+        vz = governed_vz(
+            ctx,
+            ctx.odom_supervisor.snapshot().relative_altitude,
+            dt,
+            vx_commanded=abs(lateral),
+            yaw_commanded=abs(yaw) if simple else None,
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, yaw)
-        safe_vx, safe_vy = ctx.failsafe.clamp_translation(0.0, lateral)
+        cross = 0.0 if simple else cross_axis_correction(self, ctx, lateral, dt)
+        safe_vx, safe_vy = ctx.failsafe.clamp_translation(cross, lateral)
         ctx.drone.move_velocity(
             vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw
         )

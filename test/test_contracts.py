@@ -107,6 +107,7 @@ def test_to_dict_is_callable_the_way_the_gcs_calls_it():
         ("vision", "target_classes"),
         ("rtl", "arrival_radius_m"),
         ("battery", "land_pct"),
+        ("battery", "enabled"),
         ("rtl", "target_aruco_id"),
         ("rtl", "marker_dict"),
         ("rtl", "tag_size"),
@@ -162,6 +163,7 @@ def test_params_json_payload_from_the_gcs_is_accepted():
     assert params.vision.target_classes == ["motorcycle"]
     assert params.rtl.arrival_radius_m == 0.18
     assert params.battery_land_pct == 25.0
+    assert params.battery.enabled is True
     assert params.no_fly is True
 
 
@@ -205,6 +207,49 @@ def test_config_round_trips_through_disk():
 #: refactor. The GCS reads these by exact name; fields that lose use stay.
 _FROZEN_CONFIGURATION_KEYS = frozenset(
     (
+        "battery.enabled",
+        "governor.yaw_feedforward_gain",
+        "governor.accel_feedforward_gain",
+        "governor.accel_feedforward_cutoff_hz",
+        "translation_hold.enabled",
+        "translation_hold.kp_velocity",
+        "translation_hold.ki",
+        "translation_hold.max_correction",
+        "translation_hold.min_active_speed",
+        "translation_hold.heading_hold_enabled",
+        "translation_hold.heading_kp",
+        "translation_hold.heading_max_vyaw",
+        "translation_hold.heading_deadband_deg",
+        "nudge.enabled",
+        "nudge.max_horizontal",
+        "nudge.max_vyaw",
+        "nudge.attack_sec",
+        "nudge.release_sec",
+        "nudge.deadman_sec",
+        "nudge.allow_in_inspection",
+        "nudge.allow_in_precision_landing",
+        "nudge.yaw_budget_deg",
+        "rtl.camera_offset_forward_m",
+        "rtl.camera_offset_left_m",
+        "rtl.visual_descent_enabled",
+        "rtl.descent_speed_mps",
+        "rtl.descent_gate_radius_m",
+        "rtl.descent_hysteresis",
+        "rtl.commit_height_m",
+        "rtl.commit_radius_m",
+        "rtl.ground_effect_height_m",
+        "rtl.ground_effect_gain_scale",
+        "rtl.descent_marker_lost_hold_sec",
+        "rtl.descent_timeout_sec",
+        "kinematics.climb_lag_sec",
+        "kinematics.climb_position_kp",
+        "kinematics.climb_decel_mps2",
+        "vision.selector_class_priority",
+        "vision.selector_iou_min",
+        "vision.selector_gate_px",
+        "vision.selector_lost_frames",
+        "vision.selector_switch_frames",
+        "vision.selector_box_alpha",
         "battery.land_pct",
         "calibration.altitude_anchor_enabled",
         "calibration.altitude_anchor_gate_m",

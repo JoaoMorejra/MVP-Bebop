@@ -19,12 +19,10 @@
         "gimbal.nadir_tilt_deg": -10
       },
       "expect": {
-        "errors": [
-          "E01"
-        ],
+        "errors": [],
         "warnings": []
       },
-      "note": "operator case s=-30, n=-10"
+      "note": "operator case s=-30, n=-10: E01 retired, upward tilt supported"
     },
     {
       "name": "e01_boundary_nadir_just_below",
@@ -44,11 +42,10 @@
         "gimbal.nadir_tilt_deg": -31
       },
       "expect": {
-        "errors": [
-          "E02"
-        ],
+        "errors": [],
         "warnings": []
-      }
+      },
+      "note": "E02 retired, minimal differences and equal tilts supported"
     },
     {
       "name": "e02_boundary_gap_above_tolerance",

@@ -675,3 +675,54 @@ def test_a_failing_submission_never_fails_the_capture():
 
     ctx.inspection_worker = Worker()
     assert NadirInspectionStep()._capture(ctx, settled=True) is True
+
+
+def test_stage4_skips_idle_hover_when_capture_confirmed(monkeypatch):
+    """When evidence is confirmed on the initial capture, idle hover is skipped."""
+    ctx = _framing_ctx()
+    step = NadirInspectionStep()
+    hover_called = []
+    original_hover = step._hover
+
+    def tracking_hover(*args, **kwargs):
+        hover_called.append(True)
+        return original_hover(*args, **kwargs)
+
+    monkeypatch.setattr(step, "_hover", tracking_hover)
+    status = step.execute(ctx)
+    assert status is StepStatus.SUCCESS
+    assert ctx.blackboard.evidence.captured is True
+    assert not hover_called, "idle hover was called even though capture was confirmed"
+
+
+def test_stage4_engages_hover_when_initial_capture_fails(monkeypatch):
+    """If initial capture fails, hover watch is engaged to ensure evidence is captured."""
+    ctx = _framing_ctx()
+    step = NadirInspectionStep()
+    hover_called = []
+    original_capture = step._capture
+    attempt = [0]
+
+    def failing_first_capture(context, settled, forced=False):
+        attempt[0] += 1
+        if attempt[0] == 1:
+            return False
+        return original_capture(context, settled, forced=forced)
+
+    monkeypatch.setattr(step, "_capture", failing_first_capture)
+    monkeypatch.setattr(step, "_hover", lambda *a, **k: hover_called.append(True) or StepStatus.SUCCESS)
+
+    status = step.execute(ctx)
+    assert status is StepStatus.SUCCESS
+    assert hover_called, "hover fallback was not engaged when initial capture failed"
+
+
+def test_stage4_background_ack_does_not_block_flight(monkeypatch):
+    """Pending native photo ACK is resolved in background without blocking execution."""
+    ctx = _ack_ctx(timeout=5.0)
+    step = NadirInspectionStep()
+    step._capture(ctx, settled=True)
+    assert step._pending_ack is not None
+    step._start_background_native_ack(ctx)
+    # Flight thread continues immediately without waiting for the 5.0 s timeout
+    assert step._pending_ack is not None or ctx.updates

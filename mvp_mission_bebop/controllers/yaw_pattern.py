@@ -189,7 +189,10 @@ class YawServoingController:
         self._reacquire_elapsed_sec = 0.0
         self._reacquire_hits = 0
         self._recovery_exhausted = False
+        self._last_vyaw_demand = 0.0
         self._tolerance_px = vision_cfg.optical_center_tolerance_px
+        self._max_slew_per_sec: float = float(yaw_cfg.scan_ramp_per_sec)
+        self._last_vyaw_demand: float = 0.0
 
     @property
     def phase(self) -> TrackingPhase:
@@ -210,6 +213,7 @@ class YawServoingController:
         self._reacquire_elapsed_sec = 0.0
         self._reacquire_hits = 0
         self._recovery_exhausted = False
+        self._last_vyaw_demand = 0.0
 
     def compute(
         self,
@@ -263,8 +267,15 @@ class YawServoingController:
             self._reacquire_elapsed_sec = 0.0
             self._pid.reset()
             self._shaper.reset()
+            self._last_vyaw_demand = 0.0
 
         demand = self._pid.update(err_x / half_width, dt)
+        if dt > 0.0:
+            max_delta = self._max_slew_per_sec * dt
+            delta = demand - self._last_vyaw_demand
+            if abs(delta) > max_delta:
+                demand = self._last_vyaw_demand + math.copysign(max_delta, delta)
+        self._last_vyaw_demand = demand
         vyaw = self._shaper.shape(demand, dt)
 
         dwell = max(1, int(self.vision_cfg.alignment_dwell_cycles))
@@ -276,6 +287,7 @@ class YawServoingController:
         if in_gate and measured and airframe_at_rest and self._centered_frames >= dwell:
             self._locked = True
             self._phase = TrackingPhase.LOCKED
+            self._last_vyaw_demand = 0.0
             return self._command(0.0, err_x, pixel_error, in_gate, current_tilt_deg, "yaw freeze latched")
 
         return self._command(vyaw, err_x, pixel_error, in_gate, current_tilt_deg, "centring on yaw")
@@ -289,6 +301,7 @@ class YawServoingController:
         ``vision.reacquire_timeout_sec``; on expiry the command is zero and
         ``recovery_exhausted`` is set so the step can end.
         """
+        self._last_vyaw_demand = 0.0
         self._phase = TrackingPhase.REACQUIRING
         self._reacquire_hits = 0
         self._reacquire_elapsed_sec += max(0.0, dt)

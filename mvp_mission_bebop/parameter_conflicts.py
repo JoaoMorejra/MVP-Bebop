@@ -238,24 +238,12 @@ class _Evaluation:
     # ------------------------------------------------------------------ errors
 
     def e01(self) -> Finding:
-        s, n = self.read(_SEARCH), self.read(_NADIR)
-        if s is None or n is None or n <= s - _EPS:
-            return None
-        return (
-            (_NADIR, _SEARCH),
-            f"A câmera precisa terminar mais baixa que o ângulo de varredura (nadir {n:.0f}°, varredura {s:.0f}°).",
-            f"Ajuste o nadir para menos de {s:.0f}° ou suba a varredura acima de {n:.0f}°.",
-        )
+        """Retired: the gimbal framing supports upward, downward, and equal tilts."""
+        return None
 
     def e02(self) -> Finding:
-        s, n, tol = self.read(_SEARCH), self.read(_NADIR), self.read(_NADIR_TOLERANCE)
-        if s is None or n is None or tol is None or n > s - _EPS or s - n > tol + _EPS:
-            return None
-        return (
-            (_SEARCH, _NADIR),
-            f"Diferença entre varredura e nadir de {s - n:.1f}°, dentro da tolerância de chegada ({tol:.1f}°).",
-            f"Deixe o nadir abaixo de {s - tol:.1f}°.",
-        )
+        """Retired: equal search and nadir tilts are supported as fixed-gimbal flights."""
+        return None
 
     def e03(self) -> Finding:
         """Retired: the ceiling ratchet covers the end of the native takeoff.

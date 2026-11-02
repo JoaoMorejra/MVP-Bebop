@@ -326,3 +326,92 @@ def test_the_yaw_invariant_survives_every_hold_window(stage):
 
     assert ctx.drone.commands
     assert all(vyaw == 0.0 for _vx, _vy, _vz, vyaw in ctx.drone.commands)
+
+
+# ------------------------------------------------ yaw feedforward and window
+
+
+class RecordingGovernor:
+    """Accepts the yaw demand and records every call's keyword arguments."""
+
+    climb_authority = 0.05
+
+    def __init__(self):
+        self.calls = []
+
+    def compute_vz(self, _altitude, _dt=None, vx_commanded=0.0, hold_integrator=False, yaw_commanded=0.0):
+        self.calls.append({"vx_commanded": vx_commanded, "yaw_commanded": yaw_commanded})
+        return 0.0
+
+    @staticmethod
+    def horizontal_scale():
+        return 1.0
+
+
+class LegacyGovernor:
+    """A double from before the yaw term: any extra keyword is a TypeError."""
+
+    def compute_vz(self, _altitude, _dt=None, vx_commanded=0.0):
+        return 0.0
+
+
+def _wiring_ctx(governor):
+    import types
+
+    return types.SimpleNamespace(governor=governor, odom_supervisor=types.SimpleNamespace())
+
+
+def test_governed_vz_forwards_the_yaw_demand_only_when_given():
+    from mvp_mission_bebop.steps.base import governed_vz
+
+    governor = RecordingGovernor()
+    governed_vz(_wiring_ctx(governor), 1.0, 0.05, vx_commanded=0.1, yaw_commanded=0.08)
+    assert governor.calls[-1]["yaw_commanded"] == 0.08
+    governed_vz(_wiring_ctx(LegacyGovernor()), 1.0, 0.05, vx_commanded=0.1)
+
+
+def test_the_simple_profile_steps_feed_the_yaw_to_the_governor():
+    import types
+
+    from mvp_mission_bebop.mission_mode import MissionMode
+    from mvp_mission_bebop.steps.search import ForwardSearchStep
+    from mvp_mission_bebop.steps.tracking import VisualServoingStep
+
+    ctx = Ctx(detections=False)
+    governor = RecordingGovernor()
+    ctx.governor = governor
+    with ctx.failsafe.yaw_window(0.2):
+        step = VisualServoingStep(mode=MissionMode.SIMPLE)
+        step._apply(ctx, types.SimpleNamespace(vx=0.0, vy=0.0, vyaw=-0.06), 0.05)
+        assert governor.calls[-1]["yaw_commanded"] == pytest.approx(0.06)
+        search = ForwardSearchStep(mode=MissionMode.SIMPLE)
+        search._yaw_command(ctx, 0.5, 0.08)
+        assert governor.calls[-1]["yaw_commanded"] > 0.0
+
+
+def test_the_hold_window_is_continuous_across_stages_two_to_four():
+    from mvp_mission_bebop.engine.runner import MissionRunner
+    from mvp_mission_bebop.steps.base import StepStatus
+
+    ctx = Ctx(detections=False)
+    ctx.governor = RecordingGovernor()
+    ctx.detection_reveal_enabled = True
+    ctx.current_stage = None
+    readings = []
+
+    class Probe:
+        name = "probe"
+
+        def execute(self, inner):
+            readings.append((inner.current_stage, inner.failsafe.altitude_hold_ceiling))
+            readings.append((inner.current_stage, inner.failsafe.altitude_hold_ceiling))
+            return StepStatus.SUCCESS
+
+    MissionRunner(ctx, [Probe(), Probe(), Probe(), Probe(), Probe()], stage_numbers=[1, 2, 3, 4, 5]).run()
+
+    by_stage = {stage: [c for s, c in readings if s == stage] for stage in (1, 2, 3, 4, 5)}
+    assert all(c == 0.0 for c in by_stage[1])
+    for stage in (2, 3, 4):
+        assert all(c > 0.0 for c in by_stage[stage]), stage
+    assert all(c == 0.0 for c in by_stage[5])
+    assert ctx.failsafe.altitude_hold_ceiling == 0.0

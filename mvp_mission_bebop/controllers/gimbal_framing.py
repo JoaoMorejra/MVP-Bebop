@@ -92,9 +92,13 @@ class GimbalFramingController:
             raise TypeError(f"vision_cfg must be a VisionConfig, got {type(vision_cfg)!r}")
         floor = _finite("gimbal.nadir_tilt_deg", gimbal_cfg.nadir_tilt_deg)
         ceiling = _finite("gimbal.search_tilt_deg", gimbal_cfg.search_tilt_deg)
-        if floor >= ceiling:
+        if not (-90.0 <= floor <= 20.0):
             raise ValueError(
-                f"gimbal.nadir_tilt_deg ({floor}) must lie below gimbal.search_tilt_deg ({ceiling})"
+                f"gimbal.nadir_tilt_deg ({floor}) outside mechanical envelope [-90, 20]"
+            )
+        if not (-90.0 <= ceiling <= 20.0):
+            raise ValueError(
+                f"gimbal.search_tilt_deg ({ceiling}) outside mechanical envelope [-90, 20]"
             )
         slew = _finite("gimbal.max_slew_limit_deg", gimbal_cfg.max_slew_limit_deg)
         if slew <= 0.0:
@@ -102,6 +106,11 @@ class GimbalFramingController:
 
         self.gimbal_cfg = gimbal_cfg
         self.vision_cfg = vision_cfg
+        self.min_tilt_deg: float = min(floor, ceiling)
+        self.max_tilt_deg: float = max(floor, ceiling)
+        self.is_fixed_tilt: bool = abs(floor - ceiling) < 1e-3
+        self.final_tilt_deg: float = floor
+        self.start_tilt_deg: float = ceiling
         #: Consecutive frames with the vertical error inside the tolerance.
         self._centred_frames: int = 0
 
@@ -192,14 +201,26 @@ class GimbalFramingController:
         if step_dt <= 0.0:
             raise ValueError(f"dt must be positive, got {dt!r}")
 
+        if self.is_fixed_tilt:
+            return FramingCommand(
+                tilt_deg=current,
+                vertical_error_px=0.0 if target_center is not None else float("nan"),
+                framed=True,
+                at_floor=True,
+                note="fixed tilt: held",
+            )
+
         if target_center is None:
             self._centred_frames = 0
+            at_target = self._at_floor(current)
             return FramingCommand(
                 tilt_deg=current,
                 vertical_error_px=float("nan"),
-                framed=False,
-                at_floor=self._at_floor(current),
-                note="no target in frame: tilt held",
+                framed=at_target,
+                at_floor=at_target,
+                note="no target in frame: tilt held"
+                if not at_target
+                else f"framed at final tilt {self.final_tilt_deg:.1f} deg",
             )
 
         pixel = _validated_pixel(target_center)
@@ -218,7 +239,7 @@ class GimbalFramingController:
         if centred:
             note = f"framed: |err_y| {abs(err_y):.0f} px for {self._centred_frames} frames"
         elif at_floor:
-            note = f"framed at the floor {self.gimbal_cfg.nadir_tilt_deg:.1f} deg"
+            note = f"framed at final tilt {self.final_tilt_deg:.1f} deg"
         else:
             note = f"pointing: err_y {err_y:+.0f} px"
         return FramingCommand(
@@ -260,6 +281,8 @@ class GimbalFramingController:
         step_dt = _finite("dt", dt)
         if step_dt <= 0.0:
             raise ValueError(f"dt must be positive, got {dt!r}")
+        if self.is_fixed_tilt:
+            return current
         return self._slewed(current, goal, step_dt)
 
     # -------------------------------------------------------------- helpers
@@ -284,14 +307,19 @@ class GimbalFramingController:
         return self._bounded(current + step)
 
     def _bounded(self, tilt: float) -> float:
-        return max(
-            float(self.gimbal_cfg.nadir_tilt_deg), min(float(self.gimbal_cfg.search_tilt_deg), tilt)
-        )
+        return max(self.min_tilt_deg, min(self.max_tilt_deg, tilt))
 
     def _at_floor(self, tilt: float) -> bool:
-        floor = float(self.gimbal_cfg.nadir_tilt_deg)
+        if self.is_fixed_tilt:
+            return True
         tolerance = max(0.0, float(self.gimbal_cfg.nadir_tilt_tolerance_deg))
-        return tilt <= floor + tolerance + _BAND_EPSILON_DEG
+        target = self.final_tilt_deg
+        start = self.start_tilt_deg
+        if abs(start - target) <= tolerance + _BAND_EPSILON_DEG:
+            return abs(tilt - target) <= 1e-3
+        if start > target:
+            return tilt <= target + tolerance + _BAND_EPSILON_DEG
+        return tilt >= target - tolerance - _BAND_EPSILON_DEG
 
     def _tolerance_px(self, width: int) -> float:
         """Optical-centre gate, the same one the Stage 3 lateral lock applies."""

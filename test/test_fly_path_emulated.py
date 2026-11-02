@@ -24,6 +24,7 @@ from typing import Callable, Dict, Final, List, Optional, Sequence, Tuple
 
 import pytest
 
+from mvp_mission_bebop.parameters import TranslationHoldConfig
 from support.fake_bebop.harness import EmulatedFlight, FlightResult, SHORT_FLIGHT
 
 #: Half-width of the band around a window boundary inside which a Twist may belong to
@@ -45,13 +46,17 @@ SEARCH_END_MARKERS: Final[Tuple[str, ...]] = (
 Twist = Sequence[float]
 Rule = Callable[[Twist], bool]
 
+#: Ceiling of the scoped cross-axis authority (``translation_hold.max_correction``):
+#: during a lateral leg ``vx`` carries only the orthogonal drift correction.
+CROSS_AXIS_CEILING: Final[float] = TranslationHoldConfig().max_correction + 1e-6
+
 #: Per-window admissible Twists, ``v = (linear.x, linear.y, linear.z, angular.z)``.
 #: +y is LEFT (REP-103); vyaw is locked at zero for the whole flight.
 WINDOW_RULES: Final[Dict[str, Rule]] = {
-    "step2": lambda v: v[0] == 0.0 and v[1] >= 0.0 and v[3] == 0.0,
-    "step3": lambda v: v[0] == 0.0 and v[3] == 0.0,
+    "step2": lambda v: abs(v[0]) <= CROSS_AXIS_CEILING and v[1] >= 0.0 and v[3] == 0.0,
+    "step3": lambda v: abs(v[0]) <= CROSS_AXIS_CEILING and v[3] == 0.0,
     "step4": lambda v: v[0] == 0.0 and v[1] == 0.0 and v[3] == 0.0,
-    "step5_search": lambda v: v[0] == 0.0 and v[1] <= 0.0 and v[3] == 0.0,
+    "step5_search": lambda v: v[0] <= CROSS_AXIS_CEILING and v[1] <= 0.0 and v[3] == 0.0,
     "step5_final": lambda v: v[3] == 0.0,
 }
 
@@ -200,11 +205,12 @@ def test_fly_path_fly_completes_all_stages_with_single_takeoff(fly_result):
 def test_the_outbound_leg_flies_left_and_the_return_leg_flies_right(fly_result):
     """Every non-zero Twist of Stages 2-5 obeys the lateral pattern of the window it falls in.
 
-    Stage 2 flies left only (vx == 0, vy >= 0, at least one vy > 0); Stage 3 never
-    translates forward (vx == 0); Stage 4 holds station and moves only the altitude and
-    the gimbal, which slews downward at least once; the Stage 5 search flies right only
-    (vx == 0, vy <= 0), and only the final 2D centering over the marker may use both
-    horizontal axes. vyaw stays zero throughout.
+    Stage 2 flies left only (vy >= 0, at least one vy > 0); Stage 3 never translates
+    forward; Stage 4 holds station (vx == 0) and moves only the altitude and the gimbal,
+    which slews downward at least once; the Stage 5 search flies right only (vy <= 0),
+    and only the final 2D centering over the marker may use both horizontal axes freely.
+    Outside Stage 4 and the final centering, vx carries only the cross-axis correction,
+    bounded by ``CROSS_AXIS_CEILING``. vyaw stays zero throughout.
     """
     result = fly_result
     assert result.exit_code == 0, f"flight failed with exit {result.exit_code}:\n{result.tail()}"

@@ -173,6 +173,9 @@ class AltitudeHoldGovernor:
         self._calibration = calibration
         self._descent_demand = descent_demand
         self._forcing_descent = False
+        self._last_horizontal: Optional[float] = None
+        self._accel_filtered: float = 0.0
+        self._last_feedforward: float = 0.0
         self._guard_configured = (
             guard_source is not None
             and platform_cfg is not None
@@ -264,6 +267,7 @@ class AltitudeHoldGovernor:
         dt: Optional[float] = None,
         vx_commanded: float = 0.0,
         hold_integrator: bool = False,
+        yaw_commanded: float = 0.0,
     ) -> float:
         """Corrective vertical velocity command, in normalized units.
 
@@ -288,6 +292,15 @@ class AltitudeHoldGovernor:
             The altitude only propagates (``OdometrySupervisor.vertical_coasting``):
             the integral term does not accumulate this cycle, an anti-windup
             for the absence of a measurement.
+        yaw_commanded : float
+            Yaw-rate demand issued this cycle, normalized; only ``abs`` is
+            used, times ``config.yaw_feedforward_gain``.
+
+        The feedforward is
+        ``feedforward_gain * |v_h| + yaw_feedforward_gain * |vyaw|
+        + accel_feedforward_gain * lowpass(|d|v_h|/dt|)``; the three gains
+        default to zero, which reproduces the law before the last two terms
+        existed exactly.
 
         Returns
         -------
@@ -303,7 +316,12 @@ class AltitudeHoldGovernor:
         report = self._read_guard()
         try:
             self._engage(report is not None and report.guard_active)
-            feedforward = cfg.feedforward_gain * abs(vx_commanded)
+            feedforward = (
+                cfg.feedforward_gain * abs(vx_commanded)
+                + getattr(cfg, "yaw_feedforward_gain", 0.0) * abs(yaw_commanded)
+                + self._acceleration_feedforward(abs(vx_commanded), interval)
+            )
+            self._last_feedforward = feedforward
             if self._guard_engaged and report is not None:
                 feedforward += self._edge_feedforward(report)
             if self._reentry_descent(report):
@@ -317,6 +335,31 @@ class AltitudeHoldGovernor:
             # it did not re-establish.
             self._engage(False)
             raise
+
+    @property
+    def last_feedforward(self) -> float:
+        """Translation, yaw and acceleration feedforward of the last cycle, normalized."""
+        return self._last_feedforward
+
+    def _acceleration_feedforward(self, horizontal: float, interval: float) -> float:
+        """``accel_feedforward_gain * lowpass(|d|v_h|/dt|)``; primes on the first cycle.
+
+        A first-order low-pass at ``accel_feedforward_cutoff_hz``,
+        ``alpha = dt / (dt + 1 / (2 pi f_c))``, so the step of a starting or
+        stopping translation produces a pulse that decays in a few tenths of a
+        second instead of a one-cycle spike.
+        """
+        gain = getattr(self.config, "accel_feedforward_gain", 0.0)
+        previous = self._last_horizontal
+        self._last_horizontal = horizontal
+        if previous is None:
+            self._accel_filtered = 0.0
+            return 0.0
+        rate = abs(horizontal - previous) / interval
+        cutoff = max(1e-3, float(getattr(self.config, "accel_feedforward_cutoff_hz", 2.0)))
+        alpha = interval / (interval + 1.0 / (2.0 * math.pi * cutoff))
+        self._accel_filtered += alpha * (rate - self._accel_filtered)
+        return gain * self._accel_filtered
 
     def _regulate(
         self, current_relative_alt: float, interval: float, feedforward: float, hold_integrator: bool = False
@@ -599,6 +642,9 @@ class AltitudeHoldGovernor:
 
     def reset(self) -> None:
         """Clear controller state and release the governor."""
+        self._last_horizontal = None
+        self._accel_filtered = 0.0
+        self._last_feedforward = 0.0
         self._pid.reset()
         self._profile.reset()
         self._shaper.reset()

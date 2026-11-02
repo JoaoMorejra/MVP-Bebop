@@ -267,6 +267,15 @@ class FailsafeSupervisor:
         """
         return self.yaw_authority.window(max_vyaw)
 
+    def heading_hold_window(self, max_vyaw: float) -> ContextManager[None]:
+        """Authorize the heading hold of a lateral cruise up to ``max_vyaw``.
+
+        Opened only when ``translation_hold.heading_hold_enabled`` and only
+        around the cruise; the same scoped authority as :meth:`yaw_window`,
+        so outside it yaw stays zeroed here and at the proxy.
+        """
+        return self.yaw_authority.window(max_vyaw)
+
     def clamp_kinematics(
         self, vz: float, vyaw: float, *, allow_climb: bool = False
     ) -> Tuple[float, float]:
@@ -467,6 +476,15 @@ class FailsafeSupervisor:
             Why the aircraft lands; logged, and spoken through
             :func:`spoken_reason` when it is a new fault.
         """
+        # The operator's nudge overlay sits in the proxy, in front of the
+        # driver: it must be off before the zero Twist below, or the halt
+        # would carry the operator's last intent.
+        nudge = getattr(self.actuator, "nudge", None)
+        if nudge is not None:
+            try:
+                nudge.disarm("failsafe")
+            except Exception as exc:  # noqa: BLE001 - the landing proceeds regardless
+                logger.critical("Nudge overlay could not be disarmed: %s", exc)
         repeat = self.failsafe_active and (
             reason == self._alerted_reason or reason == FAILSAFE_ALREADY_ACTIVE_REASON
         )

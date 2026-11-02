@@ -27,6 +27,7 @@ from mvp_mission_bebop.telemetry import battery as battery_module
 from mvp_mission_bebop.telemetry.battery import (
     BATTERY_WARNING_PCT,
     BatterySupervisor,
+    normalize_enabled,
     normalize_percentage,
 )
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
@@ -263,7 +264,7 @@ def test_land_pct_falls_back_to_twenty_when_absent_from_params_json():
     params.update_from_dict({"kinematics": {"target_altitude_m": 1.4}, "no_fly": True})
 
     assert params.battery_land_pct == 20.0
-    assert params.to_dict()["battery"] == {"land_pct": 20.0}
+    assert params.to_dict()["battery"] == {"enabled": True, "land_pct": 20.0}
 
 
 def test_land_pct_is_read_from_the_station_payload():
@@ -317,3 +318,126 @@ def test_a_failsafe_without_a_battery_supervisor_keeps_its_behaviour():
 
     assert failsafe.battery_supervisor is None
     assert failsafe.evaluate_system_health() == (True, "Nominal")
+
+
+# ------------------------------------------------------------ enable switch
+
+
+class HookRecorder:
+    def __init__(self) -> None:
+        self.reasons: List[str] = []
+
+    def __call__(self, reason: str) -> bool:
+        self.reasons.append(reason)
+        return True
+
+
+def armed_supervisor(enabled: bool, land_pct: float) -> "tuple[BatterySupervisor, HookRecorder]":
+    supervisor = BatterySupervisor(BatteryConfig(enabled=enabled, land_pct=land_pct), 3.0)
+    hook = HookRecorder()
+    supervisor.set_return_hook(hook, lambda: True)
+    return supervisor, hook
+
+
+def test_a_disabled_failsafe_never_requests_the_return():
+    supervisor, hook = armed_supervisor(enabled=False, land_pct=50.0)
+    supervisor.inject_synthetic_reading(10.0)
+
+    assert hook.reasons == []
+    assert supervisor.critical_reason() is None
+    assert supervisor.enabled is False
+
+
+def test_an_enabled_failsafe_returns_at_the_threshold_inclusive():
+    supervisor, hook = armed_supervisor(enabled=True, land_pct=20.0)
+    supervisor.inject_synthetic_reading(20.0)
+    supervisor.inject_synthetic_reading(19.0)
+
+    assert len(hook.reasons) == 1
+
+
+def test_a_zero_threshold_is_valid_and_fires_at_zero():
+    supervisor, hook = armed_supervisor(enabled=True, land_pct=0.0)
+    supervisor.inject_synthetic_reading(1.0)
+    assert hook.reasons == []
+    supervisor.inject_synthetic_reading(0.0)
+    assert len(hook.reasons) == 1
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [(True, True), (False, False), ("false", False), ("TRUE", True), (" False ", False), (None, True)],
+)
+def test_normalize_enabled_accepts_booleans_and_boolean_strings(value, expected):
+    assert normalize_enabled(value) is expected
+
+
+@pytest.mark.parametrize("value", ["no", "0", "", 1, 0, 1.0, [], {}])
+def test_normalize_enabled_rejects_everything_else(value):
+    with pytest.raises(TypeError):
+        normalize_enabled(value)
+
+
+def test_disabling_in_flight_suppresses_the_next_reading():
+    supervisor, hook = armed_supervisor(enabled=True, land_pct=30.0)
+    supervisor.configure(enabled=False)
+    supervisor.inject_synthetic_reading(25.0)
+
+    assert hook.reasons == []
+    assert supervisor.critical_reason() is None
+
+
+def test_configure_validates_the_threshold():
+    supervisor, _ = armed_supervisor(enabled=True, land_pct=30.0)
+    with pytest.raises(ValueError):
+        supervisor.configure(land_pct=101)
+    assert supervisor.land_pct == 30.0
+    supervisor.configure(land_pct="35")
+    assert supervisor.land_pct == 35.0
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_the_ten_percent_warning_is_informative_whatever_the_switch(enabled, records):
+    supervisor, hook = armed_supervisor(enabled=enabled, land_pct=5.0)
+    supervisor.inject_synthetic_reading(9.0)
+
+    assert len(milestone_lines(records)) == 1
+    assert hook.reasons == []
+
+
+def test_the_enable_switch_defaults_on_for_older_payloads():
+    params = MissionParameters()
+    params.update_from_dict({"battery": {"land_pct": 25}})
+
+    assert params.battery.enabled is True
+    assert BatterySupervisor(params.battery).enabled is True
+
+
+def test_a_string_enable_switch_from_the_payload_is_honoured():
+    params = MissionParameters()
+    params.update_from_dict({"battery": {"enabled": "false", "land_pct": 25}})
+
+    assert BatterySupervisor(params.battery).enabled is False
+
+
+def test_the_station_switch_listener_configures_the_supervisor():
+    from mvp_mission_bebop.mission import battery_failsafe_listener
+
+    supervisor, _ = armed_supervisor(enabled=True, land_pct=20.0)
+    listener = battery_failsafe_listener(supervisor)
+
+    listener(SimpleNamespace(data='{"enabled": false}'))
+    assert supervisor.enabled is False
+    listener(SimpleNamespace(data='{"enabled": true, "land_pct": 35}'))
+    assert supervisor.enabled is True and supervisor.land_pct == 35.0
+
+
+@pytest.mark.parametrize("payload", ["x", '{"enabled": "no"}', '{"land_pct": 140}', "[1]", '{"enabled": null}'])
+def test_the_station_switch_listener_never_raises_on_bad_input(payload):
+    from mvp_mission_bebop.mission import battery_failsafe_listener
+
+    supervisor, _ = armed_supervisor(enabled=True, land_pct=20.0)
+    battery_failsafe_listener(supervisor)(SimpleNamespace(data=payload))
+
+    assert supervisor.enabled is True
+    assert supervisor.land_pct == 20.0

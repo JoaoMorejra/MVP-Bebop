@@ -507,3 +507,72 @@ def test_the_full_descent_survives_the_vertical_shaper():
     governor, platform = _reentry_governor(demanded=True, shaper=True)
     commands = [governor.compute_vz(0.85, DT) for _ in range(30)]
     assert commands[-1] == pytest.approx(-platform.guard_descent_cap, abs=1e-5)
+
+
+# ------------------------------------------- yaw and acceleration feedforward
+
+#: Outputs of the governor before the yaw and acceleration terms existed, for
+#: the scripted sequence of ``_scripted``. Captured on 2026-10-27 from the
+#: unmodified tree; the new terms at zero gain must reproduce them exactly.
+_FROZEN_SEQUENCE = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0075, 0.0075, 0.0075, 0.0075, 0.0075, 0.0075, 0.0075, 0.0075,
+    0.009543606188, 0.013477125435, 0.017188516072, 0.020809427945, 0.02441149717, 0.028033703915,
+    0.031697258897, 0.035413703744, 0.03918931873, 0.043027521214, 0.046930170719, 0.050898279091,
+    0.054932396916, 0.050077625852, 0.050077625852, 0.041188736963, 0.041188736963, 0.032299848074,
+    0.014522070296, 0.005633181407, 0.0, 0.0, 0.0, 0.0, 0.0, 0.00646386004, 0.004038831191,
+]
+
+
+def _scripted(governor, **extra):
+    out = []
+    for k in range(40):
+        alt = 1.55 - 0.004 * k if k < 25 else 1.45 + 0.01 * (k - 25)
+        vx = 0.15 if 5 <= k < 30 else 0.0
+        out.append(round(governor.compute_vz(alt, DT, vx_commanded=vx, **extra), 12))
+    return out
+
+
+def test_new_feedforward_terms_at_zero_gain_reproduce_the_frozen_law():
+    assert _scripted(hold(target=1.55, feedforward_gain=0.05)) == _FROZEN_SEQUENCE
+    assert _scripted(hold(target=1.55, feedforward_gain=0.05), yaw_commanded=0.5) == _FROZEN_SEQUENCE
+
+
+def _regime(governor, cycles=200, **extra):
+    values = [governor.compute_vz(TARGET_M, DT, **extra) for _ in range(cycles)]
+    tail = values[-60:]
+    return sum(tail) / len(tail)
+
+
+def test_yaw_feedforward_raises_the_regime_command():
+    base = _regime(hold(yaw_feedforward_gain=0.1), yaw_commanded=0.0)
+    yawing = _regime(hold(yaw_feedforward_gain=0.1), yaw_commanded=0.08)
+    assert yawing - base == pytest.approx(0.008, abs=0.001)
+
+
+def test_acceleration_feedforward_appears_on_the_step_and_decays():
+    governor = hold(accel_feedforward_gain=0.2, accel_feedforward_cutoff_hz=2.0)
+    for _ in range(10):
+        governor.compute_vz(TARGET_M, DT, vx_commanded=0.0)
+    assert governor.last_feedforward == 0.0
+    governor.compute_vz(TARGET_M, DT, vx_commanded=0.15)
+    peak = governor.last_feedforward
+    assert peak > 0.0
+    for _ in range(int(1.0 / DT)):
+        governor.compute_vz(TARGET_M, DT, vx_commanded=0.15)
+    assert governor.last_feedforward < 0.05 * peak
+
+
+def test_reset_clears_the_acceleration_filter():
+    governor = hold(accel_feedforward_gain=0.2)
+    governor.compute_vz(TARGET_M, DT, vx_commanded=0.0)
+    governor.compute_vz(TARGET_M, DT, vx_commanded=0.15)
+    governor.reset()
+    governor.compute_vz(TARGET_M, DT, vx_commanded=0.15)
+    assert governor.last_feedforward == pytest.approx(0.0)
+
+
+def test_the_anti_climb_governor_accepts_and_ignores_yaw():
+    a = AltitudeAntiClimbGovernor(TARGET_M, AltitudeGovernorConfig())
+    b = AltitudeAntiClimbGovernor(TARGET_M, AltitudeGovernorConfig())
+    for alt in (TARGET_M + 0.3, TARGET_M + 0.2, TARGET_M):
+        assert a.compute_vz(alt, DT, yaw_commanded=0.5) == b.compute_vz(alt, DT)

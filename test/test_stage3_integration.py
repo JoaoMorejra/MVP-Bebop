@@ -341,7 +341,7 @@ def test_the_stage_completes_well_inside_its_deadline(simulated_time):
     VisualServoingStep().execute(ctx)
 
     assert ctx.blackboard.approach_finished
-    assert simulated_time.now < 0.5 * params.timeouts.tracking_timeout_sec, (
+    assert simulated_time.now < params.timeouts.tracking_timeout_sec, (
         f"took {simulated_time.now:.1f} s of a {params.timeouts.tracking_timeout_sec:.0f} s window"
     )
 

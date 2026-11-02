@@ -205,7 +205,7 @@ def test_the_pad_top_and_floor_climbs_ramp_under_the_authorized_rate(monkeypatch
     vz = [vz for _vx, _vy, vz, _vyaw in commanded]
     limit = params.kinematics.max_climb_speed_mps
     assert max(vz) > 0.0
-    assert all(0.0 <= v <= limit + 1e-6 for v in vz)
+    assert all(-limit - 1e-6 <= v <= limit + 1e-6 for v in vz), "the acquisition is two-sided but bounded"
     assert vz[0] < 0.5 * limit, "the jerk-limited profile must ramp, not step, to the climb rate"
     assert vz[-1] == 0.0
     assert not ctx.failsafe.failsafe_active
@@ -267,3 +267,75 @@ def test_the_takeoff_milestone_states_the_surface_and_the_floor_target(monkeypat
     assert payload["takeoff_surface"] == surface
     assert payload["target_altitude_m"] == pytest.approx(1.8)
     assert "native" not in payload
+
+
+# ------------------------------------------------ closed-loop, lagged airframe
+
+
+class _LaggedVertical:
+    """First-order lag of ``tau`` between the commanded and the flown ``vz``.
+
+    Installed as the proxy's simulator; everything but ``command`` is the
+    wrapped simulator's own.
+    """
+
+    def __init__(self, proxy, simulator, tau: float = 0.35) -> None:
+        self._simulator = simulator
+        self._original = simulator.command
+        self._tau = tau
+        self._v = 0.0
+        self._t = None
+        proxy.simulator = self
+
+    def __getattr__(self, name):
+        return getattr(self._simulator, name)
+
+    def command(self, vx, vy, vz, vyaw):
+        now = time.monotonic()
+        if self._t is not None:
+            self._v += (vz - self._v) * min(1.0, (now - self._t) / self._tau)
+        self._t = now
+        self._original(vx, vy, self._v, vyaw)
+
+
+class _StepLog(__import__("logging").Handler):
+    def __init__(self) -> None:
+        super().__init__(level=0)
+        self.messages = []
+
+    def emit(self, record) -> None:
+        self.messages.append(record.getMessage())
+
+
+@pytest.mark.parametrize("climb", [0.5, 1.0])
+def test_a_lagged_climb_converges_without_overshoot_and_reports_it(monkeypatch, climb):
+    import logging
+
+    params = pad_params(FIRMWARE_HOVER_ALTITUDE_M + climb, 0.0)
+    params.platform.venue_ceiling_agl_m = 3.2
+    params.kinematics.climb_decel_mps2 = 0.6
+    params.kinematics.climb_settle_max_speed_mps = 0.05
+    ctx, simulator = hovering_context(monkeypatch, params)
+    _LaggedVertical(ctx.drone, simulator)
+    peak = [0.0]
+    original = ctx.drone.move_velocity
+
+    def record(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=None):
+        peak[0] = max(peak[0], ctx.odom_supervisor.snapshot().relative_altitude)
+        original(vx=vx, vy=vy, vz=vz, vyaw=vyaw, duration=duration)
+
+    monkeypatch.setattr(ctx.drone, "move_velocity", record)
+    handler = _StepLog()
+    logging.getLogger("Step1Takeoff").addHandler(handler)
+    try:
+        assert TakeoffStep()._acquire_altitude(ctx) is StepStatus.SUCCESS
+    finally:
+        logging.getLogger("Step1Takeoff").removeHandler(handler)
+
+    target = params.relative_target_altitude_m
+    assert peak[0] <= target + 0.05
+    assert not any("did not converge" in m for m in handler.messages)
+    reports = [m for m in handler.messages if m.startswith("[ASCENT_REPORT ")]
+    assert len(reports) == 1
+    for field in ("target=", "peak=", "overshoot=", "t_converge=", "err_final="):
+        assert field in reports[0]

@@ -630,6 +630,29 @@ class MarkerObservation:
         """Straight-line distance from the camera to the marker, metres."""
         return math.sqrt(self.x_cam_m**2 + self.y_cam_m**2 + self.z_cam_m**2)
 
+    def height_above_marker_m(self, camera_tilt_deg: float) -> float:
+        """Metric height of the camera over the marker plane.
+
+        The vertical component of the camera-to-marker vector, with the axes
+        of :func:`project_marker_to_body`: camera +Y is ``(-sin t, 0, -cos t)``
+        and +Z is ``(cos t, 0, -sin t)`` in body FLU, so the marker lies
+        ``z * sin t + y * cos t`` below the lens. Free of the drift of the
+        integrated odometry, which makes it the height source of the terminal
+        descent. At nadir (``t = 90``) it is ``z_cam``.
+
+        Parameters
+        ----------
+        camera_tilt_deg : float
+            Gimbal tilt, degrees; only the magnitude is used.
+
+        Returns
+        -------
+        float
+            Height over the marker, metres.
+        """
+        depression = math.radians(abs(camera_tilt_deg))
+        return self.z_cam_m * math.sin(depression) + self.y_cam_m * math.cos(depression)
+
     @classmethod
     def from_pose_estimate(
         cls,
@@ -740,7 +763,12 @@ class CenteringCommand:
 
 
 def project_marker_to_body(
-    x_cam_m: float, y_cam_m: float, z_cam_m: float, camera_tilt_deg: float
+    x_cam_m: float,
+    y_cam_m: float,
+    z_cam_m: float,
+    camera_tilt_deg: float,
+    offset_forward_m: float = 0.0,
+    offset_left_m: float = 0.0,
 ) -> tuple[float, float]:
     """Resolve a camera-frame marker offset into body-FLU horizontal errors.
 
@@ -775,6 +803,18 @@ def project_marker_to_body(
     ``e_y = -x``, which is the familiar pure-nadir mapping and is what makes the
     tilt a configuration choice rather than a structural assumption.
 
+    The camera is not at the CoG. The marker's position in the body frame is
+    ``t_cam + R(t) * p_cam``, with ``t_cam = (offset_forward, offset_left, *)``
+    the lens position relative to the CoG (its vertical component does not
+    enter the horizontal errors), so
+
+    .. math::
+
+        e_x = d_f + z \\cos t - y \\sin t \\qquad e_y = d_l - x
+
+    Nulling these puts the CoG, not the lens, over the marker. Zero offsets
+    reproduce the projection above exactly.
+
     Parameters
     ----------
     x_cam_m, y_cam_m, z_cam_m : float
@@ -783,16 +823,42 @@ def project_marker_to_body(
         Commanded gimbal tilt in degrees, negative below the horizon. Only the
         magnitude is used, so a configuration that states the depression as a
         positive angle behaves identically.
+    offset_forward_m, offset_left_m : float
+        Lens position relative to the CoG, metres, forward and left positive.
 
     Returns
     -------
     Tuple[float, float]
-        ``(ex_body_m, ey_body_m)`` -- forward and left error, metres.
+        ``(ex_body_m, ey_body_m)`` -- forward and left error of the marker
+        relative to the CoG, metres.
     """
     depression = math.radians(abs(camera_tilt_deg))
     ex_body = z_cam_m * math.cos(depression) - y_cam_m * math.sin(depression)
     ey_body = -x_cam_m
+    if offset_forward_m or offset_left_m:
+        ex_body += offset_forward_m
+        ey_body += offset_left_m
     return ex_body, ey_body
+
+
+#: Largest credible camera-to-CoG offset, metres. The Bebop 2 is 0.33 m
+#: across; anything beyond is a unit error (millimetres or centimetres).
+_MAX_CAMERA_OFFSET_M: Final[float] = 0.5
+
+
+def _camera_offset(rtl_cfg: ReturnToLaunchConfig, name: str) -> float:
+    """Validated camera-to-CoG offset, metres (``0.0`` when the field is absent)."""
+    value = getattr(rtl_cfg, name, 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"rtl.{name} must be a number, got {type(value).__name__}")
+    offset = float(value)
+    if not math.isfinite(offset):
+        raise ValueError(f"rtl.{name} must be finite, got {offset!r}")
+    if abs(offset) > _MAX_CAMERA_OFFSET_M:
+        raise ValueError(
+            f"rtl.{name}={offset:g} m exceeds {_MAX_CAMERA_OFFSET_M:g} m; check the unit (metres)"
+        )
+    return offset
 
 
 class ArucoCenteringController:
@@ -855,6 +921,8 @@ class ArucoCenteringController:
         #: rather than read per cycle so that a mid-phase configuration edit
         #: cannot change the frame the PD state was accumulated in.
         self._tilt_deg: float = rtl_cfg.camera_tilt_deg
+        self._offset_forward_m: float = _camera_offset(rtl_cfg, "camera_offset_forward_m")
+        self._offset_left_m: float = _camera_offset(rtl_cfg, "camera_offset_left_m")
 
         # The ceiling arrives normalized because that is the domain the GCS
         # parameter sheet speaks; the law works in m/s.
@@ -985,6 +1053,11 @@ class ArucoCenteringController:
         """Phase time accumulated from the supplied ``dt`` values."""
         return self._elapsed
 
+    @property
+    def last_radial_m(self) -> Optional[float]:
+        """Radial error of the most recent valid sighting, metres (or ``None``)."""
+        return self._last_radial_m
+
     # ------------------------------------------------------------------ cycle
 
     def reset(self) -> None:
@@ -1002,7 +1075,9 @@ class ArucoCenteringController:
         self._last_speed_mps = None
         self._lost_elapsed_sec = 0.0
 
-    def update(self, observation: Optional[MarkerObservation], dt: float) -> CenteringCommand:
+    def update(
+        self, observation: Optional[MarkerObservation], dt: float, tilt_deg: Optional[float] = None
+    ) -> CenteringCommand:
         """Produce one cycle of centering guidance.
 
         Parameters
@@ -1016,6 +1091,11 @@ class ArucoCenteringController:
             True elapsed interval, in seconds, from
             :meth:`~mvp_mission_bebop.engine.rate.LoopRate.tick`. A non-positive
             interval is absorbed without advancing any state.
+        tilt_deg : Optional[float]
+            Gimbal tilt the aircraft last confirmed. Replaces the configured
+            ``rtl.camera_tilt_deg`` for this cycle when given and finite: the
+            gimbal settles short of the command (-79.2 for -80.0 in flight),
+            and the projection should use where the camera actually points.
 
         Returns
         -------
@@ -1032,8 +1112,16 @@ class ArucoCenteringController:
 
         self._lost_frames = 0
 
+        tilt = self._tilt_deg
+        if tilt_deg is not None and isinstance(tilt_deg, (int, float)) and math.isfinite(tilt_deg):
+            tilt = float(tilt_deg)
         ex_body, ey_body = project_marker_to_body(
-            observation.x_cam_m, observation.y_cam_m, observation.z_cam_m, self._tilt_deg
+            observation.x_cam_m,
+            observation.y_cam_m,
+            observation.z_cam_m,
+            tilt,
+            self._offset_forward_m,
+            self._offset_left_m,
         )
         radial = math.hypot(ex_body, ey_body)
         within = radial <= self._tolerance_m
@@ -1087,6 +1175,22 @@ class ArucoCenteringController:
             longitudinal_target = max(
                 -longitudinal_ceiling, min(longitudinal_ceiling, longitudinal_demand)
             )
+            if ex_body <= self._deadband_m:
+                longitudinal_target = min(0.0, longitudinal_demand)
+
+            # Prevent forward overshoot and preserve ArUco white quiet-zone:
+            # When the white border approaches the lower image boundary (border_margin_m < 0.08 m),
+            # clamp forward demand to zero so the airframe never overshoots and loses the tag.
+            # If the white border is in critical danger (< 0.03 m), gently back up (-0.015 m/s).
+            tag_size = float(getattr(self.rtl_cfg, "tag_size", 0.20))
+            fov_bottom_m = 0.45 * observation.z_cam_m
+            border_bottom_m = observation.y_cam_m + 0.65 * tag_size
+            border_margin_m = fov_bottom_m - border_bottom_m
+            if border_margin_m < 0.08:
+                if border_margin_m < 0.03:
+                    longitudinal_target = min(longitudinal_target, -0.015)
+                else:
+                    longitudinal_target = min(0.0, longitudinal_target)
             # Saturated as a vector, not per axis. Clipping the two channels
             # independently lets the resultant reach sqrt(2) times the ceiling on
             # a diagonal approach -- 0.113 against a configured 0.08 -- and it

@@ -1,5 +1,6 @@
 {
   "battery": {
+    "enabled": true,
     "land_pct": 20.0
   },
   "calibration": {
@@ -52,6 +53,8 @@
     ]
   },
   "governor": {
+    "accel_feedforward_cutoff_hz": 2.0,
+    "accel_feedforward_gain": 0.0,
     "climb_deadband_m": 0.05,
     "deadband_m": 0.03,
     "derivative_cutoff_hz": 2.0,
@@ -67,13 +70,14 @@
     "max_climb_speed": 0.1,
     "max_descent_speed": 0.08,
     "max_jerk_mps3": 2.0,
-    "min_horizontal_scale": 0.35
+    "min_horizontal_scale": 0.35,
+    "yaw_feedforward_gain": 0.0
   },
   "inspection": {
     "nadir_confidence_threshold": 0.3,
     "native_photo_ack_timeout_sec": 4.0,
     "settle_max_position_sigma_m": 0.04,
-    "settle_max_speed_mps": 0.03,
+    "settle_max_speed_mps": 0.05,
     "settle_max_vertical_speed": 0.02,
     "settle_min_samples": 5,
     "settle_timeout_sec": 6.0,
@@ -84,8 +88,11 @@
     "altitude_ceiling_margin_m": 0.6,
     "ceiling_breach_streak": 3,
     "climb_deadband_m": 0.05,
+    "climb_decel_mps2": 0.12,
+    "climb_lag_sec": 0.35,
+    "climb_position_kp": 1.5,
     "climb_settle_max_position_sigma_m": 0.08,
-    "climb_settle_max_speed_mps": 0.1,
+    "climb_settle_max_speed_mps": 0.05,
     "climb_settle_min_samples": 5,
     "climb_settle_window_sec": 1.0,
     "climb_timeout_sec": 15.0,
@@ -116,11 +123,11 @@
     "deadband": 0.005,
     "kd": 0.03,
     "ki": 0.0,
-    "kp": 0.35,
-    "min_effective_velocity": 0.06,
+    "kp": 0.18,
+    "min_effective_velocity": 0.02,
     "output_limits": [
-      -0.22,
-      0.22
+      -0.04,
+      0.04
     ],
     "quantization_step": 0.01
   },
@@ -134,6 +141,17 @@
     "odometry_topic": "/bebop/odom"
   },
   "no_fly": false,
+  "nudge": {
+    "allow_in_inspection": true,
+    "allow_in_precision_landing": false,
+    "attack_sec": 0.25,
+    "deadman_sec": 0.35,
+    "enabled": true,
+    "max_horizontal": 0.08,
+    "max_vyaw": 0.15,
+    "release_sec": 0.15,
+    "yaw_budget_deg": 45.0
+  },
   "output_dir": ".",
   "platform": {
     "ceiling_allowance_m": 0.0,
@@ -163,33 +181,44 @@
     "arrival_radius_m": 0.2,
     "assisted_descent_speed": 0.06,
     "braking_distance_m": 0.45,
+    "camera_offset_forward_m": 0.04,
+    "camera_offset_left_m": 0.0,
     "camera_tilt_deg": -80.0,
     "centering_kd_x": 0.02,
     "centering_kd_y": 0.03,
-    "centering_kp_x": 0.25,
+    "centering_kp_x": 0.16,
     "centering_kp_y": 0.3,
     "centering_settle_cycles": 2,
     "centering_timeout_sec": 25.0,
     "centering_tolerance_m": 0.04,
+    "commit_height_m": 0.4,
+    "commit_radius_m": 0.05,
     "confirmation_frames": 2,
     "dead_reckoning_disagreement_warn_m": 1.0,
     "deadband_m": 0.03,
+    "descent_gate_radius_m": 0.05,
+    "descent_hysteresis": 1.5,
+    "descent_marker_lost_hold_sec": 0.6,
+    "descent_speed_mps": 0.12,
     "descent_stall_epsilon_m": 0.04,
     "descent_stall_sec": 3.0,
+    "descent_timeout_sec": 20.0,
     "enabled": true,
     "final_hover_delay_sec": 2.0,
+    "ground_effect_gain_scale": 0.6,
+    "ground_effect_height_m": 0.6,
     "kd": 0.01,
     "kp": 0.15,
     "land_burst_count": 3,
     "landing_commit_dwell_sec": 0.8,
-    "landing_radius_m": 0.13,
+    "landing_radius_m": 0.06,
     "lateral_kd": 0.02,
     "lateral_kp": 0.18,
     "lost_frames_tolerance": 5,
     "marker_dict": "DICT_APRILTAG_36h11",
-    "max_accel_mps2": 0.25,
+    "max_accel_mps2": 0.12,
     "max_centering_speed": 0.08,
-    "max_jerk_mps3": 1.0,
+    "max_jerk_mps3": 0.35,
     "max_lateral_speed": 0.05,
     "max_speed": 0.1,
     "min_effective_speed": 0.035,
@@ -211,7 +240,8 @@
     "touchdown_altitude_m": 0.15,
     "touchdown_stagnation_sec": 1.5,
     "touchdown_timeout_sec": 12.0,
-    "use_dead_reckoning": true
+    "use_dead_reckoning": true,
+    "visual_descent_enabled": true
   },
   "timeouts": {
     "flat_trim_ack_timeout_sec": 3.0,
@@ -219,8 +249,19 @@
     "search_timeout_sec": 30.0,
     "takeoff_confirm_timeout_sec": 6.0,
     "target_recovery_timeout_sec": 4.0,
-    "tracking_timeout_sec": 110.0,
+    "tracking_timeout_sec": 15.0,
     "video_stream_timeout_sec": 2.0
+  },
+  "translation_hold": {
+    "enabled": true,
+    "heading_deadband_deg": 1.5,
+    "heading_hold_enabled": false,
+    "heading_kp": 0.6,
+    "heading_max_vyaw": 0.04,
+    "ki": 1.0,
+    "kp_velocity": 0.4,
+    "max_correction": 0.03,
+    "min_active_speed": 0.03
   },
   "vision": {
     "acquisition_dwell_sec": 1.0,
@@ -257,6 +298,16 @@
     "reacquire_sweep_deg": 30.0,
     "reacquire_timeout_sec": 8.0,
     "release_frames": 2,
+    "selector_box_alpha": 0.5,
+    "selector_class_priority": [
+      "acidente",
+      "motorcycle",
+      "bicycle"
+    ],
+    "selector_gate_px": 90.0,
+    "selector_iou_min": 0.25,
+    "selector_lost_frames": 6,
+    "selector_switch_frames": 4,
     "target_classes": [
       "motorcycle",
       "bicycle"
@@ -265,14 +316,14 @@
   },
   "yaw_pattern": {
     "deadband": 0.01,
-    "kd": 0.03,
+    "kd": 0.02,
     "ki": 0.0,
-    "kp": 0.45,
+    "kp": 0.14,
     "max_vyaw": 0.3,
-    "min_effective_vyaw": 0.05,
-    "pid_output_limit": 0.25,
+    "min_effective_vyaw": 0.02,
+    "pid_output_limit": 0.055,
     "quantization_step": 0.01,
-    "reacquire_vyaw": 0.08,
+    "reacquire_vyaw": 0.05,
     "return_kd": 0.02,
     "return_kp": 0.5,
     "return_max_vyaw": 0.25,
@@ -280,6 +331,6 @@
     "return_timeout_sec": 12.0,
     "return_tolerance_deg": 4.0,
     "scan_ramp_per_sec": 0.3,
-    "scan_vyaw": 0.15
+    "scan_vyaw": 0.08
   }
 }

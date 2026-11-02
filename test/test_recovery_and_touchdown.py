@@ -46,6 +46,19 @@ NADIR_TILT_DEG = GimbalConstraintsConfig().nadir_tilt_deg
 # ═══════════════════════════════════════════════ target loss in Stage 3
 
 
+
+@pytest.fixture(autouse=True)
+def _lens_frame_centering(monkeypatch):
+    """Pin the centering law in the lens frame (camera-to-CoG offset zero).
+
+    These tests simulate the marker relative to the camera and exercise the
+    law's dynamics, gates and recovery; the camera-to-CoG extrinsic that
+    shifts the equilibrium is covered by ``test_camera_extrinsics.py``.
+    """
+    from mvp_mission_bebop.controllers import rtl_guidance as _rtl_guidance
+
+    monkeypatch.setattr(_rtl_guidance, "_camera_offset", lambda _cfg, _name: 0.0)
+
 def build_controller():
     return VisualServoingController(
         gimbal_config=GimbalConstraintsConfig(

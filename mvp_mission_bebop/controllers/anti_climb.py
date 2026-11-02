@@ -106,6 +106,7 @@ class AltitudeAntiClimbGovernor:
         dt: Optional[float] = None,
         vx_commanded: float = 0.0,
         hold_integrator: bool = False,
+        yaw_commanded: float = 0.0,
     ) -> float:
         """Corrective vertical velocity command, always ``<= 0``.
 
@@ -125,6 +126,8 @@ class AltitudeAntiClimbGovernor:
             governor is configured, and the lift feedforward it feeds in
             :class:`AltitudeHoldGovernor` is a climb request, which this
             descent-only governor has no authority to make.
+        yaw_commanded : float
+            Accepted and ignored, for the same reason.
         """
         interval = LoopRate.clamp_interval(dt) if dt is not None else LoopRate.clamp_interval(1.0 / 15.0)
         excess = current_relative_alt - self.target_altitude

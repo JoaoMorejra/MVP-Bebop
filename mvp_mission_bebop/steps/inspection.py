@@ -51,7 +51,7 @@ from mvp_mission_bebop.estimation.convergence import SettlementCriteria, Settlem
 from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.perception.inspection_worker import InspectionJob
 from mvp_mission_bebop.perception.worker import detector_kwargs
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
+from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz, select_target
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 logger = logging.getLogger("Step4Inspection")
@@ -70,6 +70,35 @@ STOW_GIMBAL_TILT_DEG: Final[float] = -80.0
 #: Smallest tilt change worth transmitting, in degrees. Below it the gimbal
 #: command is not re-sent, so a converged law does not flood the gimbal topic.
 _TILT_DEADBAND_DEG: Final[float] = 1e-3
+
+
+#: Bound on the wait for a suspended nudge to ramp to zero before the capture,
+#: seconds: the overlay releases in ``nudge.release_sec`` (0.15 s by default).
+_NUDGE_RELEASE_WAIT_SEC: Final[float] = 1.0
+
+
+def nudge_active(ctx: Any) -> bool:
+    """Whether the operator's nudge added anything to the last transmitted command.
+
+    Parameters
+    ----------
+    ctx : MissionContext
+        Mission context; ``nudge`` is optional.
+
+    Returns
+    -------
+    bool
+        ``True`` while the overlay's applied nudge is non-zero.
+    """
+    nudge = getattr(ctx, "nudge", None)
+    snapshot = getattr(nudge, "snapshot", None)
+    if not callable(snapshot):
+        return False
+    try:
+        applied = snapshot().applied
+    except Exception:  # noqa: BLE001 - an unreadable overlay counts as inactive
+        return False
+    return any(value != 0.0 for value in applied)
 
 
 class _StageInterrupted(Exception):
@@ -137,8 +166,52 @@ class NadirInspectionStep(BaseStep):
 
     def _inspect(self, ctx: MissionContext, approach_finished: bool) -> StepStatus:
         """Frame, settle, capture, and hold. Called inside the altitude-hold window."""
+        if not approach_finished:
+            logger.warning(
+                "Stage 3 centering timed out after %.1f s. Capturing photo immediately "
+                "at present position and continuing mission.",
+                15.0,
+            )
+            self._hold(ctx)
+            self._capture(ctx, settled=False, forced=True)
+            self._start_background_native_ack(ctx)
+            evidence = getattr(ctx.blackboard, "evidence", None)
+            if evidence is not None and getattr(evidence, "captured", False):
+                self._announce("Registro concluído", "registro fotográfico do acidente concluído")
+                logger.info(
+                    "Stage 4 complete (forced capture on centering timeout). Evidence: raw=%s annotated=%s metadata=%s",
+                    evidence.raw_path,
+                    evidence.annotated_path,
+                    evidence.metadata_path,
+                )
+            else:
+                logger.error("Stage 4 finished without recording any evidence.")
+
+            if self._mode is MissionMode.SIMPLE:
+                tilt_span = abs(float(ctx.params.gimbal.search_tilt_deg) - float(ctx.params.gimbal.nadir_tilt_deg))
+                if tilt_span >= 1e-3:
+                    tilt = float(ctx.params.rtl.camera_tilt_deg) if ctx.params.rtl.enabled else STOW_GIMBAL_TILT_DEG
+                    logger.info("Directing gimbal to %.1f deg (nadir) before yaw return...", tilt)
+                    self._point_gimbal(ctx, tilt)
+                    settle_gimbal_deadline = Deadline(0.5)
+                    rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+                    while settle_gimbal_deadline.active and not ctx.interrupted():
+                        rate.tick()
+                        ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
+
+                status = self._restore_heading(ctx)
+                if status is not StepStatus.SUCCESS:
+                    return status
+                heading_settle_deadline = Deadline(0.5)
+                rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+                while heading_settle_deadline.active and not ctx.interrupted():
+                    rate.tick()
+                    ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
+
+            return StepStatus.SUCCESS
+
         framed = self._frame_with_gimbal(ctx)
-        degraded = not approach_finished or not framed
+        degraded = not framed
 
         settled = self._await_stillness(ctx)
         if ctx.interrupted():
@@ -153,17 +226,26 @@ class NadirInspectionStep(BaseStep):
         settled = settled and not degraded
         captured = self._capture(ctx, settled)
 
-        status = self._hover(ctx, captured)
-        if status is not StepStatus.SUCCESS:
-            return status
+        evidence = getattr(ctx.blackboard, "evidence", None)
+        evidence_confirmed = bool(
+            captured and evidence is not None and getattr(evidence, "captured", False)
+        )
 
-        if not ctx.blackboard.evidence.captured:
-            logger.warning(
-                "No evidence was recorded during the hover window; attempting a final capture."
-            )
-            self._capture(ctx, settled, forced=True)
+        if not evidence_confirmed:
+            logger.warning("Primary capture did not confirm evidence; engaging hover watch window.")
+            status = self._hover(ctx, already_captured=False, exit_on_capture=True)
+            if status is not StepStatus.SUCCESS:
+                return status
 
-        self._settle_native_ack(ctx)
+            evidence = getattr(ctx.blackboard, "evidence", None)
+            evidence_confirmed = bool(evidence is not None and getattr(evidence, "captured", False))
+            if not evidence_confirmed:
+                logger.warning(
+                    "No evidence was recorded during the hover window; attempting a final capture."
+                )
+                self._capture(ctx, settled, forced=True)
+
+        self._start_background_native_ack(ctx)
 
         if ctx.blackboard.evidence.captured:
             self._announce("Registro concluído", "registro fotográfico do acidente concluído")
@@ -176,16 +258,29 @@ class NadirInspectionStep(BaseStep):
         else:
             logger.error("Stage 4 finished without recording any evidence.")
 
+        # Volta do yaw ou pitch para a direita dependendo do modo
         if self._mode is MissionMode.SIMPLE:
-            # With or without the return, the Simple profile lands on the
-            # takeoff heading. Only an interrupt fails the restore; a window
-            # that expires returns SUCCESS and Stage 5 still lands from the
-            # heading reached.
+            tilt_span = abs(float(ctx.params.gimbal.search_tilt_deg) - float(ctx.params.gimbal.nadir_tilt_deg))
+            if tilt_span >= 1e-3:
+                tilt = float(ctx.params.rtl.camera_tilt_deg) if ctx.params.rtl.enabled else STOW_GIMBAL_TILT_DEG
+                logger.info("Directing gimbal to %.1f deg (nadir) before yaw return...", tilt)
+                self._point_gimbal(ctx, tilt)
+                # Settle in motionless hover for 0.5s so gimbal reaches -80 deg before yaw rotation
+                settle_gimbal_deadline = Deadline(0.5)
+                rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+                while settle_gimbal_deadline.active and not ctx.interrupted():
+                    rate.tick()
+                    ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
+
+            # Simple profile: restore takeoff heading with gimbal already at -80 deg
             status = self._restore_heading(ctx)
             if status is not StepStatus.SUCCESS:
                 return status
-            tilt = float(ctx.params.rtl.camera_tilt_deg) if ctx.params.rtl.enabled else STOW_GIMBAL_TILT_DEG
-            self._point_gimbal(ctx, tilt)
+            # Settle after heading restore before handing over to RTL landing
+            heading_settle_deadline = Deadline(0.5)
+            while heading_settle_deadline.active and not ctx.interrupted():
+                rate.tick()
+                ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
 
         return StepStatus.SUCCESS
 
@@ -243,12 +338,18 @@ class NadirInspectionStep(BaseStep):
             return False
         controller.reset()
 
+        tilt_span = abs(float(gimbal_cfg.search_tilt_deg) - float(gimbal_cfg.nadir_tilt_deg))
+        if tilt_span < 1e-3:
+            logger.info(
+                "Fixed tilt configured (%.1f deg): gimbal will remain stationary during inspection.",
+                float(gimbal_cfg.search_tilt_deg),
+            )
+            return True
+
         goal = self._open_loop_goal(ctx, controller, frame_dims)
         window_sec = max(
             float(ctx.params.inspection.settle_timeout_sec),
-            2.0
-            * (float(gimbal_cfg.search_tilt_deg) - float(gimbal_cfg.nadir_tilt_deg))
-            / float(gimbal_cfg.max_slew_limit_deg),
+            2.0 * tilt_span / float(gimbal_cfg.max_slew_limit_deg),
         )
         deadline = Deadline(window_sec)
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
@@ -260,8 +361,8 @@ class NadirInspectionStep(BaseStep):
             "Framing with the gimbal alone: open-loop setpoint %.1f deg, band [%.1f, %.1f] deg, "
             "window %.1f s.",
             goal,
-            gimbal_cfg.nadir_tilt_deg,
-            gimbal_cfg.search_tilt_deg,
+            controller.min_tilt_deg,
+            controller.max_tilt_deg,
             window_sec,
         )
 
@@ -293,8 +394,8 @@ class NadirInspectionStep(BaseStep):
 
                     targets = sample.result.filter_by_class(vision_cfg.target_classes)
                     center: Optional[Tuple[float, float]] = None
-                    if targets:
-                        best = max(targets, key=lambda detection: detection.confidence)
+                    best = select_target(ctx, targets)
+                    if best is not None:
                         center = (float(best.center[0]), float(best.center[1]))
                         target_seen = True
 
@@ -318,6 +419,18 @@ class NadirInspectionStep(BaseStep):
                             command.note,
                         )
                         return True
+                    if (
+                        not getattr(ctx.blackboard, "approach_finished", True)
+                        and deadline.elapsed_sec >= 1.0
+                        and abs(ctx.current_tilt_deg - goal) <= 1.0
+                    ):
+                        logger.info(
+                            "Degraded framing: gimbal reached setpoint %.1f deg after %.1f s. "
+                            "Proceeding to capture.",
+                            ctx.current_tilt_deg,
+                            deadline.elapsed_sec,
+                        )
+                        return False
         finally:
             logger.info("Framing loop cadence: %s.", rate.cadence_report())
 
@@ -336,30 +449,29 @@ class NadirInspectionStep(BaseStep):
     def _open_loop_goal(
         ctx: MissionContext, controller: GimbalFramingController, frame_dims: Tuple[int, int]
     ) -> float:
-        """Starting setpoint: the pointing solution of Stage 3's last measured pixel.
+        """Starting setpoint: open-loop pointing solution, falling back to nadir_tilt_deg.
 
-        Falls back to the current tilt when Stage 3 recorded no pixel or a
-        corrupt one; the gimbal is then left where it is rather than driven
-        toward a guess.
+        Falls back to nadir_tilt_deg when Stage 3 recorded no pixel or a
+        corrupt one, driving the gimbal toward the configured capture tilt.
         """
         pixel = ctx.blackboard.confirmed_target_px
         tilt = ctx.blackboard.confirmed_tilt_deg
         if pixel is None or tilt is None:
-            logger.warning(
-                "No confirmed target pixel from Stage 3; framing starts from the current tilt "
-                "%.1f deg.",
-                ctx.current_tilt_deg,
+            logger.info(
+                "No confirmed target pixel from Stage 3; framing starts toward nadir tilt %.1f deg.",
+                float(ctx.params.gimbal.nadir_tilt_deg),
             )
-            return float(ctx.current_tilt_deg)
+            return float(ctx.params.gimbal.nadir_tilt_deg)
         try:
             return controller.open_loop_tilt(pixel, tilt, frame_dims)
         except (TypeError, ValueError) as exc:
-            logger.error(
-                "Confirmed target pixel %r unusable (%s); framing starts from the current tilt.",
+            logger.warning(
+                "Confirmed target pixel %r unusable (%s); framing starts toward nadir tilt %.1f deg.",
                 pixel,
                 exc,
+                float(ctx.params.gimbal.nadir_tilt_deg),
             )
-            return float(ctx.current_tilt_deg)
+            return float(ctx.params.gimbal.nadir_tilt_deg)
 
     @staticmethod
     def _point_gimbal(ctx: MissionContext, tilt_deg: float) -> None:
@@ -396,7 +508,12 @@ class NadirInspectionStep(BaseStep):
                 max_vertical_speed=cfg.settle_max_vertical_speed,
             )
         )
-        deadline = Deadline(cfg.settle_timeout_sec)
+        settle_timeout = (
+            min(cfg.settle_timeout_sec, 2.0)
+            if not getattr(ctx.blackboard, "approach_finished", True)
+            else cfg.settle_timeout_sec
+        )
+        deadline = Deadline(settle_timeout)
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
         elapsed = 0.0
         report = None
@@ -418,6 +535,13 @@ class NadirInspectionStep(BaseStep):
             snapshot = ctx.odom_supervisor.snapshot()
             dt = rate.tick()
             elapsed += dt
+
+            if nudge_active(ctx):
+                # The operator is moving the airframe: stillness measured now
+                # would be measured against motion the operator is commanding.
+                # The statistics restart once the keys are released.
+                detector = SettlementDetector(detector.criteria)
+                continue
 
             report = detector.update(
                 x=snapshot.x,
@@ -450,6 +574,34 @@ class NadirInspectionStep(BaseStep):
         sent would otherwise stay open-loop for that whole window, and the anti-
         climb governor's descent command is the thing most likely to be latched.
         """
+        blackboard = getattr(ctx, "blackboard", None)
+        if blackboard is not None:
+            blackboard.nudge_suspended = True
+        try:
+            self._await_nudge_release(ctx)
+            return self._capture_unnudged(ctx, settled, forced=forced)
+        finally:
+            if blackboard is not None:
+                blackboard.nudge_suspended = False
+
+    def _await_nudge_release(self, ctx: MissionContext) -> None:
+        """Hold station until the suspended nudge has ramped to zero (bounded).
+
+        The permit is already false (``blackboard.nudge_suspended``), so the
+        overlay is releasing on its own ramp; this only waits for it, at the
+        control rate, never longer than ``_NUDGE_RELEASE_WAIT_SEC``.
+        """
+        if not nudge_active(ctx):
+            return
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        deadline = Deadline(_NUDGE_RELEASE_WAIT_SEC)
+        while deadline.active and nudge_active(ctx):
+            self._hold(ctx)
+            rate.tick()
+        self._hold(ctx)
+
+    def _capture_unnudged(self, ctx: MissionContext, settled: bool, *, forced: bool = False) -> bool:
+        """The capture proper, with the nudge suspended (see :meth:`_capture`)."""
         self._hold(ctx)
         frame = ctx.grab_frame(timeout_sec=1.5)
         if frame is None:
@@ -559,7 +711,13 @@ class NadirInspectionStep(BaseStep):
         except Exception as exc:  # noqa: BLE001 - the assessment is never flight-critical
             logger.error("Victim assessment not submitted: %s", exc)
 
-    def _hover(self, ctx: MissionContext, already_captured: bool) -> StepStatus:
+    def _hover(
+        self,
+        ctx: MissionContext,
+        already_captured: bool,
+        *,
+        exit_on_capture: bool = False,
+    ) -> StepStatus:
         """Hold the nadir hover for the configured duration.
 
         Perception runs only while evidence is still missing. The detector used
@@ -629,6 +787,10 @@ class NadirInspectionStep(BaseStep):
                             deadline.elapsed_sec,
                             deadline.remaining_sec,
                         )
+                        evidence = getattr(ctx.blackboard, "evidence", None)
+                        if exit_on_capture and bool(evidence is not None and getattr(evidence, "captured", False)):
+                            logger.info("Evidence confirmed captured; exiting hover immediately.")
+                            break
                     else:
                         ctx.perception.engage(conf=nadir_conf, imgsz=imgsz)
         finally:
@@ -741,8 +903,12 @@ class NadirInspectionStep(BaseStep):
     @staticmethod
     def _transmit_yaw(ctx: MissionContext, vyaw: float, dt: float) -> None:
         """Send a yaw command through the failsafe with every translation channel at zero."""
-        vz = governed_vz(ctx, 
-            ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=0.0
+        vz = governed_vz(
+            ctx,
+            ctx.odom_supervisor.snapshot().relative_altitude,
+            dt,
+            vx_commanded=0.0,
+            yaw_commanded=abs(vyaw),
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, vyaw)
         ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
@@ -784,6 +950,28 @@ class NadirInspectionStep(BaseStep):
         except Exception as exc:  # noqa: BLE001 - evidence bookkeeping never ends the flight
             logger.error("Could not update the evidence sidecar with the native photo ACK: %s", exc)
         return False
+
+    def _start_background_native_ack(self, ctx: MissionContext) -> None:
+        """Resolve native photo ACK in background so aircraft does not idle in hover."""
+        if self._pending_ack is None:
+            return
+        if not self._resolve_native_ack(ctx):
+            return
+
+        import threading
+
+        def _watch_ack() -> None:
+            timeout = ctx.params.inspection.native_photo_ack_timeout_sec
+            rate = LoopRate(10.0)
+            deadline = Deadline(timeout)
+            while deadline.active:
+                rate.tick()
+                if self._pending_ack is None or not self._resolve_native_ack(ctx):
+                    return
+            self._resolve_native_ack(ctx, final=True)
+
+        thread = threading.Thread(target=_watch_ack, name="NativePhotoAckWatcher", daemon=True)
+        thread.start()
 
     def _settle_native_ack(self, ctx: MissionContext) -> None:
         """Wait out a pending acknowledgement, still station keeping.

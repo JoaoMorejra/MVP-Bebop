@@ -229,3 +229,29 @@ def test_entry_asserts_the_search_tilt_before_any_translation():
     assert ctx.drone.tilts[0] == search_tilt
     assert ctx.current_tilt_deg == search_tilt
     assert "move" in events
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_the_cross_axis_hold_corrects_forward_drift_within_its_ceiling(enabled):
+    """D4/D12: ``vx`` is no longer the literal 0.0 on the lateral cruise.
+
+    With the airframe drifting forward the leg commands a bounded backward
+    correction; disabled, the channel is exactly the historical zero.
+    """
+    from test_stage_altitude_wiring import Ctx
+
+    from mvp_mission_bebop.steps.search import ForwardSearchStep
+
+    ctx = Ctx(detections=False)
+    ctx.params.translation_hold.enabled = enabled
+    ctx.odom_supervisor.vx = 0.10
+    ForwardSearchStep().execute(ctx)
+
+    commands = ctx.drone.commands
+    limit = ctx.params.translation_hold.max_correction
+    assert all(vyaw == 0.0 for _vx, _vy, _vz, vyaw in commands)
+    if enabled:
+        assert all(abs(vx) <= limit + 1e-12 for vx, _vy, _vz, _vyaw in commands)
+        assert any(vx < 0.0 for vx, _vy, _vz, _vyaw in commands)
+    else:
+        assert all(vx == 0.0 for vx, _vy, _vz, _vyaw in commands)

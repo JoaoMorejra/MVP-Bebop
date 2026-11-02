@@ -210,6 +210,23 @@ class VisionConfig:
     #: pixels at the ranges where the approach is still translating.
     perception_max_age_sec: float = 0.5
     target_classes: List[str] = field(default_factory=lambda: ["motorcycle", "bicycle"])
+    #: Class priority of the persistent target selector
+    #: (``estimation.target_selector``), highest first. The group
+    #: ``acidente`` matches every accident label
+    #: (``perception.classes.ACCIDENT_CLASS_NAMES``), so the COCO
+    #: ``motorcycle``/``bicycle`` and a future model's own ``acidente`` class
+    #: rank the same. Classes absent from the list are never selected.
+    selector_class_priority: List[str] = field(default_factory=lambda: ["acidente", "motorcycle", "bicycle"])
+    #: Least IoU with the tracked box for a detection to continue the track.
+    selector_iou_min: float = 0.25
+    #: Centroid gate, pixels, when no candidate reaches ``selector_iou_min``.
+    selector_gate_px: float = 90.0
+    #: Consecutive frames without a match before the track is released.
+    selector_lost_frames: int = 6
+    #: Consecutive frames a higher-priority candidate must persist to take over.
+    selector_switch_frames: int = 4
+    #: Weight of the newest box in the exponential smoothing of the track.
+    selector_box_alpha: float = 0.5
     confirmation_frames: int = 3
     #: Frames of sustained loss required before confirmation is withdrawn.
     #: Separate from ``confirmation_frames`` so acquisition and loss can have
@@ -387,23 +404,23 @@ class GimbalPIDConfig:
 class LateralPIDConfig:
     """PID gains for horizontal centering via body-frame lateral velocity."""
 
-    kp: float = 0.35
+    kp: float = 0.18
     ki: float = 0.0
     kd: float = 0.03
-    output_limits: Tuple[float, float] = (-0.22, 0.22)
-    deadband: float = 0.005
+    output_limits: Tuple[float, float] = (-0.04, 0.04)
+    deadband: float = 0.002
     #: Smallest cross-track command the airframe actually answers.
     #:
     #: Declared since the first revision and, until now, never read by anything.
     #: The consequence is structural rather than cosmetic: the driver quantizes
-    #: to ``int8(v * 100)``, so with ``kp = 0.35`` on normalized pixel error a
-    #: 35 px offset on an 856 px frame demands 0.029 -- two driver counts, below
+    #: to ``int8(v * 100)``, so with ``kp = 0.18`` on normalized pixel error a
+    #: 35 px offset on an 856 px frame demands 0.015 -- two driver counts, below
     #: the airframe's response threshold. The lateral loop therefore asymptoted
     #: into the actuator dead zone instead of reaching the centering tolerance.
     #: It is applied through :class:`QuantizedCommandShaper` as a duty cycle, not
     #: as a hard floor, so the commanded mean still tracks the demand down to
     #: zero.
-    min_effective_velocity: float = 0.06
+    min_effective_velocity: float = 0.02
     #: Driver command quantization step, in normalized units.
     quantization_step: float = 0.01
 
@@ -496,6 +513,18 @@ class AltitudeGovernorConfig:
     #: sink-per-commanded-speed relationship justifies a nonzero value. See
     #: the design spec's "field validation required" section.
     feedforward_gain: float = 0.0
+    #: Climb feedforward per unit of commanded ``|vyaw|``, normalized. A turn
+    #: tilts the thrust vector like a translation does, and the Simple profile
+    #: turns through Stages 2 to 4. Zero (inert) until identified from flight
+    #: data (``scripts/analyze_flight_logs.py --identify-sink``).
+    yaw_feedforward_gain: float = 0.0
+    #: Climb feedforward per unit of ``|d|v_h|/dt|`` (normalized per second),
+    #: low-passed at ``accel_feedforward_cutoff_hz``: the sink is largest while
+    #: the airframe pitches into or out of a translation. Zero (inert) until
+    #: identified.
+    accel_feedforward_gain: float = 0.0
+    #: Cutoff of the first-order filter on the acceleration term, hertz.
+    accel_feedforward_cutoff_hz: float = 2.0
 
     # -------------------------------------------- horizontal speed throttling
 
@@ -668,8 +697,22 @@ class FlightKinematicsConfig:
     #: Tuned for the Bebop sonar/barometer noise floor (~0.05-0.08 m).
     climb_settle_window_sec: float = 1.00
     climb_settle_min_samples: int = 5
-    climb_settle_max_speed_mps: float = 0.10
+    climb_settle_max_speed_mps: float = 0.05
     climb_settle_max_position_sigma_m: float = 0.08
+    #: Lead of the closed-loop climb (``controllers.altitude_acquisition``), s.
+    #:
+    #: The Bebop's vertical axis is a first-order lag of about 0.35 s behind
+    #: 0.10-0.20 s of transport delay, read by 5 Hz odometry. The position
+    #: error is taken against ``z + climb_lag_sec * vz``, where the airframe
+    #: will be once the velocity it already has plays out, which is what keeps
+    #: the climb from carrying 9-13 cm past the target at 0.25 m/s. Audited in
+    #: ``[0, 1]``.
+    climb_lag_sec: float = 0.35
+    #: Position gain of the closed-loop climb, 1/s. Audited in ``(0, 4]``.
+    climb_position_kp: float = 1.5
+    #: Deceleration of the climb's braking envelope, m/s^2: easing starts
+    #: about 0.26 m out at 0.25 m/s.
+    climb_decel_mps2: float = 0.12
     #: Convergence gate that ends the post-takeoff stabilization early.
     #:
     #: The Bebop runs its own launch profile and the SDK's ``takeoff`` returns
@@ -813,8 +856,8 @@ class ReturnToLaunchConfig:
     #: that tells them which one to trust next time.
     dead_reckoning_disagreement_warn_m: float = 1.00
     #: Acceleration and jerk ceilings for the RTL velocity profile, in m/s.
-    max_accel_mps2: float = 0.25
-    max_jerk_mps3: float = 1.00
+    max_accel_mps2: float = 0.12
+    max_jerk_mps3: float = 0.35
     #: Multivariate settlement window. Arrival requires every sample inside the
     #: arrival radius, low positional variance, and low mean speed, sustained
     #: across the window -- not N consecutive loop iterations.
@@ -933,7 +976,7 @@ class ReturnToLaunchConfig:
     reverse_cruise_velocity: float = -0.10
     #: Longitudinal (body-x) centering gains, m/s per metre of error and per
     #: metre-per-second of error rate.
-    centering_kp_x: float = 0.25
+    centering_kp_x: float = 0.16
     centering_kd_x: float = 0.02
     #: Lateral (body-y) centering gains. Higher than the longitudinal pair: the
     #: lateral error is recovered from the camera's x axis, which is unaffected
@@ -951,18 +994,59 @@ class ReturnToLaunchConfig:
     #: Radial error inside which the landing is authorized, once at residual
     #: speed for :attr:`centering_settle_cycles` consecutive cycles, in metres.
     #:
-    #: Deliberately looser than :attr:`centering_tolerance_m`. The marker is a
-    #: 0.20 m square printed on a landing pad 0.50-1.0 m across, so a touchdown
-    #: anywhere inside this radius is still solidly on the pad. Converging
-    #: tighter than this before landing buys nothing but battery: every extra
-    #: settle cycle spent chasing the tight internal tolerance is a correction
-    #: against an error the touchdown itself absorbs. centering_tolerance_m is
-    #: retained unchanged as the internal deadband/rest-mode switch the PD
-    #: converges the approach against; this is the separate, operational
-    #: statement of when the approach is done.
+    #: The operational statement of "centred over the pad", and strict: the
+    #: mission must land on the centre of the marker, not merely on the pad.
+    #: The previous 0.13 m let the gate open on the first cycle with a residual
+    #: of 0.06-0.13 m (median 0.11 m over 18 logged landings), so the PD's own
+    #: ``centering_tolerance_m`` never acted. With the staged descent
+    #: (``visual_descent_enabled``) the error is also tracked down to
+    #: ``commit_height_m`` instead of being frozen at the gate.
     #:
     #: Safe envelope: at or above :attr:`centering_tolerance_m`.
-    landing_radius_m: float = 0.13
+    landing_radius_m: float = 0.06
+    #: Horizontal distance from the CoG to the camera lens, positive with the
+    #: lens ahead of the CoG, metres.
+    #:
+    #: The marker projection resolves the error at the lens; without this
+    #: vector the law centres the lens over the marker and leaves the CoG
+    #: behind it. 0.04 m keeps the camera lens looking directly over the
+    #: marker center with the white border centered in the FOV, maximizing
+    #: marker detection margin and preventing quiet zone clipping at low altitude.
+    #:
+    #: Safe envelope: ``|offset| <= 0.3``.
+    camera_offset_forward_m: float = 0.04
+    #: Horizontal distance from the CoG to the lens, positive with the lens to
+    #: the left, metres. Zero: the camera sits on the hull's centreline.
+    #:
+    #: Safe envelope: ``|offset| <= 0.3``.
+    camera_offset_left_m: float = 0.0
+    #: Fly the marker-tracked staged descent between the centring gate and the
+    #: touchdown (``controllers.precision_descent``). ``False`` restores the
+    #: blind landing from the centring height.
+    visual_descent_enabled: bool = True
+    #: Peak descent speed of the tracked descent, m/s. Safe envelope: ``(0, 0.25]``.
+    descent_speed_mps: float = 0.12
+    #: Radial error that must hold, at residual speed, before the descent
+    #: starts, metres. Safe envelope: at or above :attr:`centering_tolerance_m`.
+    descent_gate_radius_m: float = 0.05
+    #: The descent pauses and realigns when the error exceeds
+    #: ``descent_gate_radius_m`` times this factor.
+    descent_hysteresis: float = 1.5
+    #: Height over the marker from which the touchdown is flown blind, metres.
+    #: Safe envelope: ``[0.20, 0.80]``.
+    commit_height_m: float = 0.40
+    #: Radial error required at the commit height, metres.
+    commit_radius_m: float = 0.05
+    #: Height under which the horizontal correction is scaled down: the rotor
+    #: wash reflected by the ground amplifies every correction, metres.
+    ground_effect_height_m: float = 0.60
+    #: Scale of the horizontal correction under ``ground_effect_height_m``.
+    ground_effect_gain_scale: float = 0.6
+    #: Marker loss tolerated during the descent before it realigns (above the
+    #: commit band) or commits (inside it), seconds.
+    descent_marker_lost_hold_sec: float = 0.6
+    #: Bound on the tracked descent, seconds; reaching it commits the touchdown.
+    descent_timeout_sec: float = 20.0
     #: Consecutive cycles inside :attr:`landing_radius_m` *at residual speed*
     #: required before the landing is authorized. A single sample inside the
     #: radius is satisfied by a drone flying through it at speed; two
@@ -1165,7 +1249,7 @@ class InspectionConfig:
 
     settle_window_sec: float = 1.00
     settle_min_samples: int = 5
-    settle_max_speed_mps: float = 0.03
+    settle_max_speed_mps: float = 0.05
     settle_max_position_sigma_m: float = 0.04
     #: Ceiling on the mean absolute commanded vertical speed tolerated during
     #: the stillness window, in the same normalized units
@@ -1228,7 +1312,7 @@ class TimeoutsConfig:
     #: have ended in a timeout indistinguishable from the centering deadlock it
     #: was just fixed for. 110 s covers 16.5 m of approach plus the centering
     #: and nadir settling either side of it.
-    tracking_timeout_sec: float = 110.0
+    tracking_timeout_sec: float = 15.0
     target_recovery_timeout_sec: float = 4.0
     odometry_heartbeat_timeout_sec: float = 3.0
     #: Frame-heartbeat age at which the camera stream counts as lost and
@@ -1270,6 +1354,17 @@ class BatteryConfig:
     #: only: the two languages cannot share the constant, so a change on either
     #: side must be replicated on the other.
     land_pct: float = 20.0
+    #: Whether the critical-charge return and the pre-flight charge gate act.
+    #:
+    #: Sent by the station as ``battery.enabled`` with every launch and, in
+    #: flight, on ``/bebop/mission/battery_failsafe``. ``False`` disables the
+    #: return, the Stage 1 refusal and the unknown-charge standby rule; the
+    #: informative 10 % warning (``mission.battery_warning``) is still emitted,
+    #: since it neither blocks nor triggers anything. A return already started
+    #: is never cancelled by switching it off. Validated by
+    #: ``telemetry.battery.normalize_enabled``, which also accepts the strings
+    #: ``"true"``/``"false"`` a hand-edited document may carry.
+    enabled: bool = True
 
 
 @dataclass
@@ -1418,6 +1513,71 @@ class PlatformConfig:
 
 
 @dataclass
+class TranslationHoldConfig:
+    """Retention of the axis orthogonal to a translational leg (``controllers.cross_axis_hold``).
+
+    With ``pitch = 0`` commanded on a lateral leg the firmware does not hold
+    position on the forward axis: wind, thrust asymmetry and trim error become
+    a diagonal drift. While the main axis is commanded, the orthogonal axis
+    receives ``-(kp_velocity * v + ki * integral(v))`` of its own measured body
+    velocity, saturated at ``max_correction``. Starting points calibrated on a
+    first-order plant (D14); the field values come from check F-E.
+    """
+
+    enabled: bool = True
+    #: Normalized correction per m/s of orthogonal velocity.
+    kp_velocity: float = 0.4
+    #: Normalized correction per metre of integrated orthogonal displacement.
+    #: 1.0 rather than the 0.1 first proposed: at 0.1 a constant 0.02 m/s
+    #: crosswind still leaves 63 % of the uncorrected 5 s drift, against the
+    #: 25 % acceptance; at 1.0 it leaves 21 % (``test_cross_axis_hold``).
+    ki: float = 1.0
+    #: Correction ceiling, normalized: three quanta of the driver's 0.01.
+    max_correction: float = 0.03
+    #: Main-axis command below which the law is inactive (hover holds itself).
+    min_active_speed: float = 0.03
+    #: Heading hold on the lateral cruise. Off: a yaw rate corrupts the
+    #: optical-flow odometry; enable only after check F-E measures heading drift.
+    heading_hold_enabled: bool = False
+    #: Normalized yaw rate per radian of heading error.
+    heading_kp: float = 0.6
+    #: Yaw ceiling of the heading hold, normalized.
+    heading_max_vyaw: float = 0.04
+    #: Heading error inside which no yaw is commanded, degrees.
+    heading_deadband_deg: float = 1.5
+
+
+@dataclass
+class NudgeConfig:
+    """Operator keyboard nudge (``actuators.nudge_overlay``), normalized to the driver's ``[-1, 1]``.
+
+    An additive overlay on the autonomous command with its own ceilings, ramps
+    and deadman; it never interrupts the mission. Active in Stages 2 to 5 after
+    the takeoff completes, suspended during the precision landing and in any
+    emergency; Stage 4 per ``allow_in_inspection``.
+    """
+
+    enabled: bool = True
+    #: Ceiling of the horizontal nudge, as a vector.
+    max_horizontal: float = 0.08
+    #: Ceiling of the yaw nudge.
+    max_vyaw: float = 0.15
+    #: Ramp from zero to the ceiling, seconds.
+    attack_sec: float = 0.25
+    #: Ramp from the ceiling to zero, seconds.
+    release_sec: float = 0.15
+    #: Silence from the station after which the intent is taken as released.
+    deadman_sec: float = 0.35
+    #: Nudge allowed during the Stage 4 inspection; the capture still waits
+    #: for the keys to be released.
+    allow_in_inspection: bool = True
+    #: Nudge allowed during the precision landing (centering, descent, touchdown).
+    allow_in_precision_landing: bool = False
+    #: Heading the nudge may accumulate in one direction, degrees.
+    yaw_budget_deg: float = 45.0
+
+
+@dataclass
 class YawPatternConfig:
     """Yaw laws of the Simple mission profile (``mission_mode == "simple"``).
 
@@ -1428,11 +1588,10 @@ class YawPatternConfig:
     none of them is an operator parameter.
     """
 
-    #: Yaw command of the Stage 2 scan, normalized. 0.15 is roughly 15 deg/s:
-    #: slow enough that the detector, which runs near 10 Hz, sees every
-    #: bearing for several frames, and one full turn takes about 24 s, inside
-    #: the default ``timeouts.search_timeout_sec`` of 30 s.
-    scan_vyaw: float = 0.15
+    #: Yaw command of the Stage 2 scan, normalized. 0.08 is roughly 8 deg/s:
+    #: slow and subtle so the detector sees every bearing calmly without
+    #: jerking or overshooting the target.
+    scan_vyaw: float = 0.08
     #: Slew limit of the scan command, normalized units per second. Bounds the
     #: angular acceleration so the camera does not smear on the start and stop.
     scan_ramp_per_sec: float = 0.30
@@ -1440,20 +1599,20 @@ class YawPatternConfig:
     #: other yaw magnitude in this section.
     max_vyaw: float = 0.30
     #: Stage 3 yaw PID on the normalized horizontal pixel error.
-    kp: float = 0.45
+    kp: float = 0.14
     ki: float = 0.0
-    kd: float = 0.03
-    #: Output saturation of the Stage 3 PID, normalized.
-    pid_output_limit: float = 0.25
+    kd: float = 0.02
+    #: Output saturation of the Stage 3 PID, normalized. Caps fine centering adjustments.
+    pid_output_limit: float = 0.055
     #: Output deadband of the Stage 3 PID, normalized.
     deadband: float = 0.01
     #: Smallest yaw command the airframe reproduces; sub-floor demands are
     #: duty-cycled by ``QuantizedCommandShaper`` rather than raised to the floor.
-    min_effective_vyaw: float = 0.05
+    min_effective_vyaw: float = 0.02
     #: Driver quantization step (``int8(v * 100)``).
     quantization_step: float = 0.01
     #: Rate at which Stage 3 searches toward the side the target left from.
-    reacquire_vyaw: float = 0.08
+    reacquire_vyaw: float = 0.050
     #: Heading restore (end of Stage 4): proportional and derivative gains on
     #: the wrapped heading error in radians.
     return_kp: float = 0.50
@@ -1494,6 +1653,8 @@ class MissionParameters:
     platform: PlatformConfig = field(default_factory=PlatformConfig)
     mission_mode: str = "advanced"
     yaw_pattern: YawPatternConfig = field(default_factory=YawPatternConfig)
+    translation_hold: TranslationHoldConfig = field(default_factory=TranslationHoldConfig)
+    nudge: NudgeConfig = field(default_factory=NudgeConfig)
     no_fly: bool = False
     output_dir: str = "."
 

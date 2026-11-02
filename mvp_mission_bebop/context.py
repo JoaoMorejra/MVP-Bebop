@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from mvp_mission_bebop.controllers.yaw_pattern import YawServoingController
     from mvp_mission_bebop.perception.inspection_worker import InspectionInferenceWorker
 
+from mvp_mission_bebop.actuators.nudge_overlay import NudgeOverlay
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.blackboard import EvidenceRecord, MissionBlackboard
 from mvp_mission_bebop.controllers.anti_climb import AltitudeAntiClimbGovernor
@@ -35,8 +36,10 @@ from mvp_mission_bebop.controllers.visual_servoing import VisualServoingControll
 from mvp_mission_bebop.engine.stage_gate import refuse_stage_request, stage_lock
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
+from mvp_mission_bebop.estimation.target_selector import TargetSelector
 from mvp_mission_bebop.mission_mode import DEFAULT_MODE, parse_mission_mode
 from mvp_mission_bebop.parameters import MissionParameters
+from mvp_mission_bebop.perception.classes import display_class_name, is_accident_class, is_victim_class
 from mvp_mission_bebop.perception.summary import encode_detection_summary
 from mvp_mission_bebop.perception.worker import (
     PerceptionPipeline,
@@ -170,6 +173,12 @@ class MissionContext:
         self.entered_by_jump: bool = False
         self.start_time: float = time.time()
         self.blackboard = MissionBlackboard()
+        #: Persistent target selection shared by Stages 2 to 4, so the track
+        #: identity survives the stage boundaries. ``None`` when the vision
+        #: configuration is invalid: the steps then fall back to the most
+        #: confident detection of each frame.
+        self.target_selector: Optional[TargetSelector] = self._build_target_selector(parameters)
+        self.nudge: Optional[Any] = None
 
         # Single source of truth for the normalized-command to m/s conversion.
         # Guidance laws work in physical units; this is the only place the two
@@ -194,6 +203,14 @@ class MissionContext:
         #: its own detector. Started by ``mission.py``; ``None`` in unit
         #: doubles, where the capture then submits nothing.
         self.inspection_worker: Optional["InspectionInferenceWorker"] = None
+
+    @staticmethod
+    def _build_target_selector(parameters: MissionParameters) -> Optional[TargetSelector]:
+        try:
+            return TargetSelector(parameters.vision)
+        except (TypeError, ValueError) as exc:
+            logger.error("Target selector unavailable (%s); selecting the most confident detection.", exc)
+            return None
 
     # -------------------------------------------------------------- estimation
 
@@ -493,40 +510,39 @@ class MissionContext:
 
     @staticmethod
     def _result_for_annotation(result: Any) -> Any:
-        """Clone detection result replacing 'motorcycle' and 'bicycle' with 'acidente' for visual display."""
+        """Clone a detection result with the labels the station shows.
+
+        Every accident class reads ``Acidente`` and a person ``Vitima``
+        (``perception/classes.py:display_class_name``); other classes and the
+        result itself are left untouched.
+        """
         if result is None:
             return None
-        detections = getattr(result, "detections", None)
-        if detections is not None:
-            has_target = any(
-                getattr(d, "class_name", "").lower() in ("motorcycle", "bicycle", "bycicle")
-                for d in detections
-            )
-            if not has_target:
-                return result
+
+        def shown(detection: Any) -> bool:
+            name = getattr(detection, "class_name", "")
+            return is_accident_class(name) or is_victim_class(name)
+
+        def relabel(detections: Any) -> List[Any]:
             cloned = []
             for d in detections:
-                cname = getattr(d, "class_name", "")
-                if cname.lower() in ("motorcycle", "bicycle", "bycicle"):
+                if shown(d):
                     d_copy = copy.copy(d)
-                    d_copy.class_name = "acidente"
-                    cloned.append(d_copy)
-                else:
-                    cloned.append(d)
-            res_copy = copy.copy(result)
-            res_copy.detections = cloned
-            return res_copy
-        if isinstance(result, list):
-            cloned = []
-            for d in result:
-                cname = getattr(d, "class_name", "")
-                if cname.lower() in ("motorcycle", "bicycle", "bycicle"):
-                    d_copy = copy.copy(d)
-                    d_copy.class_name = "acidente"
+                    d_copy.class_name = display_class_name(getattr(d, "class_name", ""))
                     cloned.append(d_copy)
                 else:
                     cloned.append(d)
             return cloned
+
+        detections = getattr(result, "detections", None)
+        if detections is not None:
+            if not any(shown(d) for d in detections):
+                return result
+            res_copy = copy.copy(result)
+            res_copy.detections = relabel(detections)
+            return res_copy
+        if isinstance(result, list):
+            return relabel(result)
         return result
 
     def publish_annotated_stream(
@@ -555,23 +571,10 @@ class MissionContext:
                 thickness=2,
                 text_scale=0.6,
             )
+            if annotated is frame:
+                annotated = frame.copy()
         else:
             annotated = frame.copy()
-
-        cx_int = int(self.frame_center_x)
-        cy_int = int(self.frame_center_y)
-        cv2.drawMarker(annotated, (cx_int, cy_int), (0, 255, 255), cv2.MARKER_CROSS, 20, 1)
-        cv2.rectangle(annotated, (10, 10), (self.frame_width - 10, 48), (20, 20, 20), -1)
-        cv2.putText(
-            annotated,
-            status_text,
-            (20, 36),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
 
         try:
             ros_img = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")

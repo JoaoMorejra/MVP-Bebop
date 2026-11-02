@@ -113,3 +113,19 @@ def test_a_mismatched_pair_fails_closed():
         _vz, vyaw = supervisor.clamp_kinematics(0.0, 0.2)
         proxy.move_velocity(vyaw=vyaw)
     assert raw.calls[-1][3] == 0.0
+
+
+def test_the_heading_hold_window_is_scoped_like_the_yaw_window():
+    authority = YawAuthority()
+    supervisor = failsafe(authority)
+    proxy = BenchtopDroneProxy(RawDrone(), yaw_authority=authority)
+
+    assert supervisor.clamp_kinematics(0.0, 0.03)[1] == 0.0
+    with supervisor.heading_hold_window(0.04):
+        assert supervisor.clamp_kinematics(0.0, 0.03)[1] == pytest.approx(0.03)
+        assert supervisor.clamp_kinematics(0.0, 0.10)[1] == pytest.approx(0.04)
+        proxy.move_velocity(vyaw=0.03)
+    assert supervisor.clamp_kinematics(0.0, 0.03)[1] == 0.0
+    proxy.move_velocity(vyaw=0.03)
+    assert proxy.drone.calls[0][3] == pytest.approx(0.03)
+    assert proxy.drone.calls[1][3] == 0.0

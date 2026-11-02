@@ -126,13 +126,12 @@ def audit_safe_envelopes(
     rtl, timeouts = params.rtl, params.timeouts
 
     nadir = _real(gimbal.nadir_tilt_deg)
-    search = _real(gimbal.search_tilt_deg)
-    if nadir is None or nadir < -90.0 or (search is not None and nadir >= search):
+    if nadir is None or not (-90.0 <= nadir <= 20.0):
         diverge(
             "gimbal.nadir_tilt_deg",
             gimbal.nadir_tilt_deg,
-            f"[-90, search_tilt_deg={gimbal.search_tilt_deg})",
-            "the Stage 4 gimbal framing cannot reach its steepest tilt",
+            "[-90, 20]",
+            "the Stage 4 gimbal framing setpoint lies outside physical mechanical limits",
         )
 
     target = _real(kinematics.target_altitude_m)
@@ -251,6 +250,61 @@ def audit_safe_envelopes(
             rtl.centering_timeout_sec,
             "> 0",
             "the marker centering ends before its first cycle, or its deadline raises in flight",
+        )
+
+    climb_kp = _real(kinematics.climb_position_kp)
+    if climb_kp is None or not 0.0 < climb_kp <= 4.0:
+        diverge(
+            "kinematics.climb_position_kp",
+            kinematics.climb_position_kp,
+            "(0, 4]",
+            "the closed-loop climb has no position authority, or oscillates against the vertical lag",
+        )
+
+    climb_lag = _real(kinematics.climb_lag_sec)
+    if climb_lag is None or not 0.0 <= climb_lag <= 1.0:
+        diverge(
+            "kinematics.climb_lag_sec",
+            kinematics.climb_lag_sec,
+            "[0, 1]",
+            "the climb lead no longer matches the airframe's vertical lag",
+        )
+
+    for name in ("camera_offset_forward_m", "camera_offset_left_m"):
+        offset = _real(getattr(rtl, name))
+        if offset is None or abs(offset) > 0.3:
+            diverge(
+                f"rtl.{name}",
+                getattr(rtl, name),
+                "|offset| <= 0.3",
+                "a camera-to-body offset larger than the airframe is a unit error",
+            )
+
+    commit = _real(rtl.commit_height_m)
+    if commit is None or not 0.20 <= commit <= 0.80:
+        diverge(
+            "rtl.commit_height_m",
+            rtl.commit_height_m,
+            "[0.20, 0.80]",
+            "the blind touchdown starts too low for the ground effect or too high to stay on the pad",
+        )
+
+    descent_speed = _real(rtl.descent_speed_mps)
+    if descent_speed is None or not 0.0 < descent_speed <= 0.25:
+        diverge(
+            "rtl.descent_speed_mps",
+            rtl.descent_speed_mps,
+            "(0, 0.25]",
+            "the tracked descent outruns the marker detection",
+        )
+
+    gate = _real(rtl.descent_gate_radius_m)
+    if gate is None or (tolerance is not None and gate < tolerance):
+        diverge(
+            "rtl.descent_gate_radius_m",
+            rtl.descent_gate_radius_m,
+            f">= centering_tolerance_m={rtl.centering_tolerance_m}",
+            "the descent waits on a radius tighter than the centering law converges to",
         )
 
     video = _real(timeouts.video_stream_timeout_sec)

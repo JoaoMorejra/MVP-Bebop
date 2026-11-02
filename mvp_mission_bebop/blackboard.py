@@ -78,3 +78,13 @@ class MissionBlackboard:
     #: ``False`` commanded but unconfirmed, ``None`` when no touchdown ran. Drives
     #: the exit status (``engine.exit_codes``).
     touchdown_confirmed: Optional[bool] = None
+    #: The aircraft reported a landing flying state (4 or 8); written by the
+    #: flying-state callback in ``mission.py``.
+    landing_started: bool = False
+    #: Set on entry to the Stage 5 marker centering and held to the end of the
+    #: step: the precision landing (centering, tracked descent, touchdown).
+    #: Read by the keyboard nudge permit, which suspends the overlay here.
+    precision_landing_active: bool = False
+    #: Set by Stage 4 around the evidence capture: the nudge is ramped to zero
+    #: and the photograph waits for it, so no capture is taken mid-nudge.
+    nudge_suspended: bool = False

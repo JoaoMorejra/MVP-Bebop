@@ -6,6 +6,8 @@ import logging
 import time
 from typing import Any, Callable, Final, FrozenSet, Optional, Protocol
 
+from mvp_mission_bebop.actuators.cadence import CommandCadenceMonitor
+from mvp_mission_bebop.actuators.nudge_overlay import NudgeOverlay
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
 from mvp_mission_bebop.actuators.yaw_authority import YawAuthority
 from mvp_mission_bebop.estimation.dead_reckoning import DeadReckoningTracker
@@ -97,6 +99,8 @@ class BenchtopDroneProxy:
         motion_tracker: Optional[DeadReckoningTracker] = None,
         yaw_authority: Optional[YawAuthority] = None,
         vertical_command_listener: Optional[Callable[[float], None]] = None,
+        cadence: Optional[CommandCadenceMonitor] = None,
+        nudge_overlay: Optional[NudgeOverlay] = None,
     ) -> None:
         self._no_fly: bool = bool(no_fly)
         self.yaw_authority: YawAuthority = yaw_authority if yaw_authority is not None else YawAuthority()
@@ -115,6 +119,11 @@ class BenchtopDroneProxy:
         self.vertical_command_listener = vertical_command_listener
         #: Whether :meth:`connect` found the driver; ``None`` before it ran.
         self.driver_reachable: Optional[bool] = None
+        #: Interval between transmitted commands: the effective control period
+        #: of every stage, including those that report no cadence of their own.
+        self.cadence: CommandCadenceMonitor = cadence if cadence is not None else CommandCadenceMonitor()
+        #: Operator keyboard overlay.
+        self.nudge: Optional[NudgeOverlay] = nudge_overlay
 
     @property
     def no_fly(self) -> bool:
@@ -223,6 +232,15 @@ class BenchtopDroneProxy:
                 allowed,
             )
             vyaw = allowed
+
+        if self.nudge is not None:
+            vx, vy, vyaw = self.nudge.apply(vx, vy, vyaw)
+
+        try:
+            self.cadence.note(vx, vy, vz, vyaw)
+            self.cadence.maybe_log(logger)
+        except Exception as exc:  # noqa: BLE001 - instrumentation never blocks a command
+            logger.debug("Command cadence monitor failed: %s", exc)
 
         if self.motion_tracker is not None:
             self.motion_tracker.command(vx=vx, vy=vy, vz=vz, vyaw=vyaw, duration=duration)

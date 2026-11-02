@@ -48,6 +48,19 @@ TILT = -80.0
 # ══════════════════════════════════════════════════════════ geometry helpers
 
 
+
+@pytest.fixture(autouse=True)
+def _lens_frame_centering(monkeypatch):
+    """Pin the centering law in the lens frame (camera-to-CoG offset zero).
+
+    These tests simulate the marker relative to the camera and exercise the
+    law's dynamics, gates and recovery; the camera-to-CoG extrinsic that
+    shifts the equilibrium is covered by ``test_camera_extrinsics.py``.
+    """
+    from mvp_mission_bebop.controllers import rtl_guidance as _rtl_guidance
+
+    monkeypatch.setattr(_rtl_guidance, "_camera_offset", lambda _cfg, _name: 0.0)
+
 def pad_to_camera(
     ex_body_m: float, ey_body_m: float, altitude_m: float, tilt_deg: float = TILT
 ) -> Tuple[float, float, float]:
@@ -1146,6 +1159,10 @@ def test_a_search_that_finds_nothing_still_lands():
 def test_sighting_the_marker_leads_to_centering_and_a_landing():
     ctx = Ctx(altitude=0.30)
     ctx.params.rtl.timeout_sec = 4.0
+    # The strict 0.06 m gate (D9) is reached on the sigma-delta tail of the
+    # law, which this 200 Hz plant integrates in real time: the window is
+    # sized for that tail rather than for the first entry into a loose gate.
+    ctx.params.rtl.centering_timeout_sec = 15.0
     sensor = ScriptedSensor(ctx.drone, acquire_after=3, ex=0.35, ey=-0.25)
 
     status = ClosedLoopRTLStep(sensor=sensor).execute(ctx)
@@ -1942,6 +1959,28 @@ def test_no_marker_means_no_geometry():
     assert ArucoMarkerSensor(Blind(), target_id=7, backend="solvepnp").overlay_geometry(_np.zeros((4, 4, 3))) == []
 
 
+def test_overlay_geometry_reuses_observe_without_second_detect():
+    import numpy as _np
+
+    from mvp_mission_bebop.steps.rtl import ArucoMarkerSensor
+
+    detector = FakeDetectDetector(marker_id=7, centre=(428.0, 240.0), half_px=40.0)
+    sensor = ArucoMarkerSensor(detector, target_id=7, annotate=False, backend="solvepnp")
+    frame = _np.zeros((480, 856, 3), dtype=_np.uint8)
+
+    obs = sensor.observe(frame)
+    assert obs is not None
+    assert len(detector.drawn) == 1
+
+    markers = sensor.overlay_geometry(frame)
+    assert len(detector.drawn) == 1, "overlay_geometry ran a redundant second detect()"
+    assert len(markers) == 1 and markers[0]["id"] == 7
+
+    wrong = ArucoMarkerSensor(detector, target_id=99, annotate=False, backend="solvepnp")
+    assert wrong.observe(frame) is None
+    assert wrong.overlay_geometry(frame) == []
+
+
 # ------------------------------------------------- P1 hooks for the takeoff pad (2.9)
 
 
@@ -2198,3 +2237,57 @@ def test_a_sustained_re_entry_climb_still_lands_the_aircraft_after_the_grace():
     assert status is StepStatus.FAILURE
     assert ctx.failsafe_reasons == ["Altitude ceiling breached during RTL."]
     assert min(ctx.vertical) < -0.10, "the breach never commanded the guard descent"
+
+
+def test_marker_detection_time_is_measured():
+    import time as _time
+
+    import numpy as _np
+
+    from mvp_mission_bebop.steps.rtl import ArucoMarkerSensor
+
+    class SlowDetector:
+        tag_size = 0.20
+
+        def pose_estimate(self, img, draw=False):
+            _time.sleep(0.02)
+            return None, None, None
+
+    sensor = ArucoMarkerSensor(SlowDetector(), target_id=8, backend="sdk")
+    frame = _np.zeros((480, 856, 3), dtype=_np.uint8)
+    for _ in range(5):
+        sensor.observe(frame)
+    diagnostics = sensor.diagnostics()
+    assert diagnostics["detect_ms_p50"] >= 20.0
+    assert diagnostics["detect_ms_p95"] >= diagnostics["detect_ms_p50"]
+    assert "detect_ms p50" in sensor.diagnostics_line()
+
+
+def test_the_precision_landing_flag_is_raised_on_entry_to_the_centering():
+    ctx = Ctx(altitude=0.30)
+    ctx.params.rtl.timeout_sec = 4.0
+    ctx.params.rtl.centering_timeout_sec = 0.3
+    ctx.blackboard.precision_landing_active = False
+    sensor = ScriptedSensor(ctx.drone, acquire_after=3, ex=0.35, ey=-0.25)
+
+    ClosedLoopRTLStep(sensor=sensor).execute(ctx)
+
+    assert ctx.blackboard.precision_landing_active is True
+
+
+def test_the_centering_frame_wait_is_bounded_by_the_control_period():
+    ctx = Ctx(altitude=0.30)
+    ctx.params.rtl.centering_timeout_sec = 0.5
+    waits = []
+
+    def grab_frame(timeout_sec=1.0):
+        waits.append(timeout_sec)
+        return object()
+
+    ctx.grab_frame = grab_frame
+    sensor = ScriptedSensor(ctx.drone, acquire_after=0, ex=0.30, ey=0.0)
+    centering = ArucoCenteringController(ctx.params.rtl, FlightKinematicsConfig(), SpeedCalibration(1.0))
+    ClosedLoopRTLStep(sensor=sensor)._center_over_marker(ctx, centering, sensor)
+
+    period = 1.0 / ctx.params.kinematics.control_loop_hz
+    assert waits and max(waits) <= period + 0.05

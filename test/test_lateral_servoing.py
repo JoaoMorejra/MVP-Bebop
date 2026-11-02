@@ -314,3 +314,120 @@ def test_reset_returns_to_centering():
     command = observe(controller, CENTER_X)
     assert not command.locked, "reset must also clear the centring credit"
     assert command.phase is TrackingPhase.CENTERING
+
+
+def test_alternating_confidences_do_not_flip_the_servoed_target():
+    """Two accident boxes trade the higher confidence every frame for 60 frames.
+
+    Per-frame ``max(confidence)`` would swing the servo between them; the
+    persistent selector keeps the first one and the centre handed to the law
+    neither changes side nor jumps.
+    """
+    import numpy as np
+    from nectar.ai.detection.core.types import Detection
+
+    from mvp_mission_bebop.estimation.target_selector import TargetSelector
+    from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker
+    from mvp_mission_bebop.steps.tracking import VisualServoingStep
+
+    def box(cx, conf):
+        return Detection(xyxy=np.array([cx - 40, 200, cx + 40, 280], dtype=float), confidence=conf, class_id=3, class_name="motorcycle")
+
+    selector = TargetSelector(VisionConfig())
+    tracker = ConstantVelocityTracker()
+    centres = []
+    for k in range(60):
+        high, low = (0.80, 0.60) if k % 2 else (0.60, 0.80)
+        centre, measured = VisualServoingStep._resolve_target(
+            [box(250.0, high), box(620.0, low)], tracker, 1.0 / 15.0, (856, 480), selector=selector
+        )
+        assert measured
+        centres.append(centre[0])
+    sides = [c < 428.0 for c in centres]
+    assert sum(1 for a, b in zip(sides, sides[1:]) if a != b) == 0
+    assert max(abs(b - a) for a, b in zip(centres, centres[1:])) <= 15.0
+
+
+def test_victim_detections_are_never_centered() -> None:
+    """Victim classes (person, pessoa, vitima) must never be centered by the servo."""
+    import numpy as np
+    from nectar.ai.detection.core.types import Detection
+    from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker
+    from mvp_mission_bebop.steps.tracking import VisualServoingStep
+
+    tracker = ConstantVelocityTracker()
+    victim_det = Detection(
+        xyxy=np.array([200, 200, 280, 280], dtype=float),
+        confidence=0.92,
+        class_id=0,
+        class_name="person",
+    )
+    centre, measured = VisualServoingStep._resolve_target(
+        [victim_det], tracker, dt=0.1, frame_dimensions=(856, 480), selector=None
+    )
+    assert centre is None
+    assert not measured
+
+
+def test_accident_is_strictly_prioritized_over_victim() -> None:
+    """Accident classes (motorcycle, bicycle, acidente) outrank any victim detection."""
+    import numpy as np
+    from nectar.ai.detection.core.types import Detection
+    from mvp_mission_bebop.estimation.target_tracker import ConstantVelocityTracker
+    from mvp_mission_bebop.steps.tracking import VisualServoingStep
+
+    tracker = ConstantVelocityTracker()
+    victim_det = Detection(
+        xyxy=np.array([100, 200, 180, 280], dtype=float),
+        confidence=0.95,
+        class_id=0,
+        class_name="person",
+    )
+    accident_det = Detection(
+        xyxy=np.array([500, 200, 580, 280], dtype=float),
+        confidence=0.45,
+        class_id=3,
+        class_name="motorcycle",
+    )
+    centre, measured = VisualServoingStep._resolve_target(
+        [victim_det, accident_det], tracker, dt=0.1, frame_dimensions=(856, 480), selector=None
+    )
+    assert measured
+    assert centre is not None
+    # Must follow the accident at x=540, not the victim at x=140
+    assert centre[0] == pytest.approx(540.0, abs=15.0)
+
+
+def test_visual_servoing_slew_rate_limits_demand_jerk() -> None:
+    """Step change in target centroid is ramped smoothly, eliminating sudden kicks."""
+    from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
+    from mvp_mission_bebop.parameters import (
+        FlightKinematicsConfig,
+        GimbalConstraintsConfig,
+        GimbalPIDConfig,
+        LateralPIDConfig,
+        VisionConfig,
+    )
+
+    ctrl = VisualServoingController(
+        gimbal_config=GimbalConstraintsConfig(),
+        gimbal_pid_cfg=GimbalPIDConfig(),
+        lateral_pid_cfg=LateralPIDConfig(kp=0.18, output_limits=(-0.04, 0.04)),
+        vision_cfg=VisionConfig(),
+        kinematics_cfg=FlightKinematicsConfig(),
+    )
+    dt = 0.05
+    # First cycle with large offset (err_x = 200 px)
+    cmd1 = ctrl.compute(
+        target_center=(628.0, 240.0),
+        frame_dimensions=(856, 480),
+        current_tilt_deg=-18.0,
+        relative_altitude_m=1.0,
+        dt=dt,
+        measured=True,
+        airframe_at_rest=True,
+    )
+    # The max demand change in 0.05s at 0.15/s slew is 0.0075.
+    # It must not jump immediately to the -0.04 limit!
+    assert abs(ctrl._last_vy_demand) <= 0.15 * dt + 1e-6
+    assert abs(cmd1.vy) <= 0.04

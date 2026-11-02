@@ -35,6 +35,19 @@ CENTER_X, CENTER_Y = WIDTH / 2.0, HEIGHT / 2.0
 SEARCH_TILT_DEG = -20.0
 
 
+
+@pytest.fixture(autouse=True)
+def _lens_frame_centering(monkeypatch):
+    """Pin the centering law in the lens frame (camera-to-CoG offset zero).
+
+    These tests simulate the marker relative to the camera and exercise the
+    law's dynamics, gates and recovery; the camera-to-CoG extrinsic that
+    shifts the equilibrium is covered by ``test_camera_extrinsics.py``.
+    """
+    from mvp_mission_bebop.controllers import rtl_guidance as _rtl_guidance
+
+    monkeypatch.setattr(_rtl_guidance, "_camera_offset", lambda _cfg, _name: 0.0)
+
 def build_controller(**vision_overrides):
     vision = VisionConfig(**vision_overrides)
     return VisualServoingController(

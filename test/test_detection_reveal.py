@@ -245,7 +245,7 @@ def test_takeoff_and_search_run_behind_a_closed_reveal():
 def test_result_for_annotation_maps_bicycle_and_motorcycle_to_acidente():
     res = target_result()  # has class_name="bicycle"
     adapted = MissionContext._result_for_annotation(res)
-    assert adapted.detections[0].class_name == "acidente"
+    assert adapted.detections[0].class_name == "Acidente"
     # Original should be untouched
     assert res.detections[0].class_name == "bicycle"
 
@@ -253,6 +253,14 @@ def test_result_for_annotation_maps_bicycle_and_motorcycle_to_acidente():
     det_moto = Detection(xyxy=np.array(BBOX, dtype=float), confidence=0.9, class_id=3, class_name="motorcycle")
     res_moto = DetectionResult([det_moto])
     adapted_moto = MissionContext._result_for_annotation(res_moto)
-    assert adapted_moto.detections[0].class_name == "acidente"
+    assert adapted_moto.detections[0].class_name == "Acidente"
     assert res_moto.detections[0].class_name == "motorcycle"
+
+
+def test_result_for_annotation_maps_a_person_to_vitima():
+    person = Detection(xyxy=np.array(BBOX, dtype=float), confidence=0.8, class_id=0, class_name="person")
+    car = Detection(xyxy=np.array(BBOX, dtype=float), confidence=0.7, class_id=2, class_name="car")
+    adapted = MissionContext._result_for_annotation(DetectionResult([person, car]))
+    assert [d.class_name for d in adapted.detections] == ["Vitima", "car"]
+    assert person.class_name == "person"
 

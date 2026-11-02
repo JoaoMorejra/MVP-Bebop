@@ -108,6 +108,20 @@ class LoopRate:
             f"{self._overruns} overruns ({share:.1f}%)"
         )
 
+    def remaining_sec(self) -> float:
+        """Time left in the current period, without sleeping.
+
+        A loop that waits on I/O before its :meth:`tick` (a frame grab) passes
+        this as the wait's timeout, so the wait never stretches the period the
+        command is sent at.
+
+        Returns
+        -------
+        float
+            ``period - (now - last tick)``, floored at zero.
+        """
+        return max(0.0, self._period - (self._clock() - self._last_tick))
+
     def reset(self) -> None:
         """Re-anchor the pacer to now, discarding any accumulated lateness."""
         self._last_tick = self._clock()

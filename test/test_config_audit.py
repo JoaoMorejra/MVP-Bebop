@@ -63,8 +63,7 @@ def test_the_shipped_defaults_are_inside_every_envelope():
     "section, field, value",
     [
         ("gimbal", "nadir_tilt_deg", -95.0),
-        ("gimbal", "nadir_tilt_deg", -20.0),
-        ("gimbal", "nadir_tilt_deg", -10.0),
+        ("gimbal", "nadir_tilt_deg", 25.0),
         ("kinematics", "target_altitude_m", 0.30),
         ("kinematics", "target_altitude_m", 0.10),
         ("kinematics", "altitude_ceiling_margin_m", 0.0),
@@ -84,6 +83,16 @@ def test_the_shipped_defaults_are_inside_every_envelope():
         ("rtl", "centering_timeout_sec", 0.0),
         ("rtl", "centering_timeout_sec", -5.0),
         ("rtl", "centering_timeout_sec", float("nan")),
+        ("kinematics", "climb_position_kp", 0.0),
+        ("kinematics", "climb_position_kp", 4.5),
+        ("kinematics", "climb_lag_sec", -0.1),
+        ("kinematics", "climb_lag_sec", 1.5),
+        ("rtl", "camera_offset_forward_m", 0.35),
+        ("rtl", "camera_offset_left_m", -0.4),
+        ("rtl", "commit_height_m", 0.1),
+        ("rtl", "commit_height_m", 0.9),
+        ("rtl", "descent_speed_mps", 0.3),
+        ("rtl", "descent_gate_radius_m", 0.02),
         ("timeouts", "video_stream_timeout_sec", 8.0),
         ("timeouts", "video_stream_timeout_sec", 1.0),
         ("timeouts", "video_stream_timeout_sec", float("nan")),
@@ -144,14 +153,14 @@ def test_a_lifted_ceiling_clears_the_fastest_coupled_cruise():
     assert audit_safe_envelopes(params, accepting) == []
 
 
-@pytest.mark.parametrize("search, nadir", [(0.0, -80.0), (-45.0, -80.0), (0.0, -1.0)])
-def test_the_widened_gimbal_ranges_diverge_only_when_nadir_is_not_below_search(search, nadir):
+@pytest.mark.parametrize("search, nadir", [(0.0, -80.0), (-45.0, -80.0), (0.0, -1.0), (-30.0, -10.0), (-30.0, -30.0)])
+def test_the_widened_gimbal_ranges_accept_upward_downward_and_fixed(search, nadir):
     params = MissionParameters()
     params.gimbal.search_tilt_deg = search
     params.gimbal.nadir_tilt_deg = nadir
     assert audit_safe_envelopes(params, accepting) == []
 
-    params.gimbal.nadir_tilt_deg = search
+    params.gimbal.nadir_tilt_deg = -95.0
     assert paths(audit_safe_envelopes(params, accepting)) == ["gimbal.nadir_tilt_deg"]
 
 
@@ -178,7 +187,7 @@ def test_divergences_are_logged_as_structured_warnings_and_never_raise(records):
     params.update_from_dict(
         {
             "timeouts": {"video_stream_timeout_sec": 8},
-            "gimbal": {"nadir_tilt_deg": -10.0},
+            "gimbal": {"nadir_tilt_deg": -95.0},
         }
     )
 

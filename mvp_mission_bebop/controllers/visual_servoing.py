@@ -216,6 +216,9 @@ class VisualServoingController:
         self._recovery_exhausted = False
         #: Effective tolerance, refreshed from the frame size each cycle.
         self._tolerance_px = vision_cfg.optical_center_tolerance_px
+        #: Slew rate limiter to eliminate abrupt kicks and braking
+        self._max_slew_per_sec: float = 0.15
+        self._last_vy_demand: float = 0.0
 
     # ------------------------------------------------------------- properties
 
@@ -233,6 +236,7 @@ class VisualServoingController:
         """Clear all controller state and return to centering."""
         self._lateral.reset()
         self._lateral_shaper.reset()
+        self._last_vy_demand = 0.0
         self._phase = TrackingPhase.CENTERING
         self._centered_frames = 0
         self._locked = False
@@ -240,6 +244,7 @@ class VisualServoingController:
         self._reacquire_elapsed_sec = 0.0
         self._reacquire_hits = 0
         self._recovery_exhausted = False
+        self._last_vy_demand = 0.0
 
     # ------------------------------------------------------------------ cycle
 
@@ -386,6 +391,14 @@ class VisualServoingController:
                 current_tilt_deg, pixel_error, projection, in_gate, "locked (lateral freeze)"
             )
 
+        # Slew rate limit demand to eliminate abrupt jerky accelerations and braking
+        if dt > 0.0:
+            max_delta = self._max_slew_per_sec * dt
+            delta = vy_demand - self._last_vy_demand
+            if abs(delta) > max_delta:
+                vy_demand = self._last_vy_demand + math.copysign(max_delta, delta)
+        self._last_vy_demand = vy_demand
+
         vy = self._shape_lateral(vy_demand, dt)
         if in_gate and self._centered_frames >= dwell:
             note = "centred, waiting for the airframe to settle"
@@ -418,6 +431,7 @@ class VisualServoingController:
         self._locked = True
         self._lateral.reset()
         self._lateral_shaper.reset()
+        self._last_vy_demand = 0.0
         logger.info(
             "Target centred laterally (err %+.0f px, gate %.0f px, range %s). "
             "Freezing: no further translation until the return leg.",
@@ -490,6 +504,7 @@ class VisualServoingController:
         self._centered_frames = 0
         self._lateral.reset()
         self._lateral_shaper.reset()
+        self._last_vy_demand = 0.0
 
     def note_target_lost(self, current_tilt_deg: float, dt: float) -> ServoCommand:
         """Produce one cycle of recovery when no target could be resolved.

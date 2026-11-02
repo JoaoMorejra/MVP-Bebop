@@ -132,3 +132,16 @@ def test_the_cadence_report_counts_overruns():
 
 def test_the_cadence_report_before_any_tick():
     assert LoopRate(15.0).cadence_report() == "0 cycles at 15.0 Hz target, 0 overruns (0.0%)"
+
+
+def test_remaining_sec_is_the_rest_of_the_period():
+    clock = FakeClock()
+    rate = LoopRate(10.0, clock=clock, sleeper=clock.sleep)
+    rate.tick()
+    assert rate.remaining_sec() == pytest.approx(0.10)
+    clock.advance(0.05)
+    assert rate.remaining_sec() == pytest.approx(0.05)
+    clock.advance(0.2)
+    assert rate.remaining_sec() == 0.0
+    assert rate.ticks == 1
+    assert rate.overruns == 0

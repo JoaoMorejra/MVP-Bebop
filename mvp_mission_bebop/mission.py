@@ -15,13 +15,13 @@ import os
 import signal
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Final, List, Optional, Tuple
 
 import numpy as np
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
-from geometry_msgs.msg import Vector3
+from geometry_msgs.msg import Twist, Vector3
 from std_msgs.msg import Float32, Float32MultiArray, Int32, String, UInt8, UInt32
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 
@@ -34,6 +34,7 @@ from mvp_mission_bebop.actuators.driver_discovery import (
     driver_in_graph,
     restart_ros2_daemon,
 )
+from mvp_mission_bebop.actuators.nudge_overlay import NudgeOverlay
 from mvp_mission_bebop.actuators.proxy import BenchtopDroneProxy
 from mvp_mission_bebop.actuators.yaw_authority import YawAuthority
 from mvp_mission_bebop.actuators.simulator import KinematicSimulator
@@ -91,6 +92,7 @@ from mvp_mission_bebop.steps.pipeline import build_steps
 from mvp_mission_bebop.telemetry.battery import (
     BATTERY_WARNING_PCT,
     BatterySupervisor,
+    normalize_enabled,
     normalize_percentage,
 )
 from mvp_mission_bebop.telemetry.bench import BenchTelemetryPublisher
@@ -662,8 +664,12 @@ def _check_standby_preconditions(
     if not odom_supervisor.is_telemetry_healthy():
         return False, "odometry heartbeat stale"
 
-    # Battery known in --fly
-    if not params.no_fly and battery_supervisor.current_percentage() is None:
+    # Battery known in --fly, while the battery failsafe is enabled (D7)
+    if (
+        not params.no_fly
+        and getattr(battery_supervisor, "enabled", True)
+        and battery_supervisor.current_percentage() is None
+    ):
         return False, "battery state unknown"
 
     # Flying state == 0 (landed)
@@ -675,6 +681,112 @@ def _check_standby_preconditions(
             return False, f"flying_state is {flying_state} (expected 0)"
 
     return True, ""
+
+
+def battery_failsafe_listener(supervisor: BatterySupervisor) -> Callable[[Any], None]:
+    """Callback of ``/<ns>/mission/battery_failsafe`` (``std_msgs/String``).
+
+    The station publishes ``{"enabled": bool, "land_pct": float}`` when the
+    operator flips the battery failsafe or moves its threshold in flight. A
+    payload that is not a JSON object, or carries an invalid value, is logged
+    and leaves the supervisor exactly as it was: the callback runs on the
+    executor and must never raise mid-flight.
+
+    Parameters
+    ----------
+    supervisor : BatterySupervisor
+        The mission's battery supervisor.
+
+    Returns
+    -------
+    Callable[[Any], None]
+        The subscription callback.
+    """
+
+    def _on_message(message: Any) -> None:
+        try:
+            payload = json.loads(getattr(message, "data", ""))
+        except (TypeError, ValueError) as exc:
+            logger.warning("Battery failsafe update ignored: not JSON (%s).", exc)
+            return
+        if not isinstance(payload, dict):
+            logger.warning("Battery failsafe update ignored: %r is not an object.", payload)
+            return
+        try:
+            supervisor.configure(enabled=payload.get("enabled"), land_pct=payload.get("land_pct"))
+        except (TypeError, ValueError) as exc:
+            logger.warning("Battery failsafe update ignored: %s.", exc)
+
+    return _on_message
+
+
+#: ARSDK flying states in which the nudge may act: hovering and flying.
+_NUDGE_FLYING_STATES: Final[Tuple[int, ...]] = (2, 3)
+
+
+def nudge_permit(ctx: Any, cfg: Any) -> Callable[[], bool]:
+    """The stage policy of the keyboard nudge, as a predicate for :class:`NudgeOverlay`.
+
+    The nudge acts only while the mission is airborne in Stages 2, 3 and 5
+    (Stage 4 too with ``nudge.allow_in_inspection``), never during an
+    emergency or a failsafe landing, never once the aircraft reported a
+    landing state, never while Stage 4 has suspended it around the capture,
+    and during the precision landing only with
+    ``nudge.allow_in_precision_landing``. A known flying state other than
+    hovering or flying forbids it as well. The overlay itself knows nothing of
+    stages; suspension ramps it to zero and cancels nothing.
+
+    Parameters
+    ----------
+    ctx : MissionContext
+        Mission context, read on every call.
+    cfg : NudgeConfig
+        ``allow_in_inspection`` and ``allow_in_precision_landing``.
+
+    Returns
+    -------
+    Callable[[], bool]
+        The predicate.
+    """
+    stages = {2, 3, 5} | ({4} if getattr(cfg, "allow_in_inspection", True) else set())
+
+    def _permit() -> bool:
+        failsafe = getattr(ctx, "failsafe", None)
+        if getattr(failsafe, "failsafe_active", False):
+            return False
+        emergency = getattr(ctx, "emergency_event", None)
+        if emergency is not None and emergency.is_set():
+            return False
+        blackboard = getattr(ctx, "blackboard", None)
+        if getattr(blackboard, "landing_started", False) or getattr(blackboard, "nudge_suspended", False):
+            return False
+        if getattr(blackboard, "precision_landing_active", False) and not getattr(
+            cfg, "allow_in_precision_landing", False
+        ):
+            return False
+        if getattr(ctx, "current_stage", None) not in stages:
+            return False
+        state = getattr(ctx, "flying_state", None)
+        return state is None or state in _NUDGE_FLYING_STATES
+
+    return _permit
+
+
+def nudge_listener(overlay: NudgeOverlay) -> Callable[[Any], None]:
+    """Callback of ``/<ns>/mission/nudge`` (``geometry_msgs/Twist``).
+
+    ``linear.x`` is the forward intent (W), ``linear.y`` the leftward intent
+    (A) and ``angular.z`` the left-yaw intent (Q), each in ``[-1, 1]``; the
+    overlay scales, ramps and saturates them. Never raises on the executor.
+    """
+
+    def _on_message(message: Any) -> None:
+        try:
+            overlay.set_intent(message.linear.x, message.linear.y, message.angular.z)
+        except Exception as exc:  # noqa: BLE001 - a bad message never reaches the flight
+            logger.warning("Nudge message ignored: %s", exc)
+
+    return _on_message
 
 
 def first_frame_timeout(driver_reachable: Optional[bool], camera_publishers: int) -> float:
@@ -825,6 +937,11 @@ def main() -> None:
         fallback = BatteryConfig().land_pct
         logger.error("Invalid battery.land_pct (%s); using %.0f%%.", exc, fallback)
         params.battery.land_pct = fallback
+    try:
+        params.battery.enabled = normalize_enabled(params.battery.enabled)
+    except TypeError as exc:
+        logger.error("Invalid battery.enabled (%s); the battery failsafe stays enabled.", exc)
+        params.battery.enabled = True
     battery_supervisor = BatterySupervisor(params.battery)
 
     # D2: the station speaks the numbers of this document and of no other.
@@ -850,6 +967,17 @@ def main() -> None:
     # injected for the occasion.
     simulator = KinematicSimulator(odom_supervisor, calibration) if params.no_fly else None
     yaw_authority = YawAuthority()
+    def _nudge_permitted() -> bool:
+        current = ctx_holder[0]
+        return current is not None and nudge_permit(current, params.nudge)()
+
+    def _nudge_scale() -> float:
+        current = ctx_holder[0]
+        scale = getattr(getattr(current, "governor", None), "horizontal_scale", None)
+        return float(scale()) if callable(scale) else 1.0
+
+    nudge_overlay: Optional[NudgeOverlay] = None
+
     actuator = BenchtopDroneProxy(
         raw_drone,
         no_fly=params.no_fly,
@@ -857,6 +985,7 @@ def main() -> None:
         motion_tracker=motion_tracker,
         yaw_authority=yaw_authority,
         vertical_command_listener=odom_supervisor.note_commanded_vz,
+        nudge_overlay=nudge_overlay,
     )
 
 
@@ -1148,7 +1277,16 @@ def main() -> None:
         except (TypeError, ValueError) as exc:
             logger.error("Invalid battery.land_pct (%s); keeping %.0f%%.", exc, battery_supervisor.land_pct)
             params.battery.land_pct = battery_supervisor.land_pct
-        battery_supervisor.land_pct = params.battery.land_pct
+        try:
+            params.battery.enabled = normalize_enabled(params.battery.enabled)
+        except TypeError as exc:
+            logger.error(
+                "Invalid battery.enabled (%s); keeping %s.",
+                exc,
+                "enabled" if battery_supervisor.enabled else "disabled",
+            )
+            params.battery.enabled = battery_supervisor.enabled
+        battery_supervisor.configure(enabled=params.battery.enabled, land_pct=params.battery.land_pct)
         logger.info("[STANDBY] Go received; launch document applied.")
         _log_active_parameters(params)
         launch_at_ms = command["launch_at_ms"]
@@ -1387,6 +1525,13 @@ def main() -> None:
     stage_topic = f"/{params.network.namespace.strip('/')}/mission/goto_stage"
     telemetry_node.create_subscription(Int32, stage_topic, _on_stage_request, 10)
     logger.info("Stage control listening on %s", stage_topic)
+
+    battery_failsafe_topic = f"/{params.network.namespace.strip('/')}/mission/battery_failsafe"
+    telemetry_node.create_subscription(
+        String, battery_failsafe_topic, battery_failsafe_listener(battery_supervisor), 10
+    )
+    logger.info("Battery failsafe switch listening on %s", battery_failsafe_topic)
+
 
     # The critical-charge return rides the same gate as the station's request:
     # the battery callback runs on the executor and jumps the runner to Stage 5.

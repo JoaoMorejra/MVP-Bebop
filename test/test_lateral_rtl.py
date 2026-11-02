@@ -39,15 +39,29 @@ from mvp_mission_bebop.parameters import (
     FlightKinematicsConfig,
     ReturnToLaunchConfig,
 )
+from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.steps import rtl as rtl_module
 from mvp_mission_bebop.steps.base import StepStatus
-from mvp_mission_bebop.steps.rtl import ClosedLoopRTLStep
+from mvp_mission_bebop.steps.rtl import ClosedLoopRTLStep, _PhaseOutcome
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot
 from test_aruco_rtl import Ctx, OverrideOdometry, ScriptedSensor, law, sighting
 
 DT = 1.0 / 15.0
 SEARCH_WINDOW_SEC = 3.0
 
+
+
+@pytest.fixture(autouse=True)
+def _lens_frame_centering(monkeypatch):
+    """Pin the centering law in the lens frame (camera-to-CoG offset zero).
+
+    These tests simulate the marker relative to the camera and exercise the
+    law's dynamics, gates and recovery; the camera-to-CoG extrinsic that
+    shifts the equilibrium is covered by ``test_camera_extrinsics.py``.
+    """
+    from mvp_mission_bebop.controllers import rtl_guidance as _rtl_guidance
+
+    monkeypatch.setattr(_rtl_guidance, "_camera_offset", lambda _cfg, _name: 0.0)
 
 class FakeTime:
     """Simulated monotonic clock; sleeping advances it, so loops are load-independent."""
@@ -91,9 +105,9 @@ class RecordingGovernor:
         return 1.0
 
 
-def search(ctx: Ctx, fake: FakeTime):
+def search(ctx: Ctx, fake: FakeTime, *, mode: MissionMode = MissionMode.ADVANCED):
     sensor = ScriptedSensor(ctx.drone)
-    step = ClosedLoopRTLStep(sensor=sensor)
+    step = ClosedLoopRTLStep(sensor=sensor, mode=mode)
     outcome = step._reverse_search(
         ctx, sensor, Deadline(ctx.params.rtl.timeout_sec, clock=fake.clock)
     )
@@ -112,10 +126,11 @@ def search_ctx(*, lateral_gain: float = 1.0) -> Ctx:
 # ═════════════════════════════════════════════════════════ the search cruise
 
 
-def test_the_reverse_search_flies_right_with_vx_zero(simulated_time):
+@pytest.mark.parametrize("mode", [MissionMode.SIMPLE, MissionMode.ADVANCED])
+def test_the_reverse_search_flies_right_with_vx_zero(simulated_time, mode):
     ctx = search_ctx()
 
-    outcome = search(ctx, simulated_time)
+    outcome = search(ctx, simulated_time, mode=mode)
 
     assert ctx.horizontal, "the search sent no commands at all"
     assert all(vx == 0.0 for vx, _vy in ctx.horizontal), "vx must be the literal zero"
@@ -123,6 +138,23 @@ def test_the_reverse_search_flies_right_with_vx_zero(simulated_time):
     assert any(vy < 0.0 for _vx, vy in ctx.horizontal), "it never actually flew"
     assert all(vyaw == 0.0 for _vx, _vy, _vz, vyaw in ctx.drone.commands)
     assert outcome.value == "exhausted"
+
+
+def test_reverse_search_marker_acquired_halts_and_achieves(simulated_time):
+    """When the marker is confirmed during the search, the drone halts and completes phase."""
+    ctx = search_ctx()
+    ctx.params.rtl.timeout_sec = 8.0
+    sensor = ScriptedSensor(ctx.drone, acquire_after=15, ex=-0.1, ey=-0.2)
+    step = ClosedLoopRTLStep(sensor=sensor, mode=MissionMode.ADVANCED)
+    outcome = step._reverse_search(
+        ctx, sensor, Deadline(ctx.params.rtl.timeout_sec, clock=simulated_time.clock)
+    )
+
+    assert outcome is _PhaseOutcome.ACHIEVED
+    assert ctx.blackboard.rtl_marker_sighted
+    final_vx, final_vy = ctx.horizontal[-1]
+    assert final_vx == pytest.approx(0.0)
+    assert final_vy == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize("lateral_gain", [1.0, 0.5])
@@ -416,6 +448,7 @@ def test_the_centering_transmission_feeds_the_governor_the_horizontal_norm():
 def test_a_complete_rtl_from_the_left_lands_over_the_marker(simulated_time):
     ctx = Ctx(altitude=0.30)
     ctx.params.rtl.timeout_sec = 4.0
+    ctx.params.rtl.centering_timeout_sec = 12.0
     sensor = ScriptedSensor(ctx.drone, acquire_after=20, ex=0.0, ey=-0.35)
 
     status = ClosedLoopRTLStep(sensor=sensor).execute(ctx)

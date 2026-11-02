@@ -80,9 +80,10 @@ def step_log():
     target.removeHandler(handler)
 
 
-def context(land_pct: float, reading=None, *, no_fly: bool = False):
+def context(land_pct: float, reading=None, *, no_fly: bool = False, enabled: bool = True):
     params = MissionParameters()
     params.battery.land_pct = land_pct
+    params.battery.enabled = enabled
     params.no_fly = no_fly
     odometry = OdometrySupervisor(params.kinematics, params.timeouts, params.calibration)
     battery = BatterySupervisor(params.battery)
@@ -181,3 +182,19 @@ def test_a_failsafe_without_a_battery_supervisor_does_not_gate():
     ctx = context(land_pct=22.0)
     ctx.failsafe.battery_supervisor = None
     assert TakeoffStep()._check_prearm_battery(ctx) is True
+
+
+def test_a_disabled_failsafe_launches_on_any_charge(alerts):
+    ctx = context(land_pct=20.0, reading=5.0, enabled=False)
+
+    assert TakeoffStep()._check_prearm_battery(ctx) is True
+    assert not any("mission.takeoff_failed" in m for m in alerts.messages)
+
+
+def test_an_enabled_failsafe_refuses_at_the_threshold(alerts):
+    ctx = context(land_pct=20.0, reading=20.0, enabled=True)
+
+    assert TakeoffStep()._check_prearm_battery(ctx) is False
+    refusals = [m for m in alerts.messages if m.startswith("[ALERT mission.takeoff_failed]")]
+    assert len(refusals) == 1
+    assert "decolagem cancelada" in refusals[0]

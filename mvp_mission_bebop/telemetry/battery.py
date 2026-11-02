@@ -90,6 +90,43 @@ def normalize_percentage(value: Union[int, float, str], name: str = "percentage"
     return percentage
 
 
+def normalize_enabled(value: Union[bool, int, str, None], name: str = "battery.enabled") -> bool:
+    """Convert the failsafe switch into a boolean.
+
+    Parameters
+    ----------
+    value : Union[bool, int, str, None]
+        The switch. ``None`` (a payload from a station that predates the
+        switch) reads as ``True``. The strings ``"true"`` and ``"false"``,
+        any case, are accepted because ``--params-json`` and a hand-edited
+        ``mission_config.json`` may carry the value quoted.
+    name : str
+        Field name used in error messages.
+
+    Returns
+    -------
+    bool
+        The switch.
+
+    Raises
+    ------
+    TypeError
+        For any other value, including numbers and other strings: a non-empty
+        string such as ``"no"`` must never read as ``True`` by truthiness.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token == "true":
+            return True
+        if token == "false":
+            return False
+    raise TypeError(f"{name} must be a boolean or 'true'/'false', got {value!r}")
+
+
 class BatterySupervisor:
     """Owns the latest battery reading and the critical-charge return request.
 
@@ -119,12 +156,59 @@ class BatterySupervisor:
         self.stale_timeout_sec = float(stale_timeout_sec)
 
         self._lock = threading.Lock()
+        self._enabled: bool = normalize_enabled(getattr(battery_cfg, "enabled", None))
         self._percentage: Optional[float] = None
         self._timestamp: float = 0.0
         self._warning_emitted = False
         self._return_hook: Optional[Callable[[str], bool]] = None
         self._airborne: Optional[Callable[[], bool]] = None
         self._return_requested = False
+
+    # ------------------------------------------------------------------ switch
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the critical-charge return and the pre-flight gate act."""
+        with self._lock:
+            return self._enabled
+
+    def configure(
+        self,
+        *,
+        enabled: Optional[Union[bool, str]] = None,
+        land_pct: Optional[Union[int, float, str]] = None,
+    ) -> None:
+        """Change the switch or the threshold, typically from the station in flight.
+
+        Both values are validated before either is applied, so a refused call
+        leaves the supervisor unchanged. Switching off never cancels a return
+        already requested.
+
+        Parameters
+        ----------
+        enabled : Optional[Union[bool, str]]
+            New switch; ``None`` keeps the current one.
+        land_pct : Optional[Union[int, float, str]]
+            New threshold in percent; ``None`` keeps the current one.
+
+        Raises
+        ------
+        TypeError, ValueError
+            If a value is invalid (see :func:`normalize_enabled` and
+            :func:`normalize_percentage`).
+        """
+        switch = normalize_enabled(enabled) if enabled is not None else None
+        threshold = normalize_percentage(land_pct, "battery.land_pct") if land_pct is not None else None
+        with self._lock:
+            if switch is not None:
+                self._enabled = switch
+            if threshold is not None:
+                self.land_pct = threshold
+        logger.info(
+            "Battery failsafe %s, return threshold %.0f%%.",
+            "enabled" if self.enabled else "disabled",
+            self.land_pct,
+        )
 
     # ------------------------------------------------------------------ wiring
 
@@ -203,7 +287,7 @@ class BatterySupervisor:
             self._timestamp = time.monotonic()
         if percentage <= BATTERY_WARNING_PCT:
             self._raise_warning(percentage)
-        if percentage <= self.land_pct:
+        if self.enabled and percentage <= self.land_pct:
             self._request_return()
 
     def _request_return(self) -> None:
@@ -291,9 +375,12 @@ class BatterySupervisor:
         Returns
         -------
         Optional[str]
-            A reason when a fresh reading is at or below ``land_pct``; ``None``
-            when the charge is above it or there is no fresh reading at all.
+            A reason when the failsafe is enabled and a fresh reading is at or
+            below ``land_pct``; ``None`` when disabled, when the charge is
+            above it or when there is no fresh reading at all.
         """
+        if not self.enabled:
+            return None
         percentage = self.current_percentage()
         if percentage is None or percentage > self.land_pct:
             return None

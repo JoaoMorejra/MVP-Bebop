@@ -312,7 +312,8 @@ def test_a_malformed_marker_is_refused_by_the_encoder(marker):
         )
 
 
-def test_the_bridge_decodes_and_draws_the_marker(bridge):
+def test_the_bridge_decodes_and_draws_the_marker(bridge, monkeypatch):
+    captured_labels = _captured_labels(bridge, monkeypatch)
     text = encode_detection_summary(
         detections=[], frame_width=856, frame_height=480, status="STEP 5: RTL",
         stamp_sec=1.0, inference_ms=0.0, markers=[MARKER],
@@ -321,8 +322,12 @@ def test_the_bridge_decodes_and_draws_the_marker(bridge):
     assert summary is not None and len(summary.markers) == 1
     canvas = np.zeros((480, 856, 3), dtype=np.uint8)
     bridge.draw_detection_summary(canvas, summary)
-    assert canvas[200, 430].any(), "marker outline not drawn"
-    assert canvas[230, 450].any(), "pose axis not drawn"
+    assert tuple(canvas[200, 430]) == bridge._class_colour("Base"), "marker bounding box not drawn"
+    assert not canvas[230, 450].any(), "pose axes must not be drawn inside the Base box"
+    assert captured_labels == ["Base"]
+    assert bridge._class_colour("Base") != bridge._class_colour("Acidente")
+    assert bridge._class_colour("Base") != bridge._class_colour("Vitima")
+    assert bridge._class_colour("Base") not in bridge._PALETTE
 
 
 def test_a_v1_summary_still_decodes_with_no_markers(bridge):
@@ -336,43 +341,83 @@ def test_annotated_frames_hold_priority_only_briefly(bridge):
 
 
 def test_display_class_name_maps_motorcycle_and_bicycle_to_acidente(bridge):
-    assert bridge._display_class_name("motorcycle") == "acidente"
-    assert bridge._display_class_name("Motorcycle") == "acidente"
-    assert bridge._display_class_name("bicycle") == "acidente"
-    assert bridge._display_class_name("Bicycle") == "acidente"
-    assert bridge._display_class_name("bycicle") == "acidente"
-    assert bridge._display_class_name("acidente") == "acidente"
+    assert bridge._display_class_name("motorcycle") == "Acidente"
+    assert bridge._display_class_name("Motorcycle") == "Acidente"
+    assert bridge._display_class_name("bicycle") == "Acidente"
+    assert bridge._display_class_name("Bicycle") == "Acidente"
+    assert bridge._display_class_name("bycicle") == "Acidente"
+    assert bridge._display_class_name("acidente") == "Acidente"
     assert bridge._display_class_name("car") == "car"
     assert bridge._display_class_name("") == ""
 
 
+def test_display_class_name_maps_a_person_to_vitima(bridge):
+    assert bridge._display_class_name("person") == "Vitima"
+    assert bridge._display_class_name("Person") == "Vitima"
+
+
+def test_bridge_and_mission_show_the_same_words():
+    from mvp_mission_bebop.perception.classes import display_class_name
+
+    spec = importlib.util.spec_from_file_location("mjpeg_server_words", _BRIDGE)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    try:
+        for name in ("motorcycle", "bicycle", "bycicle", "acidente", "person", "car", "dog"):
+            assert module._display_class_name(name) == display_class_name(name)
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
+def _captured_labels(bridge, monkeypatch):
+    captured = []
+    original = bridge.cv2.putText
+
+    def put_text(img, text, org, fontFace, fontScale, color, thickness=1, lineType=None):
+        captured.append(text)
+        return original(img, text, org, fontFace, fontScale, color, thickness, lineType)
+
+    monkeypatch.setattr(bridge.cv2, "putText", put_text)
+    return captured
+
+
 def test_bounding_box_label_written_as_acidente_on_live_frame(bridge, monkeypatch):
-    """When drawing bounding boxes on live frames, motorcycle/bicycle must be written as acidente."""
-    captured_labels = []
+    """When drawing bounding boxes on live frames, motorcycle/bicycle must be written as Acidente."""
+    captured_labels = _captured_labels(bridge, monkeypatch)
 
-    orig_put_text = bridge.cv2.putText
-
-    def mock_put_text(img, text, org, fontFace, fontScale, color, thickness=1, lineType=None):
-        captured_labels.append(text)
-        return orig_put_text(img, text, org, fontFace, fontScale, color, thickness, lineType)
-
-    monkeypatch.setattr(bridge.cv2, "putText", mock_put_text)
-
-    # Test with bicycle
     frame = np.zeros((480, 856, 3), dtype=np.uint8)
     summary_bicycle = bridge.parse_detection_summary(encoded(status="STEP 2: SEARCH"))
     bridge.draw_detection_summary(frame, summary_bicycle)
 
-    assert any(label.startswith("acidente 0.78") for label in captured_labels)
+    assert any(label.startswith("Acidente 0.78") for label in captured_labels)
     assert not any("bicycle" in label.lower() for label in captured_labels)
 
-    # Test with motorcycle
     captured_labels.clear()
     payload = json.loads(encoded(status="STEP 2: SEARCH"))
     payload["detections"] = [{"class_name": "motorcycle", "confidence": 0.85, "bbox_xyxy": [100, 100, 200, 200]}]
     summary_motorcycle = bridge.parse_detection_summary(json.dumps(payload))
     bridge.draw_detection_summary(frame, summary_motorcycle)
 
-    assert any(label.startswith("acidente 0.85") for label in captured_labels)
+    assert any(label.startswith("Acidente 0.85") for label in captured_labels)
     assert not any("motorcycle" in label.lower() for label in captured_labels)
 
+
+def test_bounding_box_label_written_as_vitima_for_a_person(bridge, monkeypatch):
+    captured_labels = _captured_labels(bridge, monkeypatch)
+    payload = json.loads(encoded(status="STEP 3: APPROACH"))
+    payload["detections"] = [{"class_name": "person", "confidence": 0.66, "bbox_xyxy": [300, 120, 360, 260]}]
+    frame = np.zeros((480, 856, 3), dtype=np.uint8)
+    bridge.draw_detection_summary(frame, bridge.parse_detection_summary(json.dumps(payload)))
+    assert any(label.startswith("Vitima 0.66") for label in captured_labels)
+    assert not any("person" in label.lower() for label in captured_labels)
+
+
+def test_status_banner_and_crosshair_are_not_drawn_on_live_frame(bridge, monkeypatch):
+    """Only YOLO bounding boxes (and ArUco markers) are drawn on the live video feed."""
+    captured_labels = _captured_labels(bridge, monkeypatch)
+    frame = np.zeros((480, 856, 3), dtype=np.uint8)
+    summary = bridge.parse_detection_summary(encoded(detections=(), status="STEP 2: SEARCH"))
+    drawn = bridge.draw_detection_summary(frame, summary)
+    assert not drawn.any(), "empty detection summary must leave the frame free of status banners and crosshairs"
+    assert "STEP 2: SEARCH" not in captured_labels

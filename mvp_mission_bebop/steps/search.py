@@ -42,7 +42,13 @@ from mvp_mission_bebop.controllers.yaw_pattern import YawRateLimiter
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
 from mvp_mission_bebop.mission_mode import MissionMode
-from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
+from mvp_mission_bebop.steps.base import (
+    BaseStep,
+    StepStatus,
+    cross_axis_correction,
+    governed_vz,
+    select_target,
+)
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 from mvp_mission_bebop.telemetry.odometry import OdometrySnapshot
 
@@ -99,6 +105,9 @@ class LateralSearchStep(BaseStep):
         )
         shaper = QuantizedCommandShaper(rtl_cfg.min_effective_speed, rtl_cfg.quantization_step)
         confirmer = HysteresisConfirmer(vision_cfg.confirmation_frames, vision_cfg.release_frames)
+        selector = getattr(ctx, "target_selector", None)
+        if selector is not None:
+            selector.reset()
 
         simple = self._mode is MissionMode.SIMPLE
         if simple:
@@ -329,6 +338,7 @@ class LateralSearchStep(BaseStep):
             ctx.failsafe.notify_frame_received()
             targets = sample.result.filter_by_class(vision_cfg.target_classes)
             report = confirmer.update(bool(targets))
+            chosen = select_target(ctx, targets)
 
             snapshot = ctx.odom_supervisor.snapshot()
             ctx.perception.set_status(
@@ -338,7 +348,7 @@ class LateralSearchStep(BaseStep):
             )
 
             if report.just_confirmed:
-                best = max(targets, key=lambda detection: detection.confidence)
+                best = chosen
                 logger.info(
                     "Target '%s' confirmed at %.2f confidence after %d frames. "
                     "Decelerating to station keeping.",
@@ -364,8 +374,8 @@ class LateralSearchStep(BaseStep):
                 self._halt(ctx, profile, shaper, rate.period_sec, rate)
                 return StepStatus.SUCCESS
 
-            if targets:
-                best = max(targets, key=lambda detection: detection.confidence)
+            if chosen is not None:
+                best = chosen
                 logger.info(
                     "Candidate target (%d/%d): class='%s', conf=%.2f, alt=%.2f m",
                     report.hits,
@@ -491,8 +501,9 @@ class LateralSearchStep(BaseStep):
         vz = governed_vz(ctx, 
             ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=abs(vy)
         )
+        cross = cross_axis_correction(self, ctx, max(0.0, vy), dt)
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
-        safe_vx, safe_vy = ctx.failsafe.clamp_translation(0.0, max(0.0, vy))
+        safe_vx, safe_vy = ctx.failsafe.clamp_translation(cross, max(0.0, vy))
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
 
     # -------------------------------------------------------------- yaw scan
@@ -533,8 +544,12 @@ class LateralSearchStep(BaseStep):
         if ramp is None:
             ramp = self._yaw_ramp = YawRateLimiter(ctx.params.yaw_pattern.scan_ramp_per_sec)
         vyaw = ramp.step(target_vyaw, dt)
-        vz = governed_vz(ctx, 
-            ctx.odom_supervisor.snapshot().relative_altitude, dt, vx_commanded=0.0
+        vz = governed_vz(
+            ctx,
+            ctx.odom_supervisor.snapshot().relative_altitude,
+            dt,
+            vx_commanded=0.0,
+            yaw_commanded=abs(vyaw),
         )
         safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, vyaw)
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(0.0, 0.0)

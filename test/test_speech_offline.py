@@ -394,3 +394,45 @@ def test_cache_miss_resolves_fast_while_a_stale_probe_hangs(
     assert opened == []
     assert device.played == []
     assert any(r.getMessage().startswith("[SPEECH_MISS]") for r in announcer_records)
+
+
+def test_a_whole_buffer_reports_its_start_and_length(offline: OfflineRig) -> None:
+    """The station types a finding over the audio: it needs when it starts and how long it lasts."""
+    instance, device, _opened = offline
+    statement = "Linha com duração conhecida."
+    announcer.PhraseCache().put(statement, True, PCM)
+    starts: List[Optional[float]] = []
+
+    assert instance.announce(statement, wait=True, verbatim=True, on_start=starts.append) is True
+
+    assert device.played == [PCM]
+    assert starts == [pytest.approx(len(PCM) / (2.0 * device.sample_rate) * 1000.0)]
+
+
+def test_a_line_never_played_never_reports_a_start(offline: OfflineRig) -> None:
+    instance, _device, _opened = offline
+    starts: List[Optional[float]] = []
+    assert instance.announce("Linha fora do cache, sem rede.", wait=True, verbatim=True, on_start=starts.append) is False
+    assert starts == []
+
+
+def test_daemon_says_when_a_line_starts_and_for_how_long(
+    offline: OfflineRig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    instance, _device, _opened = offline
+    statement = "Vítima consciente."
+    announcer.PhraseCache().put(statement, True, PCM)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(announcer, "get_announcer", lambda: instance)
+    requests = [{"id": 7, "text": statement, "verbatim": True}, {"op": "quit"}]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(r) + "\n" for r in requests)))
+
+    assert announcer.serve_stdin() == 0
+
+    events = [event for event in _speech_events(capsys.readouterr().out) if event.get("id") == 7]
+    assert [event["event"] for event in events] == ["start", "done"]
+    assert events[0]["audio_ms"] == round(len(PCM) / (2.0 * 24000) * 1000.0)
+    assert events[1]["ok"] is True

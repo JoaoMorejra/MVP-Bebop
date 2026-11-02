@@ -1282,7 +1282,7 @@ class MissionAudioAnnouncer:
             except Exception:
                 break
 
-            pri_int, seq, action, details, verbatim, done_fut, enqueued_at = item
+            pri_int, seq, action, details, verbatim, done_fut, enqueued_at, on_start = item
             generation = self._generation
 
             # Preemption:
@@ -1351,7 +1351,7 @@ class MissionAudioAnnouncer:
 
             streamed = False
 
-            def log_start(started_source: str) -> None:
+            def log_start(started_source: str, audio_ms: Optional[float] = None) -> None:
                 # Request to audio start, on the monotonic clock. The
                 # station's latency targets (cold, warm, urgent after cancel)
                 # are read from these lines.
@@ -1362,6 +1362,15 @@ class MissionAudioAnnouncer:
                     started_source,
                     "URGENT" if pri_int == 0 else "NORMAL",
                 )
+                # The caller's start hook: the station paces the text it types
+                # under a finding on the audio it is hearing. The length is
+                # known for a whole buffer (cache, prefetch, a finished
+                # synthesis) and not for one still streaming.
+                if on_start is not None:
+                    try:
+                        on_start(audio_ms)
+                    except Exception as exc:  # noqa: BLE001 - a presentation hook must not stop the voice
+                        logger.debug("Speech start hook failed: %s", exc)
 
             async def feed(chunk: bytes) -> None:
                 nonlocal streamed
@@ -1417,7 +1426,8 @@ class MissionAudioAnnouncer:
                     # task with it -- the whole copilot, on one stuck buffer.
                     self.device.wait_until_done(timeout=20.0)
                 self.device.play_audio(bytes(audio_buffer))
-                log_start(source)
+                rate = float(getattr(self.device, "sample_rate", 24000) or 24000)
+                log_start(source, len(audio_buffer) / (2.0 * rate) * 1000.0)
             if spoke:
                 rate = float(getattr(self.device, "sample_rate", 24000) or 24000)
                 audio_sec = len(audio_buffer) / (2.0 * rate)
@@ -1444,6 +1454,7 @@ class MissionAudioAnnouncer:
         wait: bool = False,
         timeout: Optional[float] = None,
         verbatim: bool = False,
+        on_start: Optional[Callable[[Optional[float]], None]] = None,
     ) -> bool:
         """Enqueue flight telemetry announcement asynchronously without blocking.
 
@@ -1451,6 +1462,11 @@ class MissionAudioAnnouncer:
         :func:`_format_telemetry_statement` and speaks ``action`` as written.
         The ground station uses it for the forensic report, where the sentence
         on screen and the sentence in the operator's ear must be identical.
+
+        ``on_start`` is called once, on the announcer's loop thread, when the
+        line is handed to the output device, with its audio length in
+        milliseconds, or ``None`` when it is still being streamed. A line that
+        is never played never calls it.
         """
         if not self._active or self._loop is None or self._queue is None:
             return False
@@ -1478,7 +1494,7 @@ class MissionAudioAnnouncer:
 
         self._loop.call_soon_threadsafe(
             self._queue.put_nowait,
-            (pri_int, seq, action, details, verbatim, done_fut, time.monotonic()),
+            (pri_int, seq, action, details, verbatim, done_fut, time.monotonic(), on_start),
         )
 
         if wait and done_event:
@@ -2048,15 +2064,25 @@ def announce_forensic_report(
 # Replies are one line each on stdout, prefixed so they survive anything the
 # libraries below decide to print:
 #
+#   BMG_SPEECH:{"id": 7, "event": "start", "audio_ms": 2480}
 #   BMG_SPEECH:{"id": 7, "event": "done", "ok": true}
+#
+# ``start`` says the line has begun to sound and for how long (``audio_ms``,
+# null while it is still being streamed); ``done`` that it has finished.
 # -----------------------------------------------------------------------------
 
 SPEECH_EVENT_PREFIX = "BMG_SPEECH:"
 
 
+#: ``start`` is emitted from the announcer's loop thread and ``done`` from the
+#: daemon worker: one line each, never interleaved.
+_SPEECH_EVENT_LOCK = threading.Lock()
+
+
 def _emit_speech_event(payload: Dict[str, Any]) -> None:
-    sys.stdout.write(SPEECH_EVENT_PREFIX + json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    with _SPEECH_EVENT_LOCK:
+        sys.stdout.write(SPEECH_EVENT_PREFIX + json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
 
 
 def serve_stdin() -> int:
@@ -2123,6 +2149,13 @@ def serve_stdin() -> int:
                     wait=True,
                     timeout=float(request.get("timeout") or 30.0),
                     verbatim=bool(request.get("verbatim", True)),
+                    on_start=lambda audio_ms, request_id=request_id: _emit_speech_event(
+                        {
+                            "id": request_id,
+                            "event": "start",
+                            "audio_ms": None if audio_ms is None else int(round(audio_ms)),
+                        }
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Daemon announce failure: %s", exc)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from typing import Callable, Dict, Final, List, Optional
@@ -52,6 +53,50 @@ _DETECTION_REVEAL_STAGE: Final[int] = 3
 #: Longest wait for the victim assessment after a landed mission, in seconds.
 #: It normally settled during the return; this covers a slow device only.
 _INSPECTION_DRAIN_SEC: Final[float] = 1.0
+
+#: Stages flown inside one continuous altitude-hold window (see
+#: :class:`_HoldWindowScope`).
+_CONTINUOUS_HOLD_STAGES: Final[frozenset] = frozenset({2, 3, 4})
+
+
+class _HoldWindowScope:
+    """One altitude-hold window held open across Stages 2 to 4.
+
+    Each stage opens its own window around its loops, which left the vertical
+    axis descent-only in the gaps between them (stage transitions, station
+    keeping between two loops), and the logs showed the authority revoked and
+    granted again at every boundary. This scope opens a window bounded by the
+    governor's own ``climb_authority`` when the first of Stages 2 to 4 starts
+    and closes it when a stage outside them starts or the run ends: Stage 1
+    keeps its own climb window, and Stage 5 is excluded so the touchdown
+    sequence stays descent-only. The stages' own windows nest inside it
+    (``altitude_hold_window`` saves and restores the previous ceiling).
+    """
+
+    def __init__(self, ctx: MissionContext) -> None:
+        self._ctx = ctx
+        self._stack = contextlib.ExitStack()
+        self._open = False
+
+    def enter_stage(self, stage: int) -> None:
+        """Open or close the window for the stage about to run."""
+        failsafe = getattr(self._ctx, "failsafe", None)
+        window = getattr(failsafe, "altitude_hold_window", None)
+        if not callable(window):
+            return
+        inside = stage in _CONTINUOUS_HOLD_STAGES
+        if inside and not self._open:
+            governor = getattr(self._ctx, "governor", None)
+            authority = float(getattr(governor, "climb_authority", 0.0) or 0.0)
+            self._stack.enter_context(window(authority))
+            self._open = True
+        elif not inside and self._open:
+            self.close()
+
+    def close(self) -> None:
+        """Close the window if open; idempotent."""
+        self._stack.close()
+        self._open = False
 
 #: Longest wait for the inspection worker thread to exit, in seconds.
 _INSPECTION_STOP_SEC: Final[float] = 0.5
@@ -124,6 +169,7 @@ class MissionRunner:
         all_succeeded = True
         index = 0
         entered_by_jump = False
+        hold_window = _HoldWindowScope(self.ctx)
 
         try:
             while index < len(self.steps):
@@ -155,6 +201,7 @@ class MissionRunner:
                 # (``mission.rtl_start``: "inspeção concluída").
                 self.ctx.entered_by_jump = entered_by_jump
                 self._open_reveal_past_the_search(self.stage_numbers[index])
+                hold_window.enter_stage(self.stage_numbers[index])
                 status = step.execute(self.ctx)
 
                 # A step that unwound because the operator asked for a different
@@ -201,6 +248,8 @@ class MissionRunner:
             logger.critical("Unhandled exception in mission pipeline: %s", exc, exc_info=True)
             self.ctx.failsafe.trigger_emergency_land(str(exc))
             all_succeeded = False
+        finally:
+            hold_window.close()
 
         return all_succeeded
 
@@ -279,6 +328,16 @@ class MissionRunner:
             return spoken_stage_five_name(bool(getattr(rtl, "enabled", True)))
         return _SPOKEN_STAGE_NAMES.get(stage, f"etapa {stage}")
 
+    def _disarm_nudge(self, reason: str) -> None:
+        """Latch the operator's nudge off before any emergency Twist leaves."""
+        nudge = getattr(self.ctx, "nudge", None) or getattr(getattr(self.ctx, "drone", None), "nudge", None)
+        if nudge is None:
+            return
+        try:
+            nudge.disarm(reason)
+        except Exception as exc:  # noqa: BLE001 - the landing proceeds regardless
+            logger.critical("Nudge overlay could not be disarmed: %s", exc)
+
     def _transmit_emergency_landing(self, budget_sec: float) -> None:
         """Transmit a controlled landing within the supplied time budget.
 
@@ -287,6 +346,7 @@ class MissionRunner:
         interval = _EMERGENCY_BURST_INTERVAL_SEC
         affordable = int(budget_sec / interval) if interval > 0.0 else _EMERGENCY_BURST_COUNT
         repeats = max(1, min(_EMERGENCY_BURST_COUNT, affordable))
+        self._disarm_nudge("emergency")
 
         for index in range(repeats):
             self.ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0)
@@ -300,6 +360,7 @@ class MissionRunner:
         """Release peripherals and the ROS runtime. Invoked at most once."""
         logger.info("Commencing resource de-allocation and sensor shutdown...")
 
+        self._disarm_nudge("mission end")
         if not self.ctx.blackboard.rtl_completed:
             # The mission did not land on its own, so make sure it is on its way
             # down before the process exits.
