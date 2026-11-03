@@ -19,6 +19,7 @@ from mvp_mission_bebop.steps.takeoff import TakeoffStep
 from mvp_mission_bebop.telemetry.battery import BatterySupervisor
 from mvp_mission_bebop.telemetry.failsafe import FailsafeSupervisor
 from mvp_mission_bebop.telemetry.flat_trim_ack import FlatTrimAckTracker
+from mvp_mission_bebop.telemetry.gimbal import GimbalStateMonitor
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
 
 
@@ -27,9 +28,13 @@ class RecordingDrone:
         self.no_fly = no_fly
         self.calls: List[str] = []
         self.flat_trim_ack = flat_trim_ack
+        # Stage 1 refuses a flight whose gimbal does not move; this one follows its commands.
+        self.gimbal = GimbalStateMonitor()
+        self.gimbal.orientation_callback(SimpleNamespace(x=-80.0, y=0.0))
 
     def camera_control(self, tilt, pan=0.0):
         self.calls.append("camera_control")
+        self.gimbal.orientation_callback(SimpleNamespace(x=tilt, y=pan))
 
     def flat_trim(self):
         self.calls.append("flat_trim")
@@ -102,6 +107,8 @@ def context(land_pct: float, reading=None, *, no_fly: bool = False, enabled: boo
         odom_supervisor=odometry,
         current_tilt_deg=0.0,
         flat_trim_ack=flat_trim_ack,
+        gimbal_monitor=drone.gimbal,
+        interrupted=lambda: False,
     )
 
 

@@ -26,6 +26,7 @@ from mvp_mission_bebop.perception.worker import PerceptionWorker
 from mvp_mission_bebop.steps.base import StepStatus
 from mvp_mission_bebop.steps.takeoff import TakeoffStep
 from mvp_mission_bebop.telemetry.flat_trim_ack import FlatTrimAckTracker
+from mvp_mission_bebop.telemetry.gimbal import GimbalStateMonitor
 from mvp_mission_bebop.telemetry.odometry import OdometrySupervisor
 
 FRAME = np.zeros((48, 64, 3), dtype=np.uint8)
@@ -73,9 +74,13 @@ class SleepingDrone:
         self._ack_after = ack_after_sec
         self._marks = marks
         self.calls: List[str] = []
+        # Stage 1 refuses a flight whose gimbal does not move; this one follows its commands.
+        self.gimbal = GimbalStateMonitor()
+        self.gimbal.orientation_callback(SimpleNamespace(x=-80.0, y=0.0))
 
     def camera_control(self, tilt, pan=0.0):
         self.calls.append("camera_control")
+        self.gimbal.orientation_callback(SimpleNamespace(x=tilt, y=pan))
 
     def flat_trim(self):
         self.calls.append("flat_trim")
@@ -142,9 +147,11 @@ def _bench_context(countdown_sec: float, inference_sec: float, marks: Dict[str, 
     camera = BlockingDetector(inference_sec)
     worker = PerceptionWorker(camera, frame_timeout_sec=0.05)
     worker.start()
+    drone = SleepingDrone(ack, FLAT_TRIM_ACK_SEC, marks)
     ctx = SimpleNamespace(
         params=params,
-        drone=SleepingDrone(ack, FLAT_TRIM_ACK_SEC, marks),
+        drone=drone,
+        gimbal_monitor=drone.gimbal,
         failsafe=StubFailsafe(),
         odom_supervisor=odometry,
         flat_trim_ack=ack,

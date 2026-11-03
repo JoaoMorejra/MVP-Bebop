@@ -80,6 +80,37 @@ class GimbalOutcome:
         return f"gimbal at {self.actual:.1f} deg, commanded {target:.1f} ({cause})"
 
 
+def actuation_travel(start: float, actual: float, target: float) -> float:
+    """Degrees the reported tilt moved from ``start`` toward ``target``.
+
+    Parameters
+    ----------
+    start : float
+        Tilt reported before the command, in degrees.
+    actual : float
+        Tilt reported after the command, in degrees.
+    target : float
+        Commanded tilt, in degrees.
+
+    Returns
+    -------
+    float
+        Signed travel: positive toward ``target``, negative away from it, zero
+        for a camera that did not move or was already at ``target``.
+
+    Raises
+    ------
+    ValueError
+        If any argument is not finite.
+    """
+    for name, value in (("start", start), ("actual", actual), ("target", target)):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+    if target == start:
+        return 0.0
+    return (actual - start) * math.copysign(1.0, target - start)
+
+
 def _finite(value: Any) -> Optional[float]:
     try:
         number = float(value)

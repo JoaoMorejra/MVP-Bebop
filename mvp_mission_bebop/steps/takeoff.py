@@ -19,9 +19,21 @@ from mvp_mission_bebop.estimation.convergence import SettlementCriteria, Settlem
 from mvp_mission_bebop.launch_envelope import launches_from_ground
 from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.steps.base import BaseStep, StepStatus, governed_vz
+from mvp_mission_bebop.telemetry.gimbal import actuation_travel
 from mvp_mission_bebop.telemetry.milestones import emit_milestone
 
 logger = logging.getLogger("Step1Takeoff")
+
+#: Smallest travel, in degrees, the reported tilt must make toward the
+#: commanded search tilt for the ground check to count the gimbal as actuated.
+#: Five times the 0.1 deg resolution of ``CameraState/OrientationV2``; a mute
+#: gimbal repeats its reading exactly.
+GIMBAL_MIN_TRAVEL_DEG: Final[float] = 0.5
+
+#: Longest ground wait for the gimbal to start moving, in seconds. The check
+#: returns at the first reading that has moved, so this only bounds a mute or
+#: slow-to-wake gimbal. Runs inside the launch countdown.
+_GIMBAL_GROUND_TIMEOUT_SEC: Final[float] = 10.0
 
 #: Seconds before liftoff at which the takeoff clearance call is made.
 _CLEARANCE_ANNOUNCE_SEC: float = 3.2
@@ -235,61 +247,84 @@ class TakeoffStep(BaseStep):
         return perception.session(imgsz=ctx.params.vision.inference_imgsz)
 
     def _verify_gimbal(self, ctx: MissionContext) -> bool:
-        """Verify gimbal actuation on ground before takeoff.
+        """Prove on the ground that the gimbal moves toward ``search_tilt_deg``; abort the flight if not.
 
-        Commands the gimbal to search_tilt_deg and verifies feedback.
-        If the gimbal does not respond or cannot be moved, the flight MUST
-        be cancelled/aborted immediately on the ground before takeoff.
+        Only the configured tilt is commanded. A reading at the target is not
+        proof: in a driver session whose ARSDK controller missed
+        ``defaultCameraOrientation`` every camera command is dropped while the
+        orientation keeps arriving, so a camera left near the search tilt
+        read as "confirmed" and never moved in flight. The reported tilt must
+        therefore travel :data:`GIMBAL_MIN_TRAVEL_DEG` toward the target from
+        where it was before the command. The wait uses a tolerance of
+        ``|target - start| - GIMBAL_MIN_TRAVEL_DEG``, so it ends at the first
+        reading that has moved, however small the difference; reaching the
+        target is left to the search step, which keeps commanding it. A
+        flight ends with the camera at the return tilt (-70/-80 deg); no
+        difference at all cannot be verified and is refused.
+
+        Returns
+        -------
+        bool
+            ``True`` once the gimbal was seen moving toward the search tilt (or
+            on a bench run, which commands nothing); ``False`` after a
+            ``mission.abort`` milestone.
         """
         target = float(ctx.params.gimbal.search_tilt_deg)
         ctx.current_tilt_deg = target
+        monitor = getattr(ctx, "gimbal_monitor", None)
+        start = monitor.current_tilt() if monitor is not None else None
         ctx.drone.camera_control(tilt=target, pan=0.0)
 
         if getattr(ctx.params, "no_fly", False):
             return True
-
-        monitor = getattr(ctx, "gimbal_monitor", None)
         if monitor is None:
-            return True
+            return self._gimbal_unresponsive(ctx, "sem monitor de orientação da câmera")
+        if start is None:
+            return self._gimbal_unresponsive(ctx, f"sem leitura do gimbal antes do comando de {target:.1f} deg")
+
+        distance = abs(target - start)
+        if distance < GIMBAL_MIN_TRAVEL_DEG:
+            return self._gimbal_unresponsive(
+                ctx, f"câmera já em {start:.1f} deg para o alvo {target:.1f} deg; movimento não verificável"
+            )
 
         outcome = monitor.wait_for_tilt(
             target,
-            tolerance=float(getattr(ctx.params.gimbal, "nadir_tilt_tolerance_deg", 5.0)),
-            timeout=3.0,
+            tolerance=distance - GIMBAL_MIN_TRAVEL_DEG,
+            timeout=_GIMBAL_GROUND_TIMEOUT_SEC,
             assert_command=lambda: ctx.drone.camera_control(tilt=target, pan=0.0),
             interrupted=ctx.interrupted,
             period=0.2,
         )
-
         if outcome.interrupted:
             return False
-
-        if not outcome.telemetry or not outcome.reached:
-            actual = outcome.actual if outcome.actual is not None else monitor.current_tilt()
-            ground_ok = (
-                actual is not None
-                and (
-                    abs(actual - target) <= 15.0
-                    or (target <= -15.0 and actual <= -10.0)
-                )
+        if outcome.actual is None:
+            return self._gimbal_unresponsive(ctx, outcome.describe(target))
+        travel = actuation_travel(start, outcome.actual, target)
+        if not outcome.reached or travel < GIMBAL_MIN_TRAVEL_DEG:
+            return self._gimbal_unresponsive(
+                ctx, f"{outcome.describe(target)}; deslocamento {travel:.1f} deg a partir de {start:.1f} deg"
             )
-            if ground_ok:
-                logger.info("Gimbal confirmado em solo: %.1f deg (alvo %.1f deg).", actual, target)
-                return True
 
-            logger.error(
-                "Falha no controle do gimbal: câmera não respondeu aos comandos em solo (%s).",
-                outcome.describe(target),
-            )
-            if hasattr(ctx, "emit_milestone"):
-                ctx.emit_milestone(
-                    "mission.abort",
-                    f"Falha no controle do gimbal: câmera não respondeu aos comandos ({outcome.describe(target)}). Voo cancelado em solo.",
-                )
-            return False
-
-        logger.info("Gimbal confirmado em solo: %s.", outcome.describe(target))
+        logger.info(
+            "Gimbal confirmado em solo: movimento %.1f -> %.1f deg (alvo %.1f deg) em %.2f s.",
+            start,
+            outcome.actual,
+            target,
+            outcome.waited,
+        )
         return True
+
+    @staticmethod
+    def _gimbal_unresponsive(ctx: MissionContext, detail: str) -> bool:
+        """Log and announce a gimbal that did not follow its ground commands; returns ``False``."""
+        logger.error("Falha no controle do gimbal: câmera não respondeu aos comandos em solo (%s).", detail)
+        if hasattr(ctx, "emit_milestone"):
+            ctx.emit_milestone(
+                "mission.abort",
+                f"Falha no controle do gimbal: câmera não respondeu aos comandos ({detail}). Voo cancelado em solo.",
+            )
+        return False
 
     def _ground_sequence(self, ctx: MissionContext) -> StepStatus:
         """Pre-arm checks, gimbal, flat trim, ground reference and the countdown."""
