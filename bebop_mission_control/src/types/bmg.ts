@@ -555,7 +555,15 @@ export interface BmgAPI {
 
   startMission: (
     options?: MissionLaunchOptions
-  ) => Promise<{ success: boolean; pid?: number; message?: string; error?: string; argv?: string[] }>;
+  ) => Promise<{
+    success: boolean;
+    /** An abort reached the launch before the mission was spawned (electron/launchGate.cjs). */
+    cancelled?: boolean;
+    pid?: number;
+    message?: string;
+    error?: string;
+    argv?: string[];
+  }>;
   startBenchStage: (
     options: BenchStageOptions | number
   ) => Promise<{ success: boolean; pid?: number; message?: string; error?: string; argv?: string[] }>;

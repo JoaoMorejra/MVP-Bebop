@@ -31,6 +31,8 @@ const { createOrphanReaper, parseOrphanCandidates } = require('./orphanMissions.
 const { createLandSupervisor } = require('./landSupervisor.cjs');
 const { evaluateLaunchReadiness } = require('./launchReadiness.cjs');
 const { normalizeLaunchMode } = require('./missionMode.cjs');
+const { staleDriverSession } = require('./driverSession.cjs');
+const { createLaunchGate } = require('./launchGate.cjs');
 
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 // The monorepo is checked out as <ws>/src/mvp_mission_bebop on every
@@ -135,6 +137,16 @@ let latestSpeechState = { ready: false, detail: 'não iniciado' };
 let commandProcess = null;
 /** When the last `BMG_TELEM:` sample landed. Null means none has. */
 let latestTelemetryAt = null;
+/**
+ * Last non-null `flying_state`. The bridge blanks the field once navigation
+ * goes stale, which would make an aircraft that lost its link in the air look
+ * the same as one powered off on the ground (electron/driverSession.cjs).
+ */
+let lastKnownFlyingState = null;
+/** When this station last spawned the driver; null when it did not. */
+let driverStartedAt = null;
+/** When the telemetry bridge was last started. */
+let telemetryBridgeStartedAt = null;
 
 let latestTelemetry = {
   connected: false,
@@ -446,6 +458,7 @@ function ingestTelemetryLine(line) {
     if (wifiNetworkChanged(parsed.wifi_ssid)) void refreshRos2Daemon('rede Wi-Fi mudou');
     const driverWasUp = driverUp();
     latestTelemetry = { ...latestTelemetry, ...parsed };
+    if (typeof parsed.flying_state === 'number') lastKnownFlyingState = parsed.flying_state;
     // A standby prepared without the driver is on the bench frame and one
     // prepared with it lost its link: either way it is re-prepared.
     if (driverUp() !== driverWasUp) refreshStandby();
@@ -685,6 +698,7 @@ function startBackgroundServices() {
     [path.join(STREAMER_DIR, 'telemetry_bridge.py')],
     ingestTelemetryLine
   );
+  telemetryBridgeStartedAt = Date.now();
   // Started with the others rather than on first use. A participant needs a
   // couple of seconds to complete discovery before anything it publishes is
   // actually delivered, and the command that cannot afford to wait for that is
@@ -1501,6 +1515,7 @@ async function startDriverProcess(options = {}) {
       cwd: NECTAR_SDK_DIR,
       env: getNectarEnv(),
     });
+    driverStartedAt = Date.now();
 
     recordLog('driver', { type: 'stdout', text: `[BMG] make driver-bebop IP=${latestTelemetry.drone_ip || DRONE_IP} em ${NECTAR_SDK_DIR}\n` });
     drainInto(driverProcess.stdout, 'driver', 'stdout');
@@ -1508,9 +1523,14 @@ async function startDriverProcess(options = {}) {
     driverProcess.on('error', (err) => {
       recordLog('driver', { type: 'stderr', text: `[BMG] ${err.message}\n` });
     });
+    const child = driverProcess;
     driverProcess.on('close', (code) => {
       recordLog('driver', { type: 'exit', text: `[BMG] Driver encerrado com código ${code}\n` });
+      // A forced restart kills this child and spawns the next before its
+      // `close` lands; that late event must not orphan the new driver.
+      if (driverProcess !== child) return;
       driverProcess = null;
+      driverStartedAt = null;
       latestTelemetry.driver_running = false;
       send('bmg:telemetry-update', latestTelemetry);
     });
@@ -1721,15 +1741,31 @@ ipcMain.handle('bmg:ensure-link', async (_event, options = {}) => {
         latestTelemetry.wifi_ssid = String(options.ssid);
       }
 
+      // A driver that outlived the aircraft being powered off keeps a dead
+      // ARSDK session, and `startDriverProcess` would reuse it. Judged here,
+      // before step 3 rebuilds the bridges and resets their odometry age.
+      const telemetryAge = latestTelemetryAt === null ? Infinity : Date.now() - latestTelemetryAt;
+      const session = staleDriverSession({
+        driverAlive: Boolean(driverProcess) && (await isDriverAlive()),
+        missionRunning: Boolean(missionProcess),
+        lastFlyingState: lastKnownFlyingState,
+        telemetryFresh: telemetryAge < TELEMETRY_STALE_MS,
+        odomAgeSec: latestTelemetry.odom_age_sec,
+        driverAgeMs: driverStartedAt === null ? null : Date.now() - driverStartedAt,
+        bridgeAgeMs: telemetryBridgeStartedAt === null ? null : Date.now() - telemetryBridgeStartedAt,
+      });
+
       // 2. Aircraft reachable
       //
       // Live odometry is stronger evidence than ICMP: the driver is holding an
       // ARSDK session with the airframe and samples are arriving. Some Bebop
       // firmware drops pings under video load, and waiting out the ping budget
-      // there would stall a bring-up over a link that is demonstrably up.
+      // there would stall a bring-up over a link that is demonstrably up. A
+      // stale driver proves nothing, so only the aircraft answering counts:
+      // that is what says it came back before its driver is replaced.
       linkProgress('ping', 'running', `Procurando a aeronave em ${DRONE_IP}`);
       const reachable = await waitFor(
-        async () => latestTelemetry.driver_running || (await pingDrone(1)),
+        async () => (!session.stale && latestTelemetry.driver_running) || (await pingDrone(1)),
         LINK_PING_TIMEOUT_MS,
         1000
       );
@@ -1758,8 +1794,12 @@ ipcMain.handle('bmg:ensure-link', async (_event, options = {}) => {
       linkProgress('bridges', 'ok', 'Pontes reiniciadas');
 
       // 4. Driver process
-      linkProgress('driver', 'running', 'Subindo o driver ROS 2');
-      const started = await startDriverProcess();
+      if (session.stale) {
+        linkProgress('driver', 'running', `Sessão do driver perdida (${session.reason}); reiniciando o driver`);
+      } else {
+        linkProgress('driver', 'running', 'Subindo o driver ROS 2');
+      }
+      const started = await startDriverProcess({ forceRestart: session.stale });
       if (!started.success) {
         return {
           success: false,
@@ -2790,13 +2830,12 @@ function parseLaunchDocument(paramsJson) {
   return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : null;
 }
 
-let missionStarting = false;
+const launchGate = createLaunchGate();
 
 async function startMissionProcess(options = {}) {
-  if (missionProcess || missionStarting) {
+  if (missionProcess || !launchGate.begin()) {
     return { success: false, error: 'Uma missão já está em andamento.', message: 'Uma missão já está em andamento.' };
   }
-  missionStarting = true;
   try {
     // Sweeps, not just inspects: a standby orphan already past its grace period
     // (asked to stop by an earlier sweep, at boot or at a previous attempt) is
@@ -2925,6 +2964,13 @@ async function startMissionProcess(options = {}) {
   const fullLaunch = !args.includes('--stages');
   const launchDoc = { ...doc, no_fly: Boolean(options.noFly) };
 
+  // Last point before anything is spawned or promoted, and after the last
+  // await: an abort that landed during the readiness checks ends it here.
+  if (launchGate.cancelled()) {
+    recordLog('mission', { type: 'stdout', text: '[BMG] Lançamento cancelado pelo operador antes do arranque da missão.\n' });
+    return { success: false, cancelled: true, error: 'Lançamento cancelado.', message: 'Lançamento cancelado.' };
+  }
+
   // Bring the copilot up alongside the mission rather than on its first line.
   // Starting Python, importing `google.genai` and opening a Live session costs
   // seconds; paid here they overlap the countdown, paid on demand they land on
@@ -3017,7 +3063,7 @@ async function startMissionProcess(options = {}) {
     missionStartedAt = null;
     return { success: false, error: error.message };
   } finally {
-    missionStarting = false;
+    launchGate.end();
   }
 }
 
@@ -3325,6 +3371,7 @@ function getOrInitLandSupervisor() {
 }
 
 ipcMain.handle('bmg:end-mission', singleFlight(async () => {
+  launchGate.cancel();
   const env = getNectarEnv();
   const missionKilled = await stopMissionProcess(1200);
 
@@ -3368,6 +3415,9 @@ ipcMain.handle('bmg:end-mission', singleFlight(async () => {
 }));
 
 ipcMain.handle('bmg:abort-mission', singleFlight(async () => {
+  if (launchGate.cancel()) {
+    recordLog('mission', { type: 'stdout', text: '[BMG] Aborto durante a preparação do lançamento: a missão não será iniciada.\n' });
+  }
   const env = getNectarEnv();
   const airborne = isAirborneNow();
 

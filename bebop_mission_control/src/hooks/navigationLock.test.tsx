@@ -265,3 +265,74 @@ describe('preflightLocked', () => {
     expect(states.filter((state) => preflightLocked(state, false))).toEqual(['arming', 'running', 'aborting']);
   });
 });
+
+describe('aborting a launch and launching again', () => {
+  it('an abort while the launch is being prepared leaves the station idle and launchable', async () => {
+    await mount();
+    const launch = await clickLaunch();
+
+    let aborting!: Promise<void>;
+    await act(async () => {
+      aborting = probe.runtime.abort();
+    });
+    await act(async () => bridge.abortAnswered());
+    await act(async () => aborting);
+    await act(async () => probe.runtime.reset());
+
+    // main.cjs answers the launch only now, after the operator's abort.
+    await act(async () => bridge.spawn(true));
+    const result = await launch.settled;
+    await flush();
+
+    expect(result.success).toBe(false);
+    expect(probe.runtime.state).toBe('idle');
+    expect(homeAvailable()).toBe(true);
+
+    // The next click starts a fresh launch normally.
+    await act(async () => bridge.exit(130));
+    const next = await clickLaunch();
+    expect(probe.runtime.state).toBe('arming');
+    await act(async () => bridge.spawn(true));
+    expect((await next.settled).success).toBe(true);
+    expect(probe.runtime.state).toBe('running');
+  });
+
+  it('the late exit of an aborted process does not leak into the next cycle', async () => {
+    await mount();
+    const launch = await clickLaunch();
+    await act(async () => bridge.spawn(true));
+    await launch.settled;
+
+    let aborting!: Promise<void>;
+    await act(async () => {
+      aborting = probe.runtime.abort();
+    });
+    await act(async () => bridge.abortAnswered());
+    await act(async () => aborting);
+    await act(async () => probe.runtime.reset());
+    await act(async () => bridge.exit(130));
+
+    expect(probe.runtime.state).toBe('idle');
+    expect(probe.runtime.exitCode).toBeNull();
+    expect(homeAvailable()).toBe(true);
+  });
+
+  it('aborts and launches several times in a row', async () => {
+    await mount();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const launch = await clickLaunch();
+      expect(probe.runtime.state).toBe('arming');
+      let aborting!: Promise<void>;
+      await act(async () => {
+        aborting = probe.runtime.abort();
+      });
+      await act(async () => bridge.abortAnswered());
+      await act(async () => aborting);
+      await act(async () => probe.runtime.reset());
+      await act(async () => bridge.spawn(false));
+      await launch.settled;
+      expect(probe.runtime.state).toBe('idle');
+      expect(homeAvailable()).toBe(true);
+    }
+  });
+});

@@ -38,7 +38,8 @@ import { readMissionMode, readRtlEnabled, type MissionMode } from './lib/mission
 import { NO_FLY_PATH, readFlightMode, type FlightMode } from './lib/flightMode';
 import { LAUNCH_COUNTDOWN_SEC, launchBlockers, launchCountdownSec, reconcileCoupledPaths } from './lib/launchDocument';
 import { blockingConflicts } from './lib/parameterConflicts';
-import { isMissionOver } from './lib/missionOutcome';
+import { EXIT_LAUNCH_REFUSED, isMissionOver } from './lib/missionOutcome';
+import { airborneHandoff, countdownExitHandoff } from './lib/cockpitHandoff';
 import { useFinishLock } from './hooks/useFinishLock';
 import { reportMayStart } from './lib/finishLock';
 import { useGuardedAsync } from './hooks/useGuardedAsync';
@@ -114,8 +115,14 @@ export const App: React.FC = () => {
    * the end of the previous flight is not the end of this one.
    */
   const [spawnRequested, setSpawnRequested] = useState(false);
-  /** Set by a cancel; the launch in progress checks it after each wait. */
-  const launchCancelledRef = useRef(false);
+  /**
+   * Identity of the launch the dial belongs to, bumped by every launch and
+   * every cancel. A shared "cancelled" flag was cleared by the next click, so
+   * a launch cancelled while it was still saving the parameters resumed and
+   * spawned; its `finally` then closed the dial of the launch that followed.
+   * Each launch now checks that it is still the current one after every wait.
+   */
+  const launchIdRef = useRef(0);
   /** The clearance line of the launch being prepared, as the copilot handled it (D3). */
   const [speech, setSpeech] = useState<{ startedAt: number | null; endedAt: number | null; heard: boolean; text: string | null }>(
     { startedAt: null, endedAt: null, heard: false, text: null }
@@ -319,7 +326,8 @@ export const App: React.FC = () => {
       return;
     }
     launching.current = true;
-    launchCancelledRef.current = false;
+    const launchId = ++launchIdRef.current;
+    const superseded = () => launchIdRef.current !== launchId;
     setLaunchPending(true);
     // The click instant. The mission takes off at it plus the countdown
     // (engine/launch.py) and the dial counts towards the same instant, so the
@@ -336,7 +344,7 @@ export const App: React.FC = () => {
     try {
       primeLaunchPhrases();
       const doc = await commitLaunchDocument();
-      if (launchCancelledRef.current || !doc) return;
+      if (superseded() || !doc) return;
       setParamsCommitted(true);
       setLaunchedMode(readMissionMode(doc));
       setLaunchedRtl(readRtlEnabled(doc));
@@ -365,7 +373,7 @@ export const App: React.FC = () => {
       // The document is the only source of the flight parameters (5.1): no
       // per-field option, so no fallback can stand in for a value the
       // operator never set.
-      if (launchCancelledRef.current) return;
+      if (superseded()) return;
       spawned = true;
       setSpawnRequested(true);
       const result = await mission.launch({
@@ -375,6 +383,15 @@ export const App: React.FC = () => {
         paramsJson: launchParamsJson(doc, failsafe),
       });
 
+      // Cancelled meanwhile: the cancel already restored the dial, and a newer
+      // launch may own it now.
+      if (superseded()) return;
+      if ('cancelled' in result && result.cancelled) {
+        setCounting(false);
+        setParamsCommitted(false);
+        setSpawnRequested(false);
+        return;
+      }
       if (!result.success) {
         // Stay put. Throwing the operator into the cockpit hides the control they
         // were using and gives them no way back to the thing that failed.
@@ -388,14 +405,17 @@ export const App: React.FC = () => {
         setScreen('cockpit');
       }
     } finally {
-      // Nothing was spawned: a refused document, a cancel or a throw leaves
-      // the dial split and idle again.
-      if (!spawned) {
-        setCounting(false);
-        setParamsCommitted(false);
+      // A superseded launch leaves everything to the cancel that ended it and
+      // to the launch that followed. Otherwise nothing spawned (a refused
+      // document or a throw) leaves the dial split and idle again.
+      if (!superseded()) {
+        if (!spawned) {
+          setCounting(false);
+          setParamsCommitted(false);
+        }
+        launching.current = false;
+        setLaunchPending(false);
       }
-      launching.current = false;
-      setLaunchPending(false);
     }
   }, [commitLaunchDocument, failsafe.thresholdPct, mission, narration, params, prepareSpeech, primeLaunchPhrases, resetTrack]);
 
@@ -505,11 +525,30 @@ export const App: React.FC = () => {
   }, []);
 
   // A mission that exits during the countdown — a missing camera, a refused
-  // ground calibration — is shown at once rather than after the remaining
-  // seconds of a countdown for a process that is no longer there.
+  // ground calibration — ends the countdown at once. On the ground the operator
+  // stays on pre-flight with the exit code; the cockpit only for an aircraft
+  // already in the air or a bench routine (lib/cockpitHandoff.ts).
   useEffect(() => {
-    if (counting && spawnRequested && isMissionOver(mission.state)) finishCountdown();
-  }, [counting, spawnRequested, mission.state, finishCountdown]);
+    const target = countdownExitHandoff({
+      counting,
+      spawnRequested,
+      missionState: mission.state,
+      flyingState: telemetry.flying_state,
+      refused: mission.refusal !== null || mission.exitCode === EXIT_LAUNCH_REFUSED,
+      bench: benchMode || benchStage !== null,
+    });
+    if (target === 'cockpit') {
+      finishCountdown();
+    } else if (target === 'preflight') {
+      setCounting(false);
+      setParamsCommitted(false);
+      setSpawnRequested(false);
+      setScreen('preflight');
+      setLaunchError(
+        `A missão encerrou durante a preparação (código ${mission.exitCode ?? 'desconhecido'}), com a aeronave em solo. Consulte o diagnóstico e inicie novamente.`
+      );
+    }
+  }, [counting, spawnRequested, mission.state, mission.refusal, mission.exitCode, telemetry.flying_state, benchMode, benchStage, finishCountdown]);
 
   // A launch document the mission refused (exit 78): nothing was commanded, so
   // the countdown is cancelled without opening the cockpit, and the operator
@@ -521,24 +560,26 @@ export const App: React.FC = () => {
     setLaunchError(`Lançamento recusado: ${mission.refusal.reason}`);
   }, [mission.refusal]);
 
-  // Whenever the aircraft becomes airborne or reaches flight stages, ALWAYS transition
-  // immediately to the cockpit so the operator never stays stuck on the preflight screen.
+  // The cockpit opens at the end of the launch sequence (parameters loaded and
+  // every readiness check passed). The only shortcut is an aircraft the
+  // aircraft itself reports airborne under a confirmed mission process, so it
+  // is never watched from the dial (lib/cockpitHandoff.ts).
   useEffect(() => {
-    const isFlyingOrAirborne =
-      isAirborne(telemetry.flying_state) ||
-      (typeof telemetry.altitude === 'number' && telemetry.altitude > 0.35) ||
-      mission.stage >= 2;
     if (
-      isFlyingOrAirborne &&
-      (counting || screen === 'preflight') &&
-      (mission.state === 'running' || mission.state === 'arming' || spawnRequested)
+      airborneHandoff({
+        missionState: mission.state,
+        flyingState: telemetry.flying_state,
+        stage: mission.stage,
+        counting,
+        screen,
+      })
     ) {
       finishCountdown();
     }
-  }, [telemetry.flying_state, telemetry.altitude, mission.stage, mission.state, counting, screen, spawnRequested, finishCountdown]);
+  }, [telemetry.flying_state, mission.stage, mission.state, counting, screen, finishCountdown]);
 
   const cancelCountdown = useCallback(async () => {
-    launchCancelledRef.current = true;
+    launchIdRef.current += 1;
     launching.current = false;
     setLaunchPending(false);
     setCounting(false);

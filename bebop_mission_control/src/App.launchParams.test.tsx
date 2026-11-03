@@ -937,19 +937,23 @@ describe('the launch sequence in pre-flight', () => {
     const bridge = hoisted.stable.bridge as Record<string, unknown>;
     bridge.setCockpitAbortArmed = (value: boolean) => armed.push(value);
     bridge.onAbortShortcut = () => () => undefined;
+    const telemetryBefore = hoisted.stable.telemetry.telemetry;
     try {
       await mount();
       await act(async () => {
         await call('preflight', 'onLaunch');
       });
       expect(armed).toEqual([true]);
-      // The mission reports its end of the countdown: the sequence hands over
-      // to the cockpit, whose own abort publishes in the same commit.
-      hoisted.stable.mission.state = 'faulted';
+      // The aircraft reports itself off the ground under the running mission:
+      // the sequence hands over to the cockpit, whose own abort publishes in
+      // the same commit.
+      hoisted.stable.mission.state = 'running';
+      hoisted.stable.telemetry.telemetry = { ...telemetryBefore, flying_state: 1 };
       await rerender();
       expect(hoisted.props.cockpit).toBeDefined();
       expect(armed[armed.length - 1]).toBe(true);
     } finally {
+      hoisted.stable.telemetry.telemetry = telemetryBefore;
       delete bridge.setCockpitAbortArmed;
       delete bridge.onAbortShortcut;
     }
@@ -1027,19 +1031,125 @@ describe('the launch sequence in pre-flight', () => {
   });
 
   it('airborne state immediately transitions to cockpit even during sequence', async () => {
+    const telemetryBefore = hoisted.stable.telemetry.telemetry;
+    try {
+      await mount();
+      await act(async () => {
+        await call('preflight', 'onLaunch');
+      });
+      expect(hoisted.props.cockpit).toBeUndefined();
+
+      // The process is confirmed and the aircraft reports flying_state 1 (takingoff).
+      hoisted.stable.mission.state = 'running';
+      hoisted.stable.telemetry.telemetry = { ...telemetryBefore, flying_state: 1 };
+      await rerender();
+      expect(hoisted.props.cockpit).toBeDefined();
+      expect(counting()).toBe(false);
+    } finally {
+      hoisted.stable.telemetry.telemetry = telemetryBefore;
+    }
+  });
+
+  it('odometry altitude drift at the click does not open the cockpit while the process is arming', async () => {
+    const telemetryBefore = hoisted.stable.telemetry.telemetry;
+    try {
+      await mount();
+      await act(async () => {
+        await call('preflight', 'onLaunch');
+      });
+      hoisted.stable.mission.state = 'arming';
+      hoisted.stable.telemetry.telemetry = { ...telemetryBefore, altitude: 0.6, flying_state: 0 };
+      await rerender();
+      expect(hoisted.props.cockpit).toBeUndefined();
+      expect(counting()).toBe(true);
+    } finally {
+      hoisted.stable.telemetry.telemetry = telemetryBefore;
+    }
+  });
+
+  it('a mission that exits on the ground during the sequence stays on pre-flight with the reason', async () => {
+    const mission = hoisted.stable.mission as Record<string, unknown>;
+    try {
+      await mount();
+      await act(async () => {
+        await call('preflight', 'onLaunch');
+      });
+      hoisted.stable.mission.state = 'faulted';
+      mission.exitCode = 1;
+      await rerender();
+      expect(hoisted.props.cockpit).toBeUndefined();
+      expect(counting()).toBe(false);
+      expect(String(hoisted.props.preflight.launchError)).toContain('encerrou durante a preparação (código 1)');
+    } finally {
+      delete mission.exitCode;
+    }
+  });
+
+  it('a launch cancelled while it saves the parameters neither spawns nor closes the next launch', async () => {
+    const saves: Array<(ok: boolean) => void> = [];
+    hoisted.stable.params.dirty = true;
+    hoisted.stable.params.save = vi.fn(() => new Promise<boolean>((resolve) => saves.push(resolve)));
     await mount();
+
+    let first!: Promise<unknown>;
+    await act(async () => {
+      first = call('preflight', 'onLaunch') as Promise<unknown>;
+    });
+    await act(async () => {
+      await call('preflight', 'onAbortLaunch');
+    });
+    expect(counting()).toBe(false);
+
+    let second!: Promise<unknown>;
+    await act(async () => {
+      second = call('preflight', 'onLaunch') as Promise<unknown>;
+    });
+    expect(counting()).toBe(true);
+
+    // The first launch's save settles only now.
+    await act(async () => {
+      saves[0](true);
+      await first;
+    });
+    expect(hoisted.launch).not.toHaveBeenCalled();
+    expect(counting()).toBe(true);
+
+    await act(async () => {
+      saves[1](true);
+      await second;
+    });
+    expect(hoisted.launch).toHaveBeenCalledTimes(1);
+    expect(counting()).toBe(true);
+  });
+
+  it('an abort while the host prepares the launch keeps pre-flight free for the next launch', async () => {
+    const answers: Array<(result: { success: boolean; cancelled?: boolean }) => void> = [];
+    hoisted.launch.mockImplementationOnce(
+      () => new Promise<{ success: boolean; cancelled?: boolean }>((resolve) => answers.push(resolve))
+    );
+    await mount();
+
+    let first!: Promise<unknown>;
+    await act(async () => {
+      first = call('preflight', 'onLaunch') as Promise<unknown>;
+    });
+    await rerender();
+    expect(hoisted.launch).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await call('preflight', 'onAbortLaunch');
+    });
+    await act(async () => {
+      answers[0]({ success: false, cancelled: true });
+      await first;
+    });
+    expect(counting()).toBe(false);
+    expect(hoisted.props.cockpit).toBeUndefined();
+    expect(hoisted.props.preflight.launchError ?? null).toBeNull();
+
     await act(async () => {
       await call('preflight', 'onLaunch');
     });
-    expect(hoisted.props.cockpit).toBeUndefined();
-
-    // Aircraft reports airborne flying_state 1 (takingoff)
-    hoisted.stable.telemetry.telemetry = {
-      ...hoisted.stable.telemetry.telemetry,
-      flying_state: 1,
-    };
-    await rerender();
-    expect(hoisted.props.cockpit).toBeDefined();
-    expect(counting()).toBe(false);
+    expect(hoisted.launch).toHaveBeenCalledTimes(2);
+    expect(counting()).toBe(true);
   });
 });

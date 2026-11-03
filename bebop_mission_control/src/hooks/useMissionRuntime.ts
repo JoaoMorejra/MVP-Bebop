@@ -58,6 +58,19 @@ export function useMissionRuntime() {
    * restored `running`.
    */
   const processUp = useRef(false);
+  /**
+   * Bumped by every launch, abort and reset. A launch whose answer arrives
+   * after an abort or reset belongs to a cycle the operator already left: it
+   * wrote `running` over the reset, which locked the launch control and later
+   * opened the cockpit on a mission nobody had started.
+   */
+  const cycle = useRef(0);
+  /**
+   * A run is open: from a launch, a bench routine or a running mission found
+   * at mount, until `reset`. The exit of a process killed by an abort can land
+   * after the reset; it describes the cycle that was closed, not the next one.
+   */
+  const runOpen = useRef(false);
 
   // Buffered history, so a screen mounted after launch still sees the start.
   useEffect(() => {
@@ -69,6 +82,7 @@ export function useMissionRuntime() {
     void bridge.getMissionStatus().then((status) => {
       if (status.running) {
         processUp.current = true;
+        runOpen.current = true;
         setState('running');
         setStartedAt(status.startedAt);
       }
@@ -97,6 +111,7 @@ export function useMissionRuntime() {
       }),
       bridge.onLaunchRefused?.((event) => setRefusal(event)) ?? (() => undefined),
       bridge.onMissionExit((event) => {
+        if (!runOpen.current) return;
         exitSeen.current = true;
         processUp.current = false;
         setExitCode(event.code);
@@ -116,6 +131,8 @@ export function useMissionRuntime() {
         return { success: false, message: 'Uma missão já está em andamento.' };
       }
       processUp.current = true;
+      runOpen.current = true;
+      const own = ++cycle.current;
       setRan(false);
       setState('arming');
       setStage(0);
@@ -146,6 +163,19 @@ export function useMissionRuntime() {
       }
 
       const result = await bridge.startMission(options);
+      if (cycle.current !== own) {
+        // Aborted or reset while main.cjs was still preparing the launch. The
+        // host refuses to spawn after an abort; a process that started anyway
+        // is stopped, and the state of the cycle the operator is in now is
+        // left alone.
+        if (result.success) void bridge.abortMission().catch(() => undefined);
+        return { success: false, cancelled: true, message: 'Lançamento cancelado.' };
+      }
+      if (result.cancelled) {
+        processUp.current = false;
+        setState('aborted');
+        return result;
+      }
       if (!result.success) {
         processUp.current = false;
         setState('faulted');
@@ -160,6 +190,7 @@ export function useMissionRuntime() {
   );
 
   const abort = useCallback(async () => {
+    cycle.current += 1;
     setState('aborting');
     cues.play('abort');
     if (!bridge) {
@@ -189,6 +220,8 @@ export function useMissionRuntime() {
    * presented over an aircraft sitting on the ground.
    */
   const reset = useCallback(() => {
+    cycle.current += 1;
+    runOpen.current = false;
     processUp.current = false;
     setRan(false);
     setState('idle');
@@ -214,6 +247,7 @@ export function useMissionRuntime() {
    */
   const beginBenchStage = useCallback(() => {
     processUp.current = true;
+    runOpen.current = true;
     setRan(true);
     setState('running');
     setStage(0);
