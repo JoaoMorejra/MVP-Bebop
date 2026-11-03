@@ -24,12 +24,12 @@ export interface LaunchStep {
 }
 
 export const LAUNCH_STEPS: ReadonlyArray<LaunchStep> = [
-  { id: 'params', label: 'Parâmetros', weight: 10, expectedMs: 1500 },
-  { id: 'link', label: 'Enlace', weight: 10, expectedMs: 2000 },
-  { id: 'gimbal', label: 'Gimbal', weight: 15, expectedMs: 3000 },
-  { id: 'imu', label: 'IMU', weight: 20, expectedMs: 4000 },
-  { id: 'ground', label: 'Solo', weight: 15, expectedMs: 3000 },
-  { id: 'vision', label: 'Visão', weight: 20, expectedMs: 5000 },
+  { id: 'params', label: 'Carregando ajustes', weight: 10, expectedMs: 1500 },
+  { id: 'link', label: 'Conectando ao drone', weight: 10, expectedMs: 2000 },
+  { id: 'gimbal', label: 'Testando a câmera', weight: 15, expectedMs: 3000 },
+  { id: 'imu', label: 'Nivelando sensores', weight: 20, expectedMs: 4000 },
+  { id: 'ground', label: 'Marcando o solo', weight: 15, expectedMs: 3000 },
+  { id: 'vision', label: 'Ligando a visão', weight: 20, expectedMs: 5000 },
 ];
 
 /** The percent the checkpoints alone can reach; 90..100 % belongs to "Tudo Pronto!" and the copilot speech. */
@@ -107,8 +107,8 @@ const settledState = (state: StepState) => state === 'done' || state === 'skippe
 
 /**
  * Maps a loading percentage `0..89` to the checkpoint whose cumulative weight
- * band owns that integer (`0..9` Parâmetros, `10..19` Enlace, `20..34` Gimbal,
- * `35..54` IMU, `55..69` Solo, `70..89` Visão).
+ * band owns that integer (`0..9` params, `10..19` link, `20..34` gimbal,
+ * `35..54` imu, `55..69` ground, `70..89` vision).
  */
 export function stepForPercent(pct: number): LaunchStep {
   const clamped = Math.max(0, Math.min(LOAD_CEILING_PCT - 1, Math.floor(pct)));

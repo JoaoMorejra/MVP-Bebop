@@ -73,7 +73,7 @@ describe('useLaunchSequence', () => {
 
   it('starts at 0 with the params step active right after the click even when signals are already true', () => {
     render(input({ ...ready, countdown: { remaining: 10, clearance: false, trim: 'acked' } }));
-    expect(latest).toMatchObject({ phase: 'loading', percent: 0, stepId: 'params', label: 'Parâmetros' });
+    expect(latest).toMatchObject({ phase: 'loading', percent: 0, stepId: 'params', label: 'Carregando ajustes' });
   });
 
   it('progresses from 0% to 100% over 10 seconds without skipping any integer or checkpoint label', () => {
@@ -147,7 +147,7 @@ describe('useLaunchSequence', () => {
     expect(seenPercents[seenPercents.length - 1]).toBe(100);
     // Every integer from 0 to 100 must be visited in order (+1 per step)
     expect(seenPercents).toEqual(Array.from({ length: 101 }, (_, idx) => idx));
-    expect(seenLabels).toEqual(['Parâmetros', 'Enlace', 'Gimbal', 'IMU', 'Solo', 'Visão', 'Tudo Pronto!']);
+    expect(seenLabels).toEqual(['Carregando ajustes', 'Conectando ao drone', 'Testando a câmera', 'Nivelando sensores', 'Marcando o solo', 'Ligando a visão', 'Tudo Pronto!']);
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 

@@ -357,7 +357,7 @@ export const LaunchDial: React.FC<LaunchDialProps> = ({
                     data-step-label
                     data-leaving
                     aria-hidden
-                    className="anim-step-out t-text-swap-out absolute font-sans text-xl font-medium tracking-[0.02em] text-frost/75"
+                    className="anim-step-out t-text-swap-out absolute font-sans text-base font-medium tracking-[0.01em] text-frost/75"
                   >
                     {leaving.text}
                   </span>
@@ -369,10 +369,10 @@ export const LaunchDial: React.FC<LaunchDialProps> = ({
                     data-text-anim={view?.message ? 'text-states-swap' : 'texts-reveal'}
                     aria-hidden
                     className={cn(
-                      'anim-step-in t-text-swap-in t-texts-reveal absolute text-xl font-semibold tracking-[0.02em]',
+                      'anim-step-in t-text-swap-in t-texts-reveal absolute font-semibold',
                       view?.message
-                        ? cn('title-pixel font-pixel', benchMode ? 'text-cyan' : 'text-mint')
-                        : 'font-sans text-frost'
+                        ? cn('title-pixel font-pixel text-xl tracking-[0.02em]', benchMode ? 'text-cyan' : 'text-mint')
+                        : 'font-sans text-base tracking-[0.01em] text-frost'
                     )}
                   >
                     <RevealText text={label} />

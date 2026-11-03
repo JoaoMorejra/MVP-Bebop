@@ -50,7 +50,7 @@ const view = (overrides: Partial<LaunchView>): LaunchView => ({
   phase: 'loading',
   percent: 0,
   stepId: 'params',
-  label: 'Parâmetros',
+  label: 'Carregando ajustes',
   message: null,
   ...overrides,
 });
@@ -136,16 +136,16 @@ describe('LaunchDial', () => {
     expect(host.querySelector('[data-ready-halo]')!.className).toContain('opacity-100');
   });
 
-  it('with a view it shows a large percent, a larger legible step label, and no inner radar or scan overlays', () => {
-    render({ view: view({ percent: 37, stepId: 'imu', label: 'IMU' }) });
+  it('with a view it shows a large percent, a legible step label, and no inner radar or scan overlays', () => {
+    render({ view: view({ percent: 37, stepId: 'imu', label: 'Nivelando sensores' }) });
     const pct = host.querySelector('[data-percent]')!;
     expect(pct.textContent).toBe('37%');
     expect(pct.className).toContain('text-5xl');
     const stepLabel = host.querySelector('[data-step-label]:not([data-leaving])')!;
-    expect(stepLabel.textContent).toBe('IMU');
-    expect(stepLabel.className).toContain('text-xl');
+    expect(stepLabel.textContent).toBe('Nivelando sensores');
+    expect(stepLabel.className).toContain('text-base');
     expect(stepLabel.className).toContain('t-texts-reveal');
-    expect(stepLabel.querySelectorAll('.t-reveal-item').length).toBe(3);
+    expect(stepLabel.querySelectorAll('.t-reveal-item').length).toBe('Nivelando sensores'.length);
     expect(host.querySelector('[data-dial-circle-fill]')).toBeNull();
     expect(host.querySelector('.dial-fill-sector')).toBeNull();
     expect(host.querySelector('.dial-fill-horizon')).toBeNull();
@@ -158,7 +158,7 @@ describe('LaunchDial', () => {
   });
 
   it('smoothly transitions into a proportional perimeter light during launch progression', () => {
-    render({ view: view({ percent: 45, stepId: 'imu', label: 'IMU' }) });
+    render({ view: view({ percent: 45, stepId: 'imu', label: 'Nivelando sensores' }) });
     expect(dial().getAttribute('data-dial-state')).toBe('running');
     const fillLight = host.querySelector<HTMLElement>('[data-dial-fill-light]')!;
     expect(fillLight.getAttribute('data-fill-progress')).toBe('45');
@@ -177,10 +177,10 @@ describe('LaunchDial', () => {
   });
 
   it('step label changes with text-states-swap enter and leave animation', () => {
-    render({ view: view({ stepId: 'params', label: 'Parâmetros' }) });
-    render({ view: view({ stepId: 'link', label: 'Enlace', percent: 10 }) });
+    render({ view: view({ stepId: 'params', label: 'Carregando ajustes' }) });
+    render({ view: view({ stepId: 'link', label: 'Conectando ao drone', percent: 10 }) });
     const leaving = host.querySelector('[data-step-label][data-leaving]');
-    expect(leaving?.textContent).toBe('Parâmetros');
+    expect(leaving?.textContent).toBe('Carregando ajustes');
     expect(leaving?.className).toContain('anim-step-out');
     expect(leaving?.className).toContain('t-text-swap-out');
     const entering = host.querySelector('[data-step-label]:not([data-leaving])')!;
@@ -193,9 +193,9 @@ describe('LaunchDial', () => {
   });
 
   it('announces the step, never the percent, to assistive technology', () => {
-    render({ view: view({ percent: 37, stepId: 'imu', label: 'IMU' }) });
+    render({ view: view({ percent: 37, stepId: 'imu', label: 'Nivelando sensores' }) });
     const live = host.querySelector('[aria-live="polite"]')!;
-    expect(live.textContent).toBe('IMU');
+    expect(live.textContent).toBe('Nivelando sensores');
   });
 
   it('is not clickable while a view is active', () => {

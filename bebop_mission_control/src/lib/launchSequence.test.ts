@@ -41,7 +41,7 @@ describe('launchSequence', () => {
   it('weights of the six steps add up to LOAD_CEILING_PCT', () => {
     expect(LAUNCH_STEPS.map((step) => step.id)).toEqual(['params', 'link', 'gimbal', 'imu', 'ground', 'vision']);
     expect(LAUNCH_STEPS.map((step) => step.weight)).toEqual([10, 10, 15, 20, 15, 20]);
-    expect(LAUNCH_STEPS.map((step) => step.label)).toEqual(['Parâmetros', 'Enlace', 'Gimbal', 'IMU', 'Solo', 'Visão']);
+    expect(LAUNCH_STEPS.map((step) => step.label)).toEqual(['Carregando ajustes', 'Conectando ao drone', 'Testando a câmera', 'Nivelando sensores', 'Marcando o solo', 'Ligando a visão']);
     expect(LAUNCH_STEPS.reduce((sum, step) => sum + step.weight, 0)).toBe(LOAD_CEILING_PCT);
   });
 
@@ -50,7 +50,7 @@ describe('launchSequence', () => {
     expect(view.percent).toBe(0);
     expect(view.phase).toBe('loading');
     expect(view.stepId).toBe('params');
-    expect(view.label).toBe('Parâmetros');
+    expect(view.label).toBe('Carregando ajustes');
     expect(stepStates(signals()).params).toBe('active');
   });
 
@@ -83,7 +83,7 @@ describe('launchSequence', () => {
     const view = deriveLaunchView(signals({ ...allSteps, now: T0 + 600_000 }));
     expect(view.percent).toBe(LOAD_CEILING_PCT - 1);
     expect(view.phase).toBe('loading');
-    expect(view.label).toBe('Visão');
+    expect(view.label).toBe('Ligando a visão');
   });
 
   it('partial credit inside an active step creeps up to the top of its band without crossing into the next step', () => {
@@ -103,7 +103,7 @@ describe('launchSequence', () => {
     expect(t3).toBeGreaterThan(t2);
     expect(t3).toBeLessThan(35);
     expect(deriveLaunchView(signals({ paramsCommitted: true, linkReady: true, stageReached: true, now: T0 + 12_000 })).label).toBe(
-      'Gimbal'
+      'Testando a câmera'
     );
   });
 
@@ -239,7 +239,7 @@ describe('launchSequence', () => {
         seenLabels.push(step.label);
       }
     }
-    expect(seenLabels).toEqual(['Parâmetros', 'Enlace', 'Gimbal', 'IMU', 'Solo', 'Visão']);
+    expect(seenLabels).toEqual(['Carregando ajustes', 'Conectando ao drone', 'Testando a câmera', 'Nivelando sensores', 'Marcando o solo', 'Ligando a visão']);
   });
 
   it('a countdown that reaches zero without the clearance call still completes after 10 s', () => {
