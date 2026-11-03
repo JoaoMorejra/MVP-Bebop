@@ -40,13 +40,13 @@ of how long the drone has been flying. Four phases run in order.
    saturated onto a centering speed ceiling, and rendered through the sigma-delta
    shaper so sub-quantum corrections survive the driver's ``int8(v * 100)``
    truncation. The landing is authorized only after the radial error has been
-   inside tolerance *at residual speed* for several consecutive cycles. In
-   Advanced the along-track setpoint is the visibility stand-off
-   (``rtl_guidance.visibility_standoff_m``): at -70 deg the pad cannot be
-   framed under the CoG at the return heights, so the centring and the tracked
-   descent keep it 0.13 to 0.15 m ahead, and after the commit that measured
-   residual is flown blind on short-horizon odometry
-   (``standoff_closure.StandoffClosure``) before the touchdown.
+   inside tolerance *at residual speed* for several consecutive cycles. The
+   Advanced profile flies the Simple centring envelope (ceiling, forward cap,
+   overspeed brake) with two differences only: the -70 deg tilt, and an
+   along-track setpoint at the visibility stand-off
+   (``rtl_guidance.visibility_standoff_m``), because at -70 deg the pad cannot
+   be framed under the CoG at the return heights. The touchdown follows the
+   commit exactly as in Simple; nothing is flown blind.
 4. **Touchdown.** Unchanged, and deliberately so. The burst ``land()``, the
    odometric confirmation, the descent-stall escalation and the assisted descent
    in :meth:`ClosedLoopRTLStep._touchdown` are the most thoroughly exercised code
@@ -69,6 +69,12 @@ cannot consume the budget for the convergence it exists to enable. Expiry of
 either is not an abort: the aircraft descends where it stands, under the same
 verified touchdown sequence, because a controlled landing at an imprecise
 position is strictly better than the alternatives available to a battery.
+
+Neither profile reads the odometric heading in the terminal phases. The
+Advanced profile logs it beside the marker's planar yaw for diagnosis only:
+the firmware's fused heading drifts by tens of degrees near the pad with the
+airframe still (flight 2026-11-03 06:14), and acting on it landed the aircraft
+0.8 m from the marker.
 """
 
 from __future__ import annotations
@@ -85,6 +91,7 @@ import numpy as np
 
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.cross_axis_hold import body_velocity
+from mvp_mission_bebop.controllers.heading_guard import HeadingGuard, HeadingReading
 from mvp_mission_bebop.controllers.precision_descent import DescentCommand, PrecisionDescentController
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
 from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
@@ -98,7 +105,6 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
     RTLGuidanceController,
     RTLPhase,
 )
-from mvp_mission_bebop.controllers.standoff_closure import StandoffClosure
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.engine.stage_gate import stage_lock
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
@@ -194,16 +200,6 @@ _GIMBAL_CHECK_PERIOD_SEC: Final[float] = 0.25
 #: -80 deg and the vertical half field of view is near 29 deg, so a few degrees
 #: of tilt error costs no visibility; tens of degrees do.
 _GIMBAL_TOLERANCE_DEG: Final[float] = 3.0
-
-#: Longest residual the Advanced stand-off closure will fly blind, metres. The
-#: stand-off at -70 deg is 0.13 to 0.15 m plus the centring tolerance; a
-#: residual beyond this is a carried estimate that has gone wrong, and flying
-#: it without the camera would move the aircraft away from a pad it is over.
-_MAX_STANDOFF_CLOSURE_M: Final[float] = 0.35
-
-#: Window of the stand-off closure, seconds. The closure takes under three at
-#: the centring ceiling; on expiry the touchdown proceeds from where it is.
-_STANDOFF_CLOSURE_TIMEOUT_SEC: Final[float] = 6.0
 
 #: Frame-grab budget while centering, in seconds. Deliberately tighter. This is
 #: a closed loop whose phase margin is set by its cadence, and a one-second
@@ -634,6 +630,7 @@ class ClosedLoopRTLStep(BaseStep):
         self._mode = mode
         self._guidance = guidance
         self._centering = centering
+        self._heading_guard: Optional[HeadingGuard] = None
         self._sensor = sensor
         self._stream_failed = False
 
@@ -711,8 +708,10 @@ class ClosedLoopRTLStep(BaseStep):
         # calibration only, not on the gimbal attitude.
         sensor = None if centering is None else (self._sensor or self._build_sensor(ctx))
         self._active_sensor = sensor
+        self._heading_guard = None
         if self._mode is MissionMode.SIMPLE:
             return self._land_over_base(ctx, guidance, centering, sensor)
+        self._heading_guard = HeadingGuard()
 
         evidence = getattr(ctx.blackboard, "evidence", None)
         emit_milestone(
@@ -821,13 +820,6 @@ class ClosedLoopRTLStep(BaseStep):
 
         # ---- phase 3.5: precision tracked descent -----------------------
         outcome = self._descend_over_marker(ctx, centering, sensor)
-        if outcome is _PhaseOutcome.ABORTED:
-            return StepStatus.ABORTED
-        if outcome is _PhaseOutcome.FAILED:
-            return StepStatus.FAILURE
-
-        # ---- phase 3.75: blind closure of the visibility stand-off ------
-        outcome = self._close_standoff(ctx, centering)
         if outcome is _PhaseOutcome.ABORTED:
             return StepStatus.ABORTED
         if outcome is _PhaseOutcome.FAILED:
@@ -1084,7 +1076,9 @@ class ClosedLoopRTLStep(BaseStep):
                 ctx.params.rtl,
                 ctx.params.kinematics,
                 ctx.speed_calibration,
-                simple=not advanced,
+                # Advanced flies the Simple centring envelope; only the tilt
+                # and the stand-off setpoint differ.
+                simple=True,
                 tilt_deg=ADVANCED_RETURN_TILT_DEG if advanced else None,
                 standoff=advanced,
             )
@@ -1580,6 +1574,7 @@ class ClosedLoopRTLStep(BaseStep):
                 self._assert_tilt(ctx)
 
             observation = sensor.observe(frame)
+            heading = self._supervise_heading(ctx, observation)
             command = centering.update(
                 observation, dt, tilt_deg=self._projection_tilt(ctx), body_velocity_mps=self._body_velocity(ctx)
             )
@@ -1591,7 +1586,7 @@ class ClosedLoopRTLStep(BaseStep):
                 self._publish_centering_stream(ctx, frame, command, sensor.target_id)
                 logger.info(
                     "Centering: err=(%+.3f, %+.3f) m, radial %.3f m | cmd=(vx=%.3f, vy=%.3f) "
-                    "| settle %d/%d | %s",
+                    "| settle %d/%d | %s%s",
                     command.ex_body_m,
                     command.ey_body_m,
                     command.radial_error_m,
@@ -1600,6 +1595,7 @@ class ClosedLoopRTLStep(BaseStep):
                     centering.settle_cycles,
                     max(1, int(rtl_cfg.centering_settle_cycles)),
                     command.note,
+                    self._heading_suffix(heading),
                 )
 
             if command.settled:
@@ -1679,9 +1675,19 @@ class ClosedLoopRTLStep(BaseStep):
             sensor.target_id,
             rtl_cfg.descent_gate_radius_m,
             rtl_cfg.descent_speed_mps,
-            rtl_cfg.commit_height_m,
+            descent.commit_height_m,
             rtl_cfg.descent_timeout_sec,
         )
+        if descent.commit_height_m > float(rtl_cfg.commit_height_m):
+            logger.info(
+                "Tag %.3f m leaves the frame under %.2f m: commit raised from %.2f m to %.2f m, "
+                "loss commits at once under %.2f m.",
+                centering.tag_size_m,
+                descent.framing_floor_m,
+                float(rtl_cfg.commit_height_m),
+                descent.commit_height_m,
+                descent.lost_commit_height_m,
+            )
         cycle = 0
         since_tilt = 0.0
         command: Optional[DescentCommand] = None
@@ -1725,6 +1731,7 @@ class ClosedLoopRTLStep(BaseStep):
 
             observation = sensor.observe(frame)
             snapshot = ctx.odom_supervisor.snapshot()
+            heading = self._supervise_heading(ctx, observation, snapshot)
             command = descent.update(
                 observation,
                 snapshot.relative_altitude,
@@ -1732,6 +1739,14 @@ class ClosedLoopRTLStep(BaseStep):
                 tilt_deg=self._projection_tilt(ctx),
                 body_velocity_mps=self._body_velocity(ctx, snapshot),
             )
+            if observation is not None and self._mode is not MissionMode.SIMPLE:
+                # The pad position keeps coming from the marker through the
+                # descent. Left to the odometric along-track once the centring
+                # override expires, the platform monitor read the airframe off
+                # the pad by 0.1-0.3 m with the marker under it (flights
+                # 2026-11-03 05:48 and 05:50) and drove the edge guard and the
+                # altitude estimator from that state.
+                self._report_pad_position(ctx, command.ey_body_m)
             vz = ctx.speed_calibration.to_normalized(command.vz_mps, axis="vertical")
             safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
             safe_vz = min(0.0, safe_vz)
@@ -1752,7 +1767,7 @@ class ClosedLoopRTLStep(BaseStep):
                     ),
                 )
                 logger.info(
-                    "[DESCENT t=%.2f phase=%s h=%s err=(%.3f,%.3f) vz=%.3f commit=%d]",
+                    "[DESCENT t=%.2f phase=%s h=%s err=(%.3f,%.3f) vz=%.3f commit=%d%s]",
                     deadline.elapsed_sec,
                     command.phase.value,
                     f"{command.height_m:.3f}" if command.height_m is not None else "nan",
@@ -1760,6 +1775,7 @@ class ClosedLoopRTLStep(BaseStep):
                     command.ey_body_m,
                     command.vz_mps,
                     1 if command.commit else 0,
+                    self._heading_suffix(heading),
                 )
             if command.commit:
                 logger.info("Tracked descent committed: %s.", command.note)
@@ -1777,98 +1793,45 @@ class ClosedLoopRTLStep(BaseStep):
         logger.info("Descent loop cadence: %s.", rate.cadence_report())
         return _PhaseOutcome.ACHIEVED
 
-    def _close_standoff(self, ctx: MissionContext, centering: ArucoCenteringController) -> _PhaseOutcome:
-        """Fly the visibility stand-off out blind, then hand over the touchdown.
+    def _supervise_heading(
+        self, ctx: MissionContext, observation: Optional[MarkerObservation], snapshot: Any = None
+    ) -> Optional[HeadingReading]:
+        """One cycle of heading telemetry, or ``None`` outside the Advanced return.
 
-        Advanced return only (``centering.standoff_enabled``). At
-        :data:`~mvp_mission_bebop.controllers.rtl_guidance.ADVANCED_RETURN_TILT_DEG`
-        the centring and the descent hold the marker ahead of the CoG by the
-        visibility stand-off, because under the CoG its quiet zone leaves the
-        frame. The residual -- the marker's position relative to the CoG at
-        the last sighting, carried forward on the measured velocity -- is
-        flown here on integrated odometry
-        (:class:`~mvp_mission_bebop.controllers.standoff_closure.StandoffClosure`),
-        height held (``vz = 0``), no climb authority.
-
-        No residual, a residual inside the centring tolerance, or one beyond
-        :data:`_MAX_STANDOFF_CLOSURE_M` skips the closure; expiry of
-        :data:`_STANDOFF_CLOSURE_TIMEOUT_SEC` ends it. Each hands over the
-        touchdown from the present position.
-
-        Returns
-        -------
-        _PhaseOutcome
-            ``ACHIEVED`` when the touchdown may follow; ``ABORTED`` / ``FAILED``
-            on an interrupt or a health fault.
+        Diagnostic only. The reference is latched on the first cycle of the
+        centring and kept through the descent. The odometric heading is the
+        firmware's fused estimate and drifts near the pad with the airframe
+        still; the marker's planar yaw is the camera-relative rotation. Neither
+        changes what is flown: the centring and the descent act on the
+        marker's instantaneous body-frame error, as in Simple.
         """
-        if not centering.standoff_enabled:
-            return _PhaseOutcome.ACHIEVED
-        residual = centering.residual_body_m
-        if residual is None:
-            logger.warning("Stand-off closure skipped: no marker position to close on.")
-            return _PhaseOutcome.ACHIEVED
-        forward, left = residual
-        distance = math.hypot(forward, left)
-        if distance <= centering.tolerance_m:
-            logger.info("Stand-off closure not needed: residual %.3f m inside %.3f m.", distance, centering.tolerance_m)
-            return _PhaseOutcome.ACHIEVED
-        if distance > _MAX_STANDOFF_CLOSURE_M:
+        guard = getattr(self, "_heading_guard", None)
+        if guard is None:
+            return None
+        if snapshot is None:
+            try:
+                snapshot = ctx.odom_supervisor.snapshot()
+            except Exception as exc:  # noqa: BLE001 - the marker yaw is still supervised
+                logger.debug("Odometry snapshot unavailable for the heading guard: %s", exc)
+                snapshot = None
+        yaw = getattr(snapshot, "yaw", None)
+        marker_yaw = observation.yaw_deg if observation is not None else None
+        was_violated = guard.violated
+        reading = guard.update(yaw, marker_yaw)
+        if reading.violated and not was_violated:
             logger.warning(
-                "Stand-off closure skipped: residual (%+.3f, %+.3f) m exceeds %.2f m; landing from here.",
-                forward,
-                left,
-                _MAX_STANDOFF_CLOSURE_M,
+                "Heading excursion with vyaw = 0: %s. Logged only: the terminal phases fly on the "
+                "marker, whose body-frame error stays exact under rotation.",
+                reading.note,
             )
-            return _PhaseOutcome.ACHIEVED
+        return reading
 
-        rtl_cfg = ctx.params.rtl
-        closure = StandoffClosure(
-            forward, left, max_speed_mps=centering.max_speed_mps, tolerance_m=centering.tolerance_m
-        )
-        shaper_x = QuantizedCommandShaper(rtl_cfg.min_effective_speed, rtl_cfg.quantization_step)
-        shaper_y = QuantizedCommandShaper(rtl_cfg.min_effective_speed, rtl_cfg.quantization_step)
-        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
-        deadline = Deadline(_STANDOFF_CLOSURE_TIMEOUT_SEC)
-        logger.info(
-            "Stand-off closure: flying (%+.3f, %+.3f) m blind at <= %.3f m/s, tolerance %.3f m, window %.1f s.",
-            forward,
-            left,
-            centering.max_speed_mps,
-            centering.tolerance_m,
-            _STANDOFF_CLOSURE_TIMEOUT_SEC,
-        )
-        cycle = 0
-        with ctx.failsafe.altitude_hold_window(0.0):
-            while deadline.active:
-                if ctx.interrupted():
-                    self._halt_translation(ctx, hold_altitude=False)
-                    return _PhaseOutcome.ABORTED
-                health = self._check_health(ctx)
-                if health is not None:
-                    ctx.failsafe.trigger_emergency_land(health)
-                    return _PhaseOutcome.FAILED
-
-                dt = rate.tick()
-                command = closure.update(self._body_velocity(ctx), dt)
-                if command.done:
-                    self._halt_translation(ctx, hold_altitude=False)
-                    logger.info("Stand-off closure complete after %.2f s: %s.", deadline.elapsed_sec, command.note)
-                    return _PhaseOutcome.ACHIEVED
-
-                vx = shaper_x.shape(ctx.speed_calibration.to_normalized(command.vx_mps, axis="forward"), dt)
-                vy = shaper_y.shape(ctx.speed_calibration.to_normalized(command.vy_mps, axis="lateral"), dt)
-                safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(0.0, 0.0)
-                safe_vx, safe_vy = ctx.failsafe.clamp_translation(vx, vy)
-                ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
-                if cycle % _STREAM_DECIMATION == 0:
-                    logger.info("[CLOSURE t=%.2f %s | cmd=(vx=%.3f, vy=%.3f)]", deadline.elapsed_sec, command.note, vx, vy)
-                cycle += 1
-
-        self._halt_translation(ctx, hold_altitude=False)
-        logger.warning(
-            "Stand-off closure did not complete within %.1f s; landing from here.", _STANDOFF_CLOSURE_TIMEOUT_SEC
-        )
-        return _PhaseOutcome.ACHIEVED
+    def _heading_suffix(self, reading: Optional[HeadingReading]) -> str:
+        """`` | hdg ...`` for the control log, empty outside the Advanced return."""
+        guard = getattr(self, "_heading_guard", None)
+        if guard is None or reading is None:
+            return ""
+        return f" | {guard.describe(reading)}"
 
     @staticmethod
     def _body_velocity(ctx: MissionContext, snapshot: Any = None) -> Optional[Tuple[float, float]]:

@@ -22,7 +22,6 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
     project_marker_to_body,
     visibility_standoff_m,
 )
-from mvp_mission_bebop.controllers.standoff_closure import StandoffClosure
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration
 from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.parameters import FlightKinematicsConfig, MissionParameters, ReturnToLaunchConfig
@@ -128,7 +127,6 @@ def test_advanced_law_settles_on_the_standoff_not_on_the_cog():
     assert command.settled
     assert command.standoff_m == pytest.approx(standoff)
     assert math.hypot(ex - standoff, ey) <= law.landing_radius_m
-    assert law.residual_body_m == pytest.approx((ex, ey), abs=1e-6)
 
 
 def test_advanced_law_never_drives_the_quiet_zone_out_of_frame():
@@ -145,18 +143,6 @@ def test_advanced_law_never_drives_the_quiet_zone_out_of_frame():
         if command.settled:
             break
     assert command.settled
-
-
-def test_residual_is_carried_on_the_measured_velocity_while_the_marker_is_lost():
-    cfg = ReturnToLaunchConfig()
-    law = advanced_law(cfg)
-    law.update(sighting(cfg, 0.15, 0.02, 0.4, -70.0), DT, tilt_deg=-70.0)
-    assert law.residual_body_m == pytest.approx((0.15, 0.02))
-    for _ in range(15):
-        law.update(None, DT, tilt_deg=-70.0, body_velocity_mps=(0.03, -0.01))
-    assert law.residual_body_m == pytest.approx((0.15 - 0.03, 0.02 + 0.01))
-    law.reset()
-    assert law.residual_body_m is None
 
 
 def test_simple_law_is_unchanged_by_the_advanced_options():
@@ -197,53 +183,6 @@ def test_tracked_descent_reaches_commit_on_the_standoff_at_minus_70():
     assert h <= cfg.commit_height_m + 0.02
     standoff = visibility_standoff_m(h, -70.0, cfg.tag_size, cfg.camera_offset_forward_m)
     assert ex == pytest.approx(standoff, abs=cfg.commit_radius_m)
-    assert law.residual_body_m is not None and law.residual_body_m[0] > 0.1
-
-
-# ---------------------------------------------------------------- closure
-
-
-def test_closure_flies_the_residual_on_measured_velocity():
-    closure = StandoffClosure(0.15, -0.02, max_speed_mps=0.08, tolerance_m=0.01)
-    x = y = 0.0
-    velocity: Optional[Tuple[float, float]] = (0.0, 0.0)
-    for _ in range(300):
-        command = closure.update(velocity, DT)
-        if command.done:
-            break
-        assert math.hypot(command.vx_mps, command.vy_mps) <= 0.08 + 1e-9
-        velocity = (command.vx_mps, command.vy_mps)
-        x += velocity[0] * DT
-        y += velocity[1] * DT
-    assert closure.done
-    assert math.hypot(0.15 - x, -0.02 - y) <= 0.01 + 0.08 * DT
-
-
-def test_closure_integrates_its_command_without_odometry():
-    closure = StandoffClosure(0.10, 0.0, max_speed_mps=0.08, tolerance_m=0.01)
-    for _ in range(300):
-        if closure.update(None, DT).done:
-            break
-    assert closure.done
-
-
-def test_closure_stops_when_the_target_is_passed():
-    closure = StandoffClosure(0.05, 0.0, max_speed_mps=0.08, tolerance_m=0.001)
-    command = closure.update((1.0, 0.0), 0.1)
-    assert command.done and command.vx_mps == 0.0 and command.vy_mps == 0.0
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        dict(forward_m=float("nan"), left_m=0.0, max_speed_mps=0.08, tolerance_m=0.01),
-        dict(forward_m=0.1, left_m=0.0, max_speed_mps=0.0, tolerance_m=0.01),
-        dict(forward_m=0.1, left_m=0.0, max_speed_mps=0.08, tolerance_m=-0.01),
-    ],
-)
-def test_closure_rejects_invalid_configuration(kwargs):
-    with pytest.raises(ValueError):
-        StandoffClosure(kwargs.pop("forward_m"), kwargs.pop("left_m"), **kwargs)
 
 
 # ------------------------------------------------------------------- step
@@ -270,6 +209,17 @@ def test_advanced_step_commands_minus_70_regardless_of_rtl_camera_tilt():
     assert centering.tilt_deg == ADVANCED_RETURN_TILT_DEG and centering.standoff_enabled
 
 
+def test_advanced_flies_the_simple_centring_envelope():
+    ctx, _ = _ctx()
+    advanced = ClosedLoopRTLStep(mode=MissionMode.ADVANCED)._build_centering(ctx)
+    simple = ClosedLoopRTLStep(mode=MissionMode.SIMPLE)._build_centering(ctx)
+    assert advanced.max_speed_mps == pytest.approx(simple.max_speed_mps)
+    assert advanced._forward_cap_mps == pytest.approx(simple._forward_cap_mps)
+    assert advanced._overspeed_mps == pytest.approx(simple._overspeed_mps)
+    assert advanced._overspeed_release_mps == pytest.approx(simple._overspeed_release_mps)
+    assert advanced.tolerance_m == simple.tolerance_m and advanced.landing_radius_m == simple.landing_radius_m
+
+
 def test_simple_step_keeps_rtl_camera_tilt_and_the_plain_law():
     ctx, tilts = _ctx(camera_tilt_deg=-85.0)
     step = ClosedLoopRTLStep(mode=MissionMode.SIMPLE)
@@ -278,11 +228,3 @@ def test_simple_step_keeps_rtl_camera_tilt_and_the_plain_law():
     assert ctx.current_tilt_deg == -85.0
     centering = step._build_centering(ctx)
     assert centering.tilt_deg == -85.0 and not centering.standoff_enabled
-
-
-def test_simple_step_skips_the_closure():
-    ctx, _ = _ctx()
-    step = ClosedLoopRTLStep(mode=MissionMode.SIMPLE)
-    centering = step._build_centering(ctx)
-    centering.update(sighting(ctx.params.rtl, 0.2, 0.0, 0.4, -80.0), DT, tilt_deg=-80.0)
-    assert step._close_standoff(ctx, centering).name == "ACHIEVED"

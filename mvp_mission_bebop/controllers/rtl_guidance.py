@@ -1215,10 +1215,6 @@ class ArucoCenteringController:
         self._creep_speed_mps: float = abs(
             self.calibration.to_mps(rtl_cfg.reacquire_creep_speed)
         )
-        #: Marker position relative to the CoG, ``(forward, left)`` metres: the
-        #: raw error of the last sighting, carried forward through the cycles
-        #: without one by the measured velocity. The stand-off closure flies it.
-        self._residual_body_m: Optional[Tuple[float, float]] = None
 
     # ------------------------------------------------------------- properties
 
@@ -1273,13 +1269,9 @@ class ArucoCenteringController:
         return self._standoff
 
     @property
-    def residual_body_m(self) -> Optional[Tuple[float, float]]:
-        """Marker position relative to the CoG, ``(forward, left)`` metres, or ``None``.
-
-        The raw error of the last sighting, minus the measured displacement
-        since. ``None`` before any sighting.
-        """
-        return self._residual_body_m
+    def tag_size_m(self) -> float:
+        """Black-square side of the landing marker, metres (``rtl.tag_size``)."""
+        return self._tag_size_m
 
     # ------------------------------------------------------------------ cycle
 
@@ -1298,7 +1290,6 @@ class ArucoCenteringController:
         self._last_speed_mps = None
         self._lost_elapsed_sec = 0.0
         self._braking = False
-        self._residual_body_m = None
 
     def update(
         self,
@@ -1320,7 +1311,6 @@ class ArucoCenteringController:
         unchanged. See :meth:`_track` for the rest of the parameters.
         """
         command = self._track(observation, dt, tilt_deg)
-        self._carry_residual(command, body_velocity_mps, dt)
         speed = self._measured_speed(body_velocity_mps)
         if speed is None:
             self._braking = False
@@ -1344,23 +1334,6 @@ class ArucoCenteringController:
             settled=False,
             note=f"braking: measured {speed:.3f} m/s > {self._overspeed_release_mps:.3f} m/s, firmware hover",
         )
-
-    def _carry_residual(
-        self, command: CenteringCommand, body_velocity_mps: Optional[Tuple[float, float]], dt: float
-    ) -> None:
-        """Refresh the residual on a sighting, or dead-reckon it on the measured velocity."""
-        if command.tracking:
-            self._residual_body_m = (command.ex_body_m, command.ey_body_m)
-            return
-        if self._residual_body_m is None or body_velocity_mps is None or not (dt > 0.0 and math.isfinite(dt)):
-            return
-        try:
-            forward, left = float(body_velocity_mps[0]), float(body_velocity_mps[1])
-        except (TypeError, ValueError, IndexError):
-            return
-        if math.isfinite(forward) and math.isfinite(left):
-            ex, ey = self._residual_body_m
-            self._residual_body_m = (ex - forward * dt, ey - left * dt)
 
     @staticmethod
     def _measured_speed(body_velocity_mps: Optional[Tuple[float, float]]) -> Optional[float]:
@@ -1424,8 +1397,10 @@ class ArucoCenteringController:
             self._offset_left_m,
         )
         # Advanced return: the along-track channel closes on the stand-off the
-        # tilt allows, not on the CoG; the residual is flown blind after the
-        # commit. Zero elsewhere, which leaves ex_error equal to ex_body.
+        # tilt allows, not on the CoG. At the 0.40 m commit it is 0.11 m for a
+        # 0.20 m tag, inside the 0.03-0.115 m lens-to-marker spread the Simple
+        # touchdowns show, so the touchdown follows the commit as in Simple.
+        # Zero elsewhere, which leaves ex_error equal to ex_body.
         standoff = 0.0
         if self._standoff:
             standoff = visibility_standoff_m(

@@ -1845,7 +1845,8 @@ def test_a_centering_law_that_cannot_be_configured_degrades_instead_of_raising()
     sequence, leaving one unacknowledged ``land()`` publish in its place.
     """
     ctx = Ctx(altitude=0.20)
-    ctx.params.rtl.max_centering_speed = 0.0
+    # Both profiles fly the Simple centring envelope, whose ceiling this is.
+    ctx.params.rtl.simple_max_centering_speed = 0.0
 
     assert ClosedLoopRTLStep()._build_centering(ctx) is None
 
