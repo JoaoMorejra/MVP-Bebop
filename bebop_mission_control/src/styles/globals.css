@@ -832,6 +832,20 @@
 }
 
 /* The yes/no toggle: the native checkbox drawn as the switch of the top bar menu. */
+/* A yes/no tile in a card of three or more is too narrow for the state word
+   and the switch side by side (~110 px of content against ~160 px needed):
+   the switch drops under the word instead of overflowing the tile. */
+.param-tile-boolean {
+  container-type: inline-size;
+}
+@container (max-width: 190px) {
+  .param-boolean-row {
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+}
 .param-switch {
   position: relative;
   width: 46px;
@@ -1908,6 +1922,13 @@
   width: 100%;
   height: 100%;
 }
+/* The cells give way to the photograph as it comes over them. */
+.evgrid-canvas {
+  transition: opacity 500ms ease;
+}
+.evgrid-canvas-out {
+  opacity: 0;
+}
 .evgrid-photo {
   position: absolute;
   inset: 0;
@@ -1950,20 +1971,67 @@
   left: 50%;
   top: calc(46% + 78px);
   transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 14px;
   white-space: nowrap;
   pointer-events: none;
-  font-size: 11.5px;
-  letter-spacing: 0.34em;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.36em;
   text-transform: uppercase;
-  color: rgba(232, 242, 240, 0.72);
-  text-shadow: 0 0 6px #001a2f, 0 0 14px #001a2f;
+  color: rgba(232, 242, 240, 0.7);
+  text-shadow: 0 0 8px #001a2f, 0 0 16px #001a2f;
+  animation: evgrid-breathe 3.2s ease-in-out infinite;
+}
+.evgrid-caption::before,
+.evgrid-caption::after {
+  content: '';
+  width: 26px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(52, 217, 162, 0.7));
+}
+.evgrid-caption::after {
+  transform: scaleX(-1);
+}
+@keyframes evgrid-breathe {
+  50% {
+    opacity: 0.55;
+  }
 }
 .evgrid[data-inspecting] .evgrid-caption {
   color: #34d9a2;
 }
+/* At the shutter the caption draws in on itself and fades, in step with the reticle closing. */
 .evgrid[data-shooting] .evgrid-caption {
-  opacity: 0;
-  transition: opacity 160ms ease 0.2s;
+  animation: evgrid-caption-out 0.46s cubic-bezier(0.4, 0, 0.2, 1) 0.1s both;
+}
+.evgrid[data-shooting] .evgrid-caption::before {
+  animation: evgrid-caption-line 0.4s cubic-bezier(0.4, 0, 0.2, 1) 0.1s both;
+}
+.evgrid[data-shooting] .evgrid-caption::after {
+  animation: evgrid-caption-line 0.4s cubic-bezier(0.4, 0, 0.2, 1) 0.1s both;
+}
+@keyframes evgrid-caption-out {
+  from {
+    opacity: 0.75;
+  }
+  to {
+    opacity: 0;
+    letter-spacing: 0.12em;
+    filter: blur(1.5px);
+  }
+}
+@keyframes evgrid-caption-line {
+  to {
+    transform: scaleX(0);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .evgrid-caption {
+    animation: none;
+  }
 }
 .evgrid[data-shooting] .evgrid-reticle .arm {
   animation: evgrid-arm 0.56s cubic-bezier(0.22, 1, 0.36, 1) both;
@@ -2149,52 +2217,47 @@
   }
 }
 
-/* Subtle, minimalist scan over the revealed capture while the aircraft is still airborne. */
+/* The scan: one pass over the revealed photograph, left to right, until touchdown.
+   The layer is placed over the photograph's own box (not the frame's), so it never
+   reaches the bands object-contain leaves around it. Its position is --scan-x, set
+   from the flight each frame. A thin line and a short trail, nothing else. */
 .evgrid-scan {
   position: absolute;
-  inset: 0;
   overflow: hidden;
+  border-radius: 6px;
   pointer-events: none;
+  --scan-x: 0px;
+  transition: opacity 200ms ease;
 }
-.evgrid-scan-beam {
+.evgrid-scan-out {
+  opacity: 0;
+}
+.evgrid-scan-line,
+.evgrid-scan-trail {
   position: absolute;
-  left: 0;
-  right: 0;
   top: 0;
-  height: 28%;
-  background: linear-gradient(
-    180deg var(--in-oklab),
-    transparent 0%,
-    rgba(7, 79, 82, 0.06) 50%,
-    rgba(12, 132, 105, 0.22) 94%,
-    rgba(52, 217, 162, 0.72) 100%
-  );
-  box-shadow: 0 1px 10px rgba(18, 179, 130, 0.38);
-  will-change: transform, opacity;
-  animation: evgrid-scan-sweep 2.6s cubic-bezier(0.37, 0, 0.63, 1) infinite;
+  bottom: 0;
+  left: 0;
+  will-change: transform;
 }
-@keyframes evgrid-scan-sweep {
-  0% {
-    transform: translateY(-105%);
-    opacity: 0;
-  }
-  15% {
-    opacity: 1;
-  }
-  85% {
-    opacity: 1;
-  }
-  100% {
-    transform: translateY(360%);
-    opacity: 0;
-  }
+.evgrid-scan-line {
+  width: 1.5px;
+  margin-left: -0.75px;
+  background: #34d9a2;
+  box-shadow: 0 0 8px 1px rgba(18, 179, 130, 0.55);
+  transform: translateX(var(--scan-x));
+}
+.evgrid-scan-trail {
+  width: 56px;
+  margin-left: -56px;
+  background: linear-gradient(90deg, rgba(12, 132, 105, 0), rgba(18, 179, 130, 0.12));
+  transform: translateX(var(--scan-x));
 }
 
 @media (prefers-reduced-motion: reduce) {
   .finding-badge-diamond,
   .finding-badge-glyph svg *,
   .evgrid *,
-  .evgrid-scan-beam,
   .dial-orbit-carrier,
   .dial-beam-converging,
   .dial-ready-halo,

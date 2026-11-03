@@ -8,7 +8,8 @@ import { cn, stampLabel } from '../../lib/format';
 import { FINISH_HOLD_MS, type FinishLockResult } from '../../lib/finishLock';
 import type { FindingReading } from '../../hooks/useCopilot';
 import { prefersReducedMotion } from '../shell/motion';
-import { EvidenceGrid } from './EvidenceGrid';
+import { EvidenceGrid, SCAN_MIN_PASS_MS } from './EvidenceGrid';
+import { recordRevealed, revealedProgress, scanProgress } from '../../lib/evidenceReveal';
 
 interface ForensicPanelProps {
   latest: RawEvidence | null;
@@ -224,34 +225,48 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   // detector's opinion, and the assessment is of the scene.
   const capture = captureKey !== null && source !== null ? { key: captureKey, src: source } : null;
 
-  // The photograph forms out of the grid from the capture to touchdown, on the
-  // flight's own progress over that leg. The panel settles -- the photograph
-  // rises, its time of capture appears -- once the picture is whole.
-  const [revealFrom, setRevealFrom] = useState<{ key: string; from: number } | null>(null);
+  // The photograph forms out of the grid the moment it is taken. Once it is whole
+  // the scan passes over it, once, left to right, and ends at touchdown; only then
+  // does the photograph rise and the time of capture appear.
   const [revealedKey, setRevealedKey] = useState<string | null>(null);
+  const [scanDoneKey, setScanDoneKey] = useState<string | null>(null);
+  const flightRef = useRef(flightProgress);
+  flightRef.current = flightProgress;
   useEffect(() => {
     if (captureKey === null) {
-      setRevealFrom(null);
       setRevealedKey(null);
-      return;
+      setScanDoneKey(null);
     }
-    setRevealFrom((previous) => (previous?.key === captureKey ? previous : { key: captureKey, from: flightProgress ?? 0 }));
-    // Only the capture changing starts a new reveal; the progress moving does not.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [captureKey]);
-  const revealFromHere = revealFrom !== null && revealFrom.key === captureKey ? revealFrom.from : null;
-  const reveal =
-    revealFromHere !== null && flightProgress !== undefined && revealFromHere < 1
-      ? (flightProgress - revealFromHere) / (1 - revealFromHere)
-      : 0;
-  const onRevealed = useCallback(() => setRevealedKey(captureKey), [captureKey]);
+  const groundRef = useRef(false);
+  const onRevealed = useCallback(() => {
+    if (captureKey === null) return;
+    // Back on the cockpit after touchdown with the capture already revealed once: no second pass.
+    const seen = revealedProgress(captureKey) !== null;
+    recordRevealed(captureKey, flightRef.current ?? 0);
+    setRevealedKey(captureKey);
+    if (seen && groundRef.current) setScanDoneKey(captureKey);
+  }, [captureKey]);
+  const onScanDone = useCallback(() => setScanDoneKey(captureKey), [captureKey]);
   const settled = captureKey !== null && revealedKey === captureKey;
+  const scanDone = captureKey !== null && scanDoneKey === captureKey;
 
   const inspecting = stage === 4;
   const announced = Math.max(reportAnnounced ?? reportRevealed, reportRevealed);
   const onGround = landed || missionOver;
-  const down = settled && onGround;
-  const scanningInFlight = settled && !onGround && Boolean(latest);
+  groundRef.current = onGround;
+  const down = settled && scanDone && onGround;
+  const scanFrom = revealedProgress(captureKey);
+  const scan =
+    settled && !scanDone && scanFrom !== null
+      ? {
+          progress: scanProgress(scanFrom, flightProgress),
+          closing: onGround,
+          // An aborted flight closes the pass at once; a landing gets the visible minimum.
+          minPassMs: landed ? SCAN_MIN_PASS_MS : 0,
+          onDone: onScanDone,
+        }
+      : null;
   const presenting = down && Boolean(latest) && Boolean(report);
   const analyzing = down && Boolean(latest) && !report && reportAnalyzing;
 
@@ -274,17 +289,12 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
             <EvidenceGrid
               waitProgress={waitProgress}
               capture={capture}
-              reveal={reveal}
               closing={onGround}
+              scan={scan}
               inspecting={inspecting}
               onRevealed={onRevealed}
             />
-              {scanningInFlight ? (
-                <div data-scan-sweep aria-hidden className="evgrid-scan">
-                  <span className="evgrid-scan-beam" />
-                </div>
-              ) : null}
-              {/* The photograph is revealed immediately on capture; once the aircraft lands the scan ends and the capture stamp appears. */}
+              {/* The photograph is revealed as soon as it is taken; the scan ends at touchdown, then the capture stamp appears. */}
               {down && latest ? (
                 <>
                   {FRAME_MARKS.map((position) => (

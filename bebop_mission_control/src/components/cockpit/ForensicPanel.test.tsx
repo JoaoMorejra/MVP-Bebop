@@ -3,7 +3,8 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ForensicPanel } from './ForensicPanel';
-import { GRID_TEMPO, PHOTO_IN_MS } from './EvidenceGrid';
+import { GRID_TEMPO, PHOTO_IN_MS, REVEAL_MS, SCAN_FADE_MS, SCAN_MIN_PASS_MS, SHOT_MS, containRect, revealAmount } from './EvidenceGrid';
+import { clearRevealed, recordRevealed } from '../../lib/evidenceReveal';
 import { isAirborne } from '../../lib/flightState';
 import { FINISH_HOLD_MS, FINISH_REASONS, type FinishLockResult } from '../../lib/finishLock';
 import { TOPIC_LABEL, buildForensicReport, type Finding, type FindingTopic } from '../../lib/forensics';
@@ -26,6 +27,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  clearRevealed();
 });
 
 const LOCKED: FinishLockResult = {
@@ -161,6 +163,10 @@ describe('rotorsTurning', () => {
 });
 
 describe('the report waiting for the victim assessment', () => {
+  // The capture was revealed and scanned before this panel mounted (a revisit after touchdown): no second pass.
+  beforeEach(() => {
+    recordRevealed('accident_raw_20261020_101500.png|1', 0.5);
+  });
   const LATEST = { filename: 'accident_raw_20261020_101500.png', url: 'file:///x.png', timestamp: 1 };
 
   function renderReport(props: { report: { topic: 'victim'; card: string; speech: string }[] | null; analyzing: boolean }) {
@@ -223,6 +229,9 @@ describe('the report waiting for the victim assessment', () => {
 });
 
 describe('the report inside the cockpit', () => {
+  beforeEach(() => {
+    recordRevealed('accident_raw_20261020_113500.png|0', 0.5);
+  });
   const LATEST: RawEvidence = {
     filename: 'accident_raw_20261020_113500.png',
     url: '/evidence/accident_raw_20261020_113500.png',
@@ -376,32 +385,182 @@ describe('the evidence from the flight to touchdown', () => {
     expect(photo?.getAttribute('src')).toBe(CAPTURE.url);
     expect(photo?.className).not.toContain('evgrid-photo-in');
     expect(container.querySelector('[data-capture-stamp]')).toBeNull();
-    expect(container.querySelector('[data-scan-sweep]')).toBeNull();
+    expect(container.querySelector('[data-scan-pass]')).toBeNull();
   });
 
   it('runs the grid tempo 4x faster from the start of the flight', () => {
     expect(GRID_TEMPO).toBe(12);
   });
 
-  it('reveals the photograph immediately in flight after capture and runs a minimalist scan until touchdown', async () => {
-    renderPanel({});
-    renderPanel({ latest: CAPTURE, landed: false });
-    await settle();
-    expect(grid()?.getAttribute('data-evidence-grid')).toBe('revealed');
-    expect(container.querySelector('.evgrid-photo')?.className).toContain('evgrid-photo-in');
-    const scan = container.querySelector('[data-scan-sweep]');
-    expect(scan).not.toBeNull();
-    expect(scan?.textContent).toBe('');
-    expect(container.querySelector('[data-capture-stamp]')).toBeNull();
-    expect(container.querySelector('[data-evidence-frame]')?.className).toContain('h-full');
+  describe('the scan over the photograph', () => {
+    const CLIENT_WIDTH = 400;
+    // One act per 16 ms: effects scheduled by a state change must run before the next timer is armed.
+    const frames = (ms: number) => {
+      for (let elapsed = 0; elapsed < ms; elapsed += 16) act(() => vi.advanceTimersByTime(Math.min(16, ms - elapsed)));
+    };
+    const scanPass = () => container.querySelector<HTMLElement>('[data-scan-pass]');
+    const scanX = () => parseFloat(scanPass()?.style.getPropertyValue('--scan-x') ?? 'NaN');
+    /** Flight progress is the one input the scan follows. */
+    const fly = (flight: number, extra: { landed?: boolean; missionOver?: boolean; lock?: FinishLockResult } = {}) =>
+      act(() =>
+        root.render(
+          <ForensicPanel
+            latest={CAPTURE}
+            count={1}
+            stage={5}
+            missionOver={extra.missionOver ?? false}
+            landed={extra.landed ?? false}
+            report={null}
+            reportRevealed={0}
+            flightProgress={flight}
+            waitProgress={0.4}
+            onFinish={vi.fn()}
+            lock={extra.lock ?? LOCKED}
+          />
+        )
+      );
+    /** Take the capture in flight and wait until the grid has become the photograph. */
+    const revealed = (flight = 0.5) => {
+      renderPanel({});
+      fly(flight);
+      frames(SHOT_MS + 10 + PHOTO_IN_MS + 60);
+    };
+    let widthDescriptor: PropertyDescriptor | undefined;
 
-    renderPanel({ latest: CAPTURE, landed: true, report: FINDINGS, revealed: 1, announced: 1, lock: GROUNDED });
-    expect(container.querySelector('[data-scan-sweep]')).toBeNull();
-    expect(container.querySelector('[data-capture-stamp]')?.textContent).toMatch(/capturada em/);
-    expect(container.querySelector('[data-evidence-frame]')?.className).toContain('h-[38%]');
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Date', 'setTimeout', 'clearTimeout'] });
+      widthDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
+      Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => CLIENT_WIDTH });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      if (widthDescriptor) Object.defineProperty(HTMLElement.prototype, 'clientWidth', widthDescriptor);
+      else delete (HTMLElement.prototype as unknown as { clientWidth?: number }).clientWidth;
+    });
+
+    it('does not exist while the grid is still becoming the photograph', () => {
+      renderPanel({});
+      fly(0.5);
+      frames(200);
+      expect(scanPass()).toBeNull();
+      frames(SHOT_MS + 10 + PHOTO_IN_MS + 60);
+      expect(grid()?.getAttribute('data-evidence-grid')).toBe('revealed');
+      expect(scanPass()).not.toBeNull();
+    });
+
+    it('lives inside the grid, over the photograph, with a line and a trail and no text', () => {
+      revealed();
+      const pass = scanPass()!;
+      expect(grid()?.contains(pass)).toBe(true);
+      expect(container.querySelector('[data-evidence-frame]')?.contains(pass)).toBe(true);
+      expect(pass.querySelectorAll('.evgrid-scan-line')).toHaveLength(1);
+      expect(pass.querySelectorAll('.evgrid-scan-trail')).toHaveLength(1);
+      expect(pass.textContent).toBe('');
+      expect(container.querySelector('[data-scan-sweep]')).toBeNull();
+      expect(container.querySelector('[data-capture-stamp]')).toBeNull();
+    });
+
+    it('goes left to right once, following the flight, and never back', () => {
+      revealed(0.5);
+      const seen: number[] = [];
+      const sample = (ms: number) => {
+        for (let i = 0; i < ms / 16; i += 1) {
+          frames(16);
+          seen.push(scanX());
+        }
+      };
+      sample(400);
+      expect(seen[seen.length - 1]).toBeLessThan(CLIENT_WIDTH * 0.1);
+      fly(0.75);
+      sample(6000);
+      expect(seen[seen.length - 1]).toBeGreaterThan(CLIENT_WIDTH * 0.45);
+      expect(seen[seen.length - 1]).toBeLessThan(CLIENT_WIDTH * 0.52);
+      // A measured dip in the flight's progress does not pull the line back.
+      fly(0.6);
+      sample(1500);
+      expect(seen.every((value, index) => index === 0 || value >= seen[index - 1])).toBe(true);
+      // Smooth: no frame moves it by more than a few percent of the width.
+      expect(Math.max(...seen.slice(1).map((value, index) => value - seen[index]))).toBeLessThan(CLIENT_WIDTH * 0.04);
+    });
+
+    it('runs out to the right edge at touchdown, fades, and only then lets the photograph rise', () => {
+      revealed(0.5);
+      frames(SCAN_MIN_PASS_MS + 400);
+      fly(0.9, { landed: true, lock: GROUNDED });
+      expect(container.querySelector('[data-capture-stamp]')).toBeNull();
+      // About 0.4 s to run out to the edge, then the 0.2 s fade.
+      frames(450);
+      expect(scanX()).toBe(CLIENT_WIDTH);
+      expect(scanPass()?.className).toContain('evgrid-scan-out');
+      expect(container.querySelector('[data-capture-stamp]')).toBeNull();
+      frames(SCAN_FADE_MS + 100);
+      expect(scanPass()).toBeNull();
+      expect(container.querySelector('[data-capture-stamp]')?.textContent).toMatch(/capturada em/);
+    });
+
+    it('is never shorter than its minimum pass when the aircraft lands first', () => {
+      revealed(0.5);
+      fly(0.99, { landed: true, lock: GROUNDED });
+      frames(SCAN_MIN_PASS_MS / 2);
+      // Half the minimum has passed, plus the few frames the pass had already run: never near the edge.
+      expect(scanX()).toBeLessThanOrEqual(CLIENT_WIDTH * 0.6);
+      expect(container.querySelector('[data-capture-stamp]')).toBeNull();
+      frames(SCAN_MIN_PASS_MS);
+      frames(SCAN_FADE_MS + 100);
+      expect(scanPass()).toBeNull();
+      expect(container.querySelector('[data-capture-stamp]')).not.toBeNull();
+    });
+
+    it('closes at once, with no minimum, when the flight was aborted', () => {
+      revealed(0.5);
+      fly(0.52, { missionOver: true });
+      frames(450);
+      expect(scanX()).toBe(CLIENT_WIDTH);
+    });
+
+    it('does not run a second pass when the cockpit is revisited after touchdown', () => {
+      recordRevealed('accident_raw_20261029_111530.png|0', 0.5);
+      fly(0.9, { landed: true, lock: GROUNDED });
+      frames(PHOTO_IN_MS + 100);
+      expect(scanPass()).toBeNull();
+      expect(container.querySelector('[data-capture-stamp]')).not.toBeNull();
+    });
+  });
+
+  it('places the scan in the photograph box, not in the frame', () => {
+    // 16:9 photograph in a square frame: bands above and below.
+    expect(containRect({ w: 1600, h: 900 }, { w: 600, h: 600 })).toEqual({ left: 0, top: 131.25, width: 600, height: 337.5 });
+    // The same photograph in a 16:9 frame: the whole frame.
+    expect(containRect({ w: 1600, h: 900 }, { w: 800, h: 450 })).toEqual({ left: 0, top: 0, width: 800, height: 450 });
+    // A vertical photograph in a wide frame: bands at the sides.
+    const tall = containRect({ w: 900, h: 1600 }, { w: 800, h: 450 })!;
+    expect(tall.top).toBe(0);
+    expect(tall.height).toBe(450);
+    expect(tall.width).toBeCloseTo(253.125, 6);
+    expect(tall.left).toBeCloseTo((800 - 253.125) / 2, 6);
+    expect(containRect(null, { w: 10, h: 10 })).toBeNull();
+    expect(containRect({ w: 0, h: 10 }, { w: 10, h: 10 })).toBeNull();
+  });
+
+  it('reveals the photograph over REVEAL_MS without a jump', () => {
+    expect(REVEAL_MS).toBeGreaterThanOrEqual(1500);
+    expect(revealAmount(0)).toBe(0);
+    expect(revealAmount(REVEAL_MS)).toBe(1);
+    expect(revealAmount(REVEAL_MS * 2)).toBe(1);
+    let previous = 0;
+    let largest = 0;
+    for (let ms = 16; ms <= REVEAL_MS; ms += 16) {
+      const value = revealAmount(ms);
+      expect(value).toBeGreaterThanOrEqual(previous);
+      largest = Math.max(largest, value - previous);
+      previous = value;
+    }
+    // At 60 frames a second no frame advances the reveal by more than 2 %.
+    expect(largest).toBeLessThan(0.02);
   });
 
   it('is whole on touchdown, then tells the time of capture', async () => {
+    recordRevealed('accident_raw_20261029_111530.png|0', 0.5);
     renderPanel({ latest: CAPTURE });
     renderPanel({ latest: CAPTURE, landed: true, lock: GROUNDED });
     expect(container.querySelector('.evgrid-photo')?.className).toContain('evgrid-photo-in');
@@ -412,6 +571,7 @@ describe('the evidence from the flight to touchdown', () => {
   });
 
   it('shows the cards in their boxes, typing the white sentence to end with the voice', async () => {
+    recordRevealed('accident_raw_20261029_111530.png|0', 0.5);
     renderPanel({ latest: CAPTURE, landed: true, report: FINDINGS, revealed: 0, announced: 1, readings: [{ endsAt: null }], lock: GROUNDED });
     await settle();
     vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Date', 'setTimeout', 'clearTimeout'] });

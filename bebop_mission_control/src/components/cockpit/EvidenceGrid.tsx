@@ -16,11 +16,27 @@ export const SHOT_MS = 560;
 export const RETICLE_EXIT_MS = 300;
 /** How long the photograph takes to come over the finished mosaic, ms. */
 export const PHOTO_IN_MS = 500;
+/**
+ * How long the grid takes to become the photograph, from the shutter on, ms.
+ * Time-driven, not flight-driven: the picture is shown as soon as it is taken,
+ * and it is eased so the cells never jump to their final size.
+ */
+export const REVEAL_MS = 2200;
+/** The least a scan pass takes when the aircraft lands first, ms: there is always a visible pass. */
+export const SCAN_MIN_PASS_MS = 1200;
+/** How long the scan line fades out once it reaches the right edge, ms. */
+export const SCAN_FADE_MS = 200;
+/** Time constant the scan follows the flight with, ms; and the shorter one it closes on at touchdown. */
+const SCAN_FOLLOW_TAU_MS = 900;
+const SCAN_CLOSE_TAU_MS = 80;
+/** Splits one frame may make: enough to reach the finest grid by the end of the reveal, bounded so no frame stalls. */
+const MAX_SPLITS_PER_FRAME = 160;
+const MAX_SPLITS_SLOW_FRAME = 80;
+/** A frame longer than this, ms, is slow and gets the smaller split budget. */
+const SLOW_FRAME_MS = 24;
 
 /** Time constant the grid follows the flight with, ms: quick, never a jump. */
 const FOLLOW_TAU_MS = 1050 / GRID_TEMPO;
-/** The shorter one it closes on when resolving the capture mosaic into the photograph. */
-const CLOSE_TAU_MS = 420 / GRID_TEMPO;
 /** How long a new cell takes to open out of its parent, ms. */
 const SPLIT_IN_MS = 840 / GRID_TEMPO;
 /** Period of the light running across the waiting cells, ms (scaled by 2 pi). */
@@ -47,6 +63,30 @@ const SAMPLE_COLUMNS = 192;
 
 const clamp01 = (value: number): number => (Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0);
 const easeOut = (t: number): number => 1 - Math.pow(1 - clamp01(t), 3);
+const easeInOut = (t: number): number => (1 - Math.cos(Math.PI * clamp01(t))) / 2;
+
+/** How much of the photograph the grid has become `elapsedMs` after the reveal began: 0 to 1, eased at both ends. */
+export function revealAmount(elapsedMs: number): number {
+  return easeInOut(elapsedMs / REVEAL_MS);
+}
+
+/**
+ * The box `object-contain` gives an image of size `natural` inside `frame`, in
+ * the frame's own pixels. `null` while either size is unknown. The photograph
+ * is smaller than its frame whenever their proportions differ; the scan lives
+ * in this box and nowhere else.
+ */
+export function containRect(
+  natural: { w: number; h: number } | null,
+  frame: { w: number; h: number } | null
+): { left: number; top: number; width: number; height: number } | null {
+  if (!natural || !frame) return null;
+  if (!(natural.w > 0 && natural.h > 0 && frame.w > 0 && frame.h > 0)) return null;
+  const scale = Math.min(frame.w / natural.w, frame.h / natural.h);
+  const width = natural.w * scale;
+  const height = natural.h * scale;
+  return { left: (frame.w - width) / 2, top: (frame.h - height) / 2, width, height };
+}
 
 /** A deterministic 0..1 from a number, so each cell keeps its own phase. */
 function hash(n: number): number {
@@ -178,6 +218,82 @@ class SplitQueue {
   }
 }
 
+/** CSS for a box from {@link containRect}; the whole frame while the photograph's size is not known yet. */
+function photoStyle(rect: ReturnType<typeof containRect>): React.CSSProperties {
+  return rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : { inset: 0 };
+}
+
+/**
+ * One scan pass over the photograph: a thin line and a short fading trail,
+ * left to right, one time, and nothing else (no count, no blur, no dimming of
+ * what it has not reached).
+ *
+ * Its position is the flight's progress between the end of the reveal and
+ * touchdown, followed with a time constant so it never jumps and never runs
+ * back. At touchdown it runs out to the right edge in a fraction of a second
+ * and fades; `onDone` then lets the panel move on. The pass is never shorter
+ * than `minPassMs`: a line that reached the edge before it could be seen
+ * would be a skipped animation. Written straight to the style each frame so
+ * the pass costs no React renders. Not drawn under `prefers-reduced-motion`
+ * (it reports done at once).
+ */
+const ScanPass: React.FC<{
+  rect: React.CSSProperties;
+  progress: number;
+  closing: boolean;
+  minPassMs: number;
+  onDone: () => void;
+}> = ({ rect, progress, closing, minPassMs, onDone }) => {
+  const layerRef = useRef<HTMLDivElement>(null);
+  const latest = useRef({ progress, closing, minPassMs, onDone });
+  latest.current = { progress, closing, minPassMs, onDone };
+  const [fading, setFading] = useState(false);
+
+  useEffect(() => {
+    if (prefersReducedMotion()) {
+      latest.current.onDone();
+      return;
+    }
+    const layer = layerRef.current;
+    if (!layer) return;
+    const start = performance.now();
+    let last = start;
+    let position = 0;
+    let frame = 0;
+    let fadeTimer = 0;
+    const tick = (now: number) => {
+      const dt = Math.min(100, Math.max(0, now - last));
+      last = now;
+      const { progress: p, closing: down, minPassMs: floor } = latest.current;
+      const goal = down ? 1 : clamp01(p);
+      const tau = down ? SCAN_CLOSE_TAU_MS : SCAN_FOLLOW_TAU_MS;
+      position = Math.max(position, position + (goal - position) * (1 - Math.exp(-dt / tau)));
+      // The pass is never faster than its floor, so a late capture still gets a visible pass.
+      const cap = floor > 0 ? clamp01((now - start) / floor) : 1;
+      const shown = Math.min(position >= 0.99 && down ? 1 : position, cap);
+      layer.style.setProperty('--scan-x', `${(shown * layer.clientWidth).toFixed(1)}px`);
+      if (down && shown >= 1) {
+        setFading(true);
+        fadeTimer = window.setTimeout(() => latest.current.onDone(), SCAN_FADE_MS);
+        return;
+      }
+      frame = window.requestAnimationFrame(tick);
+    };
+    frame = window.requestAnimationFrame(tick);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(fadeTimer);
+    };
+  }, []);
+
+  return (
+    <div ref={layerRef} data-scan-pass aria-hidden className={cn('evgrid-scan', fading && 'evgrid-scan-out')} style={rect}>
+      <span className="evgrid-scan-trail" />
+      <span className="evgrid-scan-line" />
+    </div>
+  );
+};
+
 /** The reticle of the flight feed (`OpticalFeed`), at 112 px: ring, four arms, the pip. */
 const Reticle: React.FC = () => (
   <svg className="evgrid-reticle" viewBox="0 0 112 112" aria-hidden>
@@ -195,10 +311,14 @@ interface EvidenceGridProps {
   waitProgress: number;
   /** The capture, once there is one. `key` names it; a new key is a new capture. */
   capture: { key: string; src: string } | null;
-  /** The flight's progress from the capture to touchdown, 0 to 1: how much of the photograph the grid has become. */
-  reveal: number;
-  /** The aircraft is down: the grid closes on the whole photograph, however far it had got. */
+  /** The aircraft is down. Only the host without a canvas reads it: the photograph is then whole at once. */
   closing: boolean;
+  /**
+   * The scan pass over the photograph, once it is revealed; null before and after. `progress` is the flight's
+   * progress from the end of the reveal to touchdown, 0 to 1. `closing` is the touchdown: the line runs out
+   * to the right edge and fades. `minPassMs` is the least the pass takes. `onDone` fires when it has faded.
+   */
+  scan: { progress: number; closing: boolean; minPassMs: number; onDone: () => void } | null;
   /** The aircraft is over the target: the caption says so. */
   inspecting: boolean;
   /** Called once the photograph is whole on screen. */
@@ -223,11 +343,11 @@ interface EvidenceGridProps {
  * there when the panel mounts (back from another tab) is not taken again.
  * Under `prefers-reduced-motion` it holds still frames.
  */
-export const EvidenceGrid: React.FC<EvidenceGridProps> = ({ waitProgress, capture, reveal, closing, inspecting, onRevealed }) => {
+export const EvidenceGrid: React.FC<EvidenceGridProps> = ({ waitProgress, capture, closing, scan, inspecting, onRevealed }) => {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const props = useRef({ waitProgress, capture, reveal, closing, onRevealed });
-  props.current = { waitProgress, capture, reveal, closing, onRevealed };
+  const props = useRef({ waitProgress, capture, closing, onRevealed });
+  props.current = { waitProgress, capture, closing, onRevealed };
   const firstKey = useRef(capture?.key ?? null);
   const [shot, setShot] = useState<{ key: string; at: number } | null>(null);
   const [whole, setWhole] = useState<string | null>(null);
@@ -235,6 +355,17 @@ export const EvidenceGrid: React.FC<EvidenceGridProps> = ({ waitProgress, captur
   const [noCanvas, setNoCanvas] = useState(false);
   /** The capture whose reticle has finished taking it and left the grid. */
   const [reticleGone, setReticleGone] = useState<string | null>(null);
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+  const [frameSize, setFrameSize] = useState<{ w: number; h: number } | null>(null);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(([entry]) => {
+      setFrameSize({ w: entry.contentRect.width, h: entry.contentRect.height });
+    });
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, []);
 
   const captureKey = capture?.key ?? null;
   useEffect(() => {
@@ -282,6 +413,8 @@ export const EvidenceGrid: React.FC<EvidenceGridProps> = ({ waitProgress, captur
     let wait = clamp01(props.current.waitProgress);
     let waitAtCapture = wait;
     let shown = 0;
+    let revealStart: number | null = null;
+    let instantKey = false;
     let doneKey: string | null = null;
     let last = performance.now();
     let frame = 0;
@@ -363,6 +496,8 @@ export const EvidenceGrid: React.FC<EvidenceGridProps> = ({ waitProgress, captur
         image = null;
         sampler = null;
         shown = 0;
+        revealStart = null;
+        instantKey = key !== null && (key === firstKey.current || reduced);
         doneKey = null;
         if (cap === null) {
           reset(now);
@@ -388,14 +523,16 @@ export const EvidenceGrid: React.FC<EvidenceGridProps> = ({ waitProgress, captur
       const timeWait = 1 - Math.exp(-Math.max(0, now - waitStart) / FLIGHT_GROWTH_TAU_MS);
       const waitTarget = Math.max(clamp01(p), timeWait);
       wait += (waitTarget - wait) * (reduced ? 1 : 1 - Math.exp(-dt / FOLLOW_TAU_MS));
-      const goal = mosaic ? 1 : 0;
-      shown += (Math.max(shown, goal) - shown) * (reduced ? 1 : 1 - Math.exp(-dt / CLOSE_TAU_MS));
-      if (goal >= 1 && 1 - shown < 0.002) shown = 1;
+      // The reveal starts the moment the shot is taken and the photograph is decoded, and runs for REVEAL_MS.
+      if (mosaic && revealStart === null) revealStart = instantKey ? now - REVEAL_MS : now;
+      shown = mosaic && revealStart !== null ? revealAmount(now - revealStart) : 0;
 
       const waitCells = 4 * Math.pow(2, (key === null ? wait : waitAtCapture) * WAIT_DOUBLINGS);
       const maxCells = Math.max(waitCells, (w * h) / MIN_CELL_AREA_PX);
       const target = Math.round(mosaic ? waitCells * Math.pow(maxCells / waitCells, Math.pow(shown, 1.7)) : waitCells);
-      while (cells.length < target && queue.size > 0) {
+      let budget = dt > SLOW_FRAME_MS ? MAX_SPLITS_SLOW_FRAME : MAX_SPLITS_PER_FRAME;
+      while (cells.length < target && queue.size > 0 && budget > 0) {
+        budget -= 1;
         const parent = queue.pop()!;
         const index = cells.indexOf(parent);
         if (index < 0) continue;
@@ -456,15 +593,9 @@ export const EvidenceGrid: React.FC<EvidenceGridProps> = ({ waitProgress, captur
       setWhole(captureKey);
       return;
     }
-    const wholeTimer = window.setTimeout(() => setWhole(captureKey), 10);
-    const revealTimer = window.setTimeout(() => {
-      setWhole(captureKey);
-      props.current.onRevealed();
-    }, PHOTO_IN_MS);
-    return () => {
-      window.clearTimeout(wholeTimer);
-      window.clearTimeout(revealTimer);
-    };
+    // No canvas to draw the grid on: the photograph is whole right after the shot.
+    const wholeTimer = window.setTimeout(() => setWhole(captureKey), SHOT_MS + 10);
+    return () => window.clearTimeout(wholeTimer);
   }, [noCanvas, captureKey, closing]);
 
   // The photograph comes over the finished mosaic, then the panel is told.
@@ -484,14 +615,19 @@ export const EvidenceGrid: React.FC<EvidenceGridProps> = ({ waitProgress, captur
       data-shooting={shooting || undefined}
       className="evgrid"
     >
-      <canvas ref={canvasRef} aria-hidden className="evgrid-canvas" />
+      <canvas ref={canvasRef} aria-hidden className={cn('evgrid-canvas', revealed && 'evgrid-canvas-out')} />
       {capture ? (
         <img
           className={cn('evgrid-photo', revealed && 'evgrid-photo-in')}
           src={capture.src}
           alt="Captura pericial com a câmera na posição vertical"
+          onLoad={(event) => {
+            const image = event.currentTarget;
+            setNatural(image.naturalWidth > 0 ? { w: image.naturalWidth, h: image.naturalHeight } : null);
+          }}
         />
       ) : null}
+      {scan && revealed ? <ScanPass rect={photoStyle(containRect(natural, frameSize))} {...scan} /> : null}
       {capture !== null && reticleGone === capture.key ? null : (
         <>
           <Reticle />
