@@ -660,7 +660,10 @@ def enable_openvino_compile_cache() -> str:
     in 241 ms from the cache against 1148 ms cold, the HD 620 in 2084 against
     2613 ms. Idempotent. Returns the cache directory.
     """
-    import openvino as ov
+    try:
+        import openvino as ov
+    except ImportError:
+        return None
 
     directory = os.environ.get(OPENVINO_CACHE_ENV) or os.path.join(
         os.path.expanduser("~"), ".cache", "bmg", "ov"
@@ -714,12 +717,22 @@ def build_device_detector(
         torch.cuda.set_per_process_memory_fraction(CUDA_MEMORY_FRACTION, 0)
         detector = Detector(model_path, device=backends["CUDA"], confidence_threshold=confidence)
         return _PinnedPredict(detector, {"quantize": cuda_quantize})
-    source = openvino_model_path(model_path)
-    enable_openvino_compile_cache()
-    if not os.path.isdir(source):
-        raise FileNotFoundError(f"OpenVINO IR not found at {source}; export it with scripts/export_openvino_model.py")
-    detector = Detector(source, framework="ultralytics", device="cpu", confidence_threshold=confidence)
-    return _PinnedPredict(detector, {"device": f"intel:{backends[device].lower()}"})
+    try:
+        import openvino  # noqa: F401
+        has_openvino = True
+    except ImportError:
+        has_openvino = False
+
+    if has_openvino:
+        source = openvino_model_path(model_path)
+        enable_openvino_compile_cache()
+        if not os.path.isdir(source):
+            raise FileNotFoundError(f"OpenVINO IR not found at {source}; export it with scripts/export_openvino_model.py")
+        detector = Detector(source, framework="ultralytics", device="cpu", confidence_threshold=confidence)
+        return _PinnedPredict(detector, {"device": f"intel:{backends[device].lower()}"})
+
+    detector = Detector(model_path, framework="ultralytics", device="cpu", confidence_threshold=confidence)
+    return _PinnedPredict(detector, {"device": "cpu"})
 
 
 def model_cache_key(model_path: str, imgsz: Optional[int]) -> str:
