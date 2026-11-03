@@ -83,7 +83,8 @@ class SimulatedState:
     yaw : float
         Heading in radians, counter-clockwise from the launch heading.
     vx, vy, vz : float
-        World-frame velocity in m/s.
+        Velocity in m/s, body FLU (forward, left, up), as the driver publishes
+        the ``/bebop/odom`` twist.
     flying_state : int
         ARSDK flying state the airframe would report, see ``FLYING_STATE_*``.
     """
@@ -357,24 +358,23 @@ class KinematicSimulator:
         if airborne:
             speed_x = self._calibration.to_mps(vx)
             speed_y = self._calibration.to_mps(vy)
-            cos_psi = math.cos(yaw)
-            sin_psi = math.sin(yaw)
-            world_vx = speed_x * cos_psi - speed_y * sin_psi
-            world_vy = speed_x * sin_psi + speed_y * cos_psi
-            world_vz = self._calibration.to_mps(vz)
+            # Body FLU, as ros2_bebop_driver publishes the /bebop/odom twist.
+            body_vx = speed_x
+            body_vy = speed_y
+            body_vz = self._calibration.to_mps(vz)
         else:
-            world_vx = world_vy = world_vz = 0.0
+            body_vx = body_vy = body_vz = 0.0
 
         self._supervisor.inject_synthetic_sample(
-            x=x, y=y, z=z, vx=world_vx, vy=world_vy, vz=world_vz, yaw=yaw
+            x=x, y=y, z=z, vx=body_vx, vy=body_vy, vz=body_vz, yaw=yaw
         )
 
         listener = self._state_listener
         if listener is None:
             return
-        speed = math.sqrt(world_vx * world_vx + world_vy * world_vy + world_vz * world_vz)
+        speed = math.sqrt(body_vx * body_vx + body_vy * body_vy + body_vz * body_vz)
         sample = SimulatedState(
-            x=x, y=y, z=z, yaw=yaw, vx=world_vx, vy=world_vy, vz=world_vz,
+            x=x, y=y, z=z, yaw=yaw, vx=body_vx, vy=body_vy, vz=body_vz,
             flying_state=bebop_flying_state(airborne, launching, target_altitude, z, speed),
         )
         try:

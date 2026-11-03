@@ -127,11 +127,10 @@ def cross_axis_correction(step: Any, ctx: MissionContext, main_command: float, d
     snapshot = ctx.odom_supervisor.snapshot()
     vx = getattr(snapshot, "vx", None)
     vy = getattr(snapshot, "vy", None)
-    yaw = getattr(snapshot, "yaw", 0.0)
     if not isinstance(vx, (int, float)) or not isinstance(vy, (int, float)):
         return 0.0
     from mvp_mission_bebop.controllers.cross_axis_hold import body_velocity
-    forward, _left = body_velocity(float(vx), float(vy), float(yaw) if isinstance(yaw, (int, float)) else 0.0)
+    forward, _left = body_velocity(float(vx), float(vy))
     correction, _yaw = hold.update("vy", main_command, forward, None, dt)
     return correction
 

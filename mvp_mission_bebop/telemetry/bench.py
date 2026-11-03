@@ -17,7 +17,7 @@ Topic contract, mirrored by ``TOPIC_BENCH_ODOM`` and
 and pinned by ``test_bench_telemetry``:
 
 * ``/<ns>/mission/bench_odom`` -- ``nav_msgs/Odometry`` in the driver's odometry
-  frame (x forward of the launch heading, y left, z up), world-frame twist.
+  frame (x forward of the launch heading, y left, z up), body-frame twist.
 * ``/<ns>/mission/bench_flying_state`` -- ``std_msgs/UInt8`` carrying the ARSDK
   flying state the airframe would report.
 """
@@ -66,7 +66,7 @@ def odometry_message(state: SimulatedState) -> Odometry:
     Returns
     -------
     Odometry
-        Pose and world-frame twist; the header stamp is left for the caller.
+        Pose and body-frame twist; the header stamp is left for the caller.
     """
     msg = Odometry()
     msg.header.frame_id = ODOM_FRAME_ID

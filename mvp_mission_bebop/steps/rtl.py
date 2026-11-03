@@ -1874,8 +1874,9 @@ class ClosedLoopRTLStep(BaseStep):
     def _body_velocity(ctx: MissionContext, snapshot: Any = None) -> Optional[Tuple[float, float]]:
         """Measured ``(forward, left)`` velocity, m/s, or ``None`` when the odometry has none.
 
-        ``/bebop/odom`` reports velocity in the odometry frame; the centring law
-        brakes on the body-frame speed (``ArucoCenteringController.update``).
+        The ``/bebop/odom`` twist is already body FLU
+        (:func:`~mvp_mission_bebop.controllers.cross_axis_hold.body_velocity`);
+        the centring law's overspeed brake reads its magnitude.
         """
         if snapshot is None:
             try:
@@ -1886,8 +1887,7 @@ class ClosedLoopRTLStep(BaseStep):
         vx, vy = getattr(snapshot, "vx", None), getattr(snapshot, "vy", None)
         if not isinstance(vx, (int, float)) or not isinstance(vy, (int, float)):
             return None
-        yaw = getattr(snapshot, "yaw", 0.0)
-        return body_velocity(float(vx), float(vy), float(yaw) if isinstance(yaw, (int, float)) else 0.0)
+        return body_velocity(float(vx), float(vy))
 
     @staticmethod
     def _projection_tilt(ctx: MissionContext) -> Optional[float]:

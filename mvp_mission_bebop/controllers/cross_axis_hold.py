@@ -29,27 +29,28 @@ from typing import Any, Final, Optional, Tuple
 _AXES: Final[Tuple[str, str]] = ("vx", "vy")
 
 
-def body_velocity(vx_world: float, vy_world: float, yaw_rad: float) -> Tuple[float, float]:
-    """Rotate an odometric velocity from the odometry frame into body FLU.
+def body_velocity(vx_odom: float, vy_odom: float) -> Tuple[float, float]:
+    """Forward and left velocity of the airframe from the ``/bebop/odom`` twist.
 
-    ``/bebop/odom`` reports velocity in the odometry frame (the kinematic
-    simulator publishes it the same way), so the forward and left components
-    are ``R(-yaw) * v``.
+    The twist is already in body FLU. ``ros2_bebop_driver`` rotates the ARSDK
+    NED speed by ``-yaw`` before publishing it (``publishOdometry``, with
+    ``child_frame_id = base_link`` as ``nav_msgs/Odometry`` requires), and the
+    kinematic simulator publishes the same frame. Rotating it by the heading a
+    second time, as this function once did, maps body velocity through the
+    absolute magnetic heading: near 180 deg forward motion reads as reverse,
+    and a closed loop on it drives the airframe away from its target.
 
     Parameters
     ----------
-    vx_world, vy_world : float
-        Velocity in the odometry frame, m/s.
-    yaw_rad : float
-        Heading, radians.
+    vx_odom, vy_odom : float
+        ``twist.linear.x`` and ``twist.linear.y`` of ``/bebop/odom``, m/s.
 
     Returns
     -------
     Tuple[float, float]
         ``(forward, left)``, m/s.
     """
-    c, s = math.cos(yaw_rad), math.sin(yaw_rad)
-    return c * vx_world + s * vy_world, -s * vx_world + c * vy_world
+    return float(vx_odom), float(vy_odom)
 
 
 class CrossAxisHold:
