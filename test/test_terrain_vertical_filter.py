@@ -48,7 +48,7 @@ def test_the_configuration_accepts_terrain_kf_and_the_altitude_sources():
     with pytest.raises(ValueError):
         normalize_firmware_altitude_source("sonar")
     cfg = CalibrationConfig()
-    assert (cfg.altitude_estimator, cfg.firmware_altitude_source) == ("legacy", "unknown")
+    assert (cfg.altitude_estimator, cfg.firmware_altitude_source) == ("terrain_kf", "baro")
     assert (cfg.vertical_lag_tau_sec, cfg.vertical_accel_noise_mps2, cfg.vz_measurement_noise_mps) == (0.35, 1.5, 0.08)
     assert (cfg.altitude_measurement_noise_m, cfg.terrain_step_noise_scale) == (0.10, 16.0)
 

@@ -22,6 +22,9 @@ class FakeOdometryMsg:
 
 
 def make_supervisor(**overrides):
+    # The position plausibility gate belongs to the "legacy" estimator; the
+    # default became "terrain_kf" after the field identification of 2026-11-02.
+    overrides.setdefault("altitude_estimator", "legacy")
     calib = CalibrationConfig(
         plausibility_max_speed_mps=0.40,
         plausibility_max_accel_mps2=0.40,

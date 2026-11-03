@@ -1195,13 +1195,17 @@ class CalibrationConfig:
     #: the position plausibility gate above; ``"vz_gated"`` integrates the
     #: gated vertical speed instead (``estimation.vertical_estimator``);
     #: ``"terrain_kf"`` runs the terrain-aware Kalman filter
-    #: (``estimation.terrain_vertical_filter``). Stays ``"legacy"`` until the
-    #: emulated M1/M2/M3 criteria and field identification F-ID pass (D7).
+    #: (``estimation.terrain_vertical_filter``). Default since the field
+    #: identification of 2026-11-02: in 16 totem flights the integrated
+    #: ``speedZ`` jumped up to 1.19 m in a second at the pad edge and diverged
+    #: up to 0.77 m from ``states/altitude``, and the governor chasing it climbed
+    #: and dived in a loop on the return; ``"legacy"`` adopts such a step after
+    #: three samples.
     #:
     #: Safe envelope: one of ``"legacy"``, ``"vz_gated"``, ``"terrain_kf"``;
     #: anything else is refused with ``ValueError`` when the odometry
     #: supervisor is built.
-    altitude_estimator: str = "legacy"
+    altitude_estimator: str = "terrain_kf"
     #: Ceiling on a trusted vertical speed sample, in metres per second.
     #:
     #: Describes the firmware's reaction, not the governor's commanded profile:
@@ -1226,10 +1230,14 @@ class CalibrationConfig:
     #: ``"terrain_kf"`` estimator: ``"unknown"`` (logged only, never used),
     #: ``"baro"`` (the airframe's height, plus a bias the filter estimates) or
     #: ``"sonar_fused"`` (the height over the terrain below, which steps by the
-    #: pad height at its edge). Stays ``"unknown"`` until field test F-ID-1. [A CONFIRMAR]
+    #: pad height at its edge). ``"baro"`` from the field identification of
+    #: 2026-11-02: across 16 totem flights ``states/altitude`` never stepped by
+    #: the 1.0 m pad height at the edge (largest change 0.51 m in a second, while
+    #: the integrated ``speedZ`` changed 1.19 m), read 0.00 on the pad after
+    #: landing, and followed the airframe's height above the takeoff point.
     #:
     #: Safe envelope: one of ``"unknown"``, ``"baro"``, ``"sonar_fused"``.
-    firmware_altitude_source: str = "unknown"
+    firmware_altitude_source: str = "baro"
     #: First-order lag of the airframe's vertical speed to the commanded
     #: ``gaz``, in seconds: the process model of ``"terrain_kf"``. [A CONFIRMAR]
     #:

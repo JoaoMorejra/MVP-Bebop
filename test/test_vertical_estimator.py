@@ -165,8 +165,8 @@ def supervisor(mode: str) -> OdometrySupervisor:
     return OdometrySupervisor(params.kinematics, params.timeouts, params.calibration, params.platform)
 
 
-def test_the_default_estimator_is_legacy():
-    assert CalibrationConfig().altitude_estimator == "legacy"
+def test_the_default_estimator_is_terrain_kf():
+    assert CalibrationConfig().altitude_estimator == "terrain_kf"
     assert normalize_altitude_estimator("legacy") == "legacy"
     assert normalize_altitude_estimator("vz_gated") == "vz_gated"
 
