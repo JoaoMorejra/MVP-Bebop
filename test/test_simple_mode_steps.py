@@ -559,6 +559,28 @@ def test_stage_3_clamps_tracking_timeout_to_15_seconds():
     assert status is StepStatus.SUCCESS
 
 
+def test_advanced_stage_4_captures_immediately_when_stage_3_timed_out():
+    import unittest.mock
+
+    ctx = Ctx(detections=True)
+    ctx.blackboard.approach_finished = False
+    captured_calls = []
+    original_capture = NadirInspectionStep._capture
+
+    def spy_capture(self, ctx_in, settled, *, forced=False):
+        captured_calls.append((settled, forced))
+        return original_capture(self, ctx_in, settled, forced=forced)
+
+    step = NadirInspectionStep(mode=MissionMode.ADVANCED)
+    with unittest.mock.patch.object(NadirInspectionStep, "_capture", spy_capture):
+        status = step.execute(ctx)
+
+    assert status is StepStatus.SUCCESS
+    assert len(captured_calls) == 1
+    assert captured_calls[0] == (False, True)
+    assert ctx.blackboard.evidence is not None
+
+
 # ------------------------------------------------------------------ Stage 5
 
 from mvp_mission_bebop.estimation.calibration import SpeedCalibration  # noqa: E402

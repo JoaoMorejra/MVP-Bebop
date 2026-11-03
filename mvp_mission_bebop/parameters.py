@@ -373,7 +373,7 @@ class VisionConfig:
     #: target was last seen on, which puts it back inside the frustum. A target
     #: last seen inside the centering tolerance authorises no motion. The name
     #: is kept from the forward pattern for the GCS contract.
-    reacquire_reverse_speed: float = 0.05
+    reacquire_reverse_speed: float = 0.035
     #: How long the lateral creep may run before reacquisition holds station.
     reacquire_reverse_sec: float = 2.0
     #: Consecutive re-detections required to leave reacquisition.
@@ -418,11 +418,11 @@ class GimbalPIDConfig:
 class LateralPIDConfig:
     """PID gains for horizontal centering via body-frame lateral velocity."""
 
-    kp: float = 0.18
+    kp: float = 0.12
     ki: float = 0.0
-    kd: float = 0.03
+    kd: float = 0.02
     output_limits: Tuple[float, float] = (-0.04, 0.04)
-    deadband: float = 0.002
+    deadband: float = 0.003
     #: Smallest cross-track command the airframe actually answers.
     #:
     #: Declared since the first revision and, until now, never read by anything.

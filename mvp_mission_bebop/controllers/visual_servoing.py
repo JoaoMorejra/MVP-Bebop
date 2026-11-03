@@ -141,6 +141,35 @@ class ServoCommand:
     vyaw: float = 0.0
 
 
+def travel_speed_limit(kinematics_cfg: FlightKinematicsConfig, lateral_pid_cfg: LateralPIDConfig) -> float:
+    """Saturation of the lateral servo, normalized: the single travel speed.
+
+    The search cruises left and the return cruises right at
+    ``kinematics.forward_cruise_velocity`` (mirrored into
+    ``rtl.reverse_cruise_velocity``, rule E05); the lateral approach between them
+    used ``lateral_pid.output_limits`` instead, so the leftward transit flew at
+    a different speed from the return. The proportional term still decelerates
+    the approach onto the target; only the ceiling is the travel speed.
+
+    Parameters
+    ----------
+    kinematics_cfg : FlightKinematicsConfig
+        Source of ``forward_cruise_velocity``.
+    lateral_pid_cfg : LateralPIDConfig
+        Fallback ``output_limits`` when the travel speed is not a positive
+        finite number.
+
+    Returns
+    -------
+    float
+        Positive normalized ceiling.
+    """
+    travel = getattr(kinematics_cfg, "forward_cruise_velocity", None)
+    if isinstance(travel, (int, float)) and not isinstance(travel, bool) and math.isfinite(travel) and travel != 0.0:
+        return abs(float(travel))
+    return abs(float(lateral_pid_cfg.output_limits[1]))
+
+
 class VisualServoingController:
     """Nulls the horizontal pixel error with lateral velocity and latches a freeze."""
 
@@ -167,7 +196,9 @@ class VisualServoingController:
         vision_cfg : VisionConfig
             Optical tolerances, dwell and reacquisition windows.
         kinematics_cfg : FlightKinematicsConfig
-            Kinematic envelope. Retained for the constructor contract.
+            ``forward_cruise_velocity`` (the station's "Velocidade de
+            Deslocamento") caps the lateral transit, so the leftward approach
+            flies at the same magnitude as the search and the rightward return.
         calibration : SpeedCalibration, optional
             Normalized-to-m/s conversion; defaults to
             ``kinematics_cfg.normalized_to_mps``.
@@ -179,7 +210,7 @@ class VisualServoingController:
         self.kinematics_cfg = kinematics_cfg
         self.calibration = calibration or SpeedCalibration(kinematics_cfg.normalized_to_mps)
 
-        lateral_limit = abs(lateral_pid_cfg.output_limits[1])
+        lateral_limit = travel_speed_limit(kinematics_cfg, lateral_pid_cfg)
         self._lateral = FilteredPID(
             PIDGains(
                 kp=lateral_pid_cfg.kp,
@@ -217,7 +248,7 @@ class VisualServoingController:
         #: Effective tolerance, refreshed from the frame size each cycle.
         self._tolerance_px = vision_cfg.optical_center_tolerance_px
         #: Slew rate limiter to eliminate abrupt kicks and braking
-        self._max_slew_per_sec: float = 0.15
+        self._max_slew_per_sec: float = 0.08
         self._last_vy_demand: float = 0.0
 
     # ------------------------------------------------------------- properties

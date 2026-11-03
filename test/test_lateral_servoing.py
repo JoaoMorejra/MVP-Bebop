@@ -431,3 +431,38 @@ def test_visual_servoing_slew_rate_limits_demand_jerk() -> None:
     # It must not jump immediately to the -0.04 limit!
     assert abs(ctrl._last_vy_demand) <= 0.15 * dt + 1e-6
     assert abs(cmd1.vy) <= 0.04
+
+
+@pytest.mark.parametrize("travel", [0.04, 0.15])
+def test_the_lateral_transit_flies_at_the_single_travel_speed(travel) -> None:
+    """The leftward approach saturates at ``forward_cruise_velocity``, as the return does."""
+    from mvp_mission_bebop.controllers.visual_servoing import VisualServoingController
+    from mvp_mission_bebop.parameters import (
+        FlightKinematicsConfig,
+        GimbalConstraintsConfig,
+        GimbalPIDConfig,
+        LateralPIDConfig,
+        VisionConfig,
+    )
+
+    ctrl = VisualServoingController(
+        gimbal_config=GimbalConstraintsConfig(),
+        gimbal_pid_cfg=GimbalPIDConfig(),
+        lateral_pid_cfg=LateralPIDConfig(kp=0.35, output_limits=(-0.04, 0.04)),
+        vision_cfg=VisionConfig(),
+        kinematics_cfg=FlightKinematicsConfig(forward_cruise_velocity=travel),
+    )
+    commands = [
+        ctrl.compute(
+            target_center=(90.0, 340.0),
+            frame_dimensions=(856, 480),
+            current_tilt_deg=-28.0,
+            relative_altitude_m=1.2,
+            dt=1.0 / 15.0,
+            measured=True,
+            airframe_at_rest=False,
+        ).vy
+        for _ in range(90)
+    ]
+    assert max(commands) == pytest.approx(travel, abs=0.0051)
+    assert all(vy >= 0.0 for vy in commands)

@@ -250,6 +250,7 @@ def flight_params():
     params = MissionParameters()
     params.kinematics.target_altitude_m = 1.20
     params.kinematics.control_loop_hz = 16.0
+    params.timeouts.tracking_timeout_sec = 25.0
     return params
 
 

@@ -120,10 +120,10 @@
     "vertical_normalized_to_mps": null
   },
   "lateral_pid": {
-    "deadband": 0.005,
-    "kd": 0.03,
+    "deadband": 0.003,
+    "kd": 0.02,
     "ki": 0.0,
-    "kp": 0.18,
+    "kp": 0.12,
     "min_effective_velocity": 0.02,
     "output_limits": [
       -0.04,
@@ -301,7 +301,7 @@
     "perception_max_age_sec": 0.5,
     "reacquire_confirm_frames": 2,
     "reacquire_reverse_sec": 2.0,
-    "reacquire_reverse_speed": 0.05,
+    "reacquire_reverse_speed": 0.035,
     "reacquire_sweep_deg": 30.0,
     "reacquire_timeout_sec": 8.0,
     "release_frames": 2,

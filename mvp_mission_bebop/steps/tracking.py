@@ -119,7 +119,7 @@ class VisualServoingStep(BaseStep):
             TrackerGains(), max_coast_sec=timeouts.target_recovery_timeout_sec
         )
 
-        tracking_timeout = min(15.0, float(timeouts.tracking_timeout_sec))
+        tracking_timeout = float(timeouts.tracking_timeout_sec)
         logger.info(
             "Lateral servo engaged: tilt held at %.1f deg, gate %.0f px, dwell %d frames, "
             "stillness %.2f m/s, window %.1f s.",
