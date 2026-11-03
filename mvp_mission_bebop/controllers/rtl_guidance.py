@@ -935,6 +935,58 @@ def visibility_standoff_m(
     return max(0.0, offset_forward_m + lead_from_lens)
 
 
+def marker_framing_floor_m(tag_size_m: float, camera_tilt_deg: float) -> float:
+    """Lowest lens height at which the marker and its quiet zone fit in the frame.
+
+    The along-track extent ``2q = 2 * 0.65 * tag`` must lie between the lowest
+    ray, ``t + phi - mu`` below the horizon, and the highest, ``t - phi + mu``.
+    A marker ``s`` ahead of the lens at height ``h`` fits when
+    ``h cot(t + phi - mu) <= s - q`` and ``s + q <= h cot(t - phi + mu)``; some
+    ``s`` satisfies both exactly when
+
+    .. math::
+
+        h \\ge \\frac{2q}{\\cot(t - \\phi + \\mu) - \\cot(t + \\phi - \\mu)}
+
+    Below this height no placement keeps the quiet zone framed: the detector
+    loses the marker by proximity whatever the centring does, so a descent that
+    waits for it there hovers for nothing. The bound scales linearly with the
+    tag: with ``mu`` = :data:`STANDOFF_MARGIN_DEG` it is 1.36 tag at -70 deg and
+    1.52 tag at -80 deg, that is 0.27/0.30 m for a 0.20 m tag, 0.54/0.61 m for
+    0.40 m and 0.61/0.68 m for 0.45 m.
+
+    Parameters
+    ----------
+    tag_size_m : float
+        Black-square side of the marker, metres.
+    camera_tilt_deg : float
+        Gimbal tilt, degrees; only the magnitude is used.
+
+    Returns
+    -------
+    float
+        Lens height over the marker plane, metres, ``> 0``.
+
+    Raises
+    ------
+    ValueError
+        If an input is not finite, the tag size is not positive, or the framed
+        band does not lie strictly between the horizon and the zenith behind.
+    """
+    values = (tag_size_m, camera_tilt_deg)
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in values):
+        raise ValueError(f"framing floor inputs must be finite numbers, got {values!r}")
+    if tag_size_m <= 0.0:
+        raise ValueError(f"tag_size_m must be positive, got {tag_size_m!r}")
+    half_fov_deg = math.degrees(math.atan(FRAME_BOTTOM_TAN)) - STANDOFF_MARGIN_DEG
+    highest_ray_deg = abs(camera_tilt_deg) - half_fov_deg
+    lowest_ray_deg = abs(camera_tilt_deg) + half_fov_deg
+    if not 0.0 < highest_ray_deg < lowest_ray_deg < 180.0:
+        raise ValueError(f"camera_tilt_deg={camera_tilt_deg!r} puts the framed band outside (0, 180) deg")
+    span = 1.0 / math.tan(math.radians(highest_ray_deg)) - 1.0 / math.tan(math.radians(lowest_ray_deg))
+    return 2.0 * QUIET_ZONE_HALF_FRACTION * tag_size_m / span
+
+
 def _camera_offset(rtl_cfg: ReturnToLaunchConfig, name: str) -> float:
     """Validated camera-to-CoG offset, metres (``0.0`` when the field is absent)."""
     value = getattr(rtl_cfg, name, 0.0)
@@ -1441,10 +1493,24 @@ class ArucoCenteringController:
             # Center of frame (y_cam=0) already corresponds to ex_body ~ +0.17m.
             # Attempting to drive ex_body to 0 moves the marker to y_cam ~ +0.18m (lower half),
             # cutting off the white quiet-zone border and causing 100% loss of ArUco detection.
-            tag_size = float(getattr(self.rtl_cfg, "tag_size", 0.20))
-            fov_bottom_m = 0.455 * observation.z_cam_m
-            border_bottom_m = observation.y_cam_m + 0.65 * tag_size
-            border_margin_m = fov_bottom_m - border_bottom_m
+            fov_bottom_m = FRAME_BOTTOM_TAN * observation.z_cam_m
+            quiet_half_m = QUIET_ZONE_HALF_FRACTION * self._tag_size_m
+            border_margin_m = fov_bottom_m - (observation.y_cam_m + quiet_half_m)
+            # The margin thresholds were tuned on a 0.20 m tag, whose quiet zone
+            # leaves 0.16 m of slack to the frame bottom even when centred at
+            # 1 m. A 0.40-0.45 m tag has under 0.20 m there and none at 0.6 m:
+            # held absolute, the thresholds would read a centred marker as one
+            # about to leave the frame and back the airframe off the pad for the
+            # whole descent. Each is therefore capped at a fraction of the slack
+            # the marker has when centred (y_cam = 0), so only a marker that has
+            # actually drifted toward the bottom triggers the guard; with no
+            # slack at all the marker cannot be framed by moving and the guard
+            # stands down (the descent commits by proximity).
+            centred_slack_m = fov_bottom_m - quiet_half_m
+            clamp_margin_m = min(0.16, 0.50 * centred_slack_m)
+            back_margin_m = min(0.10, 0.30 * centred_slack_m)
+            critical_margin_m = min(0.05, 0.15 * centred_slack_m)
+            margin_guard = centred_slack_m > 0.0
 
             # Strict guard against forward surge:
             # 1. Cap any forward target speed to at most 0.015 m/s (gentle crawl, no brute lunges).
@@ -1458,16 +1524,16 @@ class ArucoCenteringController:
             if not self._standoff:
                 # 2. When marker approaches the lower region (margin < 0.16 m or y_cam >= 0.05 m),
                 #    clamp forward demand to zero so the airframe never overshoots and loses the tag.
-                if border_margin_m < 0.16 or observation.y_cam_m >= 0.05:
+                if (margin_guard and border_margin_m < clamp_margin_m) or observation.y_cam_m >= 0.05:
                     longitudinal_target = min(0.0, longitudinal_target)
 
                 # 3. If marker is in danger of being cut off (margin < 0.10 m or y_cam > 0.10 m),
                 #    actively back up (-0.02 m/s) to keep the tag centered and restore margin.
-                if border_margin_m < 0.10 or observation.y_cam_m > 0.10:
+                if (margin_guard and border_margin_m < back_margin_m) or observation.y_cam_m > 0.10:
                     longitudinal_target = min(longitudinal_target, -0.02)
 
                 # 4. Critical margin (< 0.05 m): back up stronger (-0.035 m/s).
-                if border_margin_m < 0.05:
+                if margin_guard and border_margin_m < critical_margin_m:
                     longitudinal_target = min(longitudinal_target, -0.035)
             # Saturated as a vector, not per axis. Clipping the two channels
             # independently lets the resultant reach sqrt(2) times the ceiling on

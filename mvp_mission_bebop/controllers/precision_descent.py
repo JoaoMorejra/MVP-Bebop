@@ -26,11 +26,25 @@ State machine
     A radial error beyond ``descent_gate_radius_m * descent_hysteresis`` pauses
     the descent (``vz = 0``) and returns to ``ALIGN``.
 ``COMMIT``
-    Latched once ``h <= commit_height_m`` with the radial error inside
+    Latched once ``h`` is at or under the effective commit height with the radial error inside
     ``commit_radius_m``, or as soon as the marker is lost after it was sighted:
-    on the first missed frame below ``descent_lost_commit_height_m`` (the marker
+    on the first missed frame below the effective loss height (the marker
     leaves the field of view by proximity), after ``descent_marker_lost_hold_sec``
     above it. The step then zeroes the translation and flies the touchdown.
+
+Marker size
+-----------
+The configured heights were tuned on a 0.20 m tag, which stays framed down to
+0.30 m. A larger tag leaves the frame higher: no placement keeps a 0.40 m tag
+and its quiet zone framed below 0.61 m at -80 deg, 0.68 m for 0.45 m
+(:func:`~mvp_mission_bebop.controllers.rtl_guidance.marker_framing_floor_m`).
+Tracked below that floor the descent would only ever end by losing the
+marker, with a stale radial error. The effective commit height is therefore
+``max(commit_height_m, floor)`` and the effective loss height
+``max(descent_lost_commit_height_m, floor + COMMIT_LOSS_BAND_M)``: the commit
+is taken with the marker still in view and its radial error checked, and a
+loss near the floor commits at once instead of after the debounce. For a
+0.20 m tag both reduce to the configured values.
 
 Invariants
 ----------
@@ -52,7 +66,11 @@ from enum import Enum
 from typing import Any, Final, Optional, Tuple
 
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
-from mvp_mission_bebop.controllers.rtl_guidance import ArucoCenteringController, MarkerObservation
+from mvp_mission_bebop.controllers.rtl_guidance import (
+    ArucoCenteringController,
+    MarkerObservation,
+    marker_framing_floor_m,
+)
 
 #: Descent deceleration gain toward the commit height, 1/s.
 DESCENT_KV: Final[float] = 1.5
@@ -130,9 +148,10 @@ class PrecisionDescentController:
     rtl_cfg : ReturnToLaunchConfig
         Source of the ``descent_*``, ``commit_*`` and ``ground_effect_*``
         fields, ``centering_settle_cycles``, ``settle_max_speed_mps``,
-        ``camera_tilt_deg`` and the profile limits.
+        ``camera_tilt_deg``, ``tag_size`` and the profile limits.
     centering : ArucoCenteringController
-        The centring law; this controller drives it every cycle.
+        The centring law; this controller drives it every cycle. Its tilt and
+        tag size set the framing floor.
 
     Raises
     ------
@@ -140,7 +159,7 @@ class PrecisionDescentController:
         If a parameter is not numeric.
     ValueError
         If ``commit_height_m``, ``descent_speed_mps``, ``descent_gate_radius_m``,
-        ``commit_radius_m`` or the lost hold is not positive, or
+        ``commit_radius_m``, the lost hold or the tag size is not positive, or
         ``descent_hysteresis < 1`` or ``ground_effect_gain_scale`` is outside
         ``(0, 1]``.
     """
@@ -166,6 +185,10 @@ class PrecisionDescentController:
         # flies its own fixed depression, and the height over the marker is a
         # projection through that angle.
         self._default_tilt = float(getattr(centering, "tilt_deg", rtl_cfg.camera_tilt_deg))
+        tag_size = float(getattr(centering, "tag_size_m", getattr(rtl_cfg, "tag_size", 0.20)))
+        self._framing_floor = marker_framing_floor_m(tag_size, self._default_tilt)
+        self._commit_height = max(self._commit_height, self._framing_floor)
+        self._lost_commit_height = max(self._lost_commit_height, self._framing_floor + COMMIT_LOSS_BAND_M)
         self._centering = centering
         self._profile = JerkLimitedProfile(
             ProfileLimits(
@@ -175,6 +198,21 @@ class PrecisionDescentController:
             )
         )
         self.reset()
+
+    @property
+    def framing_floor_m(self) -> float:
+        """Lowest height at which the marker can be framed, metres."""
+        return self._framing_floor
+
+    @property
+    def commit_height_m(self) -> float:
+        """Effective commit height, metres: the configured one or the framing floor."""
+        return self._commit_height
+
+    @property
+    def lost_commit_height_m(self) -> float:
+        """Effective height under which a lost marker commits at once, metres."""
+        return self._lost_commit_height
 
     @property
     def phase(self) -> DescentPhase:
