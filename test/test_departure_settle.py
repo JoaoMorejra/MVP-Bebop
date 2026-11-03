@@ -130,3 +130,26 @@ def test_without_an_edge_distance_the_step_does_not_settle(monkeypatch):
     assert ForwardSearchStep().execute(ctx) is StepStatus.SUCCESS
     assert stamped[0][1] >= 0.0
     assert any(vy > 0.0 for t, vy in stamped if t < 0.2)
+
+
+class LowOdometry(TimedOdometry):
+    """Holds 5 cm under the target: a deficit the quantized climb never closes."""
+
+    @property
+    def relative_altitude(self) -> float:
+        self.elapsed()
+        return ON_TARGET - 0.05
+
+
+def test_a_small_deficit_the_governor_cannot_close_does_not_hold_the_departure():
+    ctx, stamped = pad_ctx(switch_sec=0.0, window=0.2, timeout=5.0)
+    odometry = LowOdometry(0.0)
+    ctx.odom_supervisor = odometry
+    ctx.failsafe.odom_supervisor = odometry
+    ctx.params.timeouts.search_timeout_sec = 1.0
+
+    assert ForwardSearchStep().execute(ctx) is StepStatus.SUCCESS
+
+    departed = [t for t, vy in stamped if vy > 0.0]
+    assert departed, "the search never left the pad"
+    assert min(departed) < 1.0

@@ -221,7 +221,7 @@ class LateralSearchStep(BaseStep):
         firmware's answer to the sonar step, which field test F-2 has to
         separate. The governor runs through the ordinary :meth:`_command` with
         zero translation until the error has stayed inside
-        ``governor.deadband_m`` for ``platform.departure_settle_window_sec``.
+        the larger of the governor deadbands and ``governor.horizontal_throttle_error_m`` for ``platform.departure_settle_window_sec``.
         Reaching ``platform.departure_settle_timeout_sec`` is not a fault: the
         search proceeds, and the governor's horizontal throttle still
         restrains the cruise while the error is large.
@@ -234,7 +234,18 @@ class LateralSearchStep(BaseStep):
         """
         platform = ctx.params.platform
         target = ctx.params.relative_target_altitude_m
-        band = ctx.params.governor.deadband_m
+        governor_cfg = ctx.params.governor
+        # The departure waits only on an error the cruise itself would be
+        # throttled for. Inside ``horizontal_throttle_error_m`` the governor
+        # flies full speed, and the old band (``deadband_m``, 3 cm) could not be
+        # reached from below: a 5 cm deficit asks for under one driver count of
+        # climb, which the int8 quantization sends as zero, and the airframe
+        # sat on the pad until the settle timeout.
+        band = max(
+            governor_cfg.deadband_m,
+            governor_cfg.climb_deadband_m,
+            governor_cfg.horizontal_throttle_error_m,
+        )
         max_age = ctx.params.vision.perception_max_age_sec
         settle_deadline = Deadline(platform.departure_settle_timeout_sec)
         inside_sec = 0.0

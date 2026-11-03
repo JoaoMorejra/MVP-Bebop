@@ -502,7 +502,7 @@ class PadPlant:
 
 
 def test_departure_settle_precedes_the_lateral_edge_crossing(monkeypatch, clock):
-    """Launch at the firmware's 1.0 m over the pad; no ``vy > 0`` until 0.8 m holds in the band."""
+    """Launch at the firmware's 1.0 m over the pad; no ``vy > 0`` until the error holds inside the departure band."""
     from test_stage_altitude_wiring import Ctx
 
     monkeypatch.setattr(
@@ -538,7 +538,8 @@ def test_departure_settle_precedes_the_lateral_edge_crossing(monkeypatch, clock)
     assert all(vx == 0.0 for _t, vx, _vy, _z, _s in commands)
     first = next(k for k, (_t, _vx, vy, _z, _s) in enumerate(commands) if vy > 0.0)
     released_at = commands[first][0]
-    band = params.governor.deadband_m
+    governor_cfg = params.governor
+    band = max(governor_cfg.deadband_m, governor_cfg.climb_deadband_m, governor_cfg.horizontal_throttle_error_m)
     settle = [c for c in commands[:first] if c[0] > released_at - params.platform.departure_settle_window_sec]
     assert settle, "translated without settling"
     assert all(abs(z - TARGET) <= band for _t, _vx, _vy, z, _s in settle)
