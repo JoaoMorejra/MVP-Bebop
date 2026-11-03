@@ -312,7 +312,8 @@
       "motorcycle",
       "bicycle"
     ],
-    "vertical_fov_deg": 50.0
+    "vertical_fov_deg": 50.0,
+    "victim_detection_enabled": true
   },
   "yaw_pattern": {
     "deadband": 0.01,

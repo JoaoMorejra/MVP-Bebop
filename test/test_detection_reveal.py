@@ -264,3 +264,10 @@ def test_result_for_annotation_maps_a_person_to_vitima():
     assert [d.class_name for d in adapted.detections] == ["Vitima", "car"]
     assert person.class_name == "person"
 
+
+def test_result_for_annotation_maps_a_person_to_person_with_victim_detection_off():
+    person = Detection(xyxy=np.array(BBOX, dtype=float), confidence=0.8, class_id=0, class_name="person")
+    bike = Detection(xyxy=np.array(BBOX, dtype=float), confidence=0.7, class_id=1, class_name="bicycle")
+    adapted = MissionContext._result_for_annotation(DetectionResult([person, bike]), False)
+    assert [d.class_name for d in adapted.detections] == ["Person", "Acidente"]
+    assert person.class_name == "person"

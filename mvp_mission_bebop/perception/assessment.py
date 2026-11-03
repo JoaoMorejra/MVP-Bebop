@@ -11,6 +11,11 @@ report can rely on:
 * ``unknown``: inference did not complete (detector absent, detector error,
   timeout). Nothing is said about the victim in that case.
 
+With ``vision.victim_detection_enabled`` off no inference runs and every capture
+settles through :func:`disabled` as a completed assessment without a victim,
+``reason`` :data:`REASON_VICTIM_DETECTION_DISABLED`: the report then always
+takes the ``not_detected`` branch.
+
 The tri-state is derived from :attr:`InspectionAssessment.status` first and from
 the detections second: a payload marked ``unavailable`` never reads as a
 detection, whatever its ``victim_detected`` field says. The absence of a
@@ -59,6 +64,9 @@ REASON_DETECTOR_UNAVAILABLE: Final[str] = "detector_unavailable"
 REASON_DETECTOR_ERROR: Final[str] = "detector_error"
 #: ``reason`` of an assessment that was still pending when the wait ran out.
 REASON_TIMEOUT: Final[str] = "timeout"
+#: ``reason`` of a completed assessment settled without inference because
+#: ``vision.victim_detection_enabled`` is off; it always reads ``not_detected``.
+REASON_VICTIM_DETECTION_DISABLED: Final[str] = "victim_detection_disabled"
 
 BoxXYXY = Tuple[int, int, int, int]
 
@@ -469,3 +477,56 @@ def unavailable(
         completed_at_utc=completed_at_utc,
     )
 
+
+def disabled(
+    capture_stamp: str,
+    frame_shape: Sequence[int],
+    *,
+    completed_at_utc: str,
+    model: str = "",
+    imgsz: Optional[int] = None,
+    conf: float = DEFAULT_VICTIM_CONF,
+) -> InspectionAssessment:
+    """Assessment of a capture flown with victim detection off.
+
+    Completed by construction and without a victim, so
+    :attr:`InspectionAssessment.victim_status` is ``not_detected`` whatever the
+    frame shows; ``reason`` is :data:`REASON_VICTIM_DETECTION_DISABLED` so the
+    sidecar records that no inference was run.
+
+    Parameters
+    ----------
+    capture_stamp : str
+        Capture timestamp the assessment belongs to.
+    frame_shape : Sequence[int]
+        NumPy shape of the inspection frame, ``(height, width[, channels])``.
+    completed_at_utc : str
+        ISO 8601 UTC instant at which the outcome was settled.
+    model, imgsz, conf
+        As in :func:`assess_detections`.
+
+    Returns
+    -------
+    InspectionAssessment
+
+    Raises
+    ------
+    TypeError, ValueError
+        On an invalid argument.
+    """
+    width, height = _frame_size(frame_shape)
+    return InspectionAssessment(
+        capture_stamp=capture_stamp,
+        status=AssessmentStatus.COMPLETE,
+        reason=REASON_VICTIM_DETECTION_DISABLED,
+        victim_detected=False,
+        victim_count=0,
+        victim_confidence=None,
+        victim_boxes=(),
+        frame=(width, height),
+        inference_ms=0.0,
+        model=model,
+        imgsz=imgsz,
+        conf=conf,
+        completed_at_utc=completed_at_utc,
+    )

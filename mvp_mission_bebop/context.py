@@ -509,10 +509,11 @@ class MissionContext:
         self.frame_center_y = self.frame_height / 2.0
 
     @staticmethod
-    def _result_for_annotation(result: Any) -> Any:
+    def _result_for_annotation(result: Any, victim_detection_enabled: bool = True) -> Any:
         """Clone a detection result with the labels the station shows.
 
-        Every accident class reads ``Acidente`` and a person ``Vitima``
+        Every accident class reads ``Acidente`` and a person ``Vitima``, or
+        ``Person`` with ``victim_detection_enabled`` off
         (``perception/classes.py:display_class_name``); other classes and the
         result itself are left untouched.
         """
@@ -528,7 +529,9 @@ class MissionContext:
             for d in detections:
                 if shown(d):
                     d_copy = copy.copy(d)
-                    d_copy.class_name = display_class_name(getattr(d, "class_name", ""))
+                    d_copy.class_name = display_class_name(
+                        getattr(d, "class_name", ""), victim_detection_enabled
+                    )
                     cloned.append(d_copy)
                 else:
                     cloned.append(d)
@@ -560,7 +563,7 @@ class MissionContext:
             return None
 
         if self.detection_reveal_enabled:
-            annotated_result = self._result_for_annotation(result)
+            annotated_result = self._result_for_annotation(result, self.victim_detection_enabled)
             annotated = self.detector.draw_detections(
                 image=frame,
                 result=annotated_result,
@@ -606,7 +609,7 @@ class MissionContext:
             message = String()
             message.data = encode_detection_summary(
                 detections=(
-                    self._describe_detections(sample.result)
+                    self._overlay_detections(sample.result)
                     if self.detection_reveal_enabled
                     else []
                 ),
@@ -886,6 +889,25 @@ class MissionContext:
                 )
             except Exception as exc:  # noqa: BLE001 - never lose a capture to metadata
                 logger.debug("Skipping undescribable detection: %s", exc)
+        return described
+
+    @property
+    def victim_detection_enabled(self) -> bool:
+        """``vision.victim_detection_enabled``; anything but ``False`` reads as on."""
+        vision = getattr(getattr(self, "params", None), "vision", None)
+        return getattr(vision, "victim_detection_enabled", True) is not False
+
+    def _overlay_detections(self, detections: Optional[Sequence[Any]]) -> List[Dict[str, Any]]:
+        """:meth:`_describe_detections` plus the ``label`` the bridge draws.
+
+        The bridge runs outside the mission and cannot read
+        ``vision.victim_detection_enabled``; the word on each box is therefore
+        decided here and carried in the overlay (``perception/summary.py``).
+        """
+        described = self._describe_detections(detections)
+        enabled = self.victim_detection_enabled
+        for entry in described:
+            entry["label"] = display_class_name(str(entry.get("class_name", "")), enabled)
         return described
 
     @staticmethod

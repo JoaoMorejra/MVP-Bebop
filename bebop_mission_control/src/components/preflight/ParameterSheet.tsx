@@ -217,11 +217,11 @@ const BooleanTile: React.FC<{
       data-conflict={conflict?.severity}
       data-conflict-reason={conflict?.title}
       data-state={tileState(conflict, changed)}
-      className="param-tile"
+      className="param-tile param-tile-boolean"
     >
       <label htmlFor={id} className="flex h-full cursor-pointer flex-col">
         <TileLabel spec={spec} changed={changed} />
-        <span className="mt-auto flex items-center justify-between gap-3 pb-1">
+        <span className="param-boolean-row mt-auto flex items-center justify-between gap-3 pb-1">
           <span key={String(value)} className="param-state anim-param-state">
             {value ? on : off}
           </span>

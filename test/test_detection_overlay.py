@@ -257,6 +257,46 @@ def test_the_mission_context_publishes_a_decodable_overlay(bridge):
     assert summary.detections[0].bbox == (400.0, 220.0, 456.0, 260.0)
 
 
+def _overlay_ctx(published, victim_detection_enabled):
+    ctx = MissionContext.__new__(MissionContext)
+    ctx.boxes_pub = types.SimpleNamespace(publish=published.append)
+    ctx._monotonic_to_ros_sec = 0.0
+    ctx.detection_reveal_enabled = True
+    ctx.params = types.SimpleNamespace(
+        vision=types.SimpleNamespace(victim_detection_enabled=victim_detection_enabled)
+    )
+    return ctx
+
+
+@pytest.mark.parametrize("enabled, word", [(True, "Vitima"), (False, "Person")])
+def test_the_overlay_carries_the_person_label_of_the_victim_mode(bridge, enabled, word):
+    published = []
+    ctx = _overlay_ctx(published, enabled)
+    sample = PerceptionSample(
+        frame=np.zeros((480, 856, 3), dtype=np.uint8),
+        result=[Detection(class_name="person"), Detection(class_name="bicycle")],
+        stamp=0.0,
+        generation=1,
+    )
+    ctx.publish_detection_summary(sample, "STEP 2: SEARCH")
+
+    payload = json.loads(published[0].data)
+    assert [entry["label"] for entry in payload["detections"]] == [word, "Acidente"]
+    assert [entry["class_name"] for entry in payload["detections"]] == ["person", "bicycle"]
+    summary = bridge.parse_detection_summary(published[0].data)
+    assert [d.label for d in summary.detections] == [word, "Acidente"]
+
+
+def test_the_bridge_draws_the_mission_label_and_falls_back_without_it(bridge, monkeypatch):
+    labels = _captured_labels(bridge, monkeypatch)
+    payload = json.loads(encoded(detections=[Detection(class_name="person")] * 2))
+    payload["detections"][0]["label"] = "Person"
+    summary = bridge.parse_detection_summary(json.dumps(payload))
+    bridge.draw_detection_summary(np.zeros((480, 856, 3), dtype=np.uint8), summary)
+    words = [text.split(" ")[0] for text in labels]
+    assert [word for word in words if word in ("Person", "Vitima")] == ["Person", "Vitima"]
+
+
 def test_an_overlay_failure_never_reaches_the_worker():
     ctx = MissionContext.__new__(MissionContext)
 

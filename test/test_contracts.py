@@ -477,6 +477,7 @@ _FROZEN_CONFIGURATION_KEYS = frozenset(
         "vision.release_frames",
         "vision.target_classes",
         "vision.vertical_fov_deg",
+        "vision.victim_detection_enabled",
         "yaw_pattern.deadband",
         "yaw_pattern.kd",
         "yaw_pattern.ki",

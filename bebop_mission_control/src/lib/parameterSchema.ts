@@ -38,6 +38,12 @@ import { MISSION_MODE_PATH, inactivePaths, type MissionMode } from './missionMod
 
 export type ParameterGroupId = 'envelope' | 'gimbal' | 'timeouts';
 
+/**
+ * `vision.victim_detection_enabled`: off, a person is drawn as `Person` and
+ * every inspection settles as `not_detected` (`perception/assessment.py:disabled`).
+ */
+export const VICTIM_DETECTION_PATH = 'vision.victim_detection_enabled';
+
 interface Common {
   path: string;
   label: string;
@@ -136,8 +142,8 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
       {
         kind: 'number',
         path: 'kinematics.forward_cruise_velocity',
-        label: 'Velocidade de Deslocamento (Pitch/Avanço)',
-        hint: 'Velocidade de avanço (pitch) na varredura e de retorno do RTL no modo avançado, sempre com a mesma magnitude.',
+        label: 'Velocidade de Deslocamento',
+        hint: 'Velocidade lateral única do modo avançado: varredura e aproximação para a esquerda e retorno do RTL para a direita, sempre com a mesma magnitude.',
         min: 0.01,
         max: 0.6,
         step: 0.01,
@@ -196,6 +202,12 @@ export const PARAMETER_GROUPS: ParameterGroup[] = [
         step: 1,
         unit: '°',
         precision: 0,
+      },
+      {
+        kind: 'boolean',
+        path: VICTIM_DETECTION_PATH,
+        label: 'Detecção de Vítima',
+        hint: 'Marcada: pessoas aparecem como Vitima e a inspeção avalia se há vítima. Desmarcada: aparecem como Person e o laudo sempre registra cena sem vítimas aparentes.',
       },
     ],
   },

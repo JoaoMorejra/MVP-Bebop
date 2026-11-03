@@ -58,6 +58,7 @@ from mvp_mission_bebop.perception.assessment import (
     REASON_TIMEOUT,
     InspectionAssessment,
     assess_detections,
+    disabled,
     unavailable,
 )
 from mvp_mission_bebop.perception.worker import detector_kwargs, normalize_imgsz
@@ -343,6 +344,10 @@ class InspectionInferenceWorker(threading.Thread):
         Victim confidence threshold, also passed to the detector.
     min_box_area_frac : float
         Minimum victim box area as a fraction of the frame.
+    victim_detection_enabled : bool
+        ``vision.victim_detection_enabled``. Off, no detector is built and
+        every job, a stopped one included, settles at once as ``not_detected``
+        (:func:`~mvp_mission_bebop.perception.assessment.disabled`).
     niceness : int
         Added to the thread's niceness on start; 0 leaves it unchanged.
     clock : Callable[[], float]
@@ -366,6 +371,7 @@ class InspectionInferenceWorker(threading.Thread):
         imgsz: Optional[int] = DEFAULT_INSPECTION_IMGSZ,
         conf_threshold: float = DEFAULT_VICTIM_CONF,
         min_box_area_frac: float = DEFAULT_MIN_BOX_AREA_FRAC,
+        victim_detection_enabled: bool = True,
         niceness: int = DEFAULT_NICENESS,
         clock: Clock = time.monotonic,
         utc_clock: UtcClock = _utc_now,
@@ -376,6 +382,10 @@ class InspectionInferenceWorker(threading.Thread):
         for sink in sinks:
             if not callable(getattr(sink, "deliver", None)):
                 raise TypeError(f"sink {sink!r} has no deliver()")
+        if not isinstance(victim_detection_enabled, bool):
+            raise TypeError(
+                f"victim_detection_enabled must be a bool, got {type(victim_detection_enabled).__name__}"
+            )
         if isinstance(niceness, bool) or not isinstance(niceness, int) or niceness < 0:
             raise ValueError(f"niceness must be a non-negative integer, got {niceness!r}")
         self._factory = detector_factory
@@ -385,6 +395,7 @@ class InspectionInferenceWorker(threading.Thread):
         self._imgsz = normalize_imgsz(imgsz)
         self._conf = float(conf_threshold)
         self._area_frac = float(min_box_area_frac)
+        self._victim_detection = victim_detection_enabled
         self._detect_kwargs = detector_kwargs(self._conf, self._imgsz)
         self._niceness = niceness
         self._clock = clock
@@ -524,6 +535,8 @@ class InspectionInferenceWorker(threading.Thread):
         return self._detector
 
     def _assess(self, job: InspectionJob) -> InspectionAssessment:
+        if not self._victim_detection:
+            return self._disabled(job)
         detector = self._ensure_detector()
         if detector is None:
             return self._unavailable(job, REASON_DETECTOR_UNAVAILABLE)
@@ -547,7 +560,19 @@ class InspectionInferenceWorker(threading.Thread):
             min_box_area_frac=self._area_frac,
         )
 
+    def _disabled(self, job: InspectionJob) -> InspectionAssessment:
+        return disabled(
+            job.capture_stamp,
+            job.frame.shape,
+            completed_at_utc=self._utc(),
+            model=self._model,
+            imgsz=self._imgsz,
+            conf=self._conf,
+        )
+
     def _unavailable(self, job: InspectionJob, reason: str, *, inference_ms: float = 0.0) -> InspectionAssessment:
+        if not self._victim_detection:
+            return self._disabled(job)
         return unavailable(
             job.capture_stamp,
             reason,

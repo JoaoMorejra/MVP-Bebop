@@ -21,6 +21,7 @@ from mvp_mission_bebop.perception.assessment import (
     REASON_DETECTOR_ERROR,
     REASON_DETECTOR_UNAVAILABLE,
     REASON_TIMEOUT,
+    REASON_VICTIM_DETECTION_DISABLED,
     AssessmentStatus,
     VictimStatus,
 )
@@ -146,6 +147,48 @@ def test_a_detected_person_is_reported_with_the_inspection_settings():
         assert detector.calls == [{"conf": 0.35, "imgsz": 640}]
     finally:
         worker.stop(2.0)
+
+
+def test_with_victim_detection_off_a_visible_person_settles_not_detected_without_inference():
+    detector = FakeDetector()
+    built = []
+
+    def factory():
+        built.append(True)
+        return detector
+
+    sink = RecordingSink()
+    worker = InspectionInferenceWorker(factory, [sink], model="yolov8n.pt", victim_detection_enabled=False)
+    worker.start()
+    try:
+        frame = FRAME.copy()
+        frame[:, :, :] = 255
+        worker.submit(InspectionJob.create(STAMP, frame, None))
+
+        assessment = worker.slot.wait(STAMP, 3.0)
+        assert assessment.status is AssessmentStatus.COMPLETE
+        assert assessment.victim_status is VictimStatus.NOT_DETECTED
+        assert assessment.reason == REASON_VICTIM_DETECTION_DISABLED
+        assert assessment.victim_boxes == ()
+        assert built == [] and detector.calls == []
+        assert worker.drain(1.0)
+        assert len(sink.calls) == 1
+    finally:
+        worker.stop(2.0)
+
+
+def test_with_victim_detection_off_a_stopped_job_still_settles_not_detected():
+    worker = InspectionInferenceWorker(lambda: FakeDetector(), victim_detection_enabled=False)
+    worker.submit(InspectionJob.create(STAMP, FRAME, None))
+    worker.stop(0.1)
+
+    assessment = worker.slot.get(STAMP)
+    assert assessment.victim_status is VictimStatus.NOT_DETECTED
+
+
+def test_victim_detection_must_be_a_bool():
+    with pytest.raises(TypeError):
+        InspectionInferenceWorker(lambda: FakeDetector(), victim_detection_enabled="false")
 
 
 def test_a_detector_exception_is_unavailable_never_not_detected():

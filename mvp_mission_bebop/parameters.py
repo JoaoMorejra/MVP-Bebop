@@ -19,7 +19,11 @@ logger = logging.getLogger("MissionParameters")
 #: Fields a document may only set with a JSON boolean, as ``(section, name)``.
 #: A truthy string (``"false"``) or ``0``/``1`` would otherwise be stored and
 #: read with the opposite or an unintended meaning.
-STRICT_BOOL_FIELDS: Final[Tuple[Tuple[str, str], ...]] = (("rtl", "enabled"), ("platform", "takeoff_from_ground"))
+STRICT_BOOL_FIELDS: Final[Tuple[Tuple[str, str], ...]] = (
+    ("rtl", "enabled"),
+    ("platform", "takeoff_from_ground"),
+    ("vision", "victim_detection_enabled"),
+)
 
 #: Mission mode removed from the station and the mission; stored documents that
 #: still name it are migrated by :func:`migrate_legacy_mission_mode`.
@@ -210,6 +214,16 @@ class VisionConfig:
     #: pixels at the ranges where the approach is still translating.
     perception_max_age_sec: float = 0.5
     target_classes: List[str] = field(default_factory=lambda: ["motorcycle", "bicycle"])
+    #: Whether a detected ``person`` is treated as a victim.
+    #:
+    #: ``True`` (normal flight): the boxes read ``Vitima`` and the Stage 4
+    #: frame is assessed for a victim (``perception/inspection_worker.py``).
+    #: ``False``: the boxes read ``Person``, the victim inference is not run
+    #: and every inspection settles as ``not_detected``, so the report always
+    #: takes the no-visible-victim branch. Target selection is unaffected: a
+    #: person is never a flight target in either mode. Safe envelope: a
+    #: ``bool``, refused otherwise by ``update_from_dict``.
+    victim_detection_enabled: bool = True
     #: Class priority of the persistent target selector
     #: (``estimation.target_selector``), highest first. The group
     #: ``acidente`` matches every accident label

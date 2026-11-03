@@ -31,6 +31,12 @@ Schema ``bmg.detections.v1`` -- a hard IPC contract with the bridge, mirrored by
 
 Box coordinates are pixels of the frame described by ``frame``. The bridge
 rescales them when the raw stream it draws on has a different geometry.
+
+A detection may carry an optional ``"label"``: the word the mission decided for
+the box (``perception/classes.py:display_class_name``, which depends on
+``vision.victim_detection_enabled``). The bridge draws it as given and falls
+back to its own mapping of ``class_name`` without it, so the field is additive
+and the schema identifier is unchanged.
 """
 
 from __future__ import annotations

@@ -454,9 +454,14 @@ describe('fillMissing', () => {
   });
 
   it('backfills the booleans a store written before them lacks, from the factory or their default', () => {
-    expect(fillMissing({}, {})).toEqual({ rtl: { enabled: true }, platform: { takeoff_from_ground: false } });
+    expect(fillMissing({}, {})).toEqual({
+      rtl: { enabled: true },
+      platform: { takeoff_from_ground: false },
+      vision: { victim_detection_enabled: true },
+    });
     expect(getPath(fillMissing({}, { rtl: { enabled: false } }), 'rtl.enabled')).toBe(false);
-    const doc = { rtl: { enabled: false }, platform: { takeoff_from_ground: true } };
+    expect(getPath(fillMissing({}, { vision: { victim_detection_enabled: false } }), 'vision.victim_detection_enabled')).toBe(false);
+    const doc = { rtl: { enabled: false }, platform: { takeoff_from_ground: true }, vision: { victim_detection_enabled: false } };
     expect(fillMissing(doc, {})).toBe(doc);
   });
 });
@@ -582,6 +587,10 @@ describe('altitudeAdjustment', () => {
     for (const path of Object.keys(REQUIRED_LAUNCH_BOOLEANS)) {
       expect(launchBlockers(setPath(doc, path, undefined))).not.toContain(path);
     }
-    expect(REQUIRED_LAUNCH_BOOLEANS).toEqual({ 'platform.takeoff_from_ground': false, 'rtl.enabled': true });
+    expect(REQUIRED_LAUNCH_BOOLEANS).toEqual({
+      'platform.takeoff_from_ground': false,
+      'rtl.enabled': true,
+      'vision.victim_detection_enabled': true,
+    });
   });
 });

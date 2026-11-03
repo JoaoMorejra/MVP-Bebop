@@ -18,10 +18,12 @@ from mvp_mission_bebop.perception.assessment import (
     ASSESSMENT_SCHEMA,
     MAX_VICTIM_BOXES,
     REASON_DETECTOR_ERROR,
+    REASON_VICTIM_DETECTION_DISABLED,
     AssessmentStatus,
     InspectionAssessment,
     VictimStatus,
     assess_detections,
+    disabled,
     unavailable,
 )
 
@@ -101,6 +103,18 @@ def test_an_unavailable_assessment_is_unknown():
     assert assessment.victim_status is VictimStatus.UNKNOWN
     assert assessment.victim_detected is False
     assert assessment.reason == REASON_DETECTOR_ERROR
+
+
+def test_a_disabled_assessment_is_complete_and_not_detected():
+    assessment = disabled(STAMP, SHAPE, completed_at_utc=UTC, model="yolov8n.pt", imgsz=640)
+
+    assert assessment.status is AssessmentStatus.COMPLETE
+    assert assessment.victim_status is VictimStatus.NOT_DETECTED
+    assert assessment.reason == REASON_VICTIM_DETECTION_DISABLED
+    assert assessment.victim_count == 0 and assessment.victim_boxes == ()
+    payload = json.loads(json.dumps(assessment.to_payload()))
+    assert payload["victim_status"] == "not_detected"
+    assert InspectionAssessment.from_payload(payload) == assessment
 
 
 def test_the_payload_round_trips_through_json():

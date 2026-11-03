@@ -206,6 +206,9 @@ class BoxDetection:
     class_name: str
     confidence: float
     bbox: Tuple[float, float, float, float]
+    #: Word the mission decided for the box (optional ``label`` of the
+    #: payload); ``None`` falls back to :func:`_display_class_name`.
+    label: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -257,7 +260,10 @@ def parse_detection_summary(text: str) -> Optional[DetectionSummary]:
             continue
         if x2 <= x1 or y2 <= y1:
             continue
-        detections.append(BoxDetection(name, confidence, (x1, y1, x2, y2)))
+        label = entry.get("label")
+        if not isinstance(label, str) or not label.strip():
+            label = None
+        detections.append(BoxDetection(name, confidence, (x1, y1, x2, y2), label))
 
     try:
         inference_ms = float(payload.get("inference_ms", 0.0))
@@ -331,7 +337,9 @@ def _display_class_name(name: str) -> str:
     In this mission YOLO's ``motorcycle`` or ``bicycle`` stands for the traffic
     accident and a ``person`` for its victim, so the cockpit reads
     ``Acidente`` and ``Vitima`` instead of the COCO labels. Any other class is
-    shown as the detector named it.
+    shown as the detector named it. Only a fallback: a detection carrying the
+    mission's own ``label`` (which reads ``Person`` with
+    ``vision.victim_detection_enabled`` off) is drawn with that word.
     """
     if not name:
         return ""
@@ -407,7 +415,7 @@ def draw_detection_summary(frame: np.ndarray, summary: DetectionSummary) -> np.n
         x1, y1, x2, y2 = detection.bbox
         top_left = (int(round(x1 * scale_x)), int(round(y1 * scale_y)))
         bottom_right = (int(round(x2 * scale_x)), int(round(y2 * scale_y)))
-        display_name = _display_class_name(detection.class_name)
+        display_name = detection.label or _display_class_name(detection.class_name)
         _draw_labelled_box(
             canvas,
             top_left,

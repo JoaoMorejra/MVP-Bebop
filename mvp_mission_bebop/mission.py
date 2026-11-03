@@ -1443,6 +1443,7 @@ def main() -> None:
         _build_inspection_detector,
         inspection_sinks,
         model=os.path.basename(params.vision.model_path),
+        victim_detection_enabled=ctx.victim_detection_enabled,
     )
     ctx.inspection_worker.start()
 
