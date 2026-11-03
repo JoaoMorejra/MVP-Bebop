@@ -301,11 +301,14 @@ def cruise_deviation(result: FlightResult) -> float:
     """Largest ``|z_floor - 1.8|`` from the start of Stage 2 to the landing command, metres.
 
     Covers the pad exit (Stage 2) and the re-entry (Stage 5) at the operating
-    height; the takeoff and the touchdown are not at it by design.
+    height; the takeoff and the touchdown are not at it by design, and neither is
+    the marker-tracked descent, which leaves the operating height on purpose
+    before ``mission.landing`` is emitted.
     """
     low2, _ = stage_window(result, 2)
     landing = [mono for mono, key, _payload in result.milestones() if key == "mission.landing"]
-    high = landing[0] if landing else math.inf
+    descent = [line.mono for line in result.lines if "Tracked descent over marker" in line.text]
+    high = min(landing[:1] + descent[:1] + [math.inf])
     window = [r["z"] for r in trajectory(result, (low2, high))]
     assert window, "no trajectory between Stage 2 and the landing"
     return max(abs(z + PAD_HEIGHT_M - 1.8) for z in window)

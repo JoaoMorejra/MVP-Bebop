@@ -24,6 +24,7 @@ import pytest
 from mvp_mission_bebop.blackboard import MissionBlackboard
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop import context as context_module
+from mvp_mission_bebop.controllers.rtl_guidance import ADVANCED_RETURN_TILT_DEG
 from mvp_mission_bebop.engine.runner import MissionRunner
 from mvp_mission_bebop.engine.stage_gate import StageRequestHandler, refuse_stage_request
 from mvp_mission_bebop.mission_mode import MissionMode, stage_five_name
@@ -462,14 +463,15 @@ def test_rtl_disabled_without_battery_still_lands_in_place(monkeypatch, mode):
 
 
 @pytest.mark.parametrize("mode", list(MissionMode))
-def test_return_attitude_is_the_rtl_camera_tilt(monkeypatch, mode):
+def test_return_attitude_is_the_profile_return_tilt(monkeypatch, mode):
     assert MissionParameters().rtl.camera_tilt_deg == -80.0
 
     _status, _step, ctx, _calls, _milestones = forced_return(monkeypatch, mode, forced=True)
 
     assert ctx.drone.tilts, "the gimbal was never commanded"
-    assert ctx.drone.tilts[0] == pytest.approx(ctx.params.rtl.camera_tilt_deg)
-    assert ctx.current_tilt_deg == pytest.approx(-80.0)
+    expected = ctx.params.rtl.camera_tilt_deg if mode is MissionMode.SIMPLE else ADVANCED_RETURN_TILT_DEG
+    assert ctx.drone.tilts[0] == pytest.approx(expected)
+    assert ctx.current_tilt_deg == pytest.approx(expected)
 
 
 @pytest.mark.parametrize("mode", list(MissionMode))

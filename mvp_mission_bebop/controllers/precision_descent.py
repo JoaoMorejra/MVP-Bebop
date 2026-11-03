@@ -23,18 +23,25 @@ State machine
     height instead of stopping on it; centring continues, its output scaled by
     ``ground_effect_gain_scale`` below ``ground_effect_height_m``, where the
     rotor wash reflected by the ground amplifies every horizontal correction.
-    A radial error beyond ``descent_gate_radius_m * descent_hysteresis`` stops
+    A radial error beyond ``descent_gate_radius_m * descent_hysteresis`` pauses
     the descent (``vz = 0``) and returns to ``ALIGN``.
 ``COMMIT``
     Latched once ``h <= commit_height_m`` with the radial error inside
-    ``commit_radius_m``, or immediately upon loss of marker sighting during
-    active descent (preventing idle hovering when proximity/FOV clips the
-    marker), or when the marker is lost for longer than
-    ``descent_marker_lost_hold_sec`` below ``commit_height_m + 0.10``. The step
-    then zeroes the translation and flies the touchdown immediately.
+    ``commit_radius_m``, or as soon as the marker is lost after it was sighted:
+    on the first missed frame below ``descent_lost_commit_height_m`` (the marker
+    leaves the field of view by proximity), after ``descent_marker_lost_hold_sec``
+    above it. The step then zeroes the translation and flies the touchdown.
 
-A loss longer than the hold above that band returns to ``ALIGN``. During the
-hold the height is held and the last height (or ``fallback_height_m``) is kept.
+Invariants
+----------
+The vertical command is never positive: ``_command`` saturates it, no phase
+asks for a climb, and a lost marker never realigns or searches. A descent
+already under way keeps descending through the loss debounce.
+
+The time spent not descending with the marker in view (alignment, pauses, the
+wait at the commit height) is bounded by ``descent_pause_max_sec`` in total.
+Once spent, the gate, the hysteresis and the commit radius stop applying: the
+descent proceeds and commits, because the air never holds an ideal alignment.
 """
 
 from __future__ import annotations
@@ -42,7 +49,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Final, Optional
+from typing import Any, Final, Optional, Tuple
 
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
 from mvp_mission_bebop.controllers.rtl_guidance import ArucoCenteringController, MarkerObservation
@@ -151,9 +158,14 @@ class PrecisionDescentController:
         if self._ge_scale > 1.0:
             raise ValueError(f"rtl.ground_effect_gain_scale must be in (0, 1], got {self._ge_scale!r}")
         self._lost_hold = _positive(rtl_cfg, "descent_marker_lost_hold_sec")
+        self._lost_commit_height = _positive(rtl_cfg, "descent_lost_commit_height_m")
+        self._pause_max = _positive(rtl_cfg, "descent_pause_max_sec")
         self._settle_target = max(1, int(rtl_cfg.centering_settle_cycles))
         self._settle_speed = abs(float(rtl_cfg.settle_max_speed_mps))
-        self._default_tilt = float(rtl_cfg.camera_tilt_deg)
+        # The centring law's tilt, not rtl.camera_tilt_deg: the Advanced return
+        # flies its own fixed depression, and the height over the marker is a
+        # projection through that angle.
+        self._default_tilt = float(getattr(centering, "tilt_deg", rtl_cfg.camera_tilt_deg))
         self._centering = centering
         self._profile = JerkLimitedProfile(
             ProfileLimits(
@@ -180,6 +192,8 @@ class PrecisionDescentController:
         self._lost_sec: float = 0.0
         self._has_started_descent: bool = False
         self._sighting_count: int = 0
+        self._wait_sec: float = 0.0
+        self._last_desired: Optional[float] = None
         self._profile.reset(0.0, 0.0)
 
     def _command(self, vx: float, vy: float, vz: float, note: str) -> DescentCommand:
@@ -207,6 +221,7 @@ class PrecisionDescentController:
         fallback_height_m: Optional[float],
         dt: float,
         tilt_deg: Optional[float] = None,
+        body_velocity_mps: Optional[Tuple[float, float]] = None,
     ) -> DescentCommand:
         """Advance one control cycle.
 
@@ -222,6 +237,9 @@ class PrecisionDescentController:
         tilt_deg : Optional[float]
             Confirmed gimbal tilt; the configured tilt when ``None`` or not
             finite.
+        body_velocity_mps : Optional[Tuple[float, float]]
+            Measured ``(forward, left)`` velocity, m/s, handed to the centring
+            law for its overspeed brake.
 
         Returns
         -------
@@ -233,34 +251,10 @@ class PrecisionDescentController:
             return self._command(0.0, 0.0, 0.0, "committed: touchdown handed over")
 
         tilt = tilt_deg if tilt_deg is not None and math.isfinite(tilt_deg) else self._default_tilt
-        centring = self._centering.update(observation, dt, tilt_deg=tilt)
+        centring = self._centering.update(observation, dt, tilt_deg=tilt, body_velocity_mps=body_velocity_mps)
 
         if observation is None:
-            self._lost_sec += dt
-            if self._height is None and fallback_height_m is not None and math.isfinite(fallback_height_m):
-                self._height = float(fallback_height_m)
-            # Instant touchdown once marker is lost:
-            # Below 0.60 m the marker naturally exceeds camera FOV; commit immediately.
-            # Otherwise, commit after the brief lost hold debounce (to reject single frame drops).
-            if self._phase is DescentPhase.DESCEND or self._has_started_descent or self._sighting_count > 0:
-                is_low_altitude = self._height is not None and self._height <= 0.60
-                if is_low_altitude or self._lost_sec >= self._lost_hold:
-                    self._phase = DescentPhase.COMMIT
-                    h_str = f"{self._height:.2f} m" if self._height is not None else "unknown height"
-                    return self._command(
-                        0.0,
-                        0.0,
-                        0.0,
-                        f"marker lost during precision descent at {h_str}: committing touchdown immediately",
-                    )
-                return self._hold(
-                    centring.vx, centring.vy, self._phase, f"marker lost {self._lost_sec:.2f} s: holding height"
-                )
-            if self._lost_sec < self._lost_hold:
-                return self._hold(
-                    centring.vx, centring.vy, self._phase, f"marker lost {self._lost_sec:.2f} s: holding height"
-                )
-            return self._hold(centring.vx, centring.vy, DescentPhase.ALIGN, "marker lost before sighting: holding")
+            return self._lost(dt, fallback_height_m)
 
         self._lost_sec = 0.0
         self._sighting_count += 1
@@ -271,26 +265,60 @@ class PrecisionDescentController:
         if self._height < self._ge_height:
             vx, vy = vx * self._ge_scale, vy * self._ge_scale
 
+        forced = self._wait_sec >= self._pause_max
+
         if self._phase is DescentPhase.ALIGN:
             if self._radial <= self._gate and centring.commanded_speed_mps <= self._settle_speed:
                 self._settle += 1
             else:
                 self._settle = 0
-            if self._settle < self._settle_target:
+            if self._settle < self._settle_target and not forced:
+                self._wait_sec += dt
                 return self._hold(vx, vy, DescentPhase.ALIGN, f"aligning: radial {self._radial:.3f} m")
             self._phase = DescentPhase.DESCEND
             self._has_started_descent = True
 
-        if self._radial > self._gate * self._hysteresis:
+        if not forced and self._radial > self._gate * self._hysteresis:
             self._settle = 0
+            self._wait_sec += dt
             return self._hold(vx, vy, DescentPhase.ALIGN, f"error grew to {self._radial:.3f} m: descent paused")
 
         if self._height <= self._commit_height:
-            if self._radial <= self._commit_radius:
+            if self._radial <= self._commit_radius or forced:
                 self._phase = DescentPhase.COMMIT
                 return self._command(0.0, 0.0, 0.0, f"commit at {self._height:.2f} m, radial {self._radial:.3f} m")
+            self._wait_sec += dt
             return self._hold(vx, vy, DescentPhase.DESCEND, f"at commit height, radial {self._radial:.3f} m")
 
-        desired = min(self._speed, DESCENT_KV * (self._height - self._commit_height) + DESCENT_FLOOR_MPS)
-        speed = self._profile.step(desired, dt)
+        self._last_desired = min(self._speed, DESCENT_KV * (self._height - self._commit_height) + DESCENT_FLOOR_MPS)
+        speed = self._profile.step(self._last_desired, dt)
         return self._command(vx, vy, -speed, f"descending at {speed:.3f} m/s, h {self._height:.2f} m")
+
+    def _lost(self, dt: float, fallback_height_m: Optional[float]) -> DescentCommand:
+        """One cycle without a validated sighting.
+
+        Horizontal command is zero: no creep, no recovery manoeuvre. After a
+        sighting the loss commits (immediately when low, after the debounce
+        otherwise); a descent under way keeps its descent through the debounce.
+        Before any sighting the height is held until the pause budget runs out,
+        then the touchdown is committed from here.
+        """
+        self._lost_sec += dt
+        if self._height is None and fallback_height_m is not None and math.isfinite(fallback_height_m):
+            self._height = float(fallback_height_m)
+
+        if self._sighting_count > 0:
+            low = self._height is not None and self._height <= self._lost_commit_height
+            if low or self._lost_sec >= self._lost_hold:
+                self._phase = DescentPhase.COMMIT
+                h_str = f"{self._height:.2f} m" if self._height is not None else "unknown height"
+                return self._command(0.0, 0.0, 0.0, f"marker lost at {h_str}: committing touchdown immediately")
+            if self._phase is DescentPhase.DESCEND and self._last_desired is not None:
+                speed = self._profile.step(self._last_desired, dt)
+                return self._command(0.0, 0.0, -speed, f"marker lost {self._lost_sec:.2f} s: descent continues")
+            return self._hold(0.0, 0.0, self._phase, f"marker lost {self._lost_sec:.2f} s: holding height")
+
+        if self._lost_sec >= max(self._lost_hold, self._pause_max):
+            self._phase = DescentPhase.COMMIT
+            return self._command(0.0, 0.0, 0.0, "marker never sighted in the descent: committing touchdown")
+        return self._hold(0.0, 0.0, DescentPhase.ALIGN, "marker not yet sighted: holding height")

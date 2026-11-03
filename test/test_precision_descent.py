@@ -49,7 +49,7 @@ def test_height_is_read_from_the_marker() -> None:
 
 def test_does_not_descend_until_gate_radius_is_met() -> None:
     ctrl, cfg = make()
-    for _ in range(100):
+    for _ in range(int(cfg.descent_pause_max_sec / DT) - 3):
         command = ctrl.update(obs(cfg, 0.10, 0.0, 1.0), None, DT, tilt_deg=TILT)
         assert command.phase is DescentPhase.ALIGN
         assert command.vz_mps == 0.0
@@ -146,7 +146,8 @@ def test_wrong_marker_id_never_counts() -> None:
     command = ctrl.update(rejected, None, DT, tilt_deg=TILT)
     assert command.height_m == before.height_m
     assert command.phase is before.phase
-    assert command.vz_mps == 0.0
+    assert command.vz_mps <= 0.0
+    assert (command.vx, command.vy) == (0.0, 0.0)
 
 
 def test_marker_sighting_then_loss_commits_immediately() -> None:
@@ -177,3 +178,79 @@ def test_invalid_config_raises() -> None:
         cfg = replace(ReturnToLaunchConfig(), **{field: value})
         with pytest.raises(ValueError):
             PrecisionDescentController(cfg, ArucoCenteringController(ReturnToLaunchConfig(), FlightKinematicsConfig()))
+
+
+def test_pause_budget_forces_the_descent_and_the_commit() -> None:
+    ctrl, cfg = make()
+    descended = False
+    command = None
+    h = 1.0
+    for _ in range(int(20.0 / DT)):
+        command = ctrl.update(obs(cfg, 0.30, 0.0, h), None, DT, tilt_deg=TILT)
+        if command.vz_mps < 0.0:
+            descended = True
+            h += command.vz_mps * DT
+        if command.commit:
+            break
+    assert descended
+    assert command is not None and command.commit
+    assert h <= cfg.commit_height_m + 0.02
+
+
+def test_waiting_at_the_commit_height_is_bounded() -> None:
+    ctrl, cfg = make()
+    cycles = 0
+    command = ctrl.update(obs(cfg, 0.30, 0.0, cfg.commit_height_m - 0.02), None, DT, tilt_deg=TILT)
+    while not command.commit and cycles < 1000:
+        command = ctrl.update(obs(cfg, 0.30, 0.0, cfg.commit_height_m - 0.02), None, DT, tilt_deg=TILT)
+        cycles += 1
+    assert command.commit
+    assert cycles * DT <= cfg.descent_pause_max_sec + 4 * DT
+
+
+def test_the_vertical_command_is_never_positive() -> None:
+    import random
+
+    rng = random.Random(7)
+    for _ in range(20):
+        ctrl, cfg = make()
+        h = 1.2
+        for _ in range(600):
+            if rng.random() < 0.15:
+                command = ctrl.update(None, h, DT, tilt_deg=TILT)
+            else:
+                command = ctrl.update(obs(cfg, rng.uniform(-0.2, 0.2), rng.uniform(-0.2, 0.2), h), None, DT, tilt_deg=TILT)
+            assert command.vz_mps <= 0.0
+            h = max(0.05, h + command.vz_mps * DT)
+            if command.commit:
+                break
+
+
+def test_descent_continues_through_the_loss_debounce_without_moving_sideways() -> None:
+    ctrl, cfg = make()
+    h, command = descend_to(ctrl, cfg, 1.1, 0.95)
+    assert command.phase is DescentPhase.DESCEND
+    command = ctrl.update(None, h, DT, tilt_deg=TILT)
+    assert command.phase is DescentPhase.DESCEND
+    assert command.vz_mps < 0.0
+    assert (command.vx, command.vy) == (0.0, 0.0)
+    for _ in range(int(cfg.descent_marker_lost_hold_sec / DT) + 3):
+        command = ctrl.update(None, h, DT, tilt_deg=TILT)
+    assert command.commit and command.vz_mps == 0.0
+
+
+def test_first_missed_frame_below_the_low_height_commits() -> None:
+    ctrl, cfg = make()
+    h, command = descend_to(ctrl, cfg, 1.1, cfg.descent_lost_commit_height_m - 0.05)
+    assert not command.commit
+    command = ctrl.update(None, None, DT, tilt_deg=TILT)
+    assert command.commit
+
+
+def test_a_marker_never_sighted_commits_after_the_pause_budget() -> None:
+    ctrl, cfg = make()
+    command = None
+    for _ in range(int(cfg.descent_pause_max_sec / DT) + 3):
+        command = ctrl.update(None, 1.0, DT, tilt_deg=TILT)
+        assert command.vz_mps == 0.0
+    assert command is not None and command.commit

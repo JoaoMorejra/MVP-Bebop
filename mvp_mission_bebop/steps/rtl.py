@@ -19,9 +19,10 @@ The return now closes on the pad itself. The launch base carries an ArUco marker
 drift-free observation: its error is a property of the camera calibration, not
 of how long the drone has been flying. Four phases run in order.
 
-1. **Camera transition.** The gimbal drops to ``rtl.camera_tilt_deg`` (-80 deg by
-   default), near-nadir with a small forward lean, so the frame covers the ground
-   below and slightly ahead of the airframe. The rightward return sweeps that
+1. **Camera transition.** The gimbal drops to the profile's return tilt: in
+   Advanced the fixed ``ADVANCED_RETURN_TILT_DEG`` (-70 deg), in Simple
+   ``rtl.camera_tilt_deg`` (-80 deg by default). Either is near-nadir with a
+   forward lean, so the frame covers the ground below and ahead of the airframe. The rightward return sweeps that
    footprint along the track and the pad enters through the right side of the
    frame. The altitude-hold governor is engaged for everything that follows
    that is not the touchdown itself.
@@ -39,7 +40,13 @@ of how long the drone has been flying. Four phases run in order.
    saturated onto a centering speed ceiling, and rendered through the sigma-delta
    shaper so sub-quantum corrections survive the driver's ``int8(v * 100)``
    truncation. The landing is authorized only after the radial error has been
-   inside tolerance *at residual speed* for several consecutive cycles.
+   inside tolerance *at residual speed* for several consecutive cycles. In
+   Advanced the along-track setpoint is the visibility stand-off
+   (``rtl_guidance.visibility_standoff_m``): at -70 deg the pad cannot be
+   framed under the CoG at the return heights, so the centring and the tracked
+   descent keep it 0.13 to 0.15 m ahead, and after the commit that measured
+   residual is flown blind on short-horizon odometry
+   (``standoff_closure.StandoffClosure``) before the touchdown.
 4. **Touchdown.** Unchanged, and deliberately so. The burst ``land()``, the
    odometric confirmation, the descent-stall escalation and the assisted descent
    in :meth:`ClosedLoopRTLStep._touchdown` are the most thoroughly exercised code
@@ -77,10 +84,12 @@ import cv2
 import numpy as np
 
 from mvp_mission_bebop.context import MissionContext
+from mvp_mission_bebop.controllers.cross_axis_hold import body_velocity
 from mvp_mission_bebop.controllers.precision_descent import DescentCommand, PrecisionDescentController
 from mvp_mission_bebop.controllers.profiling import JerkLimitedProfile, ProfileLimits
 from mvp_mission_bebop.controllers.quantization import QuantizedCommandShaper
 from mvp_mission_bebop.controllers.rtl_guidance import (
+    ADVANCED_RETURN_TILT_DEG,
     ArucoCenteringController,
     CenteringCommand,
     GuidanceCommand,
@@ -89,6 +98,7 @@ from mvp_mission_bebop.controllers.rtl_guidance import (
     RTLGuidanceController,
     RTLPhase,
 )
+from mvp_mission_bebop.controllers.standoff_closure import StandoffClosure
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.engine.stage_gate import stage_lock
 from mvp_mission_bebop.estimation.detection_filter import HysteresisConfirmer
@@ -184,6 +194,16 @@ _GIMBAL_CHECK_PERIOD_SEC: Final[float] = 0.25
 #: -80 deg and the vertical half field of view is near 29 deg, so a few degrees
 #: of tilt error costs no visibility; tens of degrees do.
 _GIMBAL_TOLERANCE_DEG: Final[float] = 3.0
+
+#: Longest residual the Advanced stand-off closure will fly blind, metres. The
+#: stand-off at -70 deg is 0.13 to 0.15 m plus the centring tolerance; a
+#: residual beyond this is a carried estimate that has gone wrong, and flying
+#: it without the camera would move the aircraft away from a pad it is over.
+_MAX_STANDOFF_CLOSURE_M: Final[float] = 0.35
+
+#: Window of the stand-off closure, seconds. The closure takes under three at
+#: the centring ceiling; on expiry the touchdown proceeds from where it is.
+_STANDOFF_CLOSURE_TIMEOUT_SEC: Final[float] = 6.0
 
 #: Frame-grab budget while centering, in seconds. Deliberately tighter. This is
 #: a closed loop whose phase margin is set by its cadence, and a one-second
@@ -732,7 +752,7 @@ class ClosedLoopRTLStep(BaseStep):
             rtl_cfg.target_aruco_id,
             rtl_cfg.marker_dict,
             rtl_cfg.tag_size,
-            rtl_cfg.camera_tilt_deg,
+            self._return_tilt(ctx),
             -abs(rtl_cfg.reverse_cruise_velocity),
             -abs(ctx.speed_calibration.to_mps(rtl_cfg.reverse_cruise_velocity, axis="lateral")),
             rtl_cfg.timeout_sec,
@@ -806,6 +826,13 @@ class ClosedLoopRTLStep(BaseStep):
         if outcome is _PhaseOutcome.FAILED:
             return StepStatus.FAILURE
 
+        # ---- phase 3.75: blind closure of the visibility stand-off ------
+        outcome = self._close_standoff(ctx, centering)
+        if outcome is _PhaseOutcome.ABORTED:
+            return StepStatus.ABORTED
+        if outcome is _PhaseOutcome.FAILED:
+            return StepStatus.FAILURE
+
         # ---- phase 4: precision touchdown -------------------------------
         return self._touchdown(ctx, guidance, at_base=True)
 
@@ -820,7 +847,7 @@ class ClosedLoopRTLStep(BaseStep):
         gimbal without updating it leaves the rest of the mission describing an
         attitude the camera left several seconds ago.
         """
-        tilt = float(ctx.params.rtl.camera_tilt_deg)
+        tilt = self._return_tilt(ctx)
         logger.info(
             "Pitching the gimbal to %.1f deg for the marker search (re-asserted every %.1f s "
             "while the return leg runs).",
@@ -991,8 +1018,19 @@ class ClosedLoopRTLStep(BaseStep):
 
         return self._touchdown(ctx, guidance, at_base=True)
 
-    @staticmethod
-    def _assert_tilt(ctx: MissionContext) -> None:
+    def _return_tilt(self, ctx: MissionContext) -> float:
+        """Gimbal depression of this profile's return leg, degrees.
+
+        Simple: ``rtl.camera_tilt_deg``. Advanced:
+        :data:`~mvp_mission_bebop.controllers.rtl_guidance.ADVANCED_RETURN_TILT_DEG`,
+        fixed, with the centring and the descent built against it
+        (:meth:`_build_centering`).
+        """
+        if self._mode is MissionMode.SIMPLE:
+            return float(ctx.params.rtl.camera_tilt_deg)
+        return ADVANCED_RETURN_TILT_DEG
+
+    def _assert_tilt(self, ctx: MissionContext) -> None:
         """Command the return-leg gimbal angle, absorbing any fault.
 
         Called repeatedly, on purpose. See :data:`_TILT_REASSERT_SEC`: the tilt
@@ -1008,7 +1046,7 @@ class ClosedLoopRTLStep(BaseStep):
         exception is absorbed -- but it is logged at warning level, because a
         camera that will not move is a landing that will not be precise.
         """
-        tilt = float(ctx.params.rtl.camera_tilt_deg)
+        tilt = self._return_tilt(ctx)
         try:
             ctx.drone.camera_control(tilt=tilt, pan=0.0)
         except Exception as exc:  # noqa: BLE001 - a gimbal fault must not abort the return
@@ -1041,8 +1079,14 @@ class ClosedLoopRTLStep(BaseStep):
             self._centering.reset()
             return self._centering
         try:
+            advanced = self._mode is not MissionMode.SIMPLE
             centering = ArucoCenteringController(
-                ctx.params.rtl, ctx.params.kinematics, ctx.speed_calibration
+                ctx.params.rtl,
+                ctx.params.kinematics,
+                ctx.speed_calibration,
+                simple=not advanced,
+                tilt_deg=ADVANCED_RETURN_TILT_DEG if advanced else None,
+                standoff=advanced,
             )
         except Exception as exc:  # noqa: BLE001 - degrade, never abort
             logger.error(
@@ -1536,7 +1580,9 @@ class ClosedLoopRTLStep(BaseStep):
                 self._assert_tilt(ctx)
 
             observation = sensor.observe(frame)
-            command = centering.update(observation, dt, tilt_deg=self._projection_tilt(ctx))
+            command = centering.update(
+                observation, dt, tilt_deg=self._projection_tilt(ctx), body_velocity_mps=self._body_velocity(ctx)
+            )
             if observation is not None:
                 self._report_pad_position(ctx, command.ey_body_m)
             self._transmit_centering(ctx, command, dt)
@@ -1639,9 +1685,28 @@ class ClosedLoopRTLStep(BaseStep):
         cycle = 0
         since_tilt = 0.0
         command: Optional[DescentCommand] = None
+        # No climb authority for the whole phase: the runner keeps an
+        # altitude-hold window open over Stage 5 whose governor aims at the
+        # centring height, and inside it any positive vz would pass the clamp.
+        with ctx.failsafe.altitude_hold_window(0.0):
+            return self._descend_loop(ctx, descent, sensor, rate, deadline, cycle, since_tilt, command)
+
+    def _descend_loop(
+        self,
+        ctx: MissionContext,
+        descent: PrecisionDescentController,
+        sensor: ArucoMarkerSensor,
+        rate: LoopRate,
+        deadline: Deadline,
+        cycle: int,
+        since_tilt: float,
+        command: Optional[DescentCommand],
+    ) -> _PhaseOutcome:
+        """Cycle of :meth:`_descend_over_marker`, run with the climb authority closed."""
+        rtl_cfg = ctx.params.rtl
         while deadline.active:
             if ctx.interrupted():
-                self._halt_translation(ctx)
+                self._halt_translation(ctx, hold_altitude=False)
                 return _PhaseOutcome.ABORTED
 
             health = self._check_health(ctx)
@@ -1661,10 +1726,15 @@ class ClosedLoopRTLStep(BaseStep):
             observation = sensor.observe(frame)
             snapshot = ctx.odom_supervisor.snapshot()
             command = descent.update(
-                observation, snapshot.relative_altitude, dt, tilt_deg=self._projection_tilt(ctx)
+                observation,
+                snapshot.relative_altitude,
+                dt,
+                tilt_deg=self._projection_tilt(ctx),
+                body_velocity_mps=self._body_velocity(ctx, snapshot),
             )
             vz = ctx.speed_calibration.to_normalized(command.vz_mps, axis="vertical")
             safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, 0.0)
+            safe_vz = min(0.0, safe_vz)
             safe_vx, safe_vy = ctx.failsafe.clamp_translation(command.vx, command.vy)
             ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
 
@@ -1693,12 +1763,12 @@ class ClosedLoopRTLStep(BaseStep):
                 )
             if command.commit:
                 logger.info("Tracked descent committed: %s.", command.note)
-                self._halt_translation(ctx)
+                self._halt_translation(ctx, hold_altitude=False)
                 logger.info("Descent loop cadence: %s.", rate.cadence_report())
                 return _PhaseOutcome.ACHIEVED
             cycle += 1
 
-        self._halt_translation(ctx)
+        self._halt_translation(ctx, hold_altitude=False)
         logger.warning(
             "Tracked descent did not commit within %.1f s (%s); handing the touchdown over from here.",
             rtl_cfg.descent_timeout_sec,
@@ -1706,6 +1776,118 @@ class ClosedLoopRTLStep(BaseStep):
         )
         logger.info("Descent loop cadence: %s.", rate.cadence_report())
         return _PhaseOutcome.ACHIEVED
+
+    def _close_standoff(self, ctx: MissionContext, centering: ArucoCenteringController) -> _PhaseOutcome:
+        """Fly the visibility stand-off out blind, then hand over the touchdown.
+
+        Advanced return only (``centering.standoff_enabled``). At
+        :data:`~mvp_mission_bebop.controllers.rtl_guidance.ADVANCED_RETURN_TILT_DEG`
+        the centring and the descent hold the marker ahead of the CoG by the
+        visibility stand-off, because under the CoG its quiet zone leaves the
+        frame. The residual -- the marker's position relative to the CoG at
+        the last sighting, carried forward on the measured velocity -- is
+        flown here on integrated odometry
+        (:class:`~mvp_mission_bebop.controllers.standoff_closure.StandoffClosure`),
+        height held (``vz = 0``), no climb authority.
+
+        No residual, a residual inside the centring tolerance, or one beyond
+        :data:`_MAX_STANDOFF_CLOSURE_M` skips the closure; expiry of
+        :data:`_STANDOFF_CLOSURE_TIMEOUT_SEC` ends it. Each hands over the
+        touchdown from the present position.
+
+        Returns
+        -------
+        _PhaseOutcome
+            ``ACHIEVED`` when the touchdown may follow; ``ABORTED`` / ``FAILED``
+            on an interrupt or a health fault.
+        """
+        if not centering.standoff_enabled:
+            return _PhaseOutcome.ACHIEVED
+        residual = centering.residual_body_m
+        if residual is None:
+            logger.warning("Stand-off closure skipped: no marker position to close on.")
+            return _PhaseOutcome.ACHIEVED
+        forward, left = residual
+        distance = math.hypot(forward, left)
+        if distance <= centering.tolerance_m:
+            logger.info("Stand-off closure not needed: residual %.3f m inside %.3f m.", distance, centering.tolerance_m)
+            return _PhaseOutcome.ACHIEVED
+        if distance > _MAX_STANDOFF_CLOSURE_M:
+            logger.warning(
+                "Stand-off closure skipped: residual (%+.3f, %+.3f) m exceeds %.2f m; landing from here.",
+                forward,
+                left,
+                _MAX_STANDOFF_CLOSURE_M,
+            )
+            return _PhaseOutcome.ACHIEVED
+
+        rtl_cfg = ctx.params.rtl
+        closure = StandoffClosure(
+            forward, left, max_speed_mps=centering.max_speed_mps, tolerance_m=centering.tolerance_m
+        )
+        shaper_x = QuantizedCommandShaper(rtl_cfg.min_effective_speed, rtl_cfg.quantization_step)
+        shaper_y = QuantizedCommandShaper(rtl_cfg.min_effective_speed, rtl_cfg.quantization_step)
+        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
+        deadline = Deadline(_STANDOFF_CLOSURE_TIMEOUT_SEC)
+        logger.info(
+            "Stand-off closure: flying (%+.3f, %+.3f) m blind at <= %.3f m/s, tolerance %.3f m, window %.1f s.",
+            forward,
+            left,
+            centering.max_speed_mps,
+            centering.tolerance_m,
+            _STANDOFF_CLOSURE_TIMEOUT_SEC,
+        )
+        cycle = 0
+        with ctx.failsafe.altitude_hold_window(0.0):
+            while deadline.active:
+                if ctx.interrupted():
+                    self._halt_translation(ctx, hold_altitude=False)
+                    return _PhaseOutcome.ABORTED
+                health = self._check_health(ctx)
+                if health is not None:
+                    ctx.failsafe.trigger_emergency_land(health)
+                    return _PhaseOutcome.FAILED
+
+                dt = rate.tick()
+                command = closure.update(self._body_velocity(ctx), dt)
+                if command.done:
+                    self._halt_translation(ctx, hold_altitude=False)
+                    logger.info("Stand-off closure complete after %.2f s: %s.", deadline.elapsed_sec, command.note)
+                    return _PhaseOutcome.ACHIEVED
+
+                vx = shaper_x.shape(ctx.speed_calibration.to_normalized(command.vx_mps, axis="forward"), dt)
+                vy = shaper_y.shape(ctx.speed_calibration.to_normalized(command.vy_mps, axis="lateral"), dt)
+                safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(0.0, 0.0)
+                safe_vx, safe_vy = ctx.failsafe.clamp_translation(vx, vy)
+                ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
+                if cycle % _STREAM_DECIMATION == 0:
+                    logger.info("[CLOSURE t=%.2f %s | cmd=(vx=%.3f, vy=%.3f)]", deadline.elapsed_sec, command.note, vx, vy)
+                cycle += 1
+
+        self._halt_translation(ctx, hold_altitude=False)
+        logger.warning(
+            "Stand-off closure did not complete within %.1f s; landing from here.", _STANDOFF_CLOSURE_TIMEOUT_SEC
+        )
+        return _PhaseOutcome.ACHIEVED
+
+    @staticmethod
+    def _body_velocity(ctx: MissionContext, snapshot: Any = None) -> Optional[Tuple[float, float]]:
+        """Measured ``(forward, left)`` velocity, m/s, or ``None`` when the odometry has none.
+
+        ``/bebop/odom`` reports velocity in the odometry frame; the centring law
+        brakes on the body-frame speed (``ArucoCenteringController.update``).
+        """
+        if snapshot is None:
+            try:
+                snapshot = ctx.odom_supervisor.snapshot()
+            except Exception as exc:  # noqa: BLE001 - no velocity means no brake, never a fault
+                logger.debug("Odometry snapshot unavailable for the overspeed brake: %s", exc)
+                return None
+        vx, vy = getattr(snapshot, "vx", None), getattr(snapshot, "vy", None)
+        if not isinstance(vx, (int, float)) or not isinstance(vy, (int, float)):
+            return None
+        yaw = getattr(snapshot, "yaw", 0.0)
+        return body_velocity(float(vx), float(vy), float(yaw) if isinstance(yaw, (int, float)) else 0.0)
 
     @staticmethod
     def _projection_tilt(ctx: MissionContext) -> Optional[float]:
@@ -1762,15 +1944,20 @@ class ClosedLoopRTLStep(BaseStep):
         safe_vx, safe_vy = ctx.failsafe.clamp_translation(command.vx, command.vy)
         ctx.drone.move_velocity(vx=safe_vx, vy=safe_vy, vz=safe_vz, vyaw=safe_vyaw)
 
-    def _halt_translation(self, ctx: MissionContext) -> None:
+    def _halt_translation(self, ctx: MissionContext, *, hold_altitude: bool = True) -> None:
         """Command a horizontal stop while leaving the vertical axis governed.
 
         Sent explicitly because the airframe latches: leaving the centering
         phase without a zero translation hands the touchdown sequence an
         aircraft still drifting under the last correction it was given.
+
+        ``hold_altitude=False`` is the tracked descent's own halt: the governor
+        holds a setpoint above the aircraft there, so governing the vertical
+        axis would command the climb back to it, and the vertical command is
+        exactly zero.
         """
         vz = 0.0
-        if self._edge_guard_configured(ctx):
+        if hold_altitude and self._edge_guard_configured(ctx):
             # Near the pad edge an exactly zero gaz hands the vertical axis to
             # the firmware's sonar hover, which is what the edge guard exists
             # to avoid. The governor keeps it, as in every other phase.

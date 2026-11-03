@@ -72,9 +72,9 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Final, Optional, Sequence
+from typing import Final, Optional, Sequence, Tuple
 
 from mvp_mission_bebop.controllers.pid import FilteredPID, PIDGains
 from mvp_mission_bebop.controllers.profiling import (
@@ -760,6 +760,11 @@ class CenteringCommand:
     #: Marker identity driving this cycle, or ``None`` while it is not visible.
     marker_id: Optional[int]
     note: str
+    #: Along-track lead of the marker the law closes on, metres
+    #: (:func:`visibility_standoff_m`). Zero outside the Advanced return, where
+    #: ``radial_error_m`` is measured to the CoG; with a stand-off it is
+    #: measured to the stand-off point and ``ex_body_m`` stays the raw error.
+    standoff_m: float = 0.0
 
 
 def project_marker_to_body(
@@ -845,6 +850,90 @@ def project_marker_to_body(
 #: across; anything beyond is a unit error (millimetres or centimetres).
 _MAX_CAMERA_OFFSET_M: Final[float] = 0.5
 
+#: Gimbal depression of the Advanced return leg, degrees (negative is down).
+#: Fixed for the profile and independent of ``rtl.camera_tilt_deg``, which
+#: remains the Simple return's angle. Twenty degrees of forward lean keeps the
+#: ground ahead of the rightward search leg in view, at the cost of a pad that
+#: cannot be framed under the CoG at low height; :func:`visibility_standoff_m`
+#: is the geometry that pays for it.
+ADVANCED_RETURN_TILT_DEG: Final[float] = -70.0
+
+#: Tangent of the half vertical field of view of the streamed frame: the
+#: 856x480 crop spans 50 deg vertically, and 0.455 is the value the frame-edge
+#: guard of :meth:`ArucoCenteringController._track` was tuned on.
+FRAME_BOTTOM_TAN: Final[float] = 0.455
+
+#: Half extent of the marker plus its white quiet zone, as a fraction of
+#: ``rtl.tag_size``. The detector needs the quiet zone, not only the black
+#: square, so this is the edge that must stay inside the frame.
+QUIET_ZONE_HALF_FRACTION: Final[float] = 0.65
+
+#: Angular margin held between the quiet zone and the frame bottom, degrees.
+#: Absorbs the pitch the airframe takes while it corrects along track.
+STANDOFF_MARGIN_DEG: Final[float] = 2.0
+
+
+def visibility_standoff_m(
+    height_m: float,
+    camera_tilt_deg: float,
+    tag_size_m: float,
+    offset_forward_m: float = 0.0,
+) -> float:
+    """Smallest lead of the marker ahead of the CoG that keeps it framed.
+
+    With depression ``t`` and half vertical field of view ``phi``, the lowest
+    ray of the frame leaves the lens at ``t + phi`` below the horizon. The near
+    edge of the quiet zone lies ``q = 0.65 * tag`` behind the marker centre, so
+    a marker ``s`` ahead of the lens at height ``h`` is fully framed when
+
+    .. math::
+
+        s \\ge q + h \\cot(t + \\phi - \\mu)
+
+    with ``mu`` the margin :data:`STANDOFF_MARGIN_DEG`. Past nadir
+    (``t + phi > 90``) the cotangent is negative and the bound shrinks with
+    height. Measured from the CoG the lead is ``d_f + s``, floored at zero: a
+    marker that fits under the CoG needs no stand-off.
+
+    With a 0.20 m tag and ``d_f = 0.04 m``: at -80 deg the bound is zero above
+    0.77 m; at -70 deg it is zero only above 3.9 m, 0.13 m at 1.0 m and 0.15 m
+    at 0.40 m.
+
+    Parameters
+    ----------
+    height_m : float
+        Lens height over the marker plane, metres. Negative values are treated
+        as zero.
+    camera_tilt_deg : float
+        Gimbal tilt, degrees; only the magnitude is used.
+    tag_size_m : float
+        Black-square side of the marker, metres.
+    offset_forward_m : float
+        Lens position ahead of the CoG, metres.
+
+    Returns
+    -------
+    float
+        Required along-track lead of the marker over the CoG, metres, ``>= 0``.
+
+    Raises
+    ------
+    ValueError
+        If an input is not finite, the tag size is not positive, or the lowest
+        framed ray is not below the horizon.
+    """
+    values = (height_m, camera_tilt_deg, tag_size_m, offset_forward_m)
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in values):
+        raise ValueError(f"visibility stand-off inputs must be finite numbers, got {values!r}")
+    if tag_size_m <= 0.0:
+        raise ValueError(f"tag_size_m must be positive, got {tag_size_m!r}")
+    lowest_ray_deg = abs(camera_tilt_deg) + math.degrees(math.atan(FRAME_BOTTOM_TAN)) - STANDOFF_MARGIN_DEG
+    if not 0.0 < lowest_ray_deg < 180.0:
+        raise ValueError(f"camera_tilt_deg={camera_tilt_deg!r} puts the frame bottom outside (0, 180) deg")
+    quiet_half = QUIET_ZONE_HALF_FRACTION * tag_size_m
+    lead_from_lens = quiet_half + max(0.0, height_m) / math.tan(math.radians(lowest_ray_deg))
+    return max(0.0, offset_forward_m + lead_from_lens)
+
 
 def _camera_offset(rtl_cfg: ReturnToLaunchConfig, name: str) -> float:
     """Validated camera-to-CoG offset, metres (``0.0`` when the field is absent)."""
@@ -912,8 +1001,24 @@ class ArucoCenteringController:
         rtl_cfg: ReturnToLaunchConfig,
         kinematics_cfg: FlightKinematicsConfig,
         calibration: Optional[SpeedCalibration] = None,
+        *,
+        simple: bool = False,
+        tilt_deg: Optional[float] = None,
+        standoff: bool = False,
     ) -> None:
+        """``simple`` selects the Simple-profile speed ceiling and forward cap
+        (``rtl.simple_max_centering_speed``, ``rtl.simple_centering_forward_cap_mps``);
+        every gate and tolerance is shared with the advanced profile.
+
+        ``tilt_deg`` replaces ``rtl.camera_tilt_deg`` as the default projection
+        tilt (the Advanced return flies :data:`ADVANCED_RETURN_TILT_DEG`).
+        ``standoff`` closes on :func:`visibility_standoff_m` instead of on the
+        CoG and replaces the -80 deg frame-edge guard, whose fixed ``y_cam``
+        thresholds would back the airframe away from a stand-off that already
+        keeps the quiet zone framed. Both default to the Simple behaviour.
+        """
         self.rtl_cfg = rtl_cfg
+        self._simple = bool(simple)
         self.kinematics_cfg = kinematics_cfg
         self.calibration = calibration or SpeedCalibration(kinematics_cfg.normalized_to_mps)
 
@@ -921,14 +1026,36 @@ class ArucoCenteringController:
         #: rather than read per cycle so that a mid-phase configuration edit
         #: cannot change the frame the PD state was accumulated in.
         self._tilt_deg: float = rtl_cfg.camera_tilt_deg
+        if tilt_deg is not None:
+            if isinstance(tilt_deg, bool) or not isinstance(tilt_deg, (int, float)):
+                raise TypeError(f"tilt_deg must be a number, got {type(tilt_deg).__name__}")
+            if not math.isfinite(tilt_deg):
+                raise ValueError(f"tilt_deg must be finite, got {tilt_deg!r}")
+            self._tilt_deg = float(tilt_deg)
+        self._standoff: bool = bool(standoff)
+        self._tag_size_m: float = float(getattr(rtl_cfg, "tag_size", 0.20))
+        if self._standoff:
+            # Validated here, before anything flies, like every other input.
+            visibility_standoff_m(0.0, self._tilt_deg, self._tag_size_m)
         self._offset_forward_m: float = _camera_offset(rtl_cfg, "camera_offset_forward_m")
         self._offset_left_m: float = _camera_offset(rtl_cfg, "camera_offset_left_m")
 
         # The ceiling arrives normalized because that is the domain the GCS
         # parameter sheet speaks; the law works in m/s.
-        self._max_speed_mps: float = abs(
-            self.calibration.to_mps(rtl_cfg.max_centering_speed)
+        ceiling = (
+            getattr(rtl_cfg, "simple_max_centering_speed", rtl_cfg.max_centering_speed)
+            if self._simple
+            else rtl_cfg.max_centering_speed
         )
+        self._max_speed_mps: float = abs(self.calibration.to_mps(ceiling))
+        forward_cap = (
+            getattr(rtl_cfg, "simple_centering_forward_cap_mps", 0.035)
+            if self._simple
+            else getattr(rtl_cfg, "centering_forward_cap_mps", 0.015)
+        )
+        self._forward_cap_mps: float = float(forward_cap)
+        if not (math.isfinite(self._forward_cap_mps) and self._forward_cap_mps > 0.0):
+            raise ValueError(f"centring forward cap must be positive, got {forward_cap!r}")
         if self._max_speed_mps <= 0.0:
             raise ValueError(
                 f"rtl.max_centering_speed must be non-zero, got "
@@ -1012,9 +1139,34 @@ class ArucoCenteringController:
         self._last_radial_m: Optional[float] = None
         self._last_speed_mps: Optional[float] = None
         self._lost_elapsed_sec: float = 0.0
+        self._overspeed_mps: float = abs(float(getattr(rtl_cfg, "centering_overspeed_mps", 0.06)))
+        self._overspeed_release_mps: float = abs(
+            float(getattr(rtl_cfg, "centering_overspeed_release_mps", 0.03))
+        )
+        if self._simple:
+            # The brake answers a speed the law did not ask for. Against the
+            # faster Simple ceiling the advanced threshold would brake the
+            # law's own commanded speed, so there it is never below twice the
+            # ceiling, released at the ceiling.
+            self._overspeed_mps = max(self._overspeed_mps, 2.0 * self._max_speed_mps)
+            self._overspeed_release_mps = max(self._overspeed_release_mps, self._max_speed_mps)
+        if not (
+            math.isfinite(self._overspeed_mps)
+            and math.isfinite(self._overspeed_release_mps)
+            and 0.0 < self._overspeed_release_mps < self._overspeed_mps
+        ):
+            raise ValueError(
+                "rtl.centering_overspeed_release_mps must be positive and below "
+                f"rtl.centering_overspeed_mps, got {self._overspeed_release_mps!r} / {self._overspeed_mps!r}"
+            )
+        self._braking: bool = False
         self._creep_speed_mps: float = abs(
             self.calibration.to_mps(rtl_cfg.reacquire_creep_speed)
         )
+        #: Marker position relative to the CoG, ``(forward, left)`` metres: the
+        #: raw error of the last sighting, carried forward through the cycles
+        #: without one by the measured velocity. The stand-off closure flies it.
+        self._residual_body_m: Optional[Tuple[float, float]] = None
 
     # ------------------------------------------------------------- properties
 
@@ -1058,6 +1210,25 @@ class ArucoCenteringController:
         """Radial error of the most recent valid sighting, metres (or ``None``)."""
         return self._last_radial_m
 
+    @property
+    def tilt_deg(self) -> float:
+        """Default projection tilt, degrees."""
+        return self._tilt_deg
+
+    @property
+    def standoff_enabled(self) -> bool:
+        """Whether the law closes on the visibility stand-off."""
+        return self._standoff
+
+    @property
+    def residual_body_m(self) -> Optional[Tuple[float, float]]:
+        """Marker position relative to the CoG, ``(forward, left)`` metres, or ``None``.
+
+        The raw error of the last sighting, minus the measured displacement
+        since. ``None`` before any sighting.
+        """
+        return self._residual_body_m
+
     # ------------------------------------------------------------------ cycle
 
     def reset(self) -> None:
@@ -1074,8 +1245,85 @@ class ArucoCenteringController:
         self._last_radial_m = None
         self._last_speed_mps = None
         self._lost_elapsed_sec = 0.0
+        self._braking = False
+        self._residual_body_m = None
 
     def update(
+        self,
+        observation: Optional[MarkerObservation],
+        dt: float,
+        tilt_deg: Optional[float] = None,
+        body_velocity_mps: Optional[Tuple[float, float]] = None,
+    ) -> CenteringCommand:
+        """Produce one cycle of centering guidance, braking on measured overspeed.
+
+        ``body_velocity_mps`` is the measured ``(forward, left)`` velocity. The
+        Bebop flies roll and pitch as a tilt, so a small held command keeps
+        accelerating the airframe instead of holding a speed. Above
+        ``rtl.centering_overspeed_mps`` the horizontal command is an exact zero,
+        which the driver sends as the firmware hover (``ros2_bebop_driver``
+        ``bebop.cpp``: zero roll and pitch clear the piloting flag) and its
+        optical-flow brake; the law resumes from rest under
+        ``centering_overspeed_release_mps``. Without a velocity the law runs
+        unchanged. See :meth:`_track` for the rest of the parameters.
+        """
+        command = self._track(observation, dt, tilt_deg)
+        self._carry_residual(command, body_velocity_mps, dt)
+        speed = self._measured_speed(body_velocity_mps)
+        if speed is None:
+            self._braking = False
+            return command
+        if self._braking:
+            self._braking = speed > self._overspeed_release_mps
+        else:
+            self._braking = speed > self._overspeed_mps
+        if not self._braking:
+            return command
+        self._longitudinal_profile.reset(0.0, 0.0)
+        self._lateral_profile.reset(0.0, 0.0)
+        self._shaper_x.reset()
+        self._shaper_y.reset()
+        self._settle_cycles = 0
+        return replace(
+            command,
+            vx=0.0,
+            vy=0.0,
+            commanded_speed_mps=0.0,
+            settled=False,
+            note=f"braking: measured {speed:.3f} m/s > {self._overspeed_release_mps:.3f} m/s, firmware hover",
+        )
+
+    def _carry_residual(
+        self, command: CenteringCommand, body_velocity_mps: Optional[Tuple[float, float]], dt: float
+    ) -> None:
+        """Refresh the residual on a sighting, or dead-reckon it on the measured velocity."""
+        if command.tracking:
+            self._residual_body_m = (command.ex_body_m, command.ey_body_m)
+            return
+        if self._residual_body_m is None or body_velocity_mps is None or not (dt > 0.0 and math.isfinite(dt)):
+            return
+        try:
+            forward, left = float(body_velocity_mps[0]), float(body_velocity_mps[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        if math.isfinite(forward) and math.isfinite(left):
+            ex, ey = self._residual_body_m
+            self._residual_body_m = (ex - forward * dt, ey - left * dt)
+
+    @staticmethod
+    def _measured_speed(body_velocity_mps: Optional[Tuple[float, float]]) -> Optional[float]:
+        """Horizontal speed of a measured ``(forward, left)`` pair, or ``None`` when unusable."""
+        if body_velocity_mps is None:
+            return None
+        try:
+            forward, left = float(body_velocity_mps[0]), float(body_velocity_mps[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if not (math.isfinite(forward) and math.isfinite(left)):
+            return None
+        return math.hypot(forward, left)
+
+    def _track(
         self, observation: Optional[MarkerObservation], dt: float, tilt_deg: Optional[float] = None
     ) -> CenteringCommand:
         """Produce one cycle of centering guidance.
@@ -1123,7 +1371,16 @@ class ArucoCenteringController:
             self._offset_forward_m,
             self._offset_left_m,
         )
-        radial = math.hypot(ex_body, ey_body)
+        # Advanced return: the along-track channel closes on the stand-off the
+        # tilt allows, not on the CoG; the residual is flown blind after the
+        # commit. Zero elsewhere, which leaves ex_error equal to ex_body.
+        standoff = 0.0
+        if self._standoff:
+            standoff = visibility_standoff_m(
+                observation.height_above_marker_m(tilt), tilt, self._tag_size_m, self._offset_forward_m
+            )
+        ex_error = ex_body - standoff
+        radial = math.hypot(ex_error, ey_body)
         within = radial <= self._tolerance_m
         within_landing_gate = radial <= self._landing_radius_m
 
@@ -1143,7 +1400,7 @@ class ArucoCenteringController:
             # is the negation of the error vector pointing at it, against a zero
             # setpoint. The sign convention is the same one the odometric law
             # above uses, deliberately: one reading of "error" across the module.
-            longitudinal_demand = self._longitudinal.update(-ex_body, dt)
+            longitudinal_demand = self._longitudinal.update(-ex_error, dt)
             lateral_demand = self._lateral.update(-ey_body, dt)
             # The body-X error is recovered through the tilt projection and the
             # ground footprint along the nose is the image's vertical extent,
@@ -1167,7 +1424,7 @@ class ArucoCenteringController:
             # final approach asymptotically crawl the last few centimetres before
             # that branch ever gets to fire.
             longitudinal_ceiling = braking_velocity(
-                abs(ex_body),
+                abs(ex_error),
                 self.rtl_cfg.max_accel_mps2,
                 cruise_velocity=self._max_speed_mps,
                 arrival_tolerance=self._deadband_m,
@@ -1175,22 +1432,43 @@ class ArucoCenteringController:
             longitudinal_target = max(
                 -longitudinal_ceiling, min(longitudinal_ceiling, longitudinal_demand)
             )
-            if ex_body <= self._deadband_m:
+            if ex_error <= self._deadband_m:
                 longitudinal_target = min(0.0, longitudinal_demand)
 
             # Prevent forward overshoot and preserve ArUco white quiet-zone:
-            # When the white border approaches the lower image boundary (border_margin_m < 0.08 m),
-            # clamp forward demand to zero so the airframe never overshoots and loses the tag.
-            # If the white border is in critical danger (< 0.03 m), gently back up (-0.015 m/s).
+            # At camera tilt -80 deg, any forward acceleration pitches the nose down,
+            # which pushes the marker toward the bottom edge of the frame.
+            # Center of frame (y_cam=0) already corresponds to ex_body ~ +0.17m.
+            # Attempting to drive ex_body to 0 moves the marker to y_cam ~ +0.18m (lower half),
+            # cutting off the white quiet-zone border and causing 100% loss of ArUco detection.
             tag_size = float(getattr(self.rtl_cfg, "tag_size", 0.20))
-            fov_bottom_m = 0.45 * observation.z_cam_m
+            fov_bottom_m = 0.455 * observation.z_cam_m
             border_bottom_m = observation.y_cam_m + 0.65 * tag_size
             border_margin_m = fov_bottom_m - border_bottom_m
-            if border_margin_m < 0.08:
-                if border_margin_m < 0.03:
-                    longitudinal_target = min(longitudinal_target, -0.015)
-                else:
+
+            # Strict guard against forward surge:
+            # 1. Cap any forward target speed to at most 0.015 m/s (gentle crawl, no brute lunges).
+            if longitudinal_target > 0.0:
+                longitudinal_target = min(self._forward_cap_mps, longitudinal_target)
+
+            # Steps 2 to 4 are the -80 deg guard. Under a stand-off the
+            # setpoint itself keeps the quiet zone framed, and at -70 deg the
+            # fixed y_cam thresholds sit above the stand-off point: they would
+            # back the airframe off it and the law would never settle.
+            if not self._standoff:
+                # 2. When marker approaches the lower region (margin < 0.16 m or y_cam >= 0.05 m),
+                #    clamp forward demand to zero so the airframe never overshoots and loses the tag.
+                if border_margin_m < 0.16 or observation.y_cam_m >= 0.05:
                     longitudinal_target = min(0.0, longitudinal_target)
+
+                # 3. If marker is in danger of being cut off (margin < 0.10 m or y_cam > 0.10 m),
+                #    actively back up (-0.02 m/s) to keep the tag centered and restore margin.
+                if border_margin_m < 0.10 or observation.y_cam_m > 0.10:
+                    longitudinal_target = min(longitudinal_target, -0.02)
+
+                # 4. Critical margin (< 0.05 m): back up stronger (-0.035 m/s).
+                if border_margin_m < 0.05:
+                    longitudinal_target = min(longitudinal_target, -0.035)
             # Saturated as a vector, not per axis. Clipping the two channels
             # independently lets the resultant reach sqrt(2) times the ceiling on
             # a diagonal approach -- 0.113 against a configured 0.08 -- and it
@@ -1245,7 +1523,8 @@ class ArucoCenteringController:
             within_tolerance=within,
             settled=settled,
             marker_id=observation.marker_id,
-            note=note,
+            note=note if standoff <= 0.0 else f"{note}, stand-off {standoff:.3f} m",
+            standoff_m=standoff,
         )
 
     # ---------------------------------------------------------------- helpers
@@ -1292,7 +1571,8 @@ class ArucoCenteringController:
             and self._lost_elapsed_sec <= self.rtl_cfg.reacquire_creep_sec
         )
         lateral_target = self._creep_speed_mps if creeping else 0.0
-        longitudinal_mps = self._longitudinal_profile.step(0.0, dt)
+        longitudinal_target = -self._creep_speed_mps if creeping else 0.0
+        longitudinal_mps = self._longitudinal_profile.step(longitudinal_target, dt)
         lateral_mps = self._lateral_profile.step(lateral_target, dt)
 
         tolerated = self._lost_frames <= self._lost_tolerance

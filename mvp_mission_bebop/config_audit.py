@@ -298,6 +298,15 @@ def audit_safe_envelopes(
             "the tracked descent outruns the marker detection",
         )
 
+    pause = _real(rtl.descent_pause_max_sec)
+    if pause is None or not 0.0 < pause <= 5.0:
+        diverge(
+            "rtl.descent_pause_max_sec",
+            rtl.descent_pause_max_sec,
+            "(0, 5]",
+            "the tracked descent would hover waiting for an alignment that never settles",
+        )
+
     gate = _real(rtl.descent_gate_radius_m)
     if gate is None or (tolerance is not None and gate < tolerance):
         diverge(

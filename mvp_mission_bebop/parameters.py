@@ -1003,6 +1003,27 @@ class ReturnToLaunchConfig:
     #: this phase is a convergence, not a transit, and every metre per second of
     #: overshoot has to be paid back over the marker.
     max_centering_speed: float = 0.08
+    #: Speed ceiling of the same centring in the Simple profile, normalized.
+    #: The Simple profile centres over the pad it never left, from a short
+    #: offset (the camera-to-body lever arm plus the hover drift), and at the
+    #: advanced ceiling its 15 s window always expired before the landing gate.
+    #: The gates, tolerances and the frame-edge guard are the same in both.
+    simple_max_centering_speed: float = 0.04
+    #: Forward speed cap of the centring, m/s: forward motion pushes the marker
+    #: toward the bottom edge at a nadir-ish tilt, where its quiet zone is lost.
+    centering_forward_cap_mps: float = 0.015
+    #: The same cap in the Simple profile, m/s.
+    simple_centering_forward_cap_mps: float = 0.035
+    #: Measured horizontal speed, m/s, above which the marker centring (and the
+    #: tracked descent) stops commanding translation and sends an exactly zero
+    #: roll/pitch, so the driver selects the firmware hover and its optical-flow
+    #: brake. The Bebop flies roll/pitch as a tilt, not a velocity: a held
+    #: 0.02 keeps accelerating the airframe, which is how a 0.02 centring command
+    #: drifted 0.5 m forward and lost the marker. Safe envelope: ``(0, 0.3]``.
+    centering_overspeed_mps: float = 0.06
+    #: Measured speed under which the brake releases and the centring resumes
+    #: from rest, m/s. Below :attr:`centering_overspeed_mps` (hysteresis).
+    centering_overspeed_release_mps: float = 0.03
     #: Radial error inside which the airframe counts as centred, in metres.
     centering_tolerance_m: float = 0.04
     #: Radial error inside which the landing is authorized, once at residual
@@ -1050,15 +1071,26 @@ class ReturnToLaunchConfig:
     #: Safe envelope: ``[0.20, 0.80]``.
     commit_height_m: float = 0.40
     #: Radial error required at the commit height, metres.
-    commit_radius_m: float = 0.05
+    commit_radius_m: float = 0.15
     #: Height under which the horizontal correction is scaled down: the rotor
     #: wash reflected by the ground amplifies every correction, metres.
     ground_effect_height_m: float = 0.60
     #: Scale of the horizontal correction under ``ground_effect_height_m``.
     ground_effect_gain_scale: float = 0.6
-    #: Marker loss tolerated during the descent before it realigns (above the
-    #: commit band) or commits (inside it), seconds.
-    descent_marker_lost_hold_sec: float = 0.6
+    #: Marker loss tolerated once the marker has been sighted, before the
+    #: touchdown is committed, seconds. A descent already under way keeps
+    #: descending through it; an alignment holds height. Never a realignment and
+    #: never a climb: the debounce only rejects a single dropped frame.
+    descent_marker_lost_hold_sec: float = 0.25
+    #: Height over the marker under which losing the marker commits the touchdown
+    #: on the first missed frame, metres: the marker leaves the field of view by
+    #: proximity there, and waiting for it is hovering for nothing.
+    descent_lost_commit_height_m: float = 0.60
+    #: Total time the tracked descent may spend not descending (alignment, pauses
+    #: for a grown error, waiting at the commit height for the radius), seconds.
+    #: Once spent, the descent proceeds and commits regardless of the radial
+    #: error: optical flow and wind never hold an ideal alignment for long.
+    descent_pause_max_sec: float = 1.5
     #: Bound on the tracked descent, seconds; reaching it commits the touchdown.
     descent_timeout_sec: float = 20.0
     #: Consecutive cycles inside :attr:`landing_radius_m` *at residual speed*

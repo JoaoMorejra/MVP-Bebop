@@ -29,6 +29,7 @@ from typing import List, Optional, Tuple
 import pytest
 
 from mvp_mission_bebop.controllers.rtl_guidance import (
+    ADVANCED_RETURN_TILT_DEG,
     ArucoCenteringController,
     CenteringCommand,
     MarkerObservation,
@@ -1087,8 +1088,8 @@ def test_the_gimbal_is_pitched_to_the_configured_search_attitude():
     ClosedLoopRTLStep(sensor=ctx.sensor).execute(ctx)
 
     assert ctx.drone.tilts, "the gimbal was never commanded"
-    assert ctx.drone.tilts[0] == pytest.approx(ctx.params.rtl.camera_tilt_deg)
-    assert ctx.current_tilt_deg == pytest.approx(ctx.params.rtl.camera_tilt_deg)
+    assert ctx.drone.tilts[0] == pytest.approx(ADVANCED_RETURN_TILT_DEG)
+    assert ctx.current_tilt_deg == pytest.approx(ADVANCED_RETURN_TILT_DEG)
 
 
 def test_the_search_leg_transmits_the_corrective_climb():
@@ -1818,7 +1819,7 @@ def test_the_gimbal_angle_is_re_asserted_through_the_return_leg():
     )
 
     assert len(ctx.drone.tilts) > 1, "the gimbal was commanded exactly once and never again"
-    assert all(tilt == pytest.approx(ctx.params.rtl.camera_tilt_deg) for tilt in ctx.drone.tilts)
+    assert all(tilt == pytest.approx(ADVANCED_RETURN_TILT_DEG) for tilt in ctx.drone.tilts)
 
 
 def test_a_gimbal_that_refuses_the_command_does_not_end_the_return():
@@ -1996,6 +1997,50 @@ def test_p1a_without_the_edge_guard_the_halt_is_unchanged():
     ctx = Ctx()
     with ctx.failsafe.altitude_hold_window(0.10):
         ClosedLoopRTLStep()._halt_translation(ctx)
+    assert ctx.drone.commands[-1] == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_the_descent_halt_never_climbs_even_with_the_edge_guard_and_an_open_window():
+    ctx = Ctx()
+    ctx.params.platform.edge_ahead_m = 0.25
+    with ctx.failsafe.altitude_hold_window(0.10):
+        ClosedLoopRTLStep()._halt_translation(ctx, hold_altitude=False)
+    assert ctx.drone.commands[-1] == (0.0, 0.0, 0.0, 0.0)
+
+
+class DescendingSensor:
+    """Sights the pad from a descending camera, then loses it."""
+
+    target_id = 8
+
+    def __init__(self, heights):
+        self._heights = list(heights)
+
+    def observe(self, frame):
+        if not self._heights:
+            return None
+        return sighting(0.02, 0.0, self._heights.pop(0), marker_id=8)
+
+
+@pytest.mark.parametrize("lost_at", [None, 0.9, 0.45])
+def test_the_tracked_descent_never_commands_a_climb_under_an_open_hold_window(lost_at):
+    from mvp_mission_bebop.steps.rtl import _PhaseOutcome
+
+    ctx = Ctx()
+    ctx.params.platform.edge_ahead_m = 0.25
+    ctx.params.kinematics.control_loop_hz = 15.0
+    heights = [1.0 - 0.01 * i for i in range(60)]
+    if lost_at is not None:
+        heights = [h for h in heights if h > lost_at]
+    sensor = DescendingSensor(heights)
+    step = ClosedLoopRTLStep(sensor=sensor)
+    centering = step._build_centering(ctx)
+    with ctx.failsafe.altitude_hold_window(0.10):
+        outcome = step._descend_over_marker(ctx, centering, sensor)
+        assert ctx.failsafe.altitude_hold_ceiling == pytest.approx(0.10)
+    assert outcome is _PhaseOutcome.ACHIEVED
+    assert ctx.drone.commands
+    assert all(vz <= 0.0 for vz in ctx.vertical)
     assert ctx.drone.commands[-1] == (0.0, 0.0, 0.0, 0.0)
 
 
@@ -2291,3 +2336,132 @@ def test_the_centering_frame_wait_is_bounded_by_the_control_period():
 
     period = 1.0 / ctx.params.kinematics.control_loop_hz
     assert waits and max(waits) <= period + 0.05
+
+
+# ------------------------------------------- overspeed brake of the centring law
+
+
+def test_measured_overspeed_sends_an_exact_zero_until_the_release_speed():
+    controller = law()
+    observation = sighting(0.30, 0.0, 1.0)
+    command = controller.update(observation, 1.0 / 15.0, body_velocity_mps=(0.10, 0.0))
+    assert (command.vx, command.vy) == (0.0, 0.0)
+    assert command.note.startswith("braking")
+    assert command.settled is False
+    command = controller.update(observation, 1.0 / 15.0, body_velocity_mps=(0.05, 0.0))
+    assert (command.vx, command.vy) == (0.0, 0.0), "the brake holds above the release speed"
+    resumed = [
+        controller.update(observation, 1.0 / 15.0, body_velocity_mps=(0.01, 0.0)) for _ in range(30)
+    ]
+    assert not any(c.note.startswith("braking") for c in resumed)
+    assert any(c.vx != 0.0 for c in resumed)
+
+
+def test_without_a_measured_velocity_the_law_never_brakes():
+    controller = law()
+    commands = [controller.update(sighting(0.30, -0.2, 1.0), 1.0 / 15.0) for _ in range(30)]
+    assert not any(c.note.startswith("braking") for c in commands)
+
+
+def test_a_non_finite_velocity_is_ignored_by_the_brake():
+    controller = law()
+    command = controller.update(sighting(0.30, 0.0, 1.0), 1.0 / 15.0, body_velocity_mps=(float("nan"), 0.0))
+    assert not command.note.startswith("braking")
+
+
+def test_an_inverted_overspeed_hysteresis_is_refused():
+    with pytest.raises(ValueError):
+        law(centering_overspeed_mps=0.03, centering_overspeed_release_mps=0.05)
+
+
+def _tilt_plant_centring(brake: bool, seconds: float = 15.0):
+    """Centre on a pad from a rightward cruise, with roll/pitch flown as a tilt.
+
+    A held command accelerates the airframe (``3 m/s^2`` per unit, light drag);
+    an exact zero on both axes is the firmware hover, which brakes hard. The
+    airframe starts 0.375 m behind and 0.28 m left of the marker, still moving
+    right at 0.15 m/s from the cruise, which is the 12:31 flight of 2026-11-02.
+    """
+    controller = law()
+    dt = 1.0 / 15.0
+    ex, ey = 0.375, -0.28
+    v_fwd, v_left = 0.0, -0.15
+    worst_ahead, worst_left = 0.0, 0.0
+    for _ in range(int(seconds / dt)):
+        command = controller.update(
+            sighting(ex, ey, 1.0), dt, body_velocity_mps=(v_fwd, v_left) if brake else None
+        )
+        if command.vx == 0.0 and command.vy == 0.0:
+            v_fwd += -2.0 * v_fwd * dt
+            v_left += -2.0 * v_left * dt
+        else:
+            v_fwd += (3.0 * command.vx - 0.3 * v_fwd) * dt
+            v_left += (3.0 * command.vy - 0.3 * v_left) * dt
+        ex -= v_fwd * dt
+        ey -= v_left * dt
+        worst_ahead = min(worst_ahead, ex)
+        worst_left = max(worst_left, ey)
+    return math.hypot(ex, ey), -worst_ahead, worst_left
+
+
+def test_the_brake_keeps_the_centring_from_overshooting_the_marker():
+    final_braked, past_braked, side_braked = _tilt_plant_centring(brake=True)
+    final_free, past_free, side_free = _tilt_plant_centring(brake=False)
+    assert past_braked <= 0.08, f"flew {past_braked:.3f} m past the marker along the nose"
+    assert side_braked <= 0.10, f"overshot {side_braked:.3f} m to the side"
+    assert past_braked + side_braked < past_free + side_free
+    assert final_braked <= final_free + 0.01, "the brake must not cost convergence"
+
+
+FIELD_LANDING_RADIUS_M = 0.15
+
+
+def _centring_time(simple: bool, seconds: float = 25.0):
+    """Seconds to the landing gate from the Simple-profile start of 2026-11-02 (0.27 m ahead).
+
+    Same tilt plant as :func:`_tilt_plant_centring`, airframe initially at rest.
+    """
+    params = MissionParameters()
+    # The landing gate the field configuration flies with (mission_config.json).
+    params.rtl.landing_radius_m = FIELD_LANDING_RADIUS_M
+    controller = ArucoCenteringController(params.rtl, FlightKinematicsConfig(), SpeedCalibration(1.0), simple=simple)
+    controller.reset()
+    dt = 1.0 / 15.0
+    ex, ey = 0.27, 0.03
+    v_fwd = v_left = 0.0
+    past = 0.0
+    for k in range(int(seconds / dt)):
+        command = controller.update(sighting(ex, ey, 1.0), dt, body_velocity_mps=(v_fwd, v_left))
+        if command.settled:
+            return k * dt, math.hypot(ex, ey), past
+        if command.vx == 0.0 and command.vy == 0.0:
+            v_fwd += -2.0 * v_fwd * dt
+            v_left += -2.0 * v_left * dt
+        else:
+            v_fwd += (3.0 * command.vx - 0.3 * v_fwd) * dt
+            v_left += (3.0 * command.vy - 0.3 * v_left) * dt
+        ex -= v_fwd * dt
+        ey -= v_left * dt
+        past = max(past, -ex)
+    return math.inf, math.hypot(ex, ey), past
+
+
+def test_the_simple_profile_centres_faster_with_the_same_gates():
+    t_simple, radial_simple, past_simple = _centring_time(simple=True)
+    t_advanced, _radial, _past = _centring_time(simple=False)
+    landing_radius = FIELD_LANDING_RADIUS_M
+    assert t_simple < 0.7 * t_advanced, f"simple {t_simple:.1f} s vs advanced {t_advanced:.1f} s"
+    assert radial_simple <= landing_radius + 1e-9
+    assert past_simple <= 0.03, f"flew {past_simple:.3f} m past the marker"
+
+
+def test_the_simple_ceiling_and_forward_cap_are_used_only_in_the_simple_profile():
+    params = MissionParameters()
+    simple = ArucoCenteringController(params.rtl, FlightKinematicsConfig(), SpeedCalibration(1.0), simple=True)
+    advanced = ArucoCenteringController(params.rtl, FlightKinematicsConfig(), SpeedCalibration(1.0))
+    assert simple.max_speed_mps == pytest.approx(params.rtl.simple_max_centering_speed)
+    assert advanced.max_speed_mps == pytest.approx(params.rtl.max_centering_speed)
+    assert simple._forward_cap_mps == pytest.approx(params.rtl.simple_centering_forward_cap_mps)
+    assert advanced._forward_cap_mps == pytest.approx(params.rtl.centering_forward_cap_mps)
+    with pytest.raises(ValueError):
+        law(centering_forward_cap_mps=0.0)

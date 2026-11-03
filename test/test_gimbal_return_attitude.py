@@ -1,4 +1,7 @@
-"""The marker-guided return confirms the gimbal reached ``rtl.camera_tilt_deg``.
+"""The marker-guided return confirms the gimbal reached its return tilt.
+
+The Simple return flies ``rtl.camera_tilt_deg``; the Advanced return flies the
+fixed ``ADVANCED_RETURN_TILT_DEG`` through the same confirmation.
 
 Every flight log since 2026-10-24 shows the step commanding -80 deg and then
 centering for its whole window without ever seeing the pad marker. Nothing in
@@ -15,6 +18,8 @@ from typing import List
 
 import pytest
 
+from mvp_mission_bebop.controllers.rtl_guidance import ADVANCED_RETURN_TILT_DEG
+from mvp_mission_bebop.mission_mode import MissionMode
 from mvp_mission_bebop.steps import rtl as rtl_module
 from mvp_mission_bebop.steps.rtl import ClosedLoopRTLStep
 from mvp_mission_bebop.telemetry.gimbal import GimbalStateMonitor
@@ -72,14 +77,14 @@ def _report(monitor: GimbalStateMonitor, tilt: float) -> None:
 
 def test_without_a_monitor_the_command_is_sent_once_and_nothing_waits(recorder) -> None:
     ctx, tilts = _ctx()
-    ClosedLoopRTLStep()._engage_return_attitude(ctx)
+    ClosedLoopRTLStep(mode=MissionMode.SIMPLE)._engage_return_attitude(ctx)
     assert tilts == [-80.0]
     assert ctx.current_tilt_deg == -80.0
 
 
 def test_without_telemetry_the_step_flies_open_loop_and_says_so(recorder) -> None:
     ctx, tilts = _ctx(GimbalStateMonitor())
-    ClosedLoopRTLStep()._engage_return_attitude(ctx)
+    ClosedLoopRTLStep(mode=MissionMode.SIMPLE)._engage_return_attitude(ctx)
     assert tilts == [-80.0]
     assert "no gimbal telemetry" in recorder.text(logging.WARNING)
 
@@ -88,7 +93,7 @@ def test_a_camera_at_the_target_is_confirmed_without_resending(recorder) -> None
     monitor = GimbalStateMonitor()
     _report(monitor, -79.2)
     ctx, tilts = _ctx(monitor)
-    ClosedLoopRTLStep()._engage_return_attitude(ctx)
+    ClosedLoopRTLStep(mode=MissionMode.SIMPLE)._engage_return_attitude(ctx)
     assert tilts == [-80.0]
     assert "gimbal confirmed at -79.2" in recorder.text(logging.INFO)
     assert recorder.text(logging.WARNING) == ""
@@ -98,7 +103,7 @@ def test_a_camera_that_stops_short_is_resent_and_reported(recorder) -> None:
     monitor = GimbalStateMonitor()
     _report(monitor, -52.0)
     ctx, tilts = _ctx(monitor)
-    ClosedLoopRTLStep()._engage_return_attitude(ctx)
+    ClosedLoopRTLStep(mode=MissionMode.SIMPLE)._engage_return_attitude(ctx)
     assert len(tilts) > 1 and set(tilts) == {-80.0}
     warning = recorder.text(logging.WARNING)
     assert "gimbal at -52.0 deg, commanded -80.0" in warning
@@ -111,7 +116,7 @@ def test_a_target_beyond_the_reported_limit_names_the_limit(recorder) -> None:
     monitor.limits_callback(types.SimpleNamespace(data=[-65.0, 17.0, -35.0, 35.0]))
     _report(monitor, -65.0)
     ctx, _ = _ctx(monitor)
-    ClosedLoopRTLStep()._engage_return_attitude(ctx)
+    ClosedLoopRTLStep(mode=MissionMode.SIMPLE)._engage_return_attitude(ctx)
     warning = recorder.text(logging.WARNING)
     assert "-65.0" in warning and "limit" in warning.lower()
 
@@ -120,7 +125,7 @@ def test_an_interrupted_step_does_not_wait(recorder) -> None:
     monitor = GimbalStateMonitor()
     _report(monitor, -40.0)
     ctx, tilts = _ctx(monitor, interrupted=True)
-    ClosedLoopRTLStep()._engage_return_attitude(ctx)
+    ClosedLoopRTLStep(mode=MissionMode.SIMPLE)._engage_return_attitude(ctx)
     assert tilts == [-80.0]
 
 
@@ -129,5 +134,15 @@ def test_the_reported_limits_are_always_logged(recorder) -> None:
     monitor.limits_callback(types.SimpleNamespace(data=[-83.0, 17.0, -35.0, 35.0]))
     _report(monitor, -80.0)
     ctx, _ = _ctx(monitor)
-    ClosedLoopRTLStep()._engage_return_attitude(ctx)
+    ClosedLoopRTLStep(mode=MissionMode.SIMPLE)._engage_return_attitude(ctx)
     assert "tilt limits -83.0 to 17.0 deg" in recorder.text(logging.INFO)
+
+
+def test_the_advanced_return_confirms_its_fixed_tilt(recorder) -> None:
+    monitor = GimbalStateMonitor()
+    _report(monitor, -52.0)
+    ctx, tilts = _ctx(monitor, tilt=-80.0)
+    ClosedLoopRTLStep(mode=MissionMode.ADVANCED)._engage_return_attitude(ctx)
+    assert len(tilts) > 1 and set(tilts) == {ADVANCED_RETURN_TILT_DEG}
+    assert "commanded -70.0" in recorder.text(logging.WARNING)
+    assert ctx.current_tilt_deg == ADVANCED_RETURN_TILT_DEG
