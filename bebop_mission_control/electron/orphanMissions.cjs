@@ -26,6 +26,9 @@
 
 const STANDBY_FLAG = '--standby';
 
+/** `mission.py --dump-defaults`, spawned by `bmg:get-parameter-defaults`. */
+const DUMP_DEFAULTS_FLAG = '--dump-defaults';
+
 /**
  * Orphan candidates from one `pgrep -af <pattern>` call, classified.
  *
@@ -51,6 +54,9 @@ function parseOrphanCandidates(pgrepOutput, { ownPid, missionPid, isTracked }) {
       return { pid, cmdline };
     })
     .filter(({ pid }) => Number.isInteger(pid) && pid > 0 && pid !== ownPid && pid !== missionPid)
+    // The station's own parameter-schema probe: it prints the defaults and
+    // exits, commands nothing, and was being interrupted mid-print on boot.
+    .filter(({ cmdline }) => !cmdline.includes(DUMP_DEFAULTS_FLAG))
     .filter(({ pid }) => !isTracked(pid))
     .map(({ pid, cmdline }) => ({ pid, standby: cmdline.includes(STANDBY_FLAG) }));
 }

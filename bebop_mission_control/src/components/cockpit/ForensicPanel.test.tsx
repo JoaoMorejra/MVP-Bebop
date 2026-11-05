@@ -2,7 +2,7 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ForensicPanel } from './ForensicPanel';
+import { FINDING_BEAT_MS, ForensicPanel, findingSchedule } from './ForensicPanel';
 import { GRID_TEMPO, PHOTO_IN_MS, REVEAL_MS, SCAN_FADE_MS, SCAN_MIN_PASS_MS, SHOT_MS, containRect, revealAmount } from './EvidenceGrid';
 import { clearRevealed, recordRevealed } from '../../lib/evidenceReveal';
 import { isAirborne } from '../../lib/flightState';
@@ -60,6 +60,7 @@ function render(lock: FinishLockResult, onFinish = vi.fn()) {
         missionOver={false}
         landed={false}
         report={null}
+        inspectionStarted={false}
         reportRevealed={0}
         onFinish={onFinish}
         lock={lock}
@@ -82,10 +83,10 @@ describe('Finalizar missão', () => {
     expect(container.textContent).not.toContain('Finalizar missão');
   });
 
-  it('appears in the bottom-right corner once it can', () => {
+  it('appears in the bottom-left corner once it can', () => {
     const { button } = render(GROUNDED);
     expect(button.className).toContain('bottom-3');
-    expect(button.className).toContain('right-3');
+    expect(button.className).toContain('left-3');
   });
 
   it('ends the cycle once the aircraft is confirmed on the ground', () => {
@@ -162,69 +163,128 @@ describe('rotorsTurning', () => {
   });
 });
 
-describe('the report waiting for the victim assessment', () => {
-  // The capture was revealed and scanned before this panel mounted (a revisit after touchdown): no second pass.
+describe('the inspection of every flight', () => {
+  const FOUR: Finding[] = [
+    { topic: 'vehicle', card: 'Veículo sem danos estruturais aparentes', speech: 'Para começar, veículo sem danos.' },
+    { topic: 'victim', card: 'Cena sem vítimas aparentes', speech: 'Além disso, cena sem vítimas aparentes.' },
+    { topic: 'samu', card: 'SAMU acionado', speech: 'O SAMU foi acionado.' },
+    { topic: 'police', card: 'Polícia acionada', speech: 'Por fim, a polícia foi acionada.' },
+  ];
+  const CAPTURE: RawEvidence = { filename: 'accident_raw_20261105_101500.png', url: '/x.png', timestamp: 1 };
+  const shownTopics = () =>
+    Array.from(container.querySelectorAll('li.finding-shown'))
+      .map((item) => (Object.keys(TOPIC_LABEL) as FindingTopic[]).find((topic) => item.textContent?.includes(TOPIC_LABEL[topic])))
+      .filter((topic): topic is FindingTopic => topic !== undefined);
+
   beforeEach(() => {
-    recordRevealed('accident_raw_20261020_101500.png|1', 0.5);
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout', 'requestAnimationFrame', 'cancelAnimationFrame', 'performance'] });
   });
-  const LATEST = { filename: 'accident_raw_20261020_101500.png', url: 'file:///x.png', timestamp: 1 };
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
-  function renderReport(props: { report: { topic: 'victim'; card: string; speech: string }[] | null; analyzing: boolean }) {
+  /** In flight: not landed, the mission still running, no voice, the finish locked. */
+  function renderInFlight(props: { report: Finding[] | null; started: boolean; capture?: RawEvidence | null }) {
     act(() =>
       root.render(
         <ForensicPanel
-          latest={LATEST}
-          count={1}
-          stage={5}
-          missionOver
-          landed
-          report={props.report}
-          reportRevealed={0}
-          reportAnalyzing={props.analyzing}
-          onFinish={vi.fn()}
-          lock={GROUNDED}
-        />
-      )
-    );
-  }
-
-  it('holds a placeholder victim card with no finding text while analyzing', async () => {
-    renderReport({ report: null, analyzing: true });
-    await settle();
-    const card = container.querySelector('[data-finding-state="analyzing"]');
-    expect(card?.textContent).toContain('Analisando imagem');
-    expect(card?.textContent).toContain('Avaliação da vítima');
-    expect(container.querySelector('ul')?.getAttribute('aria-busy')).toBe('true');
-  });
-
-  it('replaces the placeholder with the drawn findings', async () => {
-    renderReport({
-      report: [{ topic: 'victim', card: 'Cena sem vítimas aparentes', speech: 'Por fim, cena sem vítimas aparentes.' }],
-      analyzing: false,
-    });
-    await settle();
-    expect(container.querySelector('[data-finding-state="analyzing"]')).toBeNull();
-    expect(container.textContent).toContain('Cena sem vítimas aparentes');
-  });
-
-  it('shows no placeholder before the aircraft is down', () => {
-    act(() =>
-      root.render(
-        <ForensicPanel
-          latest={LATEST}
+          latest={props.capture === undefined ? CAPTURE : props.capture}
           count={1}
           stage={5}
           missionOver={false}
           landed={false}
-          report={null}
+          report={props.report}
+          inspectionStarted={props.started}
           reportRevealed={0}
-          reportAnalyzing
           onFinish={vi.fn()}
           lock={LOCKED}
         />
       )
     );
+  }
+  const advance = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  /** The whole sequence: the last finding's start and its typing. */
+  const sequenceMs = () => {
+    const slots = findingSchedule(FOUR);
+    return slots[slots.length - 1].startMs + slots[slots.length - 1].typeMs + 50;
+  };
+
+  it('shows no finding and no placeholder before the inspection starts', () => {
+    renderInFlight({ report: FOUR, started: false });
+    advance(30000);
+    expect(container.querySelector('ul')).toBeNull();
     expect(container.querySelector('[data-finding-state="analyzing"]')).toBeNull();
+  });
+
+  it('brings in all four findings once it starts, in flight and with no voice', () => {
+    renderInFlight({ report: FOUR, started: false });
+    renderInFlight({ report: FOUR, started: true });
+    expect(container.querySelector('[data-evidence-frame]')?.className).toContain('h-[38%]');
+    advance(sequenceMs());
+    expect(shownTopics()).toEqual(['vehicle', 'victim', 'samu', 'police']);
+    expect(container.querySelector('[data-capture-stamp]')).not.toBeNull();
+  });
+
+  it('brings the findings in one at a time, each typed over its sentence, never all at once', () => {
+    // A report of its own: its inspection starts now, as every flight's does.
+    const report = FOUR.map((finding) => ({ ...finding }));
+    renderInFlight({ report, started: true });
+    const slots = findingSchedule(report);
+    expect(slots[0].startMs).toBe(FINDING_BEAT_MS);
+    advance(slots[0].startMs - 1);
+    expect(shownTopics()).toHaveLength(0);
+    advance(1);
+    expect(shownTopics()).toEqual(['vehicle']);
+    expect(container.querySelector('li.finding-shown [data-typing]')).not.toBeNull();
+    for (let index = 1; index < report.length; index += 1) {
+      advance(slots[index].startMs - slots[index - 1].startMs - 1);
+      expect(shownTopics()).toHaveLength(index);
+      advance(1);
+      expect(shownTopics()).toHaveLength(index + 1);
+      expect(slots[index].startMs).toBeGreaterThanOrEqual(slots[index - 1].startMs + slots[index - 1].typeMs + FINDING_BEAT_MS);
+    }
+  });
+
+  it('shows no scrollbar beside the findings, puts Finalizar on the left and the closing line on the right', () => {
+    act(() =>
+      root.render(
+        <ForensicPanel
+          latest={CAPTURE}
+          count={1}
+          stage={5}
+          missionOver
+          landed
+          report={FOUR}
+          inspectionStarted
+          reportRevealed={0}
+          reportClosing="Relatório finalizado e disponível na estação."
+          onFinish={vi.fn()}
+          lock={GROUNDED}
+        />
+      )
+    );
+    advance(sequenceMs());
+    const list = container.querySelector('ul[aria-live]') as HTMLElement;
+    expect(list.className).toContain('scroll-none');
+    expect(list.className).not.toContain('scroll-thin');
+    const closing = Array.from(list.querySelectorAll('li')).find((item) => item.textContent?.includes('Relatório finalizado'));
+    expect(closing?.className).toContain('text-right');
+    const finish = container.querySelector('button[data-finish-state]') as HTMLElement;
+    expect(finish.className).toContain('left-3');
+    expect(finish.className).not.toContain('right-3');
+  });
+
+  it('brings in all four findings with no capture at all', () => {
+    renderInFlight({ report: FOUR, started: true, capture: null });
+    advance(sequenceMs());
+    expect(shownTopics()).toHaveLength(4);
+  });
+
+  it('holds the victim placeholder in the instant before the report is drawn', () => {
+    renderInFlight({ report: null, started: true });
+    const card = container.querySelector('[data-finding-state="analyzing"]');
+    expect(card?.textContent).toContain('Analisando imagem');
+    expect(card?.textContent).toContain('Avaliação da vítima');
   });
 });
 
@@ -268,6 +328,7 @@ describe('the report inside the cockpit', () => {
           missionOver
           landed
           report={report}
+          inspectionStarted
           reportRevealed={revealed}
           onFinish={vi.fn()}
           lock={GROUNDED}
@@ -338,6 +399,7 @@ describe('the evidence from the flight to touchdown', () => {
     announced?: number;
     readings?: Array<{ endsAt: number | null } | undefined>;
     lock?: FinishLockResult;
+    started?: boolean;
   }) {
     act(() =>
       root.render(
@@ -348,6 +410,7 @@ describe('the evidence from the flight to touchdown', () => {
           missionOver={false}
           landed={props.landed ?? false}
           report={props.report ?? null}
+          inspectionStarted={props.started ?? Boolean(props.report)}
           reportRevealed={props.revealed ?? 0}
           reportAnnounced={props.announced}
           reportReadings={props.readings}
@@ -405,12 +468,13 @@ describe('the evidence from the flight to touchdown', () => {
       act(() =>
         root.render(
           <ForensicPanel
-            latest={CAPTURE}
+            latest={inFlight}
             count={1}
             stage={5}
             missionOver={extra.missionOver ?? false}
             landed={extra.landed ?? false}
             report={null}
+            inspectionStarted={false}
             reportRevealed={0}
             flightProgress={flight}
             waitProgress={0.4}
@@ -426,9 +490,12 @@ describe('the evidence from the flight to touchdown', () => {
       frames(SHOT_MS + 10 + PHOTO_IN_MS + 60);
     };
     let widthDescriptor: PropertyDescriptor | undefined;
+    /** Announced as the flight goes on: its inspection deadline is still ahead for the whole pass. */
+    let inFlight: RawEvidence = CAPTURE;
 
     beforeEach(() => {
       vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame', 'performance', 'Date', 'setTimeout', 'clearTimeout'] });
+      inFlight = { ...CAPTURE, timestamp: Date.now() };
       widthDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
       Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => CLIENT_WIDTH });
     });
@@ -519,7 +586,7 @@ describe('the evidence from the flight to touchdown', () => {
     });
 
     it('does not run a second pass when the cockpit is revisited after touchdown', () => {
-      recordRevealed('accident_raw_20261029_111530.png|0', 0.5);
+      recordRevealed(`${inFlight.filename}|${inFlight.timestamp}`, 0.5);
       fly(0.9, { landed: true, lock: GROUNDED });
       frames(PHOTO_IN_MS + 100);
       expect(scanPass()).toBeNull();

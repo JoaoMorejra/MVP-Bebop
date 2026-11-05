@@ -71,6 +71,12 @@ export function useMissionRuntime() {
    * after the reset; it describes the cycle that was closed, not the next one.
    */
   const runOpen = useRef(false);
+  /**
+   * The operator aborted the current run. Its end is then presented as the
+   * flight ending: the process the host kills to stop it exits on a signal
+   * (`null`), which would otherwise read as a fault.
+   */
+  const operatorAborted = useRef(false);
 
   // Buffered history, so a screen mounted after launch still sees the start.
   useEffect(() => {
@@ -115,11 +121,10 @@ export function useMissionRuntime() {
         exitSeen.current = true;
         processUp.current = false;
         setExitCode(event.code);
-        const outcome = missionStateForExit(event.code);
+        const outcome = operatorAborted.current ? 'aborted' : missionStateForExit(event.code);
         setState(outcome);
-        // The abort cue already sounded on the click; an aborted exit adds none.
-        if (outcome === 'finished') cues.play('complete');
-        else if (outcome !== 'aborted') cues.play('fault');
+        if (outcome === 'finished' || outcome === 'aborted') cues.play('complete');
+        else cues.play('fault');
       }),
     ];
     return () => off.forEach((fn) => fn());
@@ -132,6 +137,7 @@ export function useMissionRuntime() {
       }
       processUp.current = true;
       runOpen.current = true;
+      operatorAborted.current = false;
       const own = ++cycle.current;
       setRan(false);
       setState('arming');
@@ -191,8 +197,8 @@ export function useMissionRuntime() {
 
   const abort = useCallback(async () => {
     cycle.current += 1;
+    operatorAborted.current = true;
     setState('aborting');
-    cues.play('abort');
     if (!bridge) {
       processUp.current = false;
       setState('idle');
@@ -222,6 +228,7 @@ export function useMissionRuntime() {
   const reset = useCallback(() => {
     cycle.current += 1;
     runOpen.current = false;
+    operatorAborted.current = false;
     processUp.current = false;
     setRan(false);
     setState('idle');
@@ -248,6 +255,7 @@ export function useMissionRuntime() {
   const beginBenchStage = useCallback(() => {
     processUp.current = true;
     runOpen.current = true;
+    operatorAborted.current = false;
     setRan(true);
     setState('running');
     setStage(0);

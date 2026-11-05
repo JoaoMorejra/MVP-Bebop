@@ -9,6 +9,7 @@ from typing import List, Tuple
 import pytest
 
 from mvp_mission_bebop.actuators.yaw_authority import YawAuthority
+from mvp_mission_bebop.blackboard import EvidenceRecord
 from mvp_mission_bebop.controllers.yaw_pattern import YawRateLimiter, YawServoingController
 from mvp_mission_bebop.engine.rate import Deadline, LoopRate
 from mvp_mission_bebop.mission_mode import MissionMode
@@ -348,43 +349,20 @@ def inspection_ctx(*, offset_deg: float) -> Ctx:
 
 
 @pytest.mark.parametrize("offset_deg", [60.0, -60.0, 170.0])
-def test_the_heading_is_restored_by_the_short_way_after_the_capture(offset_deg):
+def test_the_simple_inspection_keeps_the_heading_of_the_lock(offset_deg):
     ctx = inspection_ctx(offset_deg=offset_deg)
-    ctx.params.yaw_pattern.return_timeout_sec = 30.0
+    heading = ctx.odom_supervisor.yaw
 
     status = NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx)
 
     assert status is StepStatus.SUCCESS
-    error = abs((ctx.odom_supervisor.yaw - 0.5 + math.pi) % (2 * math.pi) - math.pi)
-    assert error <= math.radians(ctx.params.yaw_pattern.return_tolerance_deg) + 1e-6
-    assert ctx.drone.commands[-1][3] == 0.0
+    assert all(vyaw == 0.0 for *_rest, vyaw in ctx.drone.commands)
+    assert ctx.odom_supervisor.yaw == heading
     assert not ctx.failsafe.yaw_authority.is_open
-
-
-@pytest.mark.parametrize("offset_deg", [40.0, -40.0, 3.0])
-def test_the_heading_restore_returns_one_period_after_its_final_zero_twist(simulated_time, offset_deg):
-    ctx = inspection_ctx(offset_deg=offset_deg)
-    ctx.params.kinematics.control_loop_hz = 15.0
-    ctx.drone = YawDrone(ctx, period=1.0 / 15.0)
-    stamps: List[float] = []
-    original = ctx.drone.move_velocity
-
-    def stamped(*args, **kwargs):
-        stamps.append(simulated_time.now)
-        return original(*args, **kwargs)
-
-    ctx.drone.move_velocity = stamped
-
-    status = NadirInspectionStep(mode=MissionMode.SIMPLE)._restore_heading(ctx)
-
-    assert status is StepStatus.SUCCESS
-    assert ctx.drone.commands[-1][3] == 0.0
-    assert simulated_time.now - stamps[-1] >= 1.0 / 15.0 - 1e-9
 
 
 def test_the_gimbal_goes_to_the_return_tilt_at_the_end_of_the_stage():
     ctx = inspection_ctx(offset_deg=20.0)
-    ctx.params.yaw_pattern.return_timeout_sec = 30.0
 
     NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx)
 
@@ -392,131 +370,48 @@ def test_the_gimbal_goes_to_the_return_tilt_at_the_end_of_the_stage():
     assert ctx.current_tilt_deg == ctx.params.rtl.camera_tilt_deg
 
 
-def test_no_yaw_is_commanded_before_the_capture_and_hover_are_done():
+def test_the_simple_inspection_hands_over_right_after_the_gimbal_command():
     ctx = inspection_ctx(offset_deg=60.0)
-    ctx.params.yaw_pattern.return_timeout_sec = 30.0
+    commands_at_last_tilt: List[int] = []
+    pointing = ctx.drone.camera_control
+
+    def record(tilt, pan=0.0):
+        pointing(tilt, pan)
+        commands_at_last_tilt.append(len(ctx.drone.commands))
+
+    ctx.drone.camera_control = record
 
     NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx)
 
-    first_turn = next(i for i, (*_rest, vyaw) in enumerate(ctx.drone.commands) if vyaw != 0.0)
-    assert first_turn > 0
-    assert all(vyaw == 0.0 for *_rest, vyaw in ctx.drone.commands[:first_turn])
-
-
-def test_a_missing_reference_heading_skips_the_restore_but_still_lowers_the_gimbal():
-    ctx = inspection_ctx(offset_deg=60.0)
-    ctx.blackboard.initial_yaw_rad = None
-
-    assert NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx) is StepStatus.SUCCESS
-    assert all(vyaw == 0.0 for *_rest, vyaw in ctx.drone.commands)
     assert ctx.drone.camera_calls[-1] == ctx.params.rtl.camera_tilt_deg
+    assert commands_at_last_tilt[-1] == len(ctx.drone.commands)
 
 
-@pytest.mark.parametrize("reference", [float("nan"), float("inf"), float("-inf")])
-def test_a_non_finite_reference_heading_is_treated_as_missing(reference):
+@pytest.mark.parametrize("rtl_enabled", [True, False])
+@pytest.mark.parametrize("approach_finished", [True, False])
+def test_the_simple_inspection_hands_over_to_stage_five_right_after_the_capture(
+    simulated_time, monkeypatch, rtl_enabled, approach_finished
+):
     ctx = inspection_ctx(offset_deg=60.0)
-    ctx.blackboard.initial_yaw_rad = reference
-    ctx.params.yaw_pattern.return_timeout_sec = 30.0
+    ctx.params.rtl.enabled = rtl_enabled
+    ctx.blackboard.approach_finished = approach_finished
+    after_capture = {}
 
-    assert NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx) is StepStatus.SUCCESS
+    def marked_capture(self, step_ctx, settled, *, forced=False):
+        step_ctx.blackboard.evidence = EvidenceRecord(raw_path="raw.png", metadata_path="meta.json")
+        after_capture["now"] = simulated_time.now
+        after_capture["commands"] = len(step_ctx.drone.commands)
+        return True
+
+    monkeypatch.setattr(NadirInspectionStep, "_capture", marked_capture)
+
+    status = NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx)
+
+    assert status is StepStatus.SUCCESS
+    assert ctx.blackboard.evidence.captured
+    assert simulated_time.now == after_capture["now"]
+    assert len(ctx.drone.commands) == after_capture["commands"]
     assert all(vyaw == 0.0 for *_rest, vyaw in ctx.drone.commands)
-    assert ctx.drone.commands[-1][3] == 0.0
-    assert not ctx.failsafe.yaw_authority.is_open
-    assert ctx.drone.camera_calls[-1] == ctx.params.rtl.camera_tilt_deg
-    assert ctx.current_tilt_deg == ctx.params.rtl.camera_tilt_deg
-
-
-def test_nan_heading_readings_during_the_restore_command_no_yaw_and_do_not_fail_the_stage():
-    ctx = inspection_ctx(offset_deg=60.0)
-    ctx.odom_supervisor.yaw = float("nan")
-    ctx.params.yaw_pattern.return_timeout_sec = 0.5
-
-    assert NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx) is StepStatus.SUCCESS
-    assert all(vyaw == 0.0 for *_rest, vyaw in ctx.drone.commands)
-    assert ctx.drone.commands[-1][3] == 0.0
-    assert not ctx.failsafe.yaw_authority.is_open
-    assert ctx.drone.camera_calls[-1] == ctx.params.rtl.camera_tilt_deg
-    assert ctx.current_tilt_deg == ctx.params.rtl.camera_tilt_deg
-
-
-def test_a_transient_nan_heading_reading_holds_the_yaw_and_the_restore_resumes():
-    ctx = inspection_ctx(offset_deg=60.0)
-    ctx.params.yaw_pattern.return_timeout_sec = 30.0
-    odometry = ctx.odom_supervisor
-    authority = ctx.failsafe.yaw_authority
-    blind = {"reads": 10}
-    original = ctx.drone.move_velocity
-    commanded_while_blind: List[float] = []
-
-    class BlindSnapshot:
-        """Reads NaN for the first heading samples taken inside the yaw window."""
-
-        @property
-        def yaw(self):
-            if authority.is_open and blind["reads"] > 0:
-                blind["reads"] -= 1
-                return float("nan")
-            return odometry.yaw
-
-        def __getattr__(self, name):
-            return getattr(odometry, name)
-
-    class BlindHeading:
-        """Odometry whose snapshots go blind; the simulated airframe heading stays true."""
-
-        def snapshot(self):
-            return BlindSnapshot()
-
-        @property
-        def yaw(self):
-            return odometry.yaw
-
-        @yaw.setter
-        def yaw(self, value):
-            odometry.yaw = value
-
-        def __getattr__(self, name):
-            return getattr(odometry, name)
-
-    def record(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=None):
-        if authority.is_open and blind["reads"] > 0:
-            commanded_while_blind.append(vyaw)
-        original(vx, vy, vz, vyaw, duration)
-
-    ctx.odom_supervisor = BlindHeading()
-    ctx.drone.move_velocity = record
-
-    assert NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx) is StepStatus.SUCCESS
-    assert blind["reads"] == 0
-    assert commanded_while_blind and all(vyaw == 0.0 for vyaw in commanded_while_blind)
-    error = abs((odometry.yaw - 0.5 + math.pi) % (2 * math.pi) - math.pi)
-    assert error <= math.radians(ctx.params.yaw_pattern.return_tolerance_deg) + 1e-6
-    assert ctx.drone.commands[-1][3] == 0.0
-    assert not authority.is_open
-
-
-def test_a_restore_that_runs_out_of_window_does_not_fail_the_mission():
-    ctx = inspection_ctx(offset_deg=170.0)
-    ctx.params.yaw_pattern.return_timeout_sec = 0.05
-
-    assert NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx) is StepStatus.SUCCESS
-    assert ctx.drone.commands[-1][3] == 0.0
-
-
-def test_an_abort_during_the_restore_stops_the_rotation():
-    ctx = inspection_ctx(offset_deg=170.0)
-    ctx.params.yaw_pattern.return_timeout_sec = 30.0
-    original = ctx.drone.move_velocity
-
-    def abort_after_the_first_turn(vx=0.0, vy=0.0, vz=0.0, vyaw=0.0, duration=None):
-        original(vx, vy, vz, vyaw, duration)
-        if vyaw != 0.0:
-            ctx.emergency_event.set()
-
-    ctx.drone.move_velocity = abort_after_the_first_turn
-
-    assert NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx) is StepStatus.ABORTED
-    assert ctx.drone.commands[-1][3] == 0.0
 
 
 def test_the_advanced_inspection_never_yaws_and_ends_at_the_nadir_tilt():

@@ -110,8 +110,10 @@ const PillContent: React.FC<{
  * on a timer, and only to the end once the mission has moved on. A stage the
  * mission skips is still filled in full, in its turn, before the next one
  * starts. The stage being filled breathes; the pills behind it hold their full
- * fill with a tick. An abort stops the fill where it is and turns it ember; on
- * the bench it runs in the bench's cyan.
+ * fill with a tick. An operator abort is not shown as one: the strip runs on
+ * to the end in the colour of the flight, as a flight that is ending
+ * (`hooks/useStageProgress.ts`). Only a fault stops the fill where it is and
+ * turns it ember. On the bench it fills in the same green gradient.
  *
  * The strip opens the cockpit on its own, with no header above it and no rule
  * under it: the fills are the progress. On the bench the pills become
@@ -130,7 +132,7 @@ export const StageBar: React.FC<StageBarProps> = ({
   rtlEnabled = true,
   fill,
 }) => {
-  const aborted = state === 'aborting' || state === 'aborted' || state === 'faulted';
+  const aborted = state === 'faulted';
   const running = state === 'running' || state === 'arming';
   /**
    * On the bench every stage is always a button — the point of a bench is that
@@ -158,7 +160,9 @@ export const StageBar: React.FC<StageBarProps> = ({
           const halted = current && aborted;
           const rehearsing = benchStage === step;
           const pending = pendingStage === step && !current;
-          const tone: Tone = halted ? 'halted' : benchMode ? 'bench' : 'flight';
+          // The strip fills in the flight's green gradient in every mode, the
+          // bench included: a rehearsal is presented exactly as the flight.
+          const tone: Tone = halted ? 'halted' : 'flight';
           const percent = Math.round(Math.max(0, Math.min(1, amount)) * 1000) / 10;
           const label = stageLabel(missionMode, step, stepLabel, rtlEnabled);
 

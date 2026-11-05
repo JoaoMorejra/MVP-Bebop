@@ -1,9 +1,9 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, screen, shell } = require('electron');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
-const { spawn, exec, execFileSync, execSync } = require('child_process');
+const { spawn, spawnSync, exec, execFileSync, execSync } = require('child_process');
 const {
   createMilestoneParser,
   createStepMarkerParser,
@@ -867,12 +867,69 @@ function stopBridgeWatchdog() {
 // -----------------------------------------------------------------------------
 // Window
 // -----------------------------------------------------------------------------
+/**
+ * The external LED panel: a NovaStar M3 card driving a 1008x672 (3:2) surface.
+ *
+ * Its EDID advertises 1920x1080, so the output is forced to the native mode by
+ * xrandr and the display is recognised here by those exact bounds. At 1:1 the
+ * panel is narrower than the station's minimum window and the stage pills and
+ * map footer truncate; the page is instead laid out on a 1260x840 CSS viewport,
+ * the smallest 3:2 box on which every screen renders without truncation, and
+ * scaled down by the zoom factor to the panel's physical pixels.
+ */
+const LED_PANEL_SIZE = { width: 1008, height: 672 };
+const LED_PANEL_LAYOUT = { width: 1260, height: 840 };
+
+function findLedPanel() {
+  return (
+    screen
+      .getAllDisplays()
+      .find(
+        (display) =>
+          display.size.width === LED_PANEL_SIZE.width &&
+          display.size.height === LED_PANEL_SIZE.height
+      ) ?? null
+  );
+}
+
+/**
+ * Zoom for the display the window currently sits on: the panel fit on the LED
+ * panel, 1 anywhere else, so dragging the window back to the laptop restores
+ * the native scale.
+ */
+function panelZoomFactor(win) {
+  const display = screen.getDisplayMatching(win.getBounds());
+  if (
+    display.size.width !== LED_PANEL_SIZE.width ||
+    display.size.height !== LED_PANEL_SIZE.height
+  ) {
+    return 1;
+  }
+  const [width, height] = win.getContentSize();
+  return Math.min(width / LED_PANEL_LAYOUT.width, height / LED_PANEL_LAYOUT.height);
+}
+
 function createWindow(port) {
+  const ledPanel = findLedPanel();
   mainWindow = new BrowserWindow({
-    width: 1600,
-    height: 940,
-    minWidth: 1180,
-    minHeight: 720,
+    ...(ledPanel
+      ? {
+          x: ledPanel.bounds.x,
+          y: ledPanel.bounds.y,
+          width: ledPanel.bounds.width,
+          height: ledPanel.bounds.height,
+          minWidth: LED_PANEL_SIZE.width,
+          minHeight: LED_PANEL_SIZE.height,
+          // Window decorations would take rows from a 672 px surface and break
+          // the 3:2 box the layout is fitted to.
+          fullscreen: true,
+        }
+      : {
+          width: 1600,
+          height: 940,
+          minWidth: 1180,
+          minHeight: 720,
+        }),
     backgroundColor: '#12171B',
     title: 'BMG — Bebop Mission Control',
     autoHideMenuBar: true,
@@ -918,6 +975,16 @@ function createWindow(port) {
 
   const query = process.env.BMG_INITIAL_QUERY ? `?${process.env.BMG_INITIAL_QUERY}` : '';
   mainWindow.loadURL(`http://127.0.0.1:${port}/${query}`);
+
+  // Chromium resets the zoom on every navigation, and the fit depends on which
+  // display holds the window, so it is reapplied on load and on every move.
+  const applyPanelZoom = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.setZoomFactor(panelZoomFactor(mainWindow));
+  };
+  mainWindow.webContents.on('did-finish-load', applyPanelZoom);
+  mainWindow.on('resize', applyPanelZoom);
+  mainWindow.on('move', applyPanelZoom);
 
   mainWindow.webContents.on('did-finish-load', () => {
     if (!process.env.BMG_SCREENSHOT_PATH) return;
@@ -1339,6 +1406,11 @@ ipcMain.handle('bmg:set-wifi-power', async (_event, payload = {}) => {
     ? payload
     : (payload && typeof payload.enabled === 'boolean' ? payload.enabled : true);
   const action = enable ? 'on' : 'off';
+  // Same reason as `bmg:disconnect-wifi`: the radio going off kills the ARSDK
+  // session the driver will not recover by itself.
+  if (!enable && !missionProcess) {
+    await stopDriverProcess();
+  }
   const result = await spawnP('nmcli', ['radio', 'wifi', action], { env, timeout: 5000 });
   if (!result.ok) {
     return { success: false, error: (result.stderr || 'nmcli falhou ao alterar rádio Wi-Fi').trim() };
@@ -1355,6 +1427,14 @@ ipcMain.handle('bmg:disconnect-wifi', async () => {
   const env = cEnv();
   const devProbe = await execP("nmcli -t -f DEVICE,TYPE dev | grep :wifi | cut -d: -f1", { env, timeout: 3000 });
   const iface = devProbe.ok ? devProbe.stdout.trim().split('\n')[0].trim() : '';
+  // The driver does not reconnect on its own: once the radio drops, its ARSDK
+  // session is dead while the node stays in the graph advertising every topic,
+  // and the next bring-up reused it and waited out the topic check on a link
+  // that never delivers. Stopped first, while the aircraft can still be told
+  // the controller left; never under a mission, which may be airborne.
+  if (!missionProcess) {
+    await stopDriverProcess();
+  }
   if (iface) {
     await spawnP('nmcli', ['dev', 'disconnect', iface], { env, timeout: 5000 });
   }
@@ -1475,30 +1555,112 @@ async function ensureDroneRoute() {
   return false;
 }
 
-async function startDriverProcess(options = {}) {
-  if (!options.forceRestart && driverProcess && (await isDriverAlive())) {
+/**
+ * Time the driver is given to close its ARSDK session after SIGINT.
+ *
+ * `Bebop::disconnect` waits up to 3 s for STOPPED and `ros2 launch` escalates
+ * to SIGTERM 5 s after forwarding the SIGINT; past this the driver is wedged.
+ */
+const DRIVER_STOP_GRACE_MS = 6000;
+
+/**
+ * Whether a spawned `make driver-bebop` is still running.
+ *
+ * `make`, its shell wrapper and Python's start-up take one to two seconds
+ * before `ros2 launch` exists for `isDriverAlive` to find. A bring-up landing in
+ * that window read "no driver", killed only `make`, which leaves the launch it
+ * was starting orphaned and running, and spawned a second driver: two
+ * controllers on the aircraft's single session, the second one bound to a
+ * random d2c port, ARNETWORK ack timeouts on both.
+ */
+function driverChildRunning(child) {
+  return Boolean(child) && child.exitCode === null && child.signalCode === null;
+}
+
+/** Signal the driver's whole process group: `make`, its shell, `ros2 launch`, `bebop_driver`. */
+function signalDriverGroup(child, signalName) {
+  if (!child || !child.pid) return;
+  try {
+    process.kill(-child.pid, signalName);
+  } catch (_error) {
+    // group already gone
+  }
+}
+
+/** Longest wait for a `make driver-bebop` still starting to bring up its `ros2 launch`. */
+const DRIVER_LAUNCH_APPEAR_MS = 5000;
+
+/**
+ * Stop the Bebop driver and return once no driver process is left.
+ *
+ * SIGINT goes to `ros2 launch` alone, which forwards it once to `bebop_driver`;
+ * its destructor then stops the ARSDK device controller, so the aircraft
+ * releases its controller slot at once. A SIGKILL skipped that: the aircraft
+ * kept the dead session until its own watchdog expired and refused the next
+ * handshake meanwhile, which is the reconnect that "never comes up". Signalling
+ * the driver directly as well is no better: rclcpp restores the default
+ * disposition at its first SIGINT, so the forwarded second one kills it in the
+ * middle of the disconnect (exit -2).
+ *
+ * A `make` this station spawned that has not started its launch yet is waited
+ * for, so a driver still starting is stopped instead of orphaned. SIGKILL, to
+ * the whole process group, is the escalation for a driver that outlives the
+ * grace period and the cleanup of `make` and its shell.
+ */
+async function terminateDriver() {
+  const child = driverProcess;
+  driverProcess = null;
+  const running = async () => driverChildRunning(child) || (await isDriverAlive());
+  if (!(await running())) return;
+
+  if (driverChildRunning(child) && !(await isDriverAlive())) {
+    await waitFor(async () => !driverChildRunning(child) || (await isDriverAlive()), DRIVER_LAUNCH_APPEAR_MS, 200);
+  }
+  await spawnP('pkill', ['-INT', '-f', 'bebop_node_launch'], { timeout: 1000 });
+  const gone = await waitFor(async () => !(await isDriverAlive()), DRIVER_STOP_GRACE_MS, 200);
+  if (!gone) {
+    recordLog('driver', {
+      type: 'stderr',
+      text: `[BMG] Driver não encerrou em ${DRIVER_STOP_GRACE_MS / 1000} s após SIGINT; forçando.\n`,
+    });
+    await spawnP('pkill', ['-9', '-f', DRIVER_PATTERN], { timeout: 1000 });
+  }
+  signalDriverGroup(child, 'SIGKILL');
+}
+
+/**
+ * One driver start or stop at a time.
+ *
+ * Each of them kills whatever driver is running and spends seconds awaiting
+ * before it spawns. Two overlapping calls -- the ROS 2 tile and the link
+ * bring-up it triggers -- spawned two drivers against the one session the
+ * aircraft accepts, and each failed its handshake.
+ */
+let driverLifecycle = Promise.resolve();
+
+function serializeDriver(task) {
+  const run = driverLifecycle.then(task, task);
+  driverLifecycle = run.catch(() => undefined);
+  return run;
+}
+
+function startDriverProcess(options = {}) {
+  return serializeDriver(() => startDriverProcessNow(options));
+}
+
+async function startDriverProcessNow(options = {}) {
+  if (!options.forceRestart && driverChildRunning(driverProcess)) {
     latestTelemetry.driver_running = true;
     send('bmg:telemetry-update', latestTelemetry);
-    return { success: true, pid: driverProcess.pid };
+    return { success: true, pid: driverProcess.pid, restarted: false };
   }
 
-  // Always terminate any lingering zombie driver nodes first
-  if (driverProcess) {
-    try { driverProcess.kill('SIGKILL'); } catch (e) { /* ignore */ }
-    driverProcess = null;
-  }
-  try {
-    await spawnP('pkill', ['-9', '-f', DRIVER_PATTERN], { timeout: 1000 });
-  } catch (e) { /* ignore */ }
+  await terminateDriver();
 
+  // Guarded: it removes nothing while a ROS process is alive. Unlinking every
+  // `fastrtps_*` segment here used to strip the transport from live
+  // participants (standby mission, bridges, announcer).
   await cleanOrphanShm({ run: rosCommand });
-  try {
-    const fs = require('fs');
-    const shmFiles = fs.readdirSync('/dev/shm').filter((f) => f.startsWith('fastrtps_'));
-    for (const file of shmFiles) {
-      try { fs.unlinkSync('/dev/shm/' + file); } catch (e) { /* ignore */ }
-    }
-  } catch (e) { /* ignore */ }
 
   await refreshRos2Daemon('driver iniciado pela estação');
   await ensureDroneRoute();
@@ -1514,6 +1676,9 @@ async function startDriverProcess(options = {}) {
     driverProcess = spawn('make', ['driver-bebop', `IP=${latestTelemetry.drone_ip || DRONE_IP}`], {
       cwd: NECTAR_SDK_DIR,
       env: getNectarEnv(),
+      // Its own process group, so `terminateDriver` reaches the launch and the
+      // driver below `make`, which forwards no signal.
+      detached: true,
     });
     driverStartedAt = Date.now();
 
@@ -1537,7 +1702,7 @@ async function startDriverProcess(options = {}) {
 
     latestTelemetry.driver_running = true;
     send('bmg:telemetry-update', latestTelemetry);
-    return { success: true, pid: driverProcess.pid };
+    return { success: true, pid: driverProcess.pid, restarted: true };
   } catch (error) {
     driverProcess = null;
     latestTelemetry.driver_running = false;
@@ -1587,23 +1752,14 @@ async function isDriverAlive() {
     });
 }
 
-async function stopDriverProcess() {
-  if (driverProcess) {
-    try { driverProcess.kill('SIGKILL'); } catch (e) { /* already gone */ }
-    driverProcess = null;
-  }
-  try {
-    await spawnP('pkill', ['-9', '-f', DRIVER_PATTERN], { timeout: 1000 });
-  } catch (e) { /* ignore */ }
+function stopDriverProcess() {
+  return serializeDriver(stopDriverProcessNow);
+}
+
+async function stopDriverProcessNow() {
+  await terminateDriver();
 
   await cleanOrphanShm({ run: rosCommand });
-  try {
-    const fs = require('fs');
-    const shmFiles = fs.readdirSync('/dev/shm').filter((f) => f.startsWith('fastrtps_'));
-    for (const file of shmFiles) {
-      try { fs.unlinkSync('/dev/shm/' + file); } catch (e) { /* ignore */ }
-    }
-  } catch (e) { /* ignore */ }
 
   stopBackgroundServices();
   reapOrphanedServices();
@@ -1614,7 +1770,7 @@ async function stopDriverProcess() {
   latestTelemetry.topics_ready = false;
   latestTelemetry.topics = {};
   send('bmg:telemetry-update', latestTelemetry);
-  recordLog('driver', { type: 'exit', text: '[BMG] Driver ROS 2 parado instantaneamente.\n' });
+  recordLog('driver', { type: 'exit', text: '[BMG] Driver ROS 2 parado.\n' });
   return { success: true };
 }
 
@@ -1718,6 +1874,7 @@ ipcMain.handle('bmg:ensure-link', async (_event, options = {}) => {
   // competing `make driver-bebop` against the same aircraft.
   if (ensureLinkInFlight) return ensureLinkInFlight;
 
+  const linkStartedAt = Date.now();
   const attempt = (async () => {
     try {
       // 1. Network
@@ -1828,10 +1985,25 @@ ipcMain.handle('bmg:ensure-link', async (_event, options = {}) => {
 
       // 5. Bidirectional topic contract
       linkProgress('topics', 'running', 'Validando tópicos da aeronave');
-      const readiness = await waitFor(async () => {
-        const snapshot = await readLinkReadiness();
-        return snapshot.ready ? snapshot : null;
-      }, LINK_TOPICS_TIMEOUT_MS);
+      const awaitTopics = () =>
+        waitFor(async () => {
+          const snapshot = await readLinkReadiness();
+          return snapshot.ready ? snapshot : null;
+        }, LINK_TOPICS_TIMEOUT_MS);
+      let readiness = await awaitTopics();
+
+      // A reused driver whose ARSDK session died keeps its node and every topic
+      // advertised while odometry and video never arrive, and nothing in it
+      // reconnects. One restart, with the aircraft proven reachable at step 2,
+      // is the recovery; a fresh driver that still delivers nothing is reported.
+      if (!readiness && !started.restarted && !missionProcess) {
+        linkProgress('driver', 'running', 'Aeronave sem dados pelo driver atual; reiniciando o driver');
+        const restarted = await startDriverProcess({ forceRestart: true });
+        if (restarted.success) {
+          linkProgress('topics', 'running', 'Validando tópicos da aeronave');
+          readiness = await awaitTopics();
+        }
+      }
 
       if (!readiness) {
         const snapshot = await readLinkReadiness();
@@ -1844,6 +2016,11 @@ ipcMain.handle('bmg:ensure-link', async (_event, options = {}) => {
           event: linkProgress('topics', 'error', message, { missing: snapshot.missing }),
         };
       }
+
+      // The standby mission is a participant of the same kind as the bridges:
+      // prepared before the interface came up, it would take its go without
+      // ever seeing the driver and exit stale ("Falha ao iniciar").
+      if (!missionProcess) missionStandby.recycle('enlace com a aeronave refeito', linkStartedAt);
 
       return {
         success: true,
@@ -3529,10 +3706,17 @@ function stopServicesAndDriver() {
 
   stopBackgroundServices();
 
-  if (driverProcess) {
-    try { driverProcess.kill('SIGTERM'); } catch (e) { /* already exited */ }
-    driverProcess = null;
+  // SIGINT to `ros2 launch` first and a bounded wait, so `bebop_driver` stops
+  // its ARSDK device controller and the aircraft accepts the next station
+  // without waiting out its own watchdog. The SIGTERM of `make driver-stop`
+  // arriving mid-disconnect would kill it (see `terminateDriver`).
+  spawnSync('pkill', ['-INT', '-f', 'bebop_node_launch'], { timeout: 1000 });
+  const quitDeadline = Date.now() + DRIVER_STOP_GRACE_MS;
+  while (Date.now() < quitDeadline && spawnSync('pgrep', ['-f', 'ros2_bebop_driver/lib'], { timeout: 1000 }).status === 0) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
   }
+  signalDriverGroup(driverProcess, 'SIGKILL');
+  driverProcess = null;
 
   // `make driver-stop` has to complete before the app exits. Left to finish on
   // its own, Electron regularly exited first and left `ros2 launch` and the

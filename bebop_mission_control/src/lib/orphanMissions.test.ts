@@ -24,6 +24,11 @@ describe('parseOrphanCandidates', () => {
     expect(result.map((c) => c.pid)).toEqual([501]);
   });
 
+  it("ignores the station's own parameter-schema probe", () => {
+    const output = '503 python3 /x/mission.py --dump-defaults\n';
+    expect(parseOrphanCandidates(output, { ownPid: 1, missionPid: null, isTracked: () => false })).toEqual([]);
+  });
+
   it('ignores blank lines and non-numeric noise', () => {
     const output = '\n  \nnot-a-pid stray line\n501 python3 /x/mission.py --standby\n';
     const result = parseOrphanCandidates(output, { ownPid: 1, missionPid: null, isTracked: () => false });

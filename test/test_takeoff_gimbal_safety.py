@@ -142,6 +142,31 @@ def test_verify_gimbal_fails_when_a_mute_gimbal_already_reads_the_target():
     assert ctx.milestones[0][0] == "mission.abort"
 
 
+def test_verify_gimbal_proves_a_camera_already_at_the_search_tilt_through_a_probe():
+    """Flight 20261104_171409: an abort left the camera at -45 deg and every later launch was refused."""
+    monitor = GimbalStateMonitor()
+    monitor.orientation_callback(SimpleNamespace(x=-45.0, y=0.0))
+    ctx = _make_context(no_fly=False, search_tilt=-45.0, responsive=monitor)
+    ctx.gimbal_monitor = monitor
+
+    assert TakeoffStep()._verify_gimbal(ctx) is True
+    tilts = [tilt for tilt, _ in ctx.drone.camera_commands]
+    assert -35.0 in tilts
+    assert tilts[-1] == -45.0
+    assert monitor.current_tilt() == -45.0
+    assert ctx.milestones == []
+
+
+def test_verify_gimbal_fails_when_a_mute_gimbal_reads_exactly_the_search_tilt():
+    ctx = _make_context(no_fly=False, search_tilt=-45.0)
+    monitor = GimbalStateMonitor()
+    monitor.orientation_callback(SimpleNamespace(x=-45.0, y=0.0))
+    ctx.gimbal_monitor = monitor
+
+    assert TakeoffStep()._verify_gimbal(ctx) is False
+    assert ctx.milestones[0][0] == "mission.abort"
+
+
 def test_verify_gimbal_fails_when_a_mute_gimbal_sits_past_the_target():
     """Flight 20261102_170317: the camera stayed at -80 deg from the previous flight."""
     ctx = _make_context(no_fly=False, search_tilt=-28.0)

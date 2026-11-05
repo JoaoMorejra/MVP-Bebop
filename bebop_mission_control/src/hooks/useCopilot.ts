@@ -39,6 +39,9 @@ import { useBridge } from './useBridge';
  */
 export const SPEECH_CEILING_MS = 14000;
 
+/** Alert the station raises on the operator's abort (`electron/main.cjs:bmg:abort-mission`); never spoken. */
+export const OPERATOR_ABORT_ALERT = 'mission.abort';
+
 export interface Copilot {
   /**
    * Speak one line. Resolves when the operator has heard it, or when it is
@@ -278,7 +281,7 @@ export interface FindingReading {
 export const TYPE_FINISH_MS = 320;
 
 /** How long `text` takes to say: the last measurement of it, else the estimate from its length. */
-function expectedSpeechMs(text: string): number {
+export function expectedSpeechMs(text: string): number {
   let measured: number | null = null;
   try {
     measured = readSpeechMs(window.localStorage, text);
@@ -322,9 +325,12 @@ export function useFlightNarration(
     if (!bridge) return;
     const unsubMilestone = bridge.onMilestone((event) => {
       if (event.kind === 'alert') {
+        // The operator's abort is not announced: the aircraft lands and the
+        // station presents it as the flight ending (`main.cjs` still raises
+        // `mission.abort`; it stays in the log, unspoken).
+        if (event.key === OPERATOR_ABORT_ALERT) return;
         const payload = event.payload ?? {};
-        const pri = event.key === 'mission.abort' ? 'LAND' : 'URGENT';
-        queue.preempt(event.key, () => alertSentence(payload, event.key), pri);
+        queue.preempt(event.key, () => alertSentence(payload, event.key), 'URGENT');
         return;
       }
       if (event.key === 'mission.mode') {

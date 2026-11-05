@@ -6,10 +6,13 @@ import { TOPIC_LABEL } from '../../lib/forensics';
 import { PHRASE_POOLS } from '../../lib/copilotPhrases';
 import { cn, stampLabel } from '../../lib/format';
 import { FINISH_HOLD_MS, type FinishLockResult } from '../../lib/finishLock';
-import type { FindingReading } from '../../hooks/useCopilot';
-import { prefersReducedMotion } from '../shell/motion';
+import { expectedSpeechMs, type FindingReading } from '../../hooks/useCopilot';
 import { EvidenceGrid, SCAN_MIN_PASS_MS } from './EvidenceGrid';
-import { recordRevealed, revealedProgress, scanProgress } from '../../lib/evidenceReveal';
+import {
+  recordRevealed,
+  revealedProgress,
+  scanProgress,
+} from '../../lib/evidenceReveal';
 
 interface ForensicPanelProps {
   latest: RawEvidence | null;
@@ -21,6 +24,8 @@ interface ForensicPanelProps {
   landed: boolean;
   /** This flight's findings, in this flight's order. */
   report: Finding[] | null;
+  /** The flight's inspection has started (`useInspectionSchedule`): the findings take the column. */
+  inspectionStarted: boolean;
   /** How many of them the copilot has read so far. */
   reportRevealed: number;
   /**
@@ -38,16 +43,47 @@ interface ForensicPanelProps {
   flightProgress?: number;
   /** How far the flight is through its first four stages, 0 to 1: how far the waiting grid has split. */
   waitProgress?: number;
-  /**
-   * The aircraft is down and the report waits for the victim assessment of the
-   * capture: the victim card holds a visual placeholder and nothing is read.
-   */
-  reportAnalyzing?: boolean;
   /** The closing line as the copilot said it, so screen and voice agree. */
   reportClosing?: string | null;
   onFinish: () => void;
   /** The finish lock (`lib/finishLock.ts`): whether, why not, and how. */
   lock: FinishLockResult;
+}
+
+/**
+ * Pause before each finding, ms: the copilot's beat between two report lines
+ * (`lib/forensics.ts:findingGapMs`, its lower bound), and before the first the
+ * time the intro takes the floor.
+ */
+export const FINDING_BEAT_MS = 1800;
+
+/**
+ * When each finding comes in and how long it types, ms from the start of the
+ * inspection: one at a time, each typed over the time its sentence takes to
+ * say (measured on this station when known, `useCopilot.ts:expectedSpeechMs`),
+ * with {@link FINDING_BEAT_MS} before each. The same pace the cards kept when
+ * only the voice brought them in.
+ */
+export function findingSchedule(findings: readonly Finding[]): Array<{ startMs: number; typeMs: number }> {
+  let at = 0;
+  return findings.map((finding) => {
+    at += FINDING_BEAT_MS;
+    const typeMs = expectedSpeechMs(finding.speech);
+    const slot = { startMs: at, typeMs };
+    at += typeMs;
+    return slot;
+  });
+}
+
+/** When the inspection of each report started on this station, epoch ms. First sight wins. */
+const inspectionOrigins = new WeakMap<readonly Finding[], number>();
+
+function inspectionOrigin(report: readonly Finding[]): number {
+  const known = inspectionOrigins.get(report);
+  if (known !== undefined) return known;
+  const now = Date.now();
+  inspectionOrigins.set(report, now);
+  return now;
 }
 
 /** The four thin corner marks over the capture, 10 px legs. */
@@ -71,15 +107,10 @@ const FRAME_MARKS: readonly string[] = [
  * moves the cards below it, and is what a screen reader gets.
  */
 const TypewriterText: React.FC<{ text: string; endsAt: number | null }> = ({ text, endsAt }) => {
-  const typed = useRef(prefersReducedMotion() ? text.length : 0);
+  const typed = useRef(0);
   const [count, setCount] = useState(typed.current);
 
   useEffect(() => {
-    if (prefersReducedMotion()) {
-      typed.current = text.length;
-      setCount(text.length);
-      return;
-    }
     if (endsAt === null || typed.current >= text.length) return;
     let frame = 0;
     let last = Date.now();
@@ -164,8 +195,12 @@ function stampOf(evidence: RawEvidence): string {
  * assessment presented over a machine's own annotations is an assessment of the
  * machine. The annotated copy is one click away in the library.
  *
- * On touchdown the image gives up its height to the findings, which appear one
- * at a time as the copilot reads them.
+ * When the flight's inspection starts (`inspectionStarted`, from
+ * `hooks/useInspectionSchedule.ts`) the image gives up its height to the four
+ * findings, in flight or on the ground, with or without a capture. They
+ * come in one at a time on their own cadence ({@link FINDING_STAGGER_MS}); the
+ * copilot reading them, when it does, can only bring a card in sooner, never
+ * hold one back.
  */
 export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   latest,
@@ -174,12 +209,12 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   missionOver,
   landed,
   report,
+  inspectionStarted,
   reportRevealed,
   reportAnnounced,
   reportReadings = [],
   flightProgress,
   waitProgress = 0,
-  reportAnalyzing = false,
   reportClosing,
   onFinish,
   lock,
@@ -251,14 +286,41 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
   const settled = captureKey !== null && revealedKey === captureKey;
   const scanDone = captureKey !== null && scanDoneKey === captureKey;
 
+  // Cards one at a time once the inspection has started, each typed out over
+  // the time its sentence takes to say, on the copilot's own pace
+  // (`findingSchedule`); the copilot reading them may only bring one in sooner.
+  // Timed from the instant the inspection started for this report, so a
+  // cockpit reopened mid-sequence resumes it instead of typing it again.
+  const started = inspectionStarted && report !== null;
+  const [auto, setAuto] = useState<{ report: Finding[] | null; ends: number[] }>({ report: null, ends: [] });
+  useEffect(() => {
+    if (!started || !report) return;
+    const origin = inspectionOrigin(report);
+    const timers = findingSchedule(report).map(({ startMs, typeMs }, index) =>
+      window.setTimeout(
+        () =>
+          setAuto((previous) => {
+            const ends = previous.report === report ? previous.ends.slice() : [];
+            ends[index] = origin + startMs + typeMs;
+            return { report, ends };
+          }),
+        Math.max(0, origin + startMs - Date.now())
+      )
+    );
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [started, report]);
+  const autoEnds = auto.report === report ? auto.ends : [];
+  const autoShown = autoEnds.filter((end) => end !== undefined).length;
+
   const inspecting = stage === 4;
-  const announced = Math.max(reportAnnounced ?? reportRevealed, reportRevealed);
+  const voiced = Math.max(reportAnnounced ?? reportRevealed, reportRevealed);
+  const announced = Math.max(voiced, autoShown);
   const onGround = landed || missionOver;
   groundRef.current = onGround;
   const down = settled && scanDone && onGround;
   const scanFrom = revealedProgress(captureKey);
   const scan =
-    settled && !scanDone && scanFrom !== null
+    settled && !scanDone && !started && scanFrom !== null
       ? {
           progress: scanProgress(scanFrom, flightProgress),
           closing: onGround,
@@ -267,8 +329,8 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
           onDone: onScanDone,
         }
       : null;
-  const presenting = down && Boolean(latest) && Boolean(report);
-  const analyzing = down && Boolean(latest) && !report && reportAnalyzing;
+  const presenting = started;
+  const analyzing = inspectionStarted && !report;
 
   // Only when the mission may be ended: never in flight, never with nothing to end.
   const finishShown = lock.enabled;
@@ -295,7 +357,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
               onRevealed={onRevealed}
             />
               {/* The photograph is revealed as soon as it is taken; the scan ends at touchdown, then the capture stamp appears. */}
-              {down && latest ? (
+              {(down || presenting) && latest ? (
                 <>
                   {FRAME_MARKS.map((position) => (
                     <span
@@ -323,10 +385,11 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
 
           {/* The findings, in the space the image gave up. */}
           {presenting && report ? (
-            <ul aria-live="polite" className={cn('scroll-thin min-h-0 flex-1 overflow-y-auto pr-0.5', finishShown && 'pb-12')}>
+            <ul aria-live="polite" className={cn('scroll-none min-h-0 flex-1 overflow-y-auto', finishShown && 'pb-12')}>
               {report.map((finding, index) => {
                 const shown = index < announced;
-                const reading = reportReadings[index];
+                const voice = reportReadings[index];
+                const reading = voice ?? (autoEnds[index] !== undefined ? { endsAt: autoEnds[index] } : undefined);
                 return (
                   <li
                     key={finding.topic}
@@ -349,8 +412,8 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
                   </li>
                 );
               })}
-              {reportRevealed >= report.length ? (
-                <li className="anim-rise px-1 pt-1 text-2xs text-haze">
+              {Math.max(reportRevealed, autoShown) >= report.length ? (
+                <li className="anim-rise px-1 pt-1 text-right text-2xs text-haze">
                   {reportClosing ?? PHRASE_POOLS['inspection.outro'][0]}
                 </li>
               ) : null}
@@ -383,7 +446,7 @@ export const ForensicPanel: React.FC<ForensicPanelProps> = ({
             data-finish-state={lock.state}
             data-finish-reason={lock.reason || undefined}
             className={cn(
-              'finish-rise font-pixel absolute bottom-3 right-3 z-30 flex items-center gap-2 rounded-bezel border bg-hull-deep/85 px-4 py-2 text-sm font-semibold tracking-[0.04em] backdrop-blur-sm transition-colors',
+              'finish-rise font-pixel absolute bottom-3 left-3 z-30 flex items-center gap-2 rounded-bezel border bg-hull-deep/85 px-4 py-2 text-sm font-semibold tracking-[0.04em] backdrop-blur-sm transition-colors',
               lock.requiresConfirm
                 ? cn('border-ember/70 text-ember', holding && 'bg-ember/40')
                 : missionOver

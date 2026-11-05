@@ -42,37 +42,31 @@ describe('AbortControl (R6 / L2)', () => {
     expect(btn.textContent).toContain('ABORTAR MISSÃO');
   });
 
-  it('renders disabled button in commanded phase', () => {
-    const onAbort = vi.fn();
-    act(() =>
-      root.render(<AbortControl onAbort={onAbort} disabled={true} busy={true} landProgress="commanded" />)
-    );
-    const btn = getButton();
-    expect(btn.disabled).toBe(true);
-    expect(btn.textContent).toContain('POUSO COMANDADO');
-    expect(host.textContent).toContain('Pouso comandado');
-  });
+  it.each(['commanded', 'landing', 'landed'] as const)(
+    'shows nothing of the abort while the aircraft lands (%s): same wording, no chip, no motion',
+    (phase) => {
+      act(() => root.render(<AbortControl onAbort={vi.fn()} disabled busy landProgress={phase} />));
+      const btn = getButton();
+      expect(btn.disabled).toBe(true);
+      expect(btn.textContent).toContain('ABORTAR MISSÃO');
+      expect(host.textContent).not.toMatch(/pouso comandado|pousando|pousada/i);
+      expect(btn.className).not.toMatch(/animate-|active:scale|transition/);
+      // Refuses a second press, but keeps its look while the abort lands.
+      expect(btn.className).toContain('border-ember');
+      expect(btn.className).not.toContain('bg-hull');
+    }
+  );
 
-  it('renders disabled button in landing phase', () => {
+  it('does not flash when pressed', () => {
     const onAbort = vi.fn();
-    act(() =>
-      root.render(<AbortControl onAbort={onAbort} disabled={true} busy={false} landProgress="landing" />)
-    );
+    act(() => root.render(<AbortControl onAbort={onAbort} />));
     const btn = getButton();
-    expect(btn.disabled).toBe(true);
-    expect(btn.textContent).toContain('POUSANDO');
-    expect(host.textContent).toContain('Pousando');
-  });
-
-  it('renders disabled button in landed phase', () => {
-    const onAbort = vi.fn();
-    act(() =>
-      root.render(<AbortControl onAbort={onAbort} disabled={true} busy={false} landProgress="landed" />)
-    );
-    const btn = getButton();
-    expect(btn.disabled).toBe(true);
-    expect(btn.textContent).toContain('POUSADA');
-    expect(host.textContent).toContain('Pousada');
+    const before = btn.className;
+    act(() => {
+      btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    });
+    expect(onAbort).toHaveBeenCalledTimes(1);
+    expect(getButton().className).toBe(before);
   });
 
   it('re-enables button with REENVIAR POUSO in unconfirmed phase (L2)', () => {

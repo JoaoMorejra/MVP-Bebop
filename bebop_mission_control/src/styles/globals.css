@@ -126,6 +126,15 @@
     background: transparent;
   }
 
+  /* Scrolls without showing a bar: the findings column is a presentation
+     surface, and a bar beside the cards reads as clutter on the panel. */
+  .scroll-none {
+    scrollbar-width: none;
+  }
+  .scroll-none::-webkit-scrollbar {
+    display: none;
+  }
+
   /* Aerospace glass.
   
      Instrument surfaces that float over the pre-flight film: a blurred, barely

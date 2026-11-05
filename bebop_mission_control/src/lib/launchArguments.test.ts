@@ -276,7 +276,8 @@ describe('instant launch from a prepared mission', () => {
     await main.handlers['bmg:start-mission']({}, { noFly: true, launchAtMs: 777, paramsJson: JSON.stringify(doc) });
     const fresh = freshSpawns().slice(-1)[0];
     expect(fresh.args).not.toContain('--launch-at-ms');
-    expect(killed).toEqual(['SIGTERM']);
+    // Still preparing, so without its signal handlers: finished, not asked.
+    expect(killed).toEqual(['SIGKILL']);
     expect(await missionLog()).toContain('[BMG] Lançamento frio (missão em espera ainda em preparo)');
     fresh.child.emit('close', 0, null);
     await new Promise((resolve) => setTimeout(resolve, 0));

@@ -30,6 +30,12 @@ logger = logging.getLogger("Step1Takeoff")
 #: gimbal repeats its reading exactly.
 GIMBAL_MIN_TRAVEL_DEG: Final[float] = 0.5
 
+#: Offset of the probe tilt from the search tilt, in degrees, for a camera that
+#: already reads the search tilt before the ground check. Twenty times
+#: :data:`GIMBAL_MIN_TRAVEL_DEG`, and toward the horizon from any negative
+#: search tilt, so it stays inside the Bebop 2 tilt range (-83 to +17 deg).
+GIMBAL_PROBE_OFFSET_DEG: Final[float] = 10.0
+
 #: Longest ground wait for the gimbal to start moving, in seconds. The check
 #: returns at the first reading that has moved, so this only bounds a mute or
 #: slow-to-wake gimbal. Runs inside the launch countdown.
@@ -258,9 +264,15 @@ class TakeoffStep(BaseStep):
         where it was before the command. The wait uses a tolerance of
         ``|target - start| - GIMBAL_MIN_TRAVEL_DEG``, so it ends at the first
         reading that has moved, however small the difference; reaching the
-        target is left to the search step, which keeps commanding it. A
-        flight ends with the camera at the return tilt (-70/-80 deg); no
-        difference at all cannot be verified and is refused.
+        target is left to the search step, which keeps commanding it.
+
+        A camera already at the search tilt is the normal state after any
+        abort before Stage 4 and after a refused launch, both of which leave
+        it there. Refusing it made every launch after one of them fail on the
+        ground. The proof then goes through a probe tilt
+        :data:`GIMBAL_PROBE_OFFSET_DEG` away: the reading must travel toward
+        the probe, after which the search tilt is commanded again. A mute
+        gimbal still repeats its reading and is refused.
 
         Returns
         -------
@@ -282,35 +294,67 @@ class TakeoffStep(BaseStep):
         if start is None:
             return self._gimbal_unresponsive(ctx, f"sem leitura do gimbal antes do comando de {target:.1f} deg")
 
-        distance = abs(target - start)
-        if distance < GIMBAL_MIN_TRAVEL_DEG:
-            return self._gimbal_unresponsive(
-                ctx, f"câmera já em {start:.1f} deg para o alvo {target:.1f} deg; movimento não verificável"
-            )
+        if abs(target - start) >= GIMBAL_MIN_TRAVEL_DEG:
+            return self._confirm_travel(ctx, monitor, start, target)
 
+        probe = target + GIMBAL_PROBE_OFFSET_DEG
+        if probe > 0.0:
+            probe = target - GIMBAL_PROBE_OFFSET_DEG
+        logger.info(
+            "Câmera já no tilt de busca (%.1f deg): verificando o gimbal pelo tilt de prova %.1f deg.",
+            start,
+            probe,
+        )
+        ctx.drone.camera_control(tilt=probe, pan=0.0)
+        if not self._confirm_travel(ctx, monitor, start, probe):
+            return False
+        ctx.drone.camera_control(tilt=target, pan=0.0)
+        return True
+
+    def _confirm_travel(self, ctx: MissionContext, monitor: Any, start: float, aim: float) -> bool:
+        """Wait for the reported tilt to travel from ``start`` toward ``aim``.
+
+        Parameters
+        ----------
+        ctx : MissionContext
+            Mission context; its drone re-asserts ``aim`` while waiting.
+        monitor : GimbalStateMonitor
+            Source of the reported tilt.
+        start : float
+            Tilt reported before the first command, in degrees.
+        aim : float
+            Commanded tilt, in degrees, at least :data:`GIMBAL_MIN_TRAVEL_DEG`
+            away from ``start``.
+
+        Returns
+        -------
+        bool
+            ``True`` once the reading moved toward ``aim``; ``False`` after a
+            ``mission.abort`` milestone, or on an operator interrupt.
+        """
         outcome = monitor.wait_for_tilt(
-            target,
-            tolerance=distance - GIMBAL_MIN_TRAVEL_DEG,
+            aim,
+            tolerance=abs(aim - start) - GIMBAL_MIN_TRAVEL_DEG,
             timeout=_GIMBAL_GROUND_TIMEOUT_SEC,
-            assert_command=lambda: ctx.drone.camera_control(tilt=target, pan=0.0),
+            assert_command=lambda: ctx.drone.camera_control(tilt=aim, pan=0.0),
             interrupted=ctx.interrupted,
             period=0.2,
         )
         if outcome.interrupted:
             return False
         if outcome.actual is None:
-            return self._gimbal_unresponsive(ctx, outcome.describe(target))
-        travel = actuation_travel(start, outcome.actual, target)
+            return self._gimbal_unresponsive(ctx, outcome.describe(aim))
+        travel = actuation_travel(start, outcome.actual, aim)
         if not outcome.reached or travel < GIMBAL_MIN_TRAVEL_DEG:
             return self._gimbal_unresponsive(
-                ctx, f"{outcome.describe(target)}; deslocamento {travel:.1f} deg a partir de {start:.1f} deg"
+                ctx, f"{outcome.describe(aim)}; deslocamento {travel:.1f} deg a partir de {start:.1f} deg"
             )
 
         logger.info(
             "Gimbal confirmado em solo: movimento %.1f -> %.1f deg (alvo %.1f deg) em %.2f s.",
             start,
             outcome.actual,
-            target,
+            aim,
             outcome.waited,
         )
         return True

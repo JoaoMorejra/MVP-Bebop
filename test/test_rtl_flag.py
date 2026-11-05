@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import types
 
 import pytest
@@ -96,22 +95,19 @@ def test_without_the_return_nothing_spoken_names_the_base_the_return_or_the_mark
             assert payload["at_base"] is False
 
 
-def test_simple_without_the_return_restores_the_heading_then_stows_the_gimbal(simulated_time):
+def test_simple_without_the_return_stows_the_gimbal_without_turning(simulated_time):
     ctx = inspection_ctx(offset_deg=60.0)
-    ctx.params.yaw_pattern.return_timeout_sec = 30.0
     ctx.params.rtl.enabled = False
     ctx.params.rtl.camera_tilt_deg = -45.0
 
     assert NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx) is StepStatus.SUCCESS
 
-    error = abs((ctx.odom_supervisor.yaw - 0.5 + math.pi) % (2 * math.pi) - math.pi)
-    assert error <= math.radians(ctx.params.yaw_pattern.return_tolerance_deg) + 1e-6
+    assert all(vyaw == 0.0 for *_rest, vyaw in ctx.drone.commands)
     assert ctx.drone.camera_calls[-1] == STOW_GIMBAL_TILT_DEG == -80.0
 
 
 def test_simple_with_the_return_lowers_the_gimbal_to_the_marker_tilt(simulated_time):
     ctx = inspection_ctx(offset_deg=20.0)
-    ctx.params.yaw_pattern.return_timeout_sec = 30.0
     ctx.params.rtl.camera_tilt_deg = -65.0
 
     NadirInspectionStep(mode=MissionMode.SIMPLE).execute(ctx)

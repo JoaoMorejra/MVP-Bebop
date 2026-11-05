@@ -6,6 +6,7 @@ import {
   EMPTY_FILL,
   EMPTY_SIGNALS,
   advanceFill,
+  fillInputFor,
   measuredProgress,
   type FillState,
   type StageSignals,
@@ -118,16 +119,7 @@ export function useStageProgress(opts: { stage: number; state: MissionState; alt
       }
       const measured = measuredProgress(stage, signals.current, now, altitude);
       setFill((previous) => {
-        const next = advanceFill(
-          previous,
-          {
-            stage,
-            measured,
-            finished: state === 'finished',
-            halted: state === 'aborting' || state === 'aborted' || state === 'faulted',
-          },
-          dt
-        );
+        const next = advanceFill(previous, fillInputFor(state, stage, measured), dt);
         // A strip at rest renders nothing new: the app is not re-rendered for it.
         const same =
           next.cursor === previous.cursor && next.fills.every((value, index) => Math.abs(value - previous.fills[index]) < 1e-4);

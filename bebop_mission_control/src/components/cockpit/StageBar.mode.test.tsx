@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { StageBar } from './StageBar';
 import type { MissionMode } from '../../lib/missionMode';
+import type { MissionState } from '../../types/mission';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -130,7 +131,7 @@ describe('StageBar bench countdown', () => {
 });
 
 describe('StageBar fill', () => {
-  const renderFill = (fills: [number, number, number, number, number], cursor: number, state: 'running' | 'aborted' = 'running') =>
+  const renderFill = (fills: [number, number, number, number, number], cursor: number, state: MissionState = 'running') =>
     act(() =>
       root.render(
         <StageBar
@@ -164,14 +165,47 @@ describe('StageBar fill', () => {
     expect(on.style.clipPath).toBe('inset(0 58% 0 0)');
   });
 
-  it('turns the stage that stopped ember and holds its fill', () => {
-    renderFill([1, 0.3, 0, 0, 0], 2, 'aborted');
+  it('turns the stage a fault stopped ember and holds its fill', () => {
+    renderFill([1, 0.3, 0, 0, 0], 2, 'faulted');
     expect(pill(2).getAttribute('data-state')).toBe('halted');
     expect(pill(2).querySelector('[data-stage-fill]')!.className).toContain('bg-ember');
+  });
+
+  it.each(['aborting', 'aborted'] as const)('never shows an operator abort in ember (%s)', (state) => {
+    renderFill([1, 0.3, 0, 0, 0], 2, state);
+    expect(pill(2).getAttribute('data-state')).not.toBe('halted');
+    expect(host.querySelector('.bg-ember')).toBeNull();
+    expect(host.querySelector('.border-ember')).toBeNull();
   });
 
   it('has no progress rule under the pills', () => {
     renderFill([1, 0.42, 0, 0, 0], 2);
     expect(host.querySelector('nav')!.lastElementChild!.tagName).toBe('OL');
+  });
+});
+
+describe('StageBar colour', () => {
+  const pill = (step: number) => host.querySelector(`[data-stage="${step}"]`) as HTMLElement;
+
+  it('fills in the flight green gradient on the bench as in flight', () => {
+    act(() =>
+      root.render(
+        <StageBar
+          stage={3}
+          state="running"
+          benchMode
+          benchStage={null}
+          onRunStage={() => undefined}
+          onGotoStage={() => undefined}
+          pendingStage={null}
+          fill={{ cursor: 3, fills: [1, 1, 0.4, 0, 0] }}
+        />
+      )
+    );
+    for (const step of [1, 2, 3]) {
+      const fill = pill(step).querySelector('[data-stage-fill]')!;
+      expect(fill.className).toContain('stage-fill-flight');
+      expect(fill.className).not.toContain('bg-cyan');
+    }
   });
 });

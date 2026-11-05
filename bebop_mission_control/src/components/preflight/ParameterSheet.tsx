@@ -4,6 +4,7 @@ import {
   ADVANCED_PATHS,
   CENTERING_TIMEOUT_RANGE_SEC,
   PARAMETER_GROUPS,
+  PRECISION_LAND_PATH,
   groupsForMode,
   markerCount,
   type BooleanParameter,
@@ -89,13 +90,20 @@ const SCRUB_PATHS: ReadonlySet<string> = new Set([MARKER_ID_PATH, TAG_SIZE_PATH]
 const FALLBACK_MARKER_COUNT = 1000;
 
 /**
- * The pad marker of the return, as tiles like every other number: its ID in
- * the dictionary the document holds, its printed size and the centering
- * window. The dictionary itself is not offered; the ID is bounded by it.
+ * The pad marker of the return, as tiles like every other field: the
+ * Precision Land switch, the marker ID in the dictionary the document holds,
+ * its printed size and the centering window. The dictionary itself is not
+ * offered; the ID is bounded by it.
  */
-function arucoSpecs(doc: unknown): NumberParameter[] {
+function arucoSpecs(doc: unknown): ParameterSpec[] {
   const count = markerCount(getPath(doc, MARKER_DICT_PATH)) ?? FALLBACK_MARKER_COUNT;
   return [
+    {
+      kind: 'boolean',
+      path: PRECISION_LAND_PATH,
+      label: 'Precision Land',
+      hint: 'Marcada: centraliza no ArUco e desce rastreando o marcador até o toque. Desmarcada: centraliza no ArUco e pousa na vertical a partir da altitude atual.',
+    },
     { kind: 'number', path: MARKER_ID_PATH, label: 'ID do Marcador', hint: '', min: 0, max: count - 1, step: 1, precision: 0 },
     { kind: 'number', path: TAG_SIZE_PATH, label: 'Tamanho da Tag', hint: '', min: 0.05, max: MAX_TAG_SIZE_M, step: 0.005, precision: 3, unit: 'm' },
     {

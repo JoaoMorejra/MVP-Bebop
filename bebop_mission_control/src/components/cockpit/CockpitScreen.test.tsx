@@ -110,8 +110,8 @@ function renderCockpit(props: {
         cameraAvailable={true}
         onCameraTilt={vi.fn()}
         report={null}
+        inspectionStarted={false}
         reportRevealed={0}
-        reportAnalyzing={false}
         reportClosing={null}
         onAbort={onAbort}
         onFinish={vi.fn()}
@@ -406,5 +406,17 @@ describe('CockpitScreen standby vs mission layout', () => {
     expect(host.querySelector('[data-testid="stage-bar"]')).not.toBeNull();
     expect(host.querySelector('[data-testid="forensic-panel"]')).not.toBeNull();
     expect(host.textContent).toContain('ABORTAR MISSÃO');
+  });
+});
+
+describe('cockpit layout', () => {
+  it('puts the inspection panel in the left column and the feed with the map on the right', () => {
+    renderCockpit({ missionState: 'running', stage: 3 });
+    const grid = host.querySelector('[data-cockpit-layout="mission"] > div.grid') as HTMLElement;
+    const [left, right] = Array.from(grid.children);
+    expect(left.getAttribute('data-testid')).toBe('forensic-panel');
+    expect(right.querySelector('[data-testid="optical-feed"]')).not.toBeNull();
+    expect(right.querySelector('[data-testid="tactical-map"]')).not.toBeNull();
+    expect(grid.className).toContain('grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]');
   });
 });

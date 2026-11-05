@@ -98,8 +98,8 @@ describe('createStandbyManager', () => {
   it('pauses: no standby beside a mission spawned fresh, until the next ensure', () => {
     manager.ensure(doc(), true);
     manager.pause();
-    expect(children[0].signals).toEqual(['SIGTERM']);
-    children[0].emit('close', null, 'SIGTERM');
+    expect(children[0].signals).toEqual(['SIGKILL']);
+    children[0].emit('close', null, 'SIGKILL');
     vi.advanceTimersByTime(60000);
     expect(children).toHaveLength(1);
     manager.ensure(doc(), true);
@@ -120,7 +120,7 @@ describe('createStandbyManager', () => {
     manager.ensure(doc({ kinematics: { countdown_sec: 4, target_altitude_m: 3, control_loop_hz: 15 } }), true);
     expect(children).toHaveLength(1);
     manager.ensure(doc(), false);
-    expect(children[0].signals).toEqual(['SIGTERM']);
+    expect(children[0].signals).toEqual(['SIGKILL']);
     expect(children).toHaveLength(2);
   });
 
@@ -169,9 +169,64 @@ describe('createStandbyManager', () => {
     manager.ensure(doc(), true);
     expect(manager.isStandby(children[0].pid)).toBe(true);
     manager.dispose();
-    expect(children[0].signals).toEqual(['SIGTERM']);
-    children[0].emit('close', null, 'SIGTERM');
+    expect(children[0].signals).toEqual(['SIGKILL']);
+    children[0].emit('close', null, 'SIGKILL');
     vi.advanceTimersByTime(60000);
     expect(children).toHaveLength(1);
+  });
+
+  it('asks a prepared standby to stop and forces it after the grace period', () => {
+    manager.ensure(doc(), true);
+    children[0].ready();
+    manager.ensure(doc(), false);
+    expect(children[0].signals).toEqual(['SIGTERM']);
+    vi.advanceTimersByTime(2499);
+    expect(children[0].signals).toEqual(['SIGTERM']);
+    vi.advanceTimersByTime(1);
+    expect(children[0].signals).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('does not force a prepared standby that exited within the grace period', () => {
+    manager.ensure(doc(), true);
+    children[0].ready();
+    manager.pause();
+    children[0].emit('close', 3, null);
+    vi.advanceTimersByTime(60000);
+    expect(children[0].signals).toEqual(['SIGTERM']);
+  });
+
+  it('keeps a released standby tracked until its process is gone', () => {
+    manager.ensure(doc(), true);
+    children[0].ready();
+    manager.ensure(doc(), false);
+    expect(manager.isStandby(children[0].pid)).toBe(true);
+    expect(manager.isStandby(children[1].pid)).toBe(true);
+    children[0].emit('close', 3, null);
+    expect(manager.isStandby(children[0].pid)).toBe(false);
+  });
+
+  it('recycles the prepared standby for the same document and driver state', () => {
+    manager.ensure(doc(), true);
+    children[0].ready();
+    manager.recycle('enlace refeito');
+    expect(children[0].signals).toEqual(['SIGTERM']);
+    expect(children).toHaveLength(2);
+    children[1].ready();
+    expect(manager.unavailableReason(doc(), true)).toBeNull();
+  });
+
+  it('spares a standby prepared after the cut-off', () => {
+    vi.setSystemTime(1000);
+    manager.ensure(doc(), true);
+    children[0].ready();
+    manager.recycle('enlace refeito', 500);
+    expect(children[0].signals).toEqual([]);
+    manager.recycle('enlace refeito', 2000);
+    expect(children[0].signals).toEqual(['SIGTERM']);
+  });
+
+  it('recycles nothing when no standby is prepared', () => {
+    manager.recycle('enlace refeito');
+    expect(children).toHaveLength(0);
   });
 });

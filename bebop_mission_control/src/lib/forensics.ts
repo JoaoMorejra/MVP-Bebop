@@ -199,12 +199,14 @@ export function checkTopicOrder(topics: readonly FindingTopic[]): void {
 export function buildForensicReport(
   options: {
     assessment?: InspectionAssessment | null;
+    /** Imposes the victim status instead of deriving it from `assessment`. */
+    victimStatus?: VictimStatus;
     storage?: StorageLike | null;
     random?: () => number;
   } = {}
 ): Finding[] {
   const storage = options.storage;
-  const status = victimStatusOf(options.assessment ?? null);
+  const status = options.victimStatus ?? victimStatusOf(options.assessment ?? null);
   let history = storage === undefined ? loadHistory() : loadHistory(storage);
 
   const dispatch = pickVariant(
@@ -265,6 +267,13 @@ export interface ForensicScript {
 }
 
 /**
+ * `reason` of a report whose victim finding follows the operator's switch off
+ * (`vision.victim_detection_enabled`). Same string as
+ * `perception/assessment.py:REASON_VICTIM_DETECTION_DISABLED`.
+ */
+export const REASON_VICTIM_DETECTION_DISABLED = 'victim_detection_disabled';
+
+/**
  * Draw the report of one capture with its intro and outro.
  *
  * `assessment` null means no inference concluded (the station's own wait ran
@@ -274,6 +283,8 @@ export interface ForensicScript {
 export function drawForensicScript(
   options: {
     assessment: InspectionAssessment | null;
+    /** Imposes the victim status instead of deriving it from `assessment`. */
+    victimStatus?: VictimStatus;
     captureStamp?: string | null;
     reason?: string | null;
     storage?: StorageLike | null;
@@ -282,10 +293,11 @@ export function drawForensicScript(
 ): ForensicScript {
   const { assessment, storage, random } = options;
   const phraseOptions = storage === undefined ? { random } : { storage, random };
-  const findings = buildForensicReport({ assessment, storage, random });
+  const victimStatus = options.victimStatus ?? victimStatusOf(assessment);
+  const findings = buildForensicReport({ assessment, victimStatus, storage, random });
   return {
     captureStamp: options.captureStamp ?? assessment?.capture_stamp ?? null,
-    victimStatus: victimStatusOf(assessment),
+    victimStatus,
     reason: assessment ? assessment.reason : options.reason ?? null,
     intro: nextPhrase('inspection.intro', {}, phraseOptions),
     findings,

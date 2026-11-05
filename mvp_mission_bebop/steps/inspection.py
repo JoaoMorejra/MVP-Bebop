@@ -45,7 +45,6 @@ from typing import Any, Dict, Final, Optional, Tuple
 from mvp_mission_bebop.blackboard import EvidenceRecord
 from mvp_mission_bebop.context import MissionContext
 from mvp_mission_bebop.controllers.gimbal_framing import FramingCommand, GimbalFramingController
-from mvp_mission_bebop.controllers.yaw_pattern import YawHeadingController
 from mvp_mission_bebop.engine.rate import MAX_INTERVAL_SEC, Deadline, LoopRate
 from mvp_mission_bebop.estimation.convergence import SettlementCriteria, SettlementDetector
 from mvp_mission_bebop.mission_mode import MissionMode
@@ -187,27 +186,7 @@ class NadirInspectionStep(BaseStep):
             else:
                 logger.error("Stage 4 finished without recording any evidence.")
 
-            if self._mode is MissionMode.SIMPLE:
-                tilt_span = abs(float(ctx.params.gimbal.search_tilt_deg) - float(ctx.params.gimbal.nadir_tilt_deg))
-                if tilt_span >= 1e-3:
-                    tilt = float(ctx.params.rtl.camera_tilt_deg) if ctx.params.rtl.enabled else STOW_GIMBAL_TILT_DEG
-                    logger.info("Directing gimbal to %.1f deg (nadir) before yaw return...", tilt)
-                    self._point_gimbal(ctx, tilt)
-                    settle_gimbal_deadline = Deadline(0.5)
-                    rate = LoopRate(ctx.params.kinematics.control_loop_hz)
-                    while settle_gimbal_deadline.active and not ctx.interrupted():
-                        rate.tick()
-                        ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
-
-                status = self._restore_heading(ctx)
-                if status is not StepStatus.SUCCESS:
-                    return status
-                heading_settle_deadline = Deadline(0.5)
-                rate = LoopRate(ctx.params.kinematics.control_loop_hz)
-                while heading_settle_deadline.active and not ctx.interrupted():
-                    rate.tick()
-                    ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
-
+            self._lower_gimbal_for_stage_five(ctx)
             return StepStatus.SUCCESS
 
         framed = self._frame_with_gimbal(ctx)
@@ -258,30 +237,7 @@ class NadirInspectionStep(BaseStep):
         else:
             logger.error("Stage 4 finished without recording any evidence.")
 
-        # Volta do yaw ou pitch para a direita dependendo do modo
-        if self._mode is MissionMode.SIMPLE:
-            tilt_span = abs(float(ctx.params.gimbal.search_tilt_deg) - float(ctx.params.gimbal.nadir_tilt_deg))
-            if tilt_span >= 1e-3:
-                tilt = float(ctx.params.rtl.camera_tilt_deg) if ctx.params.rtl.enabled else STOW_GIMBAL_TILT_DEG
-                logger.info("Directing gimbal to %.1f deg (nadir) before yaw return...", tilt)
-                self._point_gimbal(ctx, tilt)
-                # Settle in motionless hover for 0.5s so gimbal reaches -80 deg before yaw rotation
-                settle_gimbal_deadline = Deadline(0.5)
-                rate = LoopRate(ctx.params.kinematics.control_loop_hz)
-                while settle_gimbal_deadline.active and not ctx.interrupted():
-                    rate.tick()
-                    ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
-
-            # Simple profile: restore takeoff heading with gimbal already at -80 deg
-            status = self._restore_heading(ctx)
-            if status is not StepStatus.SUCCESS:
-                return status
-            # Settle after heading restore before handing over to RTL landing
-            heading_settle_deadline = Deadline(0.5)
-            while heading_settle_deadline.active and not ctx.interrupted():
-                rate.tick()
-                ctx.drone.move_velocity(0.0, 0.0, 0.0, 0.0)
-
+        self._lower_gimbal_for_stage_five(ctx)
         return StepStatus.SUCCESS
 
     # --------------------------------------------------------------- framing
@@ -799,119 +755,31 @@ class NadirInspectionStep(BaseStep):
 
         return StepStatus.SUCCESS
 
-    def _restore_heading(self, ctx: MissionContext) -> StepStatus:
-        """Turn back to the heading recorded at the end of Stage 1 (Simple profile).
+    def _lower_gimbal_for_stage_five(self, ctx: MissionContext) -> None:
+        """Point the gimbal for Stage 5 once the evidence is recorded (Simple profile).
 
-        Runs after the evidence is recorded, so a heading fault can never cost
-        the photograph. The yaw window is open only for this loop and the last
-        command sent is an explicit zero, because the Bebop latches its last
-        Twist.
-
-        Battery, odometry and the ceiling are evaluated every cycle, as in the
-        other loops of the mission. The camera heartbeat is not: vision is
-        suspended after the capture, so the frame age is stale by construction
-        (the hover loop above has the same property and Stage 5 re-arms the
-        heartbeat on entry). The loop is also bounded by
-        ``yaw_pattern.return_timeout_sec``.
-
-        A reference that is absent, not a number or not finite skips the
-        restore. A cycle whose heading reading is not finite carries no
-        measurement: it transmits zero yaw and the window keeps bounding the
-        loop.
+        The airframe keeps the heading it reached when the target was locked:
+        Stage 5 lands in place, or centres on the pad marker from that heading,
+        so no yaw is commanded here and the stage hands over immediately. The
+        tilt is ``rtl.camera_tilt_deg`` with the return and
+        :data:`STOW_GIMBAL_TILT_DEG` without it. A gimbal band of zero width
+        (``search_tilt_deg == nadir_tilt_deg``) is a fixed camera and is left
+        untouched.
 
         Parameters
         ----------
         ctx : MissionContext
-            Mission context; reads ``blackboard.initial_yaw_rad`` and the
-            odometry heading, transmits through ``failsafe``.
-
-        Returns
-        -------
-        StepStatus
-            ``ABORTED`` on an interrupt; ``SUCCESS`` otherwise, including when
-            no usable reference heading was recorded or the window expired.
-            Stage 5 centres on the marker from whatever heading was reached.
+            Mission context; ``ctx.current_tilt_deg`` is updated with the tilt
+            transmitted.
         """
-        raw_reference = getattr(ctx.blackboard, "initial_yaw_rad", None)
-        try:
-            reference = float(raw_reference) if raw_reference is not None else math.nan
-        except (TypeError, ValueError):
-            reference = math.nan
-        if not math.isfinite(reference):
-            logger.warning(
-                "No usable takeoff heading was recorded (%r); the heading restore is skipped.",
-                raw_reference,
-            )
-            return StepStatus.SUCCESS
-
-        yaw_cfg = ctx.params.yaw_pattern
-        controller = YawHeadingController(yaw_cfg)
-        controller.reset()
-        rate = LoopRate(ctx.params.kinematics.control_loop_hz)
-        deadline = Deadline(yaw_cfg.return_timeout_sec)
-        blind_cycles = 0
-        logger.info(
-            "Restoring the takeoff heading %.1f deg: tolerance %.1f deg, window %.1f s.",
-            math.degrees(reference),
-            yaw_cfg.return_tolerance_deg,
-            yaw_cfg.return_timeout_sec,
-        )
-        try:
-            with ctx.failsafe.yaw_window(yaw_cfg.max_vyaw):
-                while deadline.active:
-                    if ctx.interrupted():
-                        return StepStatus.ABORTED
-                    if not ctx.drone.no_fly:
-                        healthy, reason = ctx.failsafe.evaluate_system_health(check_video=False)
-                        if not healthy:
-                            ctx.failsafe.trigger_emergency_land(reason)
-                            return StepStatus.FAILURE
-                    dt = min(rate.tick(), MAX_INTERVAL_SEC)
-                    yaw = float(ctx.odom_supervisor.snapshot().yaw)
-                    if not math.isfinite(yaw):
-                        if blind_cycles == 0:
-                            logger.warning(
-                                "Heading reading not finite (%r); holding zero yaw until it recovers.",
-                                yaw,
-                            )
-                        blind_cycles += 1
-                        self._transmit_yaw(ctx, 0.0, dt)
-                        continue
-                    command = controller.update(yaw, reference, dt)
-                    self._transmit_yaw(ctx, command.vyaw, dt)
-                    if command.settled:
-                        logger.info(
-                            "Heading restored after %.1f s (residual %.1f deg, %d blind cycles).",
-                            deadline.elapsed_sec,
-                            math.degrees(command.error_rad),
-                            blind_cycles,
-                        )
-                        return StepStatus.SUCCESS
-            logger.warning(
-                "Heading not restored within %.1f s (%d blind cycles); continuing from the "
-                "heading reached.",
-                yaw_cfg.return_timeout_sec,
-                blind_cycles,
-            )
-            return StepStatus.SUCCESS
-        finally:
-            self._hold(ctx)
-            # Pace the exit so the closing zero Twist reaches the consumer before Stage 5 starts.
-            rate.tick()
-            logger.info("Heading loop cadence: %s.", rate.cadence_report())
-
-    @staticmethod
-    def _transmit_yaw(ctx: MissionContext, vyaw: float, dt: float) -> None:
-        """Send a yaw command through the failsafe with every translation channel at zero."""
-        vz = governed_vz(
-            ctx,
-            ctx.odom_supervisor.snapshot().relative_altitude,
-            dt,
-            vx_commanded=0.0,
-            yaw_commanded=abs(vyaw),
-        )
-        safe_vz, safe_vyaw = ctx.failsafe.clamp_kinematics(vz, vyaw)
-        ctx.drone.move_velocity(vx=0.0, vy=0.0, vz=safe_vz, vyaw=safe_vyaw)
+        if self._mode is not MissionMode.SIMPLE:
+            return
+        gimbal = ctx.params.gimbal
+        if abs(float(gimbal.search_tilt_deg) - float(gimbal.nadir_tilt_deg)) < 1e-3:
+            return
+        tilt = float(ctx.params.rtl.camera_tilt_deg) if ctx.params.rtl.enabled else STOW_GIMBAL_TILT_DEG
+        logger.info("Directing gimbal to %.1f deg for Stage 5; no heading restore.", tilt)
+        self._point_gimbal(ctx, tilt)
 
     # ----------------------------------------------------------- native ACK
 

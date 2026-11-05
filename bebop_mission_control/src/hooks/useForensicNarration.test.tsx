@@ -6,10 +6,10 @@ import { PHRASE_POOLS } from '../lib/copilotPhrases';
 import type { Finding, ForensicScript } from '../lib/forensics';
 import { VICTIM_WORDINGS, scriptLines } from '../lib/forensics';
 import { NarrationQueue } from '../lib/narrationQueue';
-import type { InspectionAssessment, RawEvidence, VictimStatus } from '../types/bmg';
+import type { RawEvidence } from '../types/bmg';
 import { TYPE_FINISH_MS, useForensicNarration, type FindingReading } from './useCopilot';
 import { SPEECH_MS_KEY, estimateSpeechMs } from '../lib/speechTiming';
-import { ASSESSMENT_GROUND_WAIT_MS, useForensicReport, type ForensicReportState } from './useForensicReport';
+import { useForensicReport, type ForensicReportState } from './useForensicReport';
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -251,53 +251,33 @@ const CAPTURE: RawEvidence = {
   timestamp: 1,
 };
 
-function assessmentFor(status: VictimStatus | 'unavailable'): InspectionAssessment {
-  const detected = status === 'detected';
-  return {
-    schema: 'bmg.inspection.v1',
-    capture_stamp: '20261020_101500',
-    status: status === 'unavailable' ? 'unavailable' : 'complete',
-    reason: status === 'unavailable' ? 'detector_error' : null,
-    // A malformed unavailable payload claiming a victim must still read as unknown.
-    victim_detected: detected || status === 'unavailable',
-    victim_count: detected || status === 'unavailable' ? 1 : 0,
-    victim_confidence: detected ? 0.62 : null,
-    victim_boxes: detected ? [[100, 100, 160, 220]] : [],
-    frame: [856, 480],
-    inference_ms: 212.3,
-    model: 'yolov8n.pt',
-    imgsz: 640,
-    conf: 0.35,
-    completed_at_utc: '2026-10-20T13:15:01+00:00',
-  };
-}
-
 const flow = { state: null as ForensicReportState | null, prepared: [] as string[] };
 
 function Flow({
   queue,
-  capture,
-  assessment,
+  runToken,
+  victimDetection,
   grounded,
 }: {
   queue: NarrationQueue;
-  capture: RawEvidence | null;
-  assessment: InspectionAssessment | null;
+  runToken: string | null;
+  victimDetection: boolean;
   grounded: boolean;
 }) {
   const state = useForensicReport({
-    capture,
-    assessment,
-    grounded,
+    runToken,
+    victimDetection,
+    capture: runToken === null ? null : CAPTURE,
     prepare: (text) => flow.prepared.push(text),
   });
-  const { revealed } = useForensicNarration(queue, grounded && Boolean(capture), state.script);
+  const { revealed } = useForensicNarration(queue, grounded && runToken !== null, state.script);
   flow.state = state;
   seen.revealed = revealed;
   return null;
 }
 
 const victimCard = () => flow.state?.script?.findings.find((finding) => finding.topic === 'victim')?.card;
+const topics = () => (flow.state?.script?.findings ?? []).map((finding) => finding.topic);
 
 describe('useForensicReport', () => {
   beforeEach(() => {
@@ -305,32 +285,59 @@ describe('useForensicReport', () => {
     flow.prepared = [];
   });
 
-  it.each([
-    ['detected', 'detected'],
-    ['not_detected', 'not_detected'],
-    ['unavailable', 'unknown'],
-  ] as const)('draws on a %s assessment and reads the %s victim line', async (status, pool) => {
+  it('draws nothing until there is a flight to inspect', async () => {
+    const queue = new NarrationQueue(async () => false, () => undefined);
+    await act(async () => root.render(<Flow queue={queue} runToken={null} victimDetection grounded={false} />));
+    expect(flow.state?.script).toBeNull();
+    expect(flow.prepared).toEqual([]);
+  });
+
+  it('switch on: a victim, conscious and unhurt, read first, every flight, with no detector', async () => {
+    const queue = new NarrationQueue(async () => false, () => undefined);
+    for (let flight = 0; flight < 4; flight++) {
+      await act(async () => root.render(<Flow queue={queue} runToken={`run-${flight}`} victimDetection grounded={false} />));
+      const script = flow.state?.script as ForensicScript;
+      expect(script.findings).toHaveLength(4);
+      expect(script.victimStatus).toBe('detected');
+      expect(VICTIM_WORDINGS.detected).toContain(victimCard());
+      expect(topics().slice(0, 2)).toEqual(['victim', 'vehicle']);
+      expect(new Set(topics())).toEqual(new Set(['victim', 'vehicle', 'samu', 'police']));
+    }
+  });
+
+  it('switch off: the vehicle first, then no visible victim, every flight', async () => {
+    const queue = new NarrationQueue(async () => false, () => undefined);
+    for (let flight = 0; flight < 4; flight++) {
+      await act(async () =>
+        root.render(<Flow queue={queue} runToken={`run-${flight}`} victimDetection={false} grounded={false} />)
+      );
+      const script = flow.state?.script as ForensicScript;
+      expect(script.findings).toHaveLength(4);
+      expect(script.victimStatus).toBe('not_detected');
+      expect(script.reason).toBe('victim_detection_disabled');
+      expect(VICTIM_WORDINGS.not_detected).toContain(victimCard());
+      expect(topics().slice(0, 2)).toEqual(['vehicle', 'victim']);
+    }
+  });
+
+  it('draws once per flight and hands all six lines to the copilot', async () => {
+    const queue = new NarrationQueue(async () => false, () => undefined);
+    await act(async () => root.render(<Flow queue={queue} runToken="run-a" victimDetection grounded={false} />));
+    const drawn = flow.state?.script as ForensicScript;
+    expect(flow.prepared).toEqual(scriptLines(drawn));
+    await act(async () => root.render(<Flow queue={queue} runToken="run-a" victimDetection={false} grounded={false} />));
+    expect(flow.state?.script).toBe(drawn);
+    await act(async () => root.render(<Flow queue={queue} runToken="run-b" victimDetection grounded={false} />));
+    expect(flow.state?.script).not.toBe(drawn);
+  });
+
+  it('reads it only on confirmed ground, intro first, each finding in turn', async () => {
     const v = voice();
     const queue = new NarrationQueue(v.say, v.cancel);
-    await act(async () =>
-      root.render(<Flow queue={queue} capture={CAPTURE} assessment={null} grounded={false} />)
-    );
-    expect(flow.state?.analyzing).toBe(true);
-    expect(flow.prepared).toEqual([]);
-
-    await act(async () =>
-      root.render(<Flow queue={queue} capture={CAPTURE} assessment={assessmentFor(status)} grounded={false} />)
-    );
-    const script = flow.state?.script as ForensicScript;
-    expect(flow.state?.analyzing).toBe(false);
-    expect(script.victimStatus).toBe(pool);
-    expect(VICTIM_WORDINGS[pool]).toContain(victimCard());
-    expect(flow.prepared).toEqual(scriptLines(script));
+    await act(async () => root.render(<Flow queue={queue} runToken="run-a" victimDetection grounded={false} />));
     expect(v.spoken).toEqual([]);
-
-    await act(async () =>
-      root.render(<Flow queue={queue} capture={CAPTURE} assessment={assessmentFor(status)} grounded />)
-    );
+    const script = flow.state?.script as ForensicScript;
+    await act(async () => root.render(<Flow queue={queue} runToken="run-a" victimDetection grounded />));
     expect(v.spoken).toEqual([script.intro]);
     for (const finding of script.findings) {
       await act(async () => v.finish());
@@ -339,69 +346,21 @@ describe('useForensicReport', () => {
     }
   });
 
-  it('reads nothing while the assessment is pending, then the neutral line once the wait runs out', async () => {
-    const v = voice();
-    const queue = new NarrationQueue(v.say, v.cancel);
-    await act(async () => root.render(<Flow queue={queue} capture={CAPTURE} assessment={null} grounded />));
-
-    await tick(ASSESSMENT_GROUND_WAIT_MS - 1);
-    expect(flow.state?.analyzing).toBe(true);
-    expect(flow.state?.script).toBeNull();
-    expect(v.spoken).toEqual([]);
-
-    await tick(1);
-    const script = flow.state?.script as ForensicScript;
-    expect(script.victimStatus).toBe('unknown');
-    expect(script.reason).toBe('timeout');
-    expect(VICTIM_WORDINGS.unknown).toContain(victimCard());
-    expect(flow.prepared).toEqual(scriptLines(script));
-    expect(v.spoken).toEqual([script.intro]);
-  });
-
-  it('does not start the wait while the aircraft is still flying', async () => {
+  it('alternates SAMU and police from one flight to the next', async () => {
     const queue = new NarrationQueue(async () => false, () => undefined);
-    await act(async () => root.render(<Flow queue={queue} capture={CAPTURE} assessment={null} grounded={false} />));
-    await tick(ASSESSMENT_GROUND_WAIT_MS * 3);
-    expect(flow.state?.script).toBeNull();
-    expect(flow.state?.analyzing).toBe(true);
-  });
-
-  it('a result arriving after the wait ran out does not redraw the report', async () => {
-    const queue = new NarrationQueue(async () => false, () => undefined);
-    await act(async () => root.render(<Flow queue={queue} capture={CAPTURE} assessment={null} grounded />));
-    await tick(ASSESSMENT_GROUND_WAIT_MS);
-    const drawn = flow.state?.script;
-    await act(async () =>
-      root.render(<Flow queue={queue} capture={CAPTURE} assessment={assessmentFor('detected')} grounded />)
-    );
-    expect(flow.state?.script).toBe(drawn);
-    expect(flow.state?.script?.victimStatus).toBe('unknown');
-  });
-
-  it('opens with the victim every flight and alternates SAMU and police', async () => {
-    const queue = new NarrationQueue(async () => false, () => undefined);
-    const leads: string[] = [];
     const tails: string[] = [];
     for (let flight = 0; flight < 4; flight++) {
-      const capture = { ...CAPTURE, timestamp: flight };
-      await act(async () => root.render(<Flow queue={queue} capture={null} assessment={null} grounded={false} />));
-      await act(async () =>
-        root.render(<Flow queue={queue} capture={capture} assessment={assessmentFor('detected')} grounded={false} />)
-      );
-      const findings = flow.state?.script?.findings ?? [];
-      leads.push(findings.slice(0, 2).map((finding) => finding.topic).join(','));
-      tails.push(findings.slice(2).map((finding) => finding.topic).join(','));
+      await act(async () => root.render(<Flow queue={queue} runToken={`run-${flight}`} victimDetection grounded={false} />));
+      tails.push(topics().slice(2).join(','));
     }
-    expect(new Set(leads)).toEqual(new Set(['victim,vehicle']));
     for (let flight = 1; flight < 4; flight++) expect(tails[flight]).not.toBe(tails[flight - 1]);
   });
 
   it('shows on the card exactly the words it speaks', async () => {
     const queue = new NarrationQueue(async () => false, () => undefined);
-    for (const status of ['detected', 'not_detected', 'unavailable'] as const) {
-      await act(async () => root.render(<Flow queue={queue} capture={null} assessment={null} grounded={false} />));
+    for (const victim of [true, false]) {
       await act(async () =>
-        root.render(<Flow queue={queue} capture={CAPTURE} assessment={assessmentFor(status)} grounded={false} />)
+        root.render(<Flow queue={queue} runToken={`run-${victim}`} victimDetection={victim} grounded={false} />)
       );
       for (const finding of flow.state?.script?.findings ?? []) {
         const decapitalised = /^.[A-Z]/.test(finding.card)

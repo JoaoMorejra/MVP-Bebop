@@ -283,3 +283,16 @@ describe('battery return narration (Task 2B)', () => {
     expect(spoken[0]).toMatch(/[Bb]ateria|carga/);
   });
 });
+
+describe('the operator abort', () => {
+  it('is never announced, while other alerts still are', async () => {
+    emit(milestone('mission.start'));
+    emit({ kind: 'alert', key: 'mission.abort', payload: { text: 'Missão abortada. Pouso imediato comandado.', priority: 'URGENT' }, at: Date.now(), source: 'station' });
+    await settle();
+    expect(spoken.join(' ')).not.toMatch(/abortad/i);
+
+    emit({ kind: 'alert', key: 'mission.failsafe', payload: { text: 'Falha de segurança.', priority: 'CRITICAL' }, at: Date.now(), source: 'mission' });
+    await settle();
+    expect(spoken).toContain('Falha de segurança.');
+  });
+});

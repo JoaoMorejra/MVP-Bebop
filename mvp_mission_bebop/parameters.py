@@ -960,8 +960,8 @@ class ReturnToLaunchConfig:
     #: marker's black border, edge to edge.
     #:
     #: Safe envelope: a positive, finite length; the station also caps it at
-    #: 1.0 m (rule E07).
-    tag_size: float = 0.20
+    #: 1.0 m (rule E07). The field pad is a 0.25 m tag.
+    tag_size: float = 0.25
     #: Gimbal depression for the return leg, in degrees (negative is down).
     #:
     #: Near-nadir, and deliberately not fully nadir. The return leg is flown to
@@ -1057,10 +1057,16 @@ class ReturnToLaunchConfig:
     camera_offset_left_m: float = 0.0
     #: Fly the marker-tracked staged descent between the centring gate and the
     #: touchdown (``controllers.precision_descent``). ``False`` restores the
-    #: blind landing from the centring height.
+    #: blind landing from the centring height: the airframe still centres over
+    #: the marker at the altitude it holds, then the firmware landing descends
+    #: from there with no further horizontal correction. Exposed by the station
+    #: as the "Precision Land" toggle.
     visual_descent_enabled: bool = True
-    #: Peak descent speed of the tracked descent, m/s. Safe envelope: ``(0, 0.25]``.
-    descent_speed_mps: float = 0.12
+    #: Peak descent speed of the tracked descent, m/s. Slow on purpose: every
+    #: centimetre per second of descent is less time for the centring to null a
+    #: drift before the commit height, and the jerk-limited ramp into a pause is
+    #: proportionally shorter. Safe envelope: ``(0, 0.25]``.
+    descent_speed_mps: float = 0.08
     #: Radial error that must hold, at residual speed, before the descent
     #: starts, metres. Safe envelope: at or above :attr:`centering_tolerance_m`.
     descent_gate_radius_m: float = 0.05
@@ -1077,14 +1083,15 @@ class ReturnToLaunchConfig:
     ground_effect_height_m: float = 0.60
     #: Scale of the horizontal correction under ``ground_effect_height_m``.
     ground_effect_gain_scale: float = 0.6
-    #: Marker loss tolerated once the marker has been sighted, before the
-    #: touchdown is committed, seconds. A descent already under way keeps
-    #: descending through it; an alignment holds height. Never a realignment and
-    #: never a climb: the debounce only rejects a single dropped frame.
+    #: Wait for a marker the tracked descent has never sighted, seconds, as the
+    #: floor of :attr:`descent_pause_max_sec` for that case. A marker already
+    #: sighted, by the descent or by the centring before it, is never waited
+    #: for: its first missed cycle commits the touchdown from where the aircraft
+    #: is, with no debounce, no search and no realignment.
     descent_marker_lost_hold_sec: float = 0.25
-    #: Height over the marker under which losing the marker commits the touchdown
-    #: on the first missed frame, metres: the marker leaves the field of view by
-    #: proximity there, and waiting for it is hovering for nothing.
+    #: Height over the marker reported as the low-loss band of the descent,
+    #: metres (raised to the framing floor plus a band for a large tag). Every
+    #: loss after a sighting commits at once, at any height.
     descent_lost_commit_height_m: float = 0.60
     #: Total time the tracked descent may spend not descending (alignment, pauses
     #: for a grown error, waiting at the commit height for the radius), seconds.
@@ -1092,7 +1099,9 @@ class ReturnToLaunchConfig:
     #: error: optical flow and wind never hold an ideal alignment for long.
     descent_pause_max_sec: float = 1.5
     #: Bound on the tracked descent, seconds; reaching it commits the touchdown.
-    descent_timeout_sec: float = 20.0
+    #: Sized for the slow descent from the highest return altitude to the commit
+    #: height, with the pause budget on top.
+    descent_timeout_sec: float = 30.0
     #: Consecutive cycles inside :attr:`landing_radius_m` *at residual speed*
     #: required before the landing is authorized. A single sample inside the
     #: radius is satisfied by a drone flying through it at speed; two

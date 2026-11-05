@@ -63,14 +63,14 @@ interface CockpitScreenProps {
   onCameraTilt: (degrees: number) => void;
   /** This flight's forensic findings, in this flight's order. */
   report: Finding[] | null;
+  /** The flight's inspection has started (`useInspectionSchedule`). */
+  inspectionStarted: boolean;
   /** How many of them the copilot has read out so far. */
   reportRevealed: number;
   /** How many findings the copilot has begun to read; defaults to `reportRevealed`. */
   reportAnnounced?: number;
   /** When each finding's sentence stops sounding, which paces its typed text. */
   reportReadings?: ReadonlyArray<FindingReading | undefined>;
-  /** The aircraft is down and the report waits for the victim assessment. */
-  reportAnalyzing: boolean;
   /** The report's closing line as the copilot said it. */
   reportClosing: string | null;
   onAbort: () => void;
@@ -118,10 +118,10 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
   cameraAvailable,
   onCameraTilt,
   report,
+  inspectionStarted,
   reportRevealed,
   reportAnnounced,
   reportReadings,
-  reportAnalyzing,
   reportClosing,
   onAbort,
   onFinish,
@@ -253,7 +253,26 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
       {/* The feed is drawn object-cover from a 16:9 stream: the columns and rows
           keep its box near 16:9 at the station's 1600x900, so the picture is
           not cropped to a letterbox. */}
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)] gap-1.5">
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)] gap-1.5">
+        {/* What the flight is producing. */}
+        <ForensicPanel
+          latest={latestCapture}
+          count={captureCount}
+          stage={stage}
+          missionOver={over}
+          landed={landed}
+          report={report}
+          inspectionStarted={inspectionStarted}
+          reportRevealed={reportRevealed}
+          reportAnnounced={reportAnnounced}
+          reportReadings={reportReadings}
+          flightProgress={stageFill ? (stageFill.fills[3] + stageFill.fills[4]) / 2 : undefined}
+          waitProgress={stageFill ? (stageFill.fills[0] + stageFill.fills[1] + stageFill.fills[2] + stageFill.fills[3]) / 4 : 0}
+          reportClosing={reportClosing}
+          onFinish={onFinish}
+          lock={finishLock}
+        />
+
         {/* What the aircraft is doing. */}
         <div className="grid min-h-0 min-w-0 grid-rows-[minmax(0,1.5fr)_minmax(0,1fr)] gap-1.5">
           <div className="relative min-h-0">
@@ -292,24 +311,6 @@ export const CockpitScreen: React.FC<CockpitScreenProps> = ({
           />
         </div>
 
-        {/* What the flight is producing. */}
-        <ForensicPanel
-          latest={latestCapture}
-          count={captureCount}
-          stage={stage}
-          missionOver={over}
-          landed={landed}
-          report={report}
-          reportRevealed={reportRevealed}
-          reportAnnounced={reportAnnounced}
-          reportReadings={reportReadings}
-          flightProgress={stageFill ? (stageFill.fills[3] + stageFill.fills[4]) / 2 : undefined}
-          waitProgress={stageFill ? (stageFill.fills[0] + stageFill.fills[1] + stageFill.fills[2] + stageFill.fills[3]) / 4 : 0}
-          reportAnalyzing={reportAnalyzing}
-          reportClosing={reportClosing}
-          onFinish={onFinish}
-          lock={finishLock}
-        />
       </div>
 
     </div>

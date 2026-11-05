@@ -78,6 +78,8 @@ function standbyKey(doc, driverRunning) {
  *   Starts `mission.py --standby` for `doc`.
  * @param {(text: string) => void} options.log
  * @param {number} [options.retryMs]  Pause before re-preparing after a standby exited.
+ * @param {number} [options.releaseGraceMs]  How long a prepared standby asked to
+ *   stop (SIGTERM) is given before it is forced.
  *
  * A standby that exits with `EXIT_LAUNCH_REFUSED` refused the stored document
  * itself; preparing it again every `retryMs` would only be refused again. The
@@ -85,8 +87,13 @@ function standbyKey(doc, driverRunning) {
  * different document, which is what the save of the parameter sheet does
  * (`refreshStandby` after `bmg:save-parameters`).
  */
-function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
+function createStandbyManager({ spawnStandby, log, retryMs = 5000, releaseGraceMs = 2500 }) {
   let current = null; // { child, key, doc, driverRunning, ready, buffer }
+  // Released standbys until their process is gone, by pid. Dropping them from
+  // the bookkeeping at the SIGTERM made each one, for the seconds it took to
+  // exit, an untracked `mission.py` that the launch's orphan check refused on:
+  // "Missão órfã ainda em execução" on the very click that recycled it.
+  const draining = new Map();
   let wanted = null; // { doc, driverRunning }
   let retryTimer = null;
   let disposed = false;
@@ -101,10 +108,26 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
     if (!entry) return;
     entry.released = true;
     log(`[BMG] Missão em espera reciclada (${reason}).\n`);
+    if (entry.child.exitCode != null || entry.child.signalCode != null) return;
+    draining.set(entry.child.pid, entry);
+    // A standby still preparing has not installed its signal handlers: SIGTERM
+    // then lands in rclpy, which invalidates the context and leaves the process
+    // running into errors. It has commanded nothing and never will, so it is
+    // finished outright; a prepared one is asked first and forced after the grace.
+    const signalName = entry.ready ? 'SIGTERM' : 'SIGKILL';
     try {
-      entry.child.kill('SIGTERM');
+      entry.child.kill(signalName);
     } catch (_error) {
       // already gone
+    }
+    if (entry.ready) {
+      entry.forceTimer = setTimeout(() => {
+        try {
+          entry.child.kill('SIGKILL');
+        } catch (_error) {
+          // already gone
+        }
+      }, releaseGraceMs);
     }
   };
 
@@ -125,6 +148,7 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
       ready: false,
       buffer: '',
       released: false,
+      startedAt: Date.now(),
     };
     current = entry;
     const onData = (chunk) => {
@@ -144,6 +168,8 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
     child.stdout.on('data', onData);
     child.on('close', (code) => {
       if (current === entry) current = null;
+      if (draining.get(child.pid) === entry) draining.delete(child.pid);
+      if (entry.forceTimer) clearTimeout(entry.forceTimer);
       if (entry.taken || entry.released || disposed) return;
       if (code === EXIT_LAUNCH_REFUSED) {
         refusedDoc = JSON.stringify(entry.doc);
@@ -222,7 +248,24 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
     if (entry) release(entry, 'missão lançada sem espera');
   };
 
-  const isStandby = (pid) => Boolean(current && current.child.pid === pid);
+  const isStandby = (pid) => Boolean((current && current.child.pid === pid) || draining.has(pid));
+
+  /**
+   * Re-prepare the standby from scratch for the same document and driver state.
+   *
+   * A Fast DDS participant created before the host joined the aircraft's
+   * network does not discover the driver over the new interface, so a standby
+   * prepared earlier would receive its go blind and exit stale. The link
+   * bring-up rebuilds the bridges for that reason and recycles this once the
+   * link is proven, sparing a standby already prepared after `startedBefore`.
+   */
+  const recycle = (reason, startedBefore = Infinity) => {
+    if (disposed || !current || current.startedAt >= startedBefore) return;
+    const stale = current;
+    current = null;
+    release(stale, reason);
+    start(stale.doc, stale.driverRunning);
+  };
 
   /** Whether the last standby refused its document and none is prepared until it changes. */
   const isRefused = () => refusedDoc !== null;
@@ -235,7 +278,7 @@ function createStandbyManager({ spawnStandby, log, retryMs = 5000 }) {
     if (entry) release(entry, 'estação encerrando');
   };
 
-  return { ensure, take, unavailableReason, pause, isStandby, isRefused, dispose };
+  return { ensure, take, unavailableReason, pause, recycle, isStandby, isRefused, dispose };
 }
 
 module.exports = { CRITICAL_PATHS, STANDBY_READY_LINE, createStandbyManager, standbyKey };

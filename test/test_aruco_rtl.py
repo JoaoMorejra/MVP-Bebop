@@ -2466,3 +2466,53 @@ def test_the_simple_ceiling_and_forward_cap_are_used_only_in_the_simple_profile(
     assert advanced._forward_cap_mps == pytest.approx(params.rtl.centering_forward_cap_mps)
     with pytest.raises(ValueError):
         law(centering_forward_cap_mps=0.0)
+
+
+@pytest.mark.parametrize("simple", [False, True])
+def test_precision_land_off_centres_then_lands_from_the_altitude_held(monkeypatch, simple):
+    from mvp_mission_bebop.mission_mode import MissionMode
+    from mvp_mission_bebop.steps import rtl as rtl_module
+
+    def no_descent(*_args, **_kwargs):
+        raise AssertionError("the tracked descent ran with Precision Land off")
+
+    monkeypatch.setattr(rtl_module, "PrecisionDescentController", no_descent)
+    monkeypatch.setattr(ClosedLoopRTLStep, "_announce", staticmethod(lambda action, detail: None))
+
+    ctx = Ctx(altitude=0.30)
+    ctx.params.rtl.visual_descent_enabled = False
+    ctx.params.rtl.timeout_sec = 4.0
+    ctx.params.rtl.centering_timeout_sec = 6.0
+    sensor = ScriptedSensor(ctx.drone, acquire_after=3, ex=0.10, ey=-0.06)
+    mode = MissionMode.SIMPLE if simple else MissionMode.ADVANCED
+    step = ClosedLoopRTLStep(sensor=sensor, mode=mode, rtl_enabled=True)
+
+    order: List[str] = []
+    for name in ("_center_over_marker", "_descend_over_marker", "_touchdown"):
+        original = getattr(step, name)
+
+        def traced(*args, _name=name, _original=original, **kwargs):
+            order.append(_name)
+            return _original(*args, **kwargs)
+
+        setattr(step, name, traced)
+
+    status = step.execute(ctx)
+
+    assert status is StepStatus.SUCCESS
+    assert order == ["_center_over_marker", "_descend_over_marker", "_touchdown"]
+    assert ctx.drone.land_calls > 0
+
+
+def test_precision_land_names_the_landing_that_follows_the_centring():
+    params = MissionParameters()
+    on = ClosedLoopRTLStep._centred_detail(params.rtl)
+    params.rtl.visual_descent_enabled = False
+    off = ClosedLoopRTLStep._centred_detail(params.rtl)
+    assert on.endswith("pouso de precisão")
+    assert off.endswith("pouso na vertical")
+    assert "landing from the altitude held" in ClosedLoopRTLStep._residual_handover(params.rtl)
+
+
+def test_the_factory_pad_is_the_field_tag():
+    assert MissionParameters().rtl.tag_size == pytest.approx(0.25)

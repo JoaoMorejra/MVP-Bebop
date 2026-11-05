@@ -5,6 +5,7 @@ import {
   EMPTY_SIGNALS,
   MEASURED_CEILING,
   advanceFill,
+  fillInputFor,
   creep,
   measuredProgress,
   type FillInput,
@@ -175,5 +176,22 @@ describe('recordMilestone', () => {
     expect(s.approach).toEqual({ at: T0 + 3, windowSec: 30 });
     expect(s.landing).toEqual({ at: T0 + 4, altitude: 1.8 });
     expect(recordMilestone(s, { key: 'mission.start', payload: {}, at: T0 + 5 })).toEqual(signals());
+  });
+});
+
+describe('fillInputFor', () => {
+  it.each(['aborting', 'aborted'] as const)('runs an operator abort (%s) on to the end like a flight that is ending', (state) => {
+    expect(fillInputFor(state, 2, 0.3)).toEqual({ stage: 5, measured: 0.3, finished: true, halted: false });
+    let fill = advanceFill(EMPTY_FILL, input({ stage: 2, measured: 0.3 }), 100);
+    for (let t = 0; t < 20000; t += 100) fill = advanceFill(fill, fillInputFor(state, 2, 0.3), 100);
+    expect(fill.fills).toEqual([1, 1, 1, 1, 1]);
+  });
+
+  it('holds the strip where a fault stopped it', () => {
+    expect(fillInputFor('faulted', 2, 0.3)).toEqual({ stage: 2, measured: 0.3, finished: false, halted: true });
+  });
+
+  it('passes a running flight through unchanged', () => {
+    expect(fillInputFor('running', 3, 0.5)).toEqual({ stage: 3, measured: 0.5, finished: false, halted: false });
   });
 });

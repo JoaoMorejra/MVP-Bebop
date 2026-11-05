@@ -10,6 +10,8 @@
  * reports the next one. Pure: no React, no clock of its own.
  */
 
+import type { MissionState } from '../types/mission';
+
 /** The signals of one flight, as the hook collects them. Times are epoch ms. */
 export interface StageSignals {
   /** When the mission reported entering each stage, by stage number. */
@@ -162,6 +164,24 @@ export interface FillInput {
   finished: boolean;
   /** The flight stopped (abort, fault): the strip holds where it is. */
   halted: boolean;
+}
+
+/**
+ * What the strip is fed for a mission in `state` at `stage`.
+ *
+ * An operator abort is presented as the flight ending: the strip runs on to
+ * stage 5 at {@link COMPLETE_RATE}, every stage left filled in its turn, and
+ * the last completes, exactly as a flight that finished. Only a fault holds
+ * the strip where it stopped.
+ */
+export function fillInputFor(state: MissionState, stage: number, measured: number): FillInput {
+  const ending = state === 'aborting' || state === 'aborted';
+  return {
+    stage: ending && stage > 0 ? 5 : stage,
+    measured,
+    finished: state === 'finished' || ending,
+    halted: state === 'faulted',
+  };
 }
 
 /**

@@ -1,82 +1,61 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { InspectionAssessment, RawEvidence } from '../types/bmg';
+import { useEffect, useRef, useState } from 'react';
+import type { RawEvidence } from '../types/bmg';
 import { captureStampOf } from '../types/bmg';
 import type { StorageLike } from '../lib/copilotPhrases';
-import { drawForensicScript, scriptLines, type ForensicScript } from '../lib/forensics';
-
-/**
- * How long the report waits on the ground for the victim assessment, in ms.
- *
- * The assessment normally settles during the return leg. Past this wait after
- * confirmed ground, the report is drawn with the neutral victim line (reason
- * `timeout`); it is never drawn with a result that did not arrive.
- */
-export const ASSESSMENT_GROUND_WAIT_MS = 6000;
+import { REASON_VICTIM_DETECTION_DISABLED, drawForensicScript, scriptLines, type ForensicScript } from '../lib/forensics';
 
 export interface ForensicReportState {
-  /** The drawn report of the capture on screen, or null while none is drawn. */
+  /** The drawn report of the current flight, or null while none is drawn. */
   script: ForensicScript | null;
-  /** A capture is on screen and its report waits for the victim assessment. */
-  analyzing: boolean;
 }
 
 /**
- * The forensic report of the latest capture, drawn when its assessment arrives.
+ * The forensic report of the current flight: four findings, every flight.
  *
- * The draw happens once per capture: on the matching `mission.inspection_ready`
- * when it comes in flight (the usual case, so the reveal on the ground waits
- * for nothing), or, if the aircraft is down and it has not come within
- * {@link ASSESSMENT_GROUND_WAIT_MS}, with no assessment and reason `timeout`.
- * All six lines are handed to `prepare` the moment they are drawn so the copilot
- * synthesizes them before the reveal. Until a draw, `analyzing` is true and
- * nothing about the victim is read. The capture leaving (a new launch, the end
- * of the cycle) drops the report with it.
+ * Drawn once per flight as soon as there is something to inspect
+ * (`useInspectionSchedule` hands out `runToken`), so its six lines are with
+ * the copilot before they are needed. The victim finding is the operator's
+ * `vision.victim_detection_enabled`, not a detector verdict: on, a victim is
+ * reported, conscious and without visible injuries, and the report opens with
+ * the victim; off, no visible victim is reported and the report opens with the
+ * vehicle. A new flight drops the report with the old one.
+ *
+ * Parameters
+ * ----------
+ * runToken : the flight the report is for, or null while there is none.
+ * victimDetection : `vision.victim_detection_enabled` of the flight.
+ * capture : the flight's capture, for the stamp the script carries; may be null.
  */
 export function useForensicReport(options: {
+  runToken: string | null;
+  victimDetection: boolean;
   capture: RawEvidence | null;
-  assessment: InspectionAssessment | null;
-  grounded: boolean;
   prepare: (text: string) => void;
   storage?: StorageLike | null;
   random?: () => number;
 }): ForensicReportState {
-  const { capture, assessment, grounded, prepare, storage, random } = options;
-  const [script, setScript] = useState<ForensicScript | null>(null);
-  const drawnFor = useRef<RawEvidence | null>(null);
-  const settings = useRef({ prepare, storage, random });
-  settings.current = { prepare, storage, random };
+  const { runToken, victimDetection, capture, prepare, storage, random } = options;
+  const [drawn, setDrawn] = useState<{ run: string; script: ForensicScript } | null>(null);
+  const drawnRun = useRef<string | null>(null);
+  const settings = useRef({ prepare, storage, random, victimDetection, capture });
+  settings.current = { prepare, storage, random, victimDetection, capture };
 
-  const draw = useCallback((evidence: RawEvidence, result: InspectionAssessment | null, reason: string | null) => {
-    if (drawnFor.current === evidence) return;
-    drawnFor.current = evidence;
-    const { prepare: synthesize, storage: store, random: rng } = settings.current;
-    const drawn = drawForensicScript({
-      assessment: result,
-      captureStamp: captureStampOf(evidence.filename),
-      reason,
+  useEffect(() => {
+    if (runToken === null || drawnRun.current === runToken) return;
+    drawnRun.current = runToken;
+    const { prepare: synthesize, storage: store, random: rng, victimDetection: victim, capture: evidence } =
+      settings.current;
+    const script = drawForensicScript({
+      assessment: null,
+      victimStatus: victim ? 'detected' : 'not_detected',
+      captureStamp: evidence ? captureStampOf(evidence.filename) : null,
+      reason: victim ? null : REASON_VICTIM_DETECTION_DISABLED,
       ...(store === undefined ? {} : { storage: store }),
       random: rng,
     });
-    for (const line of scriptLines(drawn)) synthesize(line);
-    setScript(drawn);
-  }, []);
+    for (const line of scriptLines(script)) synthesize(line);
+    setDrawn({ run: runToken, script });
+  }, [runToken]);
 
-  useEffect(() => {
-    if (drawnFor.current !== capture) {
-      drawnFor.current = null;
-      setScript(null);
-    }
-  }, [capture]);
-
-  useEffect(() => {
-    if (capture && assessment) draw(capture, assessment, null);
-  }, [capture, assessment, draw]);
-
-  useEffect(() => {
-    if (!capture || !grounded || script !== null) return;
-    const timer = window.setTimeout(() => draw(capture, null, 'timeout'), ASSESSMENT_GROUND_WAIT_MS);
-    return () => window.clearTimeout(timer);
-  }, [capture, grounded, script, draw]);
-
-  return { script: capture ? script : null, analyzing: Boolean(capture) && script === null };
+  return { script: runToken !== null && drawn?.run === runToken ? drawn.script : null };
 }

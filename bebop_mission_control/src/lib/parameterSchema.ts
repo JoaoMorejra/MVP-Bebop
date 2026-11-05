@@ -298,19 +298,28 @@ export function groupsForMode(mode: MissionMode, doc?: unknown): ParameterGroup[
 }
 
 /**
+ * Precision Land: the marker-tracked descent from the centring height down to
+ * the commit height (`rtl.visual_descent_enabled`, `controllers/precision_descent.py`).
+ * Off, the aircraft still centres over the marker at the altitude it holds and
+ * the firmware landing descends from there.
+ */
+export const PRECISION_LAND_PATH = 'rtl.visual_descent_enabled';
+
+/**
  * Stage 5 fields edited in "Configurações Avançadas".
  *
- * The pad marker (`steps/rtl.py` builds its detector from the first three) and
+ * The pad marker (`steps/rtl.py` builds its detector from the first three),
  * the window of the centering over it (`rtl.centering_timeout_sec`, separate
- * from `rtl.timeout_sec`, which bounds the search). Kept out of
- * {@link PARAMETER_GROUPS}, so neither the operator preset nor "Restaurar
- * Padrões" moves them.
+ * from `rtl.timeout_sec`, which bounds the search) and the Precision Land
+ * switch. Kept out of {@link PARAMETER_GROUPS}, so the operator preset does
+ * not move them.
  */
 export const ADVANCED_PATHS = [
   'rtl.target_aruco_id',
   'rtl.marker_dict',
   'rtl.tag_size',
   'rtl.centering_timeout_sec',
+  PRECISION_LAND_PATH,
 ] as const;
 
 /**

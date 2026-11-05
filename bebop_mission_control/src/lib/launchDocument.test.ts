@@ -320,6 +320,7 @@ describe('advanced marker settings', () => {
       'rtl.marker_dict',
       'rtl.tag_size',
       'rtl.centering_timeout_sec',
+      'rtl.visual_descent_enabled',
     ]);
     for (const path of ADVANCED_PATHS) {
       expect(TRACKED_PATHS).toContain(path);
@@ -455,13 +456,18 @@ describe('fillMissing', () => {
 
   it('backfills the booleans a store written before them lacks, from the factory or their default', () => {
     expect(fillMissing({}, {})).toEqual({
-      rtl: { enabled: true },
+      rtl: { enabled: true, visual_descent_enabled: true },
       platform: { takeoff_from_ground: false },
       vision: { victim_detection_enabled: true },
     });
     expect(getPath(fillMissing({}, { rtl: { enabled: false } }), 'rtl.enabled')).toBe(false);
     expect(getPath(fillMissing({}, { vision: { victim_detection_enabled: false } }), 'vision.victim_detection_enabled')).toBe(false);
-    const doc = { rtl: { enabled: false }, platform: { takeoff_from_ground: true }, vision: { victim_detection_enabled: false } };
+    expect(getPath(fillMissing({}, { rtl: { visual_descent_enabled: false } }), 'rtl.visual_descent_enabled')).toBe(false);
+    const doc = {
+      rtl: { enabled: false, visual_descent_enabled: false },
+      platform: { takeoff_from_ground: true },
+      vision: { victim_detection_enabled: false },
+    };
     expect(fillMissing(doc, {})).toBe(doc);
   });
 });
@@ -591,6 +597,7 @@ describe('altitudeAdjustment', () => {
       'platform.takeoff_from_ground': false,
       'rtl.enabled': true,
       'vision.victim_detection_enabled': true,
+      'rtl.visual_descent_enabled': true,
     });
   });
 });

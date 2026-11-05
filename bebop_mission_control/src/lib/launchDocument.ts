@@ -18,6 +18,7 @@ import {
   ALTITUDE_PATH,
   BOOLEAN_PARAMETERS,
   NUMBER_PARAMETERS,
+  PRECISION_LAND_PATH,
   CENTERING_TIMEOUT_RANGE_SEC,
   isKnownMarkerDictionary,
   markerCount,
@@ -152,14 +153,16 @@ export const BACKFILL_PATHS: readonly string[] = ['yaw_pattern.scan_vyaw'];
 
 /**
  * The sheet's booleans, with the value a store written before them stands for:
- * the return (`rtl.enabled = true`) and the pad top
- * (`platform.takeoff_from_ground = false`), what every flight did then. A
+ * the return (`rtl.enabled = true`), the pad top
+ * (`platform.takeoff_from_ground = false`) and the tracked descent of Precision
+ * Land (`rtl.visual_descent_enabled = true`), what every flight did then. A
  * launch never needs them present (the mission has the same defaults); one
  * present must be a JSON boolean ({@link launchBlockers}).
  */
-export const REQUIRED_LAUNCH_BOOLEANS: Readonly<Record<string, boolean>> = Object.fromEntries(
-  BOOLEAN_PARAMETERS.map((spec) => [spec.path, spec.path === TAKEOFF_FROM_GROUND_PATH ? false : true])
-);
+export const REQUIRED_LAUNCH_BOOLEANS: Readonly<Record<string, boolean>> = Object.fromEntries([
+  ...BOOLEAN_PARAMETERS.map((spec) => [spec.path, spec.path === TAKEOFF_FROM_GROUND_PATH ? false : true]),
+  [PRECISION_LAND_PATH, true],
+]);
 
 /**
  * `doc` with each of `paths` taken from `factory` when `doc` does not hold a

@@ -801,9 +801,9 @@ class ClosedLoopRTLStep(BaseStep):
         if outcome is _PhaseOutcome.EXHAUSTED:
             if marker_sighted:
                 logger.warning(
-                    "Centering window of %.1f s expired with residual error; "
-                    "proceeding to tracked precision descent to continue centering while descending.",
+                    "Centering window of %.1f s expired with residual error; %s",
                     rtl_cfg.centering_timeout_sec,
+                    self._residual_handover(rtl_cfg),
                 )
             else:
                 logger.warning(
@@ -813,10 +813,7 @@ class ClosedLoopRTLStep(BaseStep):
                 )
                 return self._touchdown(ctx, guidance, at_base=True)
         else:
-            self._announce(
-                "Centralizado sobre a base",
-                "aeronave centralizada sobre o marcador, iniciando pouso de precisão",
-            )
+            self._announce("Centralizado sobre a base", self._centred_detail(rtl_cfg))
 
         # ---- phase 3.5: precision tracked descent -----------------------
         outcome = self._descend_over_marker(ctx, centering, sensor)
@@ -966,7 +963,8 @@ class ClosedLoopRTLStep(BaseStep):
         )
         self._announce(
             "Centralizando sobre a base",
-            "centralizando sobre o marcador da base para o pouso de precisão",
+            "centralizando sobre o marcador da base para o pouso"
+            + (" de precisão" if rtl_cfg.visual_descent_enabled else ""),
         )
         with ctx.failsafe.altitude_hold_window(ctx.params.governor.climb_authority):
             outcome = self._center_over_marker(ctx, centering, sensor)
@@ -984,9 +982,9 @@ class ClosedLoopRTLStep(BaseStep):
         if outcome is _PhaseOutcome.EXHAUSTED:
             if marker_sighted:
                 logger.warning(
-                    "Centering window of %.1f s expired with residual error; "
-                    "proceeding to tracked precision descent to continue centering while descending.",
+                    "Centering window of %.1f s expired with residual error; %s",
                     rtl_cfg.centering_timeout_sec,
+                    self._residual_handover(rtl_cfg),
                 )
             else:
                 logger.warning(
@@ -996,10 +994,7 @@ class ClosedLoopRTLStep(BaseStep):
                 )
                 return self._touchdown(ctx, guidance, at_base=True)
         else:
-            self._announce(
-                "Centralizado sobre a base",
-                "aeronave centralizada sobre o marcador, iniciando pouso de precisão",
-            )
+            self._announce("Centralizado sobre a base", self._centred_detail(rtl_cfg))
 
         # ---- phase 3.5: precision tracked descent -----------------------
         outcome = self._descend_over_marker(ctx, centering, sensor)
@@ -1636,6 +1631,20 @@ class ClosedLoopRTLStep(BaseStep):
         """
         return min(_CENTERING_FRAME_TIMEOUT_SEC, max(_MIN_FRAME_WAIT_SEC, rate.remaining_sec()))
 
+    @staticmethod
+    def _residual_handover(rtl_cfg: Any) -> str:
+        """What follows a centring window that expired with the marker sighted."""
+        if rtl_cfg.visual_descent_enabled:
+            return "proceeding to tracked precision descent to continue centering while descending."
+        return "precision land disabled; landing from the altitude held."
+
+    @staticmethod
+    def _centred_detail(rtl_cfg: Any) -> str:
+        """Spoken detail of a settled centring, naming the landing that follows."""
+        if rtl_cfg.visual_descent_enabled:
+            return "aeronave centralizada sobre o marcador, iniciando pouso de precisão"
+        return "aeronave centralizada sobre o marcador, iniciando pouso na vertical"
+
     def _descend_over_marker(
         self,
         ctx: MissionContext,
@@ -1671,7 +1680,8 @@ class ClosedLoopRTLStep(BaseStep):
         rate = LoopRate(ctx.params.kinematics.control_loop_hz)
         deadline = Deadline(rtl_cfg.descent_timeout_sec)
         logger.info(
-            "Tracked descent over marker %d: gate %.3f m, %.2f m/s down to %.2f m, window %.1f s.",
+            "Tracked descent over marker %d: gate %.3f m, %.2f m/s down to %.2f m, window %.1f s; "
+            "a lost marker lands at once.",
             sensor.target_id,
             rtl_cfg.descent_gate_radius_m,
             rtl_cfg.descent_speed_mps,
@@ -1680,13 +1690,11 @@ class ClosedLoopRTLStep(BaseStep):
         )
         if descent.commit_height_m > float(rtl_cfg.commit_height_m):
             logger.info(
-                "Tag %.3f m leaves the frame under %.2f m: commit raised from %.2f m to %.2f m, "
-                "loss commits at once under %.2f m.",
+                "Tag %.3f m leaves the frame under %.2f m: commit raised from %.2f m to %.2f m.",
                 centering.tag_size_m,
                 descent.framing_floor_m,
                 float(rtl_cfg.commit_height_m),
                 descent.commit_height_m,
-                descent.lost_commit_height_m,
             )
         cycle = 0
         since_tilt = 0.0

@@ -172,7 +172,9 @@ describe('pre-flight lock across a real flight', () => {
     await act(async () => bridge.exit(130));
     await act(async () => bridge.abortAnswered());
     await act(async () => aborting);
-    expect(probe.runtime.state).toBe('faulted');
+    // The process killed by the abort exits on a signal; the operator's abort
+    // still reads as an abort, never as a fault.
+    expect(probe.runtime.state).toBe('aborted');
     expect(homeAvailable()).toBe(false);
     await act(async () => probe.runtime.reset());
     expect(homeAvailable()).toBe(true);

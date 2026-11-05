@@ -7,6 +7,7 @@ Entry point executing the deterministic 5-step mission pipeline via Nectar SDK.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import json
 import logging
@@ -15,7 +16,7 @@ import os
 import signal
 import sys
 import time
-from typing import Any, Callable, Dict, Final, List, Optional, Tuple
+from typing import Any, Callable, Dict, Final, List, NoReturn, Optional, Tuple
 
 import numpy as np
 from nav_msgs.msg import Odometry
@@ -1564,5 +1565,47 @@ def main() -> None:
     sys.exit(runner.exit_code(succeeded))
 
 
+def _exit_promptly(status: object) -> NoReturn:
+    """Leave the interpreter as soon as the mission has asked to exit.
+
+    By the time ``main`` raises ``SystemExit`` the runner's finalizer has
+    commanded the landing, released the camera and shut the Nectar/ROS runtime
+    down. What remains is interpreter teardown, dominated by the garbage
+    collection of the torch modules and the CUDA context: measured at 3.6 s on
+    the MX110. The station gives an aborted mission 900 ms before SIGKILL
+    (``stopMissionProcess``), so every abort ended killed with its exit code
+    lost, and a recycled standby outlived its grace period the same way. The
+    ``atexit`` handlers still run (the OpenVINO child reaper, the Nectar
+    shutdown); only the collection is skipped.
+
+    Parameters
+    ----------
+    status : object
+        ``SystemExit.code``: ``None`` for 0, an ``int`` as is, anything else
+        printed to stderr and mapped to 1, as the interpreter itself does.
+    """
+    if status is None:
+        code = 0
+    elif isinstance(status, int):
+        code = status
+    else:
+        print(status, file=sys.stderr)
+        code = 1
+    try:
+        atexit._run_exitfuncs()
+    finally:
+        logging.shutdown()
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        os._exit(code)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exit_request:
+        _exit_promptly(exit_request.code)
+    _exit_promptly(0)

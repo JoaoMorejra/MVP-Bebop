@@ -30,7 +30,8 @@ import {
   useNarrationQueue,
 } from './hooks/useCopilot';
 import { useVoiceLevel } from './hooks/useVoiceLevel';
-import { useInspectionAssessment } from './hooks/useInspectionAssessment';
+import { useInspectionSchedule } from './hooks/useInspectionSchedule';
+import { VICTIM_DETECTION_PATH } from './lib/parameterSchema';
 import { useForensicReport } from './hooks/useForensicReport';
 import { LAUNCH_KEYS, planSentence, reserveLaunchPhrase } from './lib/copilotPhrases';
 import { deepEqual, getPath } from './lib/paths';
@@ -144,6 +145,8 @@ export const App: React.FC = () => {
   const [launchedMode, setLaunchedMode] = useState<MissionMode | null>(null);
   /** Return plan of the launch in progress (`rtl.enabled`), read with the mode. */
   const [launchedRtl, setLaunchedRtl] = useState<boolean | null>(null);
+  /** `vision.victim_detection_enabled` of the document the current flight was launched with. */
+  const [launchedVictim, setLaunchedVictim] = useState<boolean | null>(null);
   /** Launch surface of the launch in progress, read with the mode. */
   const [launchedSurface, setLaunchedSurface] = useState<'platform' | 'ground' | null>(null);
   const [benchStage, setBenchStage] = useState<number | null>(null);
@@ -348,6 +351,7 @@ export const App: React.FC = () => {
       setParamsCommitted(true);
       setLaunchedMode(readMissionMode(doc));
       setLaunchedRtl(readRtlEnabled(doc));
+      setLaunchedVictim(getPath(doc, VICTIM_DETECTION_PATH) !== false);
       setLaunchedSurface(launchesFromGround(doc) ? 'ground' : 'platform');
       // No longer an operator parameter: the window is fixed at
       // LAUNCH_COUNTDOWN_SEC and pinned in the document, which the mission
@@ -815,6 +819,7 @@ export const App: React.FC = () => {
     setLaunchError(null);
     setLaunchedMode(null);
     setLaunchedRtl(null);
+    setLaunchedVictim(null);
     setLaunchedSurface(null);
     setCounting(false);
     setParamsCommitted(false);
@@ -841,16 +846,16 @@ export const App: React.FC = () => {
     finishing,
   });
 
-  // The report is drawn when the victim assessment of the capture arrives,
-  // normally during the return leg, so the wording and the order are settled
-  // before the aircraft is back on the ground. The capture leaving (a new
-  // launch, the end of the cycle) drops it.
+  // Every flight that reaches Stage 4 gets its four findings, in flight or on
+  // the ground, aborted or not (`hooks/useInspectionSchedule.ts`). The victim
+  // finding is the operator's switch, not a detector verdict. The voice still
+  // waits for confirmed ground; the cards on screen do not wait for the voice.
   const grounded = reportMayStart(finishLock);
-  const inspection = useInspectionAssessment(mission.latestCapture);
+  const schedule = useInspectionSchedule(mission.startedAt, mission.stage, mission.latestCapture);
   const forensic = useForensicReport({
+    runToken: schedule.runToken,
+    victimDetection: launchedVictim ?? getPath(params.committed, VICTIM_DETECTION_PATH) !== false,
     capture: mission.latestCapture,
-    assessment: inspection,
-    grounded,
     prepare: prepareSpeech,
   });
   const report = forensic.script?.findings ?? null;
@@ -863,7 +868,7 @@ export const App: React.FC = () => {
     closing: reportClosing,
   } = useForensicNarration(
     narration,
-    grounded && !reportDismissed && Boolean(mission.latestCapture),
+    grounded && !reportDismissed && schedule.started,
     forensic.script
   );
 
@@ -913,8 +918,8 @@ export const App: React.FC = () => {
           cameraTilt={camera.tilt}
           cameraAvailable={camera.available}
           onCameraTilt={camera.set}
-          report={touchedDown ? report : null}
-          reportAnalyzing={touchedDown && forensic.analyzing}
+          report={report}
+          inspectionStarted={schedule.started}
           reportRevealed={reportRevealed}
           reportAnnounced={reportAnnounced}
           reportReadings={reportReadings}
@@ -977,7 +982,7 @@ export const App: React.FC = () => {
     abort,
     finishMission,
     report,
-    forensic.analyzing,
+    schedule.started,
     landed,
     touchedDown,
     reportRevealed,

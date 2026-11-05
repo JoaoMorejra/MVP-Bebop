@@ -152,7 +152,7 @@ describe('ParameterSheet Pouso ArUco', () => {
     expect(section()).not.toBeNull();
     expect(section()!.querySelector('h3')?.textContent).toBe('Pouso ArUco');
     const paths = Array.from(section()!.querySelectorAll('[data-parameter]')).map((n) => n.getAttribute('data-parameter'));
-    expect(paths).toEqual(['rtl.target_aruco_id', 'rtl.tag_size', 'rtl.centering_timeout_sec']);
+    expect(paths).toEqual(['rtl.visual_descent_enabled', 'rtl.target_aruco_id', 'rtl.tag_size', 'rtl.centering_timeout_sec']);
     expect(Array.from(container.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Aruco')).toBe(false);
     expect(document.querySelector('[role="dialog"]')).toBeNull();
   });
@@ -186,6 +186,16 @@ describe('ParameterSheet Pouso ArUco', () => {
     expect(onEdit).toHaveBeenLastCalledWith('rtl.tag_size', 0.175);
     act(() => slide(range('rtl.centering_timeout_sec'), '40'));
     expect(onEdit).toHaveBeenLastCalledWith('rtl.centering_timeout_sec', 40);
+  });
+
+  it('offers Precision Land as a switch that writes rtl.visual_descent_enabled', () => {
+    const onEdit = render(pad({ 'rtl.visual_descent_enabled': true }), null);
+    const tile = section()!.querySelector('[data-parameter="rtl.visual_descent_enabled"]')!;
+    expect(tile.textContent).toContain('Precision Land');
+    const toggle = tile.querySelector('input[role="switch"]') as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+    act(() => toggle.click());
+    expect(onEdit).toHaveBeenLastCalledWith('rtl.visual_descent_enabled', false);
   });
 
   it('marks an ID outside the dictionary as an error and keeps Salvar shut', () => {

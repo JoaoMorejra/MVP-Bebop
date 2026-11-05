@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import { AlertOctagon, RotateCcw } from 'lucide-react';
 import { cn } from '../../lib/format';
 import type { LandProgressPhase } from '../../types/bmg';
@@ -16,8 +16,12 @@ export interface AbortControlProps {
 /**
  * Zero the velocity, command a landing, and stop the mission process.
  *
- * One press, acted on immediately. In unconfirmed state (R6 / L2), the button
- * re-enables with "REENVIAR POUSO" to allow repeating the land command.
+ * One press, acted on immediately, and shown as nothing: no flash, no press
+ * scale, no change of wording while the aircraft lands. The abort is the
+ * operator's own business; the audience watching the station sees the flight
+ * come to an end, not an abort. The one exception is a landing the aircraft
+ * never confirmed (R6 / L2): the button re-enables as "REENVIAR POUSO", still
+ * and steady, so the land command can be repeated.
  */
 export const AbortControl: React.FC<AbortControlProps> = ({
   onAbort,
@@ -26,44 +30,36 @@ export const AbortControl: React.FC<AbortControlProps> = ({
   landProgress,
   fill = false,
 }) => {
-  const [flash, setFlash] = useState(false);
   const firedRef = useRef(false);
-  const flashTimer = useRef<number | null>(null);
+  const releaseTimer = useRef<number | null>(null);
 
   const isUnconfirmed = landProgress === 'unconfirmed';
   const effectiveDisabled = isUnconfirmed ? false : Boolean(disabled || busy);
+  // While the abort it started is landing the aircraft the button refuses a
+  // second press but keeps its look: greying it out on the press would show
+  // the abort. It greys only once it is unavailable for another reason (on
+  // the ground, after the flight), exactly as at the end of a normal flight.
+  const looksDisabled = effectiveDisabled && !busy;
 
   const fire = useCallback(() => {
     if (effectiveDisabled || firedRef.current) return;
     firedRef.current = true;
-    setFlash(true);
     onAbort();
-    if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
-    flashTimer.current = window.setTimeout(() => {
+    if (releaseTimer.current !== null) window.clearTimeout(releaseTimer.current);
+    releaseTimer.current = window.setTimeout(() => {
       firedRef.current = false;
-      setFlash(false);
     }, 600);
   }, [effectiveDisabled, onAbort]);
 
   useEffect(
     () => () => {
-      if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
+      if (releaseTimer.current !== null) window.clearTimeout(releaseTimer.current);
     },
     []
   );
 
-  let label = 'ABORTAR MISSÃO';
-  if (isUnconfirmed) {
-    label = 'REENVIAR POUSO';
-  } else if (landProgress === 'landed') {
-    label = 'POUSADA';
-  } else if (landProgress === 'landing') {
-    label = 'POUSANDO';
-  } else if (landProgress === 'commanded' || busy) {
-    label = 'POUSO COMANDADO';
-  }
-
-  const progressText = landProgressLabel(landProgress);
+  const label = isUnconfirmed ? 'REENVIAR POUSO' : 'ABORTAR MISSÃO';
+  const progressText = isUnconfirmed ? landProgressLabel(landProgress) : null;
 
   return (
     <div className={cn('flex flex-col items-center gap-1', fill && 'h-full w-full')}>
@@ -81,20 +77,18 @@ export const AbortControl: React.FC<AbortControlProps> = ({
         className={cn(
           'group relative flex items-center gap-2.5 overflow-hidden rounded-full border-2 px-6 py-2.5',
           fill && 'h-full w-full justify-center',
-          'transition-all duration-150 active:scale-[0.98]',
           isUnconfirmed
-            ? 'border-amber-500 bg-amber-500/25 text-amber-200 shadow-abort backdrop-blur-sm hover:bg-amber-500/40 animate-pulse'
-            : effectiveDisabled
+            ? 'border-amber-500 bg-amber-500/25 text-amber-200 shadow-abort backdrop-blur-sm'
+            : looksDisabled
             ? 'cursor-not-allowed border-strut bg-hull text-haze-deep'
-            : 'border-ember bg-ember/20 text-frost shadow-abort backdrop-blur-sm hover:bg-ember/35',
-          flash && 'bg-ember text-abyss'
+            : 'border-ember bg-ember/20 text-frost shadow-abort backdrop-blur-sm'
         )}
       >
         {isUnconfirmed ? (
           <RotateCcw
             size={16}
             strokeWidth={2}
-            className={cn('relative shrink-0 text-amber-400', flash && 'text-abyss')}
+            className="relative shrink-0 text-amber-400"
           />
         ) : (
           <AlertOctagon
@@ -102,7 +96,7 @@ export const AbortControl: React.FC<AbortControlProps> = ({
             strokeWidth={2}
             className={cn(
               'relative shrink-0',
-              effectiveDisabled ? 'text-haze-deep' : flash ? 'text-abyss' : 'text-ember'
+              looksDisabled ? 'text-haze-deep' : 'text-ember'
             )}
           />
         )}

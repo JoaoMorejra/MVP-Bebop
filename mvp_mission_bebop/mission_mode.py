@@ -5,7 +5,8 @@ Both profiles fly the same five deterministic stages and emit the same
 
 * ``advanced``: the lateral search, the visual approach and the inspection.
 * ``simple``: the airframe never translates. Stage 2 and 3 rotate about the
-  vertical axis and stage 4 restores the takeoff heading after the capture.
+  vertical axis; stage 4 keeps the heading of the lock and hands over to
+  stage 5 right after the capture.
 
 What stage 5 does is a separate, per-flight choice, ``rtl.enabled``: the ArUco
 return and precision landing on the pad (in the Simple profile, the centering
