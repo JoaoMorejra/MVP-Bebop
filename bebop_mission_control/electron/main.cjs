@@ -909,6 +909,28 @@ function panelZoomFactor(win) {
   return Math.min(width / LED_PANEL_LAYOUT.width, height / LED_PANEL_LAYOUT.height);
 }
 
+/**
+ * Moves the window onto the LED panel, fullscreen, once the panel exists.
+ *
+ * The panel is often absent when the station starts: the NovaStar card first
+ * comes up on its 1920x1080 EDID mode and only reaches 1008x672 when the xrandr
+ * setup script runs. A window created before that carries the laptop's
+ * 1180x720 minimum, which the panel cannot hold, so the minimum is lowered
+ * before the move.
+ */
+function placeOnLedPanel(win) {
+  if (!win || win.isDestroyed()) return;
+  const panel = findLedPanel();
+  if (!panel) return;
+  const current = screen.getDisplayMatching(win.getBounds());
+  if (current.id === panel.id && win.isFullScreen()) return;
+  win.setMinimumSize(LED_PANEL_SIZE.width, LED_PANEL_SIZE.height);
+  if (win.isFullScreen()) win.setFullScreen(false);
+  if (win.isMaximized()) win.unmaximize();
+  win.setBounds(panel.bounds);
+  win.setFullScreen(true);
+}
+
 function createWindow(port) {
   const ledPanel = findLedPanel();
   mainWindow = new BrowserWindow({
@@ -985,6 +1007,14 @@ function createWindow(port) {
   mainWindow.webContents.on('did-finish-load', applyPanelZoom);
   mainWindow.on('resize', applyPanelZoom);
   mainWindow.on('move', applyPanelZoom);
+
+  const followLedPanel = () => placeOnLedPanel(mainWindow);
+  screen.on('display-added', followLedPanel);
+  screen.on('display-metrics-changed', followLedPanel);
+  mainWindow.on('closed', () => {
+    screen.removeListener('display-added', followLedPanel);
+    screen.removeListener('display-metrics-changed', followLedPanel);
+  });
 
   mainWindow.webContents.on('did-finish-load', () => {
     if (!process.env.BMG_SCREENSHOT_PATH) return;
